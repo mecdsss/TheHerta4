@@ -45,6 +45,7 @@ def ImprotFromWorkSpaceFull(self, context):
         
         # 获取导入的数据类型文件夹路径列表
         final_import_folder_path_list = WorkSpaceHelper.get_ordered_gpu_cpu_import_folderpath_list(submesh_folder_path)
+        print("Final Import Folder Path List: " + str(final_import_folder_path_list))
         
         # 接下来开始导入，尝试对当前DrawIB的每个数据类型都进行导入
         # 如果出错的话直接提示错误并continue
@@ -53,15 +54,17 @@ def ImprotFromWorkSpaceFull(self, context):
 
             try:
                 print("尝试导入路径: " + import_folder_path)
-                draw_ib = submesh_folder_name.split("-")[0]
-                this_alias = "." + (drawib_aliasname_dict.get(draw_ib) or "自定义名称")
+                object_display_name = WorkSpaceHelper.get_display_submesh_name(
+                    submesh_folder_name,
+                    drawib_aliasname_dict=drawib_aliasname_dict,
+                )
                 json_file_path = os.path.join(import_folder_path, submesh_folder_name + ".json")
                 imported_obj = SSMTImportHelper.create_mesh_from_json(
                     json_file_path=json_file_path,
                     import_collection=workspace_collection,
                 )
                 if imported_obj is not None:
-                    imported_obj.name = submesh_folder_name + this_alias
+                    imported_obj.name = object_display_name
                     imported_obj.data.name = imported_obj.name
                     imported_objects.append(imported_obj)
 
@@ -161,7 +164,10 @@ def ImprotFromWorkSpaceFull(self, context):
                     else:
                         node.component = "1"
 
-                    node.alias_name = drawib_aliasname_dict.get(draw_ib, "自定义名称")
+                    node.alias_name = WorkSpaceHelper.get_object_display_name(
+                        submesh_folder_name,
+                        drawib_aliasname_dict=drawib_aliasname_dict,
+                    )
                     node.label = obj.name
 
                     if target_group.inputs[-1].is_linked:

@@ -18,6 +18,46 @@ class DedupedTextureInfo:
 class WorkSpaceHelper:
 
     @staticmethod
+    def get_object_display_name(submesh_folder_name: str, drawib_aliasname_dict: Dict[str, str] | None = None) -> str:
+        normalized_folder_name = str(submesh_folder_name or "").strip()
+        if not normalized_folder_name:
+            return ""
+
+        drawib_aliasname_dict = drawib_aliasname_dict or WorkSpaceHelper.get_drawib_aliasname_dict()
+        folder_prefix, _, folder_alias = normalized_folder_name.partition(".")
+        draw_ib = folder_prefix.split("-")[0]
+
+        configured_alias = str(drawib_aliasname_dict.get(draw_ib, "")).strip()
+        if configured_alias:
+            return configured_alias
+
+        if folder_alias.strip():
+            return folder_alias.strip()
+
+        return folder_prefix
+
+    @staticmethod
+    def get_display_submesh_name(submesh_folder_name: str, drawib_aliasname_dict: Dict[str, str] | None = None) -> str:
+        normalized_folder_name = str(submesh_folder_name or "").strip()
+        if not normalized_folder_name:
+            return ""
+
+        alias_name = WorkSpaceHelper.get_object_display_name(
+            normalized_folder_name,
+            drawib_aliasname_dict=drawib_aliasname_dict,
+        )
+        if not alias_name:
+            return normalized_folder_name
+
+        name_prefix, _, existing_alias = normalized_folder_name.partition(".")
+        if existing_alias.strip() and alias_name == existing_alias.strip():
+            return normalized_folder_name
+
+        # 本地重构后的蓝图/导出链仍依赖“前缀.别名”结构。
+        # 当上游没有提供别名时，这里回退为“前缀.前缀”，避免继续写入“自定义名称”。
+        return name_prefix + "." + alias_name
+
+    @staticmethod
     def get_ordered_gpu_cpu_import_folderpath_list(submesh_folderpath:str)-> List[str]:
         # 导入时，要按照先GPU类型，再CPU类型进行排序
         gpu_import_folder_path_list = []

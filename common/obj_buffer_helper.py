@@ -39,7 +39,7 @@ class ObjBufferHelper:
                 color_coll = obj.data.color_attributes if hasattr(obj.data, 'color_attributes') else obj.data.vertex_colors
                 if d3d11_element_name not in color_coll:
                     if hasattr(obj.data, 'color_attributes'):
-                        obj.data.color_attributes.new(name=d3d11_element_name, type='FLOAT_COLOR', domain='CORNER')
+                        obj.data.color_attributes.new(name=d3d11_element_name, type='BYTE_COLOR', domain='CORNER')
                     else:
                         obj.data.vertex_colors.new(name=d3d11_element_name)
                     print("当前obj ["+ obj.name +"] 缺少游戏渲染所需的COLOR: ["+  "COLOR" + "]，已自动补全")
@@ -310,6 +310,7 @@ class ObjBufferHelper:
             color_data = None
 
         if color_data is not None:
+            # Blender 颜色层读取接口统一返回 0-1 的 RGBA 浮点值，这里按 float32 处理中间结果。
             result = numpy.zeros(mesh_loops_length, dtype=(numpy.float32, 4))
 
             color_data.foreach_get("color", result.ravel())

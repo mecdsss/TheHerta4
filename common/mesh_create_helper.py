@@ -98,7 +98,7 @@ class MeshCreateHelper:
                     colors_flat[:, 0] = data[loop_vertex_indices].astype(numpy.float32)
 
                 if hasattr(mesh, 'color_attributes'):
-                    color_attr = mesh.color_attributes.new(name=element.ElementName, type='FLOAT_COLOR', domain='CORNER')
+                    color_attr = mesh.color_attributes.new(name=element.ElementName, type='BYTE_COLOR', domain='CORNER')
                     color_attr.data.foreach_set('color', colors_flat.ravel())
                 else:
                     mesh.vertex_colors.new(name=element.ElementName)
