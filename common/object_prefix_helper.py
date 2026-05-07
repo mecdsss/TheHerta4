@@ -1,5 +1,7 @@
 import re
 
+import bpy
+
 from ..utils.ssmt_error_utils import SSMTErrorUtils
 
 
@@ -83,12 +85,17 @@ class ObjectPrefixHelper:
         clean_prefix = cls.normalize_prefix(prefix)
         clean_separator = separator or "."
 
+        if clean_prefix and clean_name == clean_prefix:
+            return clean_prefix, clean_separator, ""
+
         if clean_prefix and clean_name.startswith(clean_prefix + clean_separator):
             return clean_prefix, clean_separator, clean_name[len(clean_prefix + clean_separator):]
 
         parsed = cls.extract_prefix_info(clean_name)
         if parsed:
             parsed_prefix, parsed_separator = parsed
+            if clean_name == parsed_prefix:
+                return parsed_prefix, parsed_separator, ""
             token = parsed_prefix + parsed_separator
             if clean_name.startswith(token):
                 return parsed_prefix, parsed_separator, clean_name[len(token):]
@@ -202,6 +209,14 @@ class ObjectPrefixHelper:
 
         prefix, separator, base_name = cls.split_name_and_prefix(object_name)
         if prefix and separator == "." and base_name:
-            return base_name
+            if bpy.data.objects.get(base_name) is not None:
+                return base_name
+
+        if prefix:
+            for obj in bpy.data.objects:
+                if obj.name == object_name:
+                    return obj.name
+                if cls.has_prefix(obj.name, prefix):
+                    return obj.name
 
         return object_name

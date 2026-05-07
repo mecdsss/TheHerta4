@@ -509,28 +509,96 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         if match:
             return match.group(1)
 
+        match = re.search(r'ResourceTexture_[^=]+_(T\d+)(?:_\d+)?$', resource_name, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
         match = re.search(r'Resource-.*-([^_-]+)$', resource_name)
         if match:
             return match.group(1)
 
         return None
 
-    def build_mapping_for_section(self, lines):
-        mapping = OrderedDict()
-        line_pattern = re.compile(r'^(ps-t\d+|Resource\\[^\s=]+)\s*=\s*(?:ref\s+)?(.*)$')
-        for line in lines:
-            resource_match = line_pattern.match(line.strip())
-            if resource_match:
-                param_name = resource_match.group(1).strip()
-                resource_name = resource_match.group(2).strip()
-                texture_type = self.extract_texture_type_from_resource(resource_name)
-                if texture_type:
-                    mapping[param_name] = texture_type
-        return mapping
+    @staticmethod
+    def _parse_ps_texture_material_slot(material_name):
+        clean_name = str(material_name or "").strip()
+        if not clean_name:
+            return None
+        match = re.match(r'^(?:ps[-_ ]*)?t(\d+)(?:[_\-. ].*)?$', clean_name, re.IGNORECASE)
+        if not match:
+            return None
 
-    def find_matching_materials(self, obj, texture_type):
-        texture_type_lower = texture_type.lower()
+        slot_number = str(int(match.group(1)))
+        return f"ps-t{slot_number}", f"T{slot_number}"
 
+    @staticmethod
+    def _resource_token(value):
+        token = re.sub(r"[^0-9A-Za-z_]+", "_", str(value or "").strip())
+        token = token.strip("_")
+        return token or "part"
+
+    def _object_texture_resource_token(self, obj):
+        try:
+            from ..common.object_prefix_helper import ObjectPrefixHelper
+        except Exception:
+            ObjectPrefixHelper = None
+
+        candidate_names = []
+
+        def append_candidate_name(name):
+            name = str(name or "").strip()
+            if name and name not in candidate_names:
+                candidate_names.append(name)
+
+        if obj:
+            append_candidate_name(getattr(obj, "name", ""))
+            append_candidate_name(getattr(obj, "original_object_name", ""))
+            for stripped_name in self._strip_all_suffixes(getattr(obj, "name", "")):
+                append_candidate_name(stripped_name)
+
+            if ObjectPrefixHelper is not None:
+                try:
+                    append_candidate_name(ObjectPrefixHelper.resolve_source_object_name(obj.name))
+                except Exception:
+                    pass
+
+        if ObjectPrefixHelper is not None:
+            for name in candidate_names:
+                try:
+                    prefix_info = ObjectPrefixHelper.extract_prefix_info(name)
+                except Exception:
+                    prefix_info = None
+                if not prefix_info:
+                    continue
+                prefix, _ = prefix_info
+                parts = ObjectPrefixHelper.parse_prefix_parts(prefix)
+                draw_ib = parts.get("draw_ib", "")
+                index_count = parts.get("index_count", "")
+                first_index = parts.get("first_index", "")
+                if draw_ib and index_count and first_index:
+                    return self._resource_token(f"{draw_ib}_{index_count}_{first_index}")
+                if draw_ib:
+                    return self._resource_token(draw_ib)
+
+        for name in candidate_names:
+            match = re.match(r'^([A-Za-z0-9]{6,})(?:[-_](\d+)(?:[-_](\d+))?)?', name)
+            if not match:
+                continue
+            draw_ib = match.group(1)
+            index_count = match.group(2)
+            first_index = match.group(3)
+            if draw_ib and index_count and first_index:
+                return self._resource_token(f"{draw_ib}_{index_count}_{first_index}")
+            if draw_ib:
+                return self._resource_token(draw_ib)
+
+        return self._resource_token(getattr(obj, "name", "") if obj else "")
+
+    def _ps_texture_resource_name(self, obj, slot_label):
+        slot_token = str(slot_label or "").replace("ps-", "").replace("-", "_").upper()
+        return f"ResourceTexture_{self._object_texture_resource_token(obj)}_{slot_token}"
+
+    def _get_material_candidate_objects(self, obj):
         try:
             from .preprocess_cache import PreProcessCache
             from ..common.object_prefix_helper import ObjectPrefixHelper
@@ -558,8 +626,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             if PreProcessCache is not None:
                 append_candidate_name(obj.get(PreProcessCache.COPY_SOURCE_PROP, ""))
 
-            original_object_name = getattr(obj, "original_object_name", "")
-            append_candidate_name(original_object_name)
+            append_candidate_name(getattr(obj, "original_object_name", ""))
 
             if ObjectPrefixHelper is not None:
                 append_candidate_name(ObjectPrefixHelper.resolve_source_object_name(obj.name))
@@ -586,8 +653,56 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         elif obj:
             candidate_objects.append(obj)
 
+        return candidate_objects
+
+    def _collect_ps_texture_slot_materials(self, obj):
+        slot_to_materials = OrderedDict()
+        if not obj:
+            return slot_to_materials
+
+        for candidate_obj in self._get_material_candidate_objects(obj):
+            for material_slot in getattr(candidate_obj, "material_slots", []):
+                material = material_slot.material
+                if not material:
+                    continue
+                parsed_slot = self._parse_ps_texture_material_slot(material.name)
+                if not parsed_slot:
+                    continue
+                param_name, texture_type = parsed_slot
+                slot_info = slot_to_materials.setdefault(
+                    param_name,
+                    {
+                        "texture_type": texture_type,
+                        "materials": OrderedDict(),
+                    },
+                )
+                signature = self._build_material_signature(material)
+                if signature not in slot_info["materials"]:
+                    slot_info["materials"][signature] = material
+
+            if slot_to_materials:
+                break
+
+        return slot_to_materials
+
+    def build_mapping_for_section(self, lines):
+        mapping = OrderedDict()
+        line_pattern = re.compile(r'^(ps-t\d+|Resource\\[^\s=]+)\s*=\s*(?:ref\s+)?(.*)$')
+        for line in lines:
+            resource_match = line_pattern.match(line.strip())
+            if resource_match:
+                param_name = resource_match.group(1).strip()
+                resource_name = resource_match.group(2).strip()
+                texture_type = self.extract_texture_type_from_resource(resource_name)
+                if texture_type:
+                    mapping[param_name] = texture_type
+        return mapping
+
+    def find_matching_materials(self, obj, texture_type):
+        texture_type_lower = texture_type.lower()
+
         matching_materials = OrderedDict()
-        for candidate_obj in candidate_objects:
+        for candidate_obj in self._get_material_candidate_objects(obj):
             for material_slot in candidate_obj.material_slots:
                 material = material_slot.material
                 if not material:
@@ -714,7 +829,8 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
     def generate_material_lines(self, matching_materials, param_name, texture_type, obj,
                                 texture_folder, all_sections,
                                 object_to_diffuse_swapkey, material_group_to_swapkey,
-                                swap_key_prefix, next_swap_key_num, used_swap_keys):
+                                swap_key_prefix, next_swap_key_num, used_swap_keys,
+                                resource_name_provider=None):
         generated_lines = []
         brightness_param_name = r"$\RabbitFX\brightness"
 
@@ -725,7 +841,14 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 if match:
                     generated_lines.append(f"{brightness_param_name} = {match.group(1)}")
 
-            new_line = self.create_resource_entry(material, param_name, texture_folder, all_sections)
+            resource_name = resource_name_provider(material, 0) if resource_name_provider else None
+            new_line = self.create_resource_entry(
+                material,
+                param_name,
+                texture_folder,
+                all_sections,
+                resource_name_override=resource_name,
+            )
             if new_line:
                 generated_lines.append(new_line)
 
@@ -748,7 +871,14 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
             generated_lines.append(f"; {texture_type} 材质切换 (组: {current_swap_variable})")
             for index, material in enumerate(matching_materials):
-                new_line = self.create_resource_entry(material, param_name, texture_folder, all_sections)
+                resource_name = resource_name_provider(material, index) if resource_name_provider else None
+                new_line = self.create_resource_entry(
+                    material,
+                    param_name,
+                    texture_folder,
+                    all_sections,
+                    resource_name_override=resource_name,
+                )
                 if new_line:
                     generated_lines.append(f"if {current_swap_variable} == {index}")
                     if texture_type == 'Glowmap':
@@ -761,7 +891,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
         return generated_lines, next_swap_key_num
 
-    def create_resource_entry(self, material, param_name, texture_folder, all_sections):
+    def create_resource_entry(self, material, param_name, texture_folder, all_sections, resource_name_override=None):
         global _material_resource_cache
 
         texture_image = self.get_texture_from_material(material)
@@ -769,10 +899,12 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
         # 同内容材质复用同一个 Resource 名称，避免材质后处理把同图资源反复写出。
         material_signature = self._build_material_signature(material)
-        cached_entry = _material_resource_cache.get(material_signature)
+        resource_name_override = str(resource_name_override or "").strip()
+        cache_key = material_signature if not resource_name_override else (material_signature, resource_name_override)
+        cached_entry = _material_resource_cache.get(cache_key)
 
         if cached_entry:
-            resource_name = cached_entry.get("resource_name", f"Resource_{material.name}")
+            resource_name = cached_entry.get("resource_name", resource_name_override or f"Resource_{material.name}")
             copied_filename = self.copy_texture_file(
                 texture_image,
                 texture_folder,
@@ -781,9 +913,9 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             )
         else:
             copied_filename = self.copy_texture_file(texture_image, texture_folder, material)
-            resource_name = f"Resource_{material.name}"
+            resource_name = resource_name_override or f"Resource_{material.name}"
             if copied_filename:
-                _material_resource_cache[material_signature] = {
+                _material_resource_cache[cache_key] = {
                     "resource_name": resource_name,
                     "filename": copied_filename,
                 }
@@ -892,6 +1024,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             
             new_lines_for_this_mesh = []
             generated_zzmi_style, generated_rabbitfx_style, generated_glowmap, generated_fxmap = False, False, False, False
+            generated_ps_slots = set()
             is_pst_style = any(k.lower().startswith("ps-t") for k in ini_mapping.keys())
             is_zzmi_style = any(k.lower().startswith("resource\\zzmi\\") for k in ini_mapping.keys())
             is_rabbitfx_style = any(k.lower().startswith("resource\\rabbitfx\\") for k in ini_mapping.keys())
@@ -909,11 +1042,43 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                             generated_zzmi_style = True
                         elif is_rabbitfx_param:
                             generated_rabbitfx_style = True
+                        resource_name_provider = None
+                        if param_name.lower().startswith("ps-t"):
+                            resource_name_provider = lambda material, index, slot=param_name: (
+                                self._ps_texture_resource_name(obj, slot)
+                                if index == 0
+                                else f"{self._ps_texture_resource_name(obj, slot)}_{index}"
+                            )
                         generated_lines, next_swap_key_num = self.generate_material_lines(
                             matching_materials, param_name, texture_type, obj, texture_folder, all_sections,
                             object_to_diffuse_swapkey, material_group_to_swapkey,
-                            swap_key_prefix, next_swap_key_num, used_swap_keys)
+                            swap_key_prefix, next_swap_key_num, used_swap_keys,
+                            resource_name_provider=resource_name_provider)
                         new_lines_for_this_mesh.extend(generated_lines)
+                        if param_name.lower().startswith("ps-t"):
+                            generated_ps_slots.add(param_name.lower())
+
+            slot_materials = self._collect_ps_texture_slot_materials(obj)
+            for param_name, slot_info in slot_materials.items():
+                if param_name.lower() in generated_ps_slots:
+                    continue
+                texture_type = slot_info["texture_type"]
+                matching_materials = list(slot_info["materials"].values())
+                if not matching_materials:
+                    continue
+                matched_types.append(texture_type)
+                resource_name_provider = lambda material, index, slot=param_name: (
+                    self._ps_texture_resource_name(obj, slot)
+                    if index == 0
+                    else f"{self._ps_texture_resource_name(obj, slot)}_{index}"
+                )
+                generated_lines, next_swap_key_num = self.generate_material_lines(
+                    matching_materials, param_name, texture_type, obj, texture_folder, all_sections,
+                    object_to_diffuse_swapkey, material_group_to_swapkey,
+                    swap_key_prefix, next_swap_key_num, used_swap_keys,
+                    resource_name_provider=resource_name_provider)
+                new_lines_for_this_mesh.extend(generated_lines)
+
             fxmap_lines = []
             for texture_type in ['Glowmap', 'FXMap']:
                 matching_materials = self.find_matching_materials(obj, texture_type)

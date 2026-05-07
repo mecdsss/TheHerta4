@@ -10,6 +10,20 @@ from ..common.object_prefix_helper import ObjectPrefixHelper
 from .node_base import SSMTBlueprintTree, SSMTNodeBase
 
 
+_RESULT_OUTPUT_NODE_TYPES = {
+    'SSMTNode_Result_Output',
+    'SSMTNode_Result_Output_NTMIModImp',
+}
+
+
+def _is_result_output_node(node):
+    return getattr(node, "bl_idname", "") in _RESULT_OUTPUT_NODE_TYPES
+
+
+def _is_dynamic_socket_node(node):
+    return getattr(node, "bl_idname", "") == 'SSMTNode_Object_Group' or _is_result_output_node(node)
+
+
 def _get_active_blueprint_tree(context):
     """获取当前活动的蓝图节点树
     
@@ -529,7 +543,7 @@ class SSMT_OT_GroupNodesToNestedBlueprint(bpy.types.Operator):
 
         unsupported_nodes = [
             node for node in selected_nodes
-            if node.bl_idname == 'SSMTNode_Result_Output' or node.bl_idname.startswith('SSMTNode_PostProcess_')
+            if _is_result_output_node(node) or node.bl_idname.startswith('SSMTNode_PostProcess_')
         ]
         if unsupported_nodes:
             names = ', '.join(node.name for node in unsupported_nodes[:4])
@@ -598,7 +612,7 @@ class SSMT_OT_GroupNodesToNestedBlueprint(bpy.types.Operator):
 
         dynamic_classes = set()
         for source_node in selected_nodes:
-            if source_node.bl_idname in ('SSMTNode_Object_Group', 'SSMTNode_Result_Output'):
+            if _is_dynamic_socket_node(source_node):
                 dynamic_classes.add(type(source_node))
 
         saved_updates = {}
@@ -656,7 +670,7 @@ class SSMT_OT_GroupNodesToNestedBlueprint(bpy.types.Operator):
                 cls.update = original_update
 
             for node in created_nodes.values():
-                if node.bl_idname in ('SSMTNode_Object_Group', 'SSMTNode_Result_Output'):
+                if _is_dynamic_socket_node(node):
                     try:
                         node.update()
                     except Exception:
@@ -752,7 +766,7 @@ class SSMT_OT_UngroupNestedBlueprint(bpy.types.Operator):
             self.report({'ERROR'}, f"关联的蓝图 '{nested_tree_name}' 不存在或不是SSMT蓝图")
             return {'CANCELLED'}
 
-        output_nodes = [n for n in nested_tree.nodes if n.bl_idname == 'SSMTNode_Result_Output']
+        output_nodes = [n for n in nested_tree.nodes if _is_result_output_node(n)]
         if not output_nodes:
             self.report({'ERROR'}, "嵌套蓝图中没有输出节点，无法解组")
             return {'CANCELLED'}
@@ -789,7 +803,7 @@ class SSMT_OT_UngroupNestedBlueprint(bpy.types.Operator):
                 if to_socket_index is not None:
                     external_output_links.append((link.to_node, to_socket_index))
 
-        nodes_to_copy = [n for n in nested_tree.nodes if n.bl_idname not in ('SSMTNode_Result_Output', 'NodeFrame')]
+        nodes_to_copy = [n for n in nested_tree.nodes if not _is_result_output_node(n) and n.bl_idname != 'NodeFrame']
 
         if not nodes_to_copy:
             self.report({'WARNING'}, "嵌套蓝图中没有可解组的节点")
@@ -797,7 +811,7 @@ class SSMT_OT_UngroupNestedBlueprint(bpy.types.Operator):
 
         dynamic_classes = set()
         for source_node in nodes_to_copy:
-            if source_node.bl_idname in ('SSMTNode_Object_Group', 'SSMTNode_Result_Output'):
+            if _is_dynamic_socket_node(source_node):
                 dynamic_classes.add(type(source_node))
 
         saved_updates = {}
@@ -829,7 +843,7 @@ class SSMT_OT_UngroupNestedBlueprint(bpy.types.Operator):
                 cls.update = original_update
 
             for node in created_nodes.values():
-                if node.bl_idname in ('SSMTNode_Object_Group', 'SSMTNode_Result_Output'):
+                if _is_dynamic_socket_node(node):
                     try:
                         node.update()
                     except Exception:
@@ -966,7 +980,7 @@ class SSMT_OT_ViewChain(bpy.types.Operator):
             visited.add(node)
             chain_nodes.add(node)
 
-            if node.bl_idname == 'SSMTNode_Result_Output':
+            if _is_result_output_node(node):
                 output_found = True
                 return
 
@@ -1022,6 +1036,7 @@ class SSMT_MT_NodeMenu_Object(bpy.types.Menu):
         _add_node_entry(layout, "物体信息", 'OBJECT_DATAMODE', "SSMTNode_Object_Info")
         _add_node_entry(layout, "物体组", 'GROUP', "SSMTNode_Object_Group")
         _add_node_entry(layout, "Mod输出", 'EXPORT', "SSMTNode_Result_Output")
+        _add_node_entry(layout, "NTMI ModImp输出", 'EXPORT', "SSMTNode_Result_Output_NTMIModImp")
         _add_node_entry(layout, "重命名物体", 'FONT_DATA', "SSMTNode_Object_Rename")
         _add_node_entry(layout, "物体切换", 'ARROW_LEFTRIGHT', "SSMTNode_ObjectSwap")
 

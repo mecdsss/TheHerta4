@@ -17,6 +17,7 @@ class BlueprintExportHelper:
     max_export_count = 1
 
     runtime_blueprint_tree_name = ""
+    runtime_result_output_node_type = ""
     multi_file_export_nodes = []
 
     current_buffer_folder_name = "Meshes"
@@ -34,6 +35,25 @@ class BlueprintExportHelper:
     @staticmethod
     def _is_valid_blueprint_tree(tree):
         return tree is not None and getattr(tree, "bl_idname", "") == 'SSMTBlueprintTreeType'
+
+    @staticmethod
+    def set_runtime_result_output_node_type(node_type: str = ""):
+        BlueprintExportHelper.runtime_result_output_node_type = str(node_type or "").strip()
+
+    @staticmethod
+    def clear_runtime_result_output_node_type():
+        BlueprintExportHelper.runtime_result_output_node_type = ""
+
+    @staticmethod
+    def iter_result_output_node_types():
+        preferred = BlueprintExportHelper.runtime_result_output_node_type
+        if preferred:
+            yield preferred
+        yield 'SSMTNode_Result_Output'
+
+    @staticmethod
+    def is_result_output_node(node) -> bool:
+        return getattr(node, "bl_idname", "") in set(BlueprintExportHelper.iter_result_output_node_types())
 
     @staticmethod
     def get_all_blueprint_trees():
@@ -372,6 +392,12 @@ class BlueprintExportHelper:
     @staticmethod
     def get_node_from_bl_idname(tree, node_type:str):
         if not tree:
+            return None
+        if node_type == 'SSMTNode_Result_Output':
+            for result_node_type in BlueprintExportHelper.iter_result_output_node_types():
+                for node in tree.nodes:
+                    if node.bl_idname == result_node_type:
+                        return node
             return None
         for node in tree.nodes:
             if node.bl_idname == node_type:

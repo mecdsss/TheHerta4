@@ -14,6 +14,7 @@ from .export_helper import BlueprintExportHelper
 _NODE_TYPE_OBJECT_INFO = 'SSMTNode_Object_Info'
 _NODE_TYPE_OBJECT_GROUP = 'SSMTNode_Object_Group'
 _NODE_TYPE_RESULT_OUTPUT = 'SSMTNode_Result_Output'
+_NODE_TYPE_RESULT_OUTPUT_NTMI_MODIMP = 'SSMTNode_Result_Output_NTMIModImp'
 _NODE_TYPE_SHAPEKEY = 'SSMTNode_ShapeKey'
 _NODE_TYPE_SHAPEKEY_OUTPUT = 'SSMTNode_ShapeKey_Output'
 _NODE_TYPE_OBJECT_RENAME = 'SSMTNode_Object_Rename'
@@ -31,6 +32,7 @@ _KNOWN_NODE_TYPES = {
     _NODE_TYPE_OBJECT_INFO,
     _NODE_TYPE_OBJECT_GROUP,
     _NODE_TYPE_RESULT_OUTPUT,
+    _NODE_TYPE_RESULT_OUTPUT_NTMI_MODIMP,
     _NODE_TYPE_SHAPEKEY,
     _NODE_TYPE_SHAPEKEY_OUTPUT,
     _NODE_TYPE_OBJECT_RENAME,
@@ -136,6 +138,9 @@ class ProcessingChain:
 
         elif node_type == 'Result_Output':
             return "ResultOutput[unique]"
+
+        elif node_type == 'Result_Output_NTMIModImp':
+            return "ResultOutputNTMIModImp[unique]"
 
         elif node_type == 'VertexGroupProcess':
             params = []
