@@ -53,6 +53,9 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
     def _hash_to_resource_prefix(self, h):
         return h.replace('-', '_')
 
+    def _resource_name_from_prefix(self, resource_prefix: str) -> str:
+        return f"Resource_{resource_prefix}_Position"
+
     def draw_buttons(self, context, layout):
         layout.prop(self, "hash_values")
         layout.prop(self, "animation_swapkey")
@@ -478,8 +481,9 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
 
                     shader_lines.append("")
                     shader_lines.append("    cs = ./res/merge_anim_packed_delta.hlsl")
-                    shader_lines.append(f"    cs-u5 = copy Resource{hash_prefix}Position_1")
-                    shader_lines.append(f"    Resource{hash_prefix}Position = ref cs-u5")
+                    base_resource_name = self._resource_name_from_prefix(hash_prefix)
+                    shader_lines.append(f"    cs-u5 = copy {base_resource_name}_1")
+                    shader_lines.append(f"    {base_resource_name} = ref cs-u5")
 
                     shader_source_path = self._get_shader_source_path()
                     if shader_source_path and os.path.exists(shader_source_path):
@@ -528,7 +532,11 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                     constants_lines.append(f"global persist {self.active_swapkey} = 0")
 
                 for base_name, hash_prefix in processed_base_names:
-                    post_copy_line = f"post Resource{hash_prefix}Position = copy_desc Resource{hash_prefix}Position_1"
+                    base_resource_name = self._resource_name_from_prefix(hash_prefix)
+                    legacy_base_resource_name = f"Resource{hash_prefix}Position"
+                    legacy_post_copy_line = f"post {legacy_base_resource_name} = copy_desc {legacy_base_resource_name}_1"
+                    constants_lines = [line for line in constants_lines if line != legacy_post_copy_line]
+                    post_copy_line = f"post {base_resource_name} = copy_desc {base_resource_name}_1"
                     post_run_line = f"post run = CustomShader_{base_name}_1Anim"
 
                     if post_copy_line not in constants_lines:

@@ -363,14 +363,9 @@ class DirectShapeKeyOutputMixin:
         constants_content = "".join(constants_lines)
         vars_to_define = set()
 
-        existing_param_names = set()
         shapekey_freq_params = {}
         for name in all_unique_names:
-            shapekey_freq_params[name] = self.node._create_safe_var_name(
-                name,
-                prefix="$Freq_",
-                existing_names=existing_param_names,
-            )
+            shapekey_freq_params[name] = self.node.get_shape_key_export_variable_name(name)
 
         intensity_lines = []
         for name, param in shapekey_freq_params.items():

@@ -42,6 +42,7 @@ class WorkSpaceHelper:
         if not normalized_folder_name:
             return ""
 
+        name_prefix, _, existing_alias = normalized_folder_name.partition(".")
         alias_name = WorkSpaceHelper.get_object_display_name(
             normalized_folder_name,
             drawib_aliasname_dict=drawib_aliasname_dict,
@@ -49,12 +50,12 @@ class WorkSpaceHelper:
         if not alias_name:
             return normalized_folder_name
 
-        name_prefix, _, existing_alias = normalized_folder_name.partition(".")
         if existing_alias.strip() and alias_name == existing_alias.strip():
             return normalized_folder_name
 
-        # 本地重构后的蓝图/导出链仍依赖“前缀.别名”结构。
-        # 当上游没有提供别名时，这里回退为“前缀.前缀”，避免继续写入“自定义名称”。
+        if alias_name == name_prefix:
+            return name_prefix
+
         return name_prefix + "." + alias_name
 
     @staticmethod

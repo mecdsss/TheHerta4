@@ -69,12 +69,9 @@ class PanelBasicInformation(bpy.types.Panel):
             selected_name=getattr(global_properties, "selected_blueprint_name", ""),
             context=context,
         )
-        if preferred_blueprint_name and global_properties.selected_blueprint_name != preferred_blueprint_name:
-            global_properties.selected_blueprint_name = preferred_blueprint_name
-        elif not preferred_blueprint_name and global_properties.selected_blueprint_name != "__NONE__":
-            global_properties.selected_blueprint_name = "__NONE__"
+        selected_blueprint_name = preferred_blueprint_name or getattr(global_properties, "selected_blueprint_name", "") or "__NONE__"
 
-        layout.label(text="TheHerta4 v4.2.9", icon='INFO')
+        layout.label(text="TheHerta4 v4.2.10", icon='INFO')
         layout.label(text=TR.translate("SSMT缓存文件夹路径: ") + GlobalConfig.ssmtlocation)
         layout.label(text=TR.translate("当前配置名称: ") + GlobalConfig.gamename)
         layout.label(text=TR.translate("当前游戏预设: ") + GlobalConfig.logic_name)
@@ -120,35 +117,35 @@ class PanelBasicInformation(bpy.types.Panel):
             text="",
             icon='GREASEPENCIL',
         )
-        rename_operator.blueprint_name = preferred_blueprint_name or global_properties.selected_blueprint_name
+        rename_operator.blueprint_name = selected_blueprint_name
 
         delete_operator = blueprint_row.operator(
             "theherta3.delete_persistent_blueprint",
             text="",
             icon='TRASH',
         )
-        delete_operator.blueprint_name = preferred_blueprint_name or global_properties.selected_blueprint_name
+        delete_operator.blueprint_name = selected_blueprint_name
 
         open_operator = blueprint_row.operator(
             "theherta3.open_persistent_blueprint",
             text="",
             icon='NODETREE',
         )
-        open_operator.blueprint_name = preferred_blueprint_name
+        open_operator.blueprint_name = selected_blueprint_name if selected_blueprint_name != "__NONE__" else ""
 
         open_current = blueprint_box.operator(
             "theherta3.open_persistent_blueprint",
             text="打开蓝图界面",
             icon='NODETREE',
         )
-        open_current.blueprint_name = preferred_blueprint_name
+        open_current.blueprint_name = selected_blueprint_name if selected_blueprint_name != "__NONE__" else ""
 
         generate_operator = blueprint_box.operator(
             SSMTGenerateModBlueprint.bl_idname,
             text="生成所选蓝图 Mod",
             icon='EXPORT',
         )
-        generate_operator.blueprint_name = preferred_blueprint_name or global_properties.selected_blueprint_name
+        generate_operator.blueprint_name = selected_blueprint_name
 
         layout.separator()
 

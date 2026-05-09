@@ -1,349 +1,272 @@
 """
-物体切换节点 - 用于在 INI 中添加条件判定，实现物体的动态切换
-支持无限嵌套和自定义快捷键
+Object swap node support.
 """
 
-import bpy
 from dataclasses import dataclass
-from .node_base import SSMTNodeBase, SSMTSocketObject
-from ..utils.log_utils import LOG
-from ..common.m_key import M_Key
+
+import bpy
+
+from .node_base import SSMTNodeBase
+from .variable_registry import ensure_object_swap_variable_name, mark_variable_name_used, normalize_variable_name
 
 
 @dataclass
 class SwapKeyConfig:
-    """单个物体切换节点的快捷键配置
-    
-    Attributes:
-        node_id: 节点唯一标识
-        index: 节点序号（用于生成 swapkey0, swapkey1 等）
-        hotkey: 快捷键，格式为 "Modifier KeyName"
-        swap_type: 切换类型 (cycle/toggle/hold)
-        option_count: 选项数量（会生成 0, 1, 2... 序列）
-        comment: 备注信息（会生成在 KeySwap 段落中作为注释）
-        custom_var_name: 自定义变量名（不含$前缀），为空时使用默认的 $swapkey{index}
-    """
-    
-    node_id: str = ""  # 节点唯一标识
-    index: int = 0  # 节点序号（用于生成 swapkey0, swapkey1 等）
-    
-    hotkey: str = "No_Modifiers Numpad3"  # 快捷键
-    swap_type: str = "cycle"  # 切换类型: cycle, toggle, hold
-    option_count: int = 2  # 选项数量（会生成 0, 1, 2... 序列）
-    comment: str = ""  # 备注信息（会生成在 KeySwap 段落中作为注释）
-    custom_var_name: str = ""  # 自定义变量名（不含$前缀），为空时使用默认的 $swapkey{index}
-    
+    node_id: str = ""
+    index: int = 0
+    hotkey: str = "No_Modifiers Numpad3"
+    swap_type: str = "cycle"
+    option_count: int = 2
+    comment: str = ""
+    custom_var_name: str = ""
+    assigned_variable_name: str = ""
+
     def get_swap_key_name(self) -> str:
-        """生成对应的 $swapkey 变量名
-        
-        如果设置了自定义变量名，则使用自定义名称（自动添加$前缀），
-        否则使用默认的 $swapkey{index} 格式。
-        
-        Returns:
-            str: 格式为 "$自定义名" 或 "$swapkey{index}" 的变量名
-        """
         if self.custom_var_name:
             return f"${self.custom_var_name}"
+        if self.assigned_variable_name:
+            return f"${self.assigned_variable_name}"
         return f"$swapkey{self.index}"
-    
+
     def get_key_swap_section_name(self) -> str:
-        """生成 [KeySwap_N] 段落名称
-        
-        Returns:
-            str: 格式为 "KeySwap_{index}" 的段落名
-        """
         return f"KeySwap_{self.index}"
-    
+
     def get_active_param_name(self) -> str:
-        """生成对应的 $active 参数名
-        
-        Returns:
-            str: 格式为 "$active{index}" 的参数名
-        """
         return f"$active{self.index}"
-    
+
     def get_condition_value(self, option_index: int) -> str:
-        """生成条件值，用于 drawindexed 中的 if 判定
-        
-        Args:
-            option_index: 选项索引
-            
-        Returns:
-            str: 选项索引的字符串形式
-        """
         return str(option_index)
-    
+
     def get_condition_str(self, value: int = 1) -> str:
-        """生成完整的条件字符串
-        
-        Args:
-            value: 比较的目标值，默认为1
-            
-        Returns:
-            str: 格式为 "$swapkey{index} == {value}" 的条件字符串
-        """
         return f"{self.get_swap_key_name()} == {value}"
 
 
 class SSMTNode_ObjectSwap(SSMTNodeBase):
-    """物体切换节点 - 在 INI 中为物体添加条件判定"""
-    
-    bl_idname = 'SSMTNode_ObjectSwap'
-    bl_label = '物体切换'
-    bl_icon = 'SHADERFX'
-    
-    # ============= 节点属性 =============
-    
+    bl_idname = "SSMTNode_ObjectSwap"
+    bl_label = "物体切换"
+    bl_icon = "SHADERFX"
+
     def update_all_properties(self, context):
-        """所有属性变化时更新节点宽度"""
-        self.update_node_width([self.comment, self.hotkey])
+        normalized = normalize_variable_name(self.custom_var_name)
+        if normalized != str(self.custom_var_name or "").strip().lstrip("$"):
+            self.custom_var_name = normalized
+            return
+        if normalized:
+            mark_variable_name_used(normalized, context=context)
+        ensure_object_swap_variable_name(self, context=context)
+        self.update_node_width([self.comment, self.hotkey, self.custom_var_name, self.assigned_variable_name])
 
     comment: bpy.props.StringProperty(
         name="备注",
-        description="节点的备注信息，会生成在 KeySwap 段落中作为注释",
+        description="生成到 KeySwap 段落中的注释。",
         default="",
-        update=update_all_properties
+        update=update_all_properties,
     )
-    
+
     custom_var_name: bpy.props.StringProperty(
         name="变量名",
-        description="自定义变量名（不含$前缀），留空则自动分配 $swapkeyN。例如输入 hair 将生成 $hair",
+        description="节点创建时会自动填入预分配变量名，你可以直接复制或手动修改它。",
         default="",
-        update=update_all_properties
+        update=update_all_properties,
     )
-    
-    # 快捷键配置
+
+    assigned_variable_name: bpy.props.StringProperty(
+        name="Assigned Variable Name",
+        description="Preallocated global variable name for this node.",
+        default="",
+        options={"HIDDEN"},
+    )
+
     hotkey: bpy.props.StringProperty(
         name="快捷键",
-        description="按键的虚拟键码组合，格式: Modifier KeyName，例如 No_Modifiers Numpad3",
+        description="按键格式: Modifier KeyName，例如 No_Modifiers Numpad3。",
         default="No_Modifiers Numpad3",
-        update=update_all_properties
+        update=update_all_properties,
     )
-    
-    def update_swap_type(self, context):
-        """切换类型变化时触发更新"""
-        pass
-    
+
     swap_type: bpy.props.EnumProperty(
         name="切换类型",
-        description="切换的类型",
+        description="切换模式。",
         items=[
-            ('cycle', '循环切换 (cycle)', '循环切换所有选项'),
-            ('toggle', '开关切换 (toggle)', '在两个选项间切换'),
-            ('hold', '按住 (hold)', '按住时激活'),
+            ("cycle", "循环切换", "循环切换所有选项"),
+            ("toggle", "开关切换", "在两个选项间切换"),
+            ("hold", "按住生效", "按住时激活"),
         ],
-        default='cycle',
-        update=update_swap_type
+        default="cycle",
+        update=update_all_properties,
     )
-    
+
     def update_input_slot_count(self, context):
-        """输入口数量变化时触发更新"""
         self._update_input_sockets()
-    
-    # 输入口数量（支持动态增减）
+
     input_slot_count: bpy.props.IntProperty(
         name="输入口数量",
-        description="物体切换节点的输入口数量（每个输入口对应一个选项）",
+        description="每个输入口对应一个切换选项。",
         min=1,
         max=1024,
         default=2,
-        update=update_input_slot_count
+        update=update_input_slot_count,
     )
-    
-    def update_condition_operator(self, context):
-        """条件运算符变化时触发更新"""
-        pass
-    
-    # 条件运算符：用于连接多个 swapkey 条件
+
     condition_operator: bpy.props.EnumProperty(
         name="条件运算符",
-        description="多个 swapkey 条件之间的逻辑运算符（&& 表示所有条件都满足，|| 表示至少一个条件满足）",
+        description="多个切换条件之间的逻辑运算符。",
         items=[
-            ('&&', 'AND (&&)', '所有条件都满足时才执行'),
-            ('||', 'OR (||)', '至少一个条件满足时就执行'),
+            ("&&", "AND (&&)", "所有条件都满足时执行"),
+            ("||", "OR (||)", "任一条件满足时执行"),
         ],
-        default='&&',
-        update=update_condition_operator
+        default="&&",
+        update=update_all_properties,
     )
-    
-    # ============= 调试和说明相关 =============
-    
+
     description_expanded: bpy.props.BoolProperty(
         name="展开说明",
-        description="展开节点说明菜单",
-        default=False
+        description="展开节点说明菜单。",
+        default=False,
     )
-    
+
     def init(self, context):
-        """初始化节点"""
-        # 添加输出口
-        self.outputs.new('SSMTSocketObject', "Output")
-        
-        # 添加初始输入口
+        ensure_object_swap_variable_name(self, context=context)
+        self.outputs.new("SSMTSocketObject", "Output")
         self._update_input_sockets()
-        
-        self.width = 300
-    
+        self.width = 320
+
+    def copy(self, node):
+        self.assigned_variable_name = ""
+        ensure_object_swap_variable_name(self)
+        self.custom_var_name = self.assigned_variable_name
+
     def _update_input_sockets(self):
-        """根据 input_slot_count 更新输入口
-        
-        输入槽编号从 0 开始，与 KeySwap 的选项值对应：
-        - 选项_0: 对应 $swapkey == 0
-        - 选项_1: 对应 $swapkey == 1
-        - 以此类推
-        """
         current_count = len(self.inputs)
         target_count = self.input_slot_count
-        
-        # 移除多余的输入口
-        while len(self.inputs) > target_count:
+
+        while current_count > target_count:
             self.inputs.remove(self.inputs[-1])
-        
-        # 添加不足的输入口，编号从 0 开始
-        while len(self.inputs) < target_count:
-            idx = len(self.inputs)  # 从 0 开始
-            self.inputs.new('SSMTSocketObject', f"选项_{idx}")
-        
-        # 重命名所有输入口，确保名称正确
+            current_count -= 1
+
+        while current_count < target_count:
+            self.inputs.new("SSMTSocketObject", f"选项_{current_count}")
+            current_count += 1
+
         for idx, inp in enumerate(self.inputs):
             inp.name = f"选项_{idx}"
-    
+
     def update(self):
-        """当属性变化时更新"""
+        ensure_object_swap_variable_name(self)
         self._update_input_sockets()
-    
+
     def draw_buttons(self, context, layout):
-        """绘制节点 UI"""
-        
         layout.prop(self, "comment", text="备注")
         layout.prop(self, "custom_var_name", text="变量名")
+        if not str(self.custom_var_name or "").strip() and str(self.assigned_variable_name or "").strip():
+            layout.label(text=f"预分配变量: ${self.assigned_variable_name}", icon="INFO")
         layout.prop(self, "hotkey", text="按键")
-        layout.prop(self, "swap_type", text="类型")
-        
-        layout.separator()
-        layout.prop(self, "condition_operator", text="逻辑运算符")
-        
+
         layout.separator()
         layout.label(text="选项数量:")
         row = layout.row(align=True)
         row.prop(self, "input_slot_count", text="")
-        
         if self.input_slot_count >= 2:
-            row.operator("ssmt.add_swap_option", text="", icon='ADD').node_name = self.name
+            row.operator("ssmt.add_swap_option", text="", icon="ADD").node_name = self.name
         if self.input_slot_count > 1:
-            row.operator("ssmt.remove_swap_option", text="", icon='REMOVE').node_name = self.name
-        
+            row.operator("ssmt.remove_swap_option", text="", icon="REMOVE").node_name = self.name
+
         layout.separator()
         row = layout.row()
-        icon = 'TRIA_DOWN' if self.description_expanded else 'TRIA_RIGHT'
+        icon = "TRIA_DOWN" if self.description_expanded else "TRIA_RIGHT"
         row.prop(self, "description_expanded", text="节点说明", icon=icon, emboss=True)
-        
+
         if self.description_expanded:
             col = layout.column()
             col.scale_y = 0.8
-            
+            col.prop(self, "swap_type", text="类型")
+            col.prop(self, "condition_operator", text="运算符")
+            col.separator()
             self._draw_node_description(col)
-    
+
     def _draw_node_description(self, layout):
-        """动态生成节点说明信息"""
-        
-        layout.label(text="本节点会添加的配置段落:", icon='INFO')
-        layout.label(text="  • [KeySwap_*]        快捷键配置", icon='NONE')
-        layout.label(text="  • [Constants]         变量声明", icon='NONE')
-        layout.label(text="  • [Present]           参数初始化", icon='NONE')
-        layout.label(text="  • [TextureOverride_*] 激活参数设定", icon='NONE')
-        
+        var_display = f"${self.custom_var_name}" if self.custom_var_name else f"${self.assigned_variable_name}"
+        option_seq = ", ".join(str(i) for i in range(self.input_slot_count))
+
+        layout.label(text="本节点会追加以下配置段落:", icon="INFO")
+        layout.label(text="  [KeySwap_*]", icon="NONE")
+        layout.label(text="  [Constants]", icon="NONE")
+        layout.label(text="  [Present]", icon="NONE")
+        layout.label(text="  [TextureOverride_*]", icon="NONE")
+
         layout.separator()
-        layout.label(text="当前节点参数:", icon='FILE_TEXT')
-        
-        layout.label(text=f"  备注: {self.comment if self.comment else '(未设置)'}", icon='NONE')
-        var_display = f"${self.custom_var_name}" if self.custom_var_name else "$swapkeyN (自动分配)"
-        layout.label(text=f"  变量名: {var_display}", icon='NONE')
-        layout.label(text=f"  快捷键: {self.hotkey}", icon='NONE')
-        layout.label(text=f"  类型: {self.swap_type}", icon='NONE')
-        layout.label(text=f"  逻辑运算符: {self.condition_operator}", icon='NONE')
-        
+        layout.label(text="当前节点参数:", icon="FILE_TEXT")
+        layout.label(text=f"  备注: {self.comment if self.comment else '(未设置)'}", icon="NONE")
+        layout.label(text=f"  变量: {var_display}", icon="NONE")
+        layout.label(text=f"  按键: {self.hotkey}", icon="NONE")
+        layout.label(text=f"  类型: {self.swap_type}", icon="NONE")
+        layout.label(text=f"  运算符: {self.condition_operator}", icon="NONE")
+
         layout.separator()
-        layout.label(text="选项配置:", icon='TRACKING')
-        option_seq = ', '.join(str(i) for i in range(self.input_slot_count))
-        layout.label(text=f"  选项值: {option_seq}", icon='NONE')
-        layout.label(text=f"  条件格式: {var_display} == 选项值", icon='NONE')
-        
+        layout.label(text="选项配置:", icon="TRACKING")
+        layout.label(text=f"  选项值: {option_seq}", icon="NONE")
+        layout.label(text=f"  条件格式: {var_display} == 选项值", icon="NONE")
+
         layout.separator()
-        layout.label(text="生成示例:", icon='INFO')
-        layout.label(text=f"  [KeySwap_*]", icon='NONE')
+        layout.label(text="生成示例:", icon="INFO")
+        layout.label(text="  [KeySwap_*]", icon="NONE")
         if self.comment:
-            layout.label(text=f"  ; {self.comment}", icon='NONE')
-        layout.label(text=f"  condition = $active0 == 1", icon='NONE')
-        layout.label(text=f"  key = {self.hotkey}", icon='NONE')
-        layout.label(text=f"  type = {self.swap_type}", icon='NONE')
-        layout.label(text=f"  {var_display} = {option_seq},", icon='NONE')
+            layout.label(text=f"  ; {self.comment}", icon="NONE")
+        layout.label(text="  condition = $active0 == 1", icon="NONE")
+        layout.label(text=f"  key = {self.hotkey}", icon="NONE")
+        layout.label(text=f"  type = {self.swap_type}", icon="NONE")
+        layout.label(text=f"  {var_display} = {option_seq},", icon="NONE")
 
 
 class SSMT_OT_AddSwapOption(bpy.types.Operator):
-    """添加一个物体切换选项"""
     bl_idname = "ssmt.add_swap_option"
     bl_label = "添加选项"
-    bl_options = {'REGISTER', 'UNDO'}
-    
+    bl_options = {"REGISTER", "UNDO"}
+
     node_name: bpy.props.StringProperty()
-    
+
     @classmethod
     def poll(cls, context):
         return context.active_node is not None
-    
+
     def execute(self, context):
         tree = context.space_data.edit_tree
         node = tree.nodes.get(self.node_name)
-        
-        if node and node.bl_idname == 'SSMTNode_ObjectSwap':
-            if node.input_slot_count < 1024:
-                node.input_slot_count += 1
-        
-        return {'FINISHED'}
+        if node and node.bl_idname == "SSMTNode_ObjectSwap" and node.input_slot_count < 1024:
+            node.input_slot_count += 1
+        return {"FINISHED"}
 
 
 class SSMT_OT_RemoveSwapOption(bpy.types.Operator):
-    """移除一个物体切换选项"""
     bl_idname = "ssmt.remove_swap_option"
     bl_label = "移除选项"
-    bl_options = {'REGISTER', 'UNDO'}
-    
+    bl_options = {"REGISTER", "UNDO"}
+
     node_name: bpy.props.StringProperty()
-    
+
     @classmethod
     def poll(cls, context):
         return context.active_node is not None
-    
+
     def execute(self, context):
         tree = context.space_data.edit_tree
         node = tree.nodes.get(self.node_name)
-        
-        if node and node.bl_idname == 'SSMTNode_ObjectSwap':
-            if node.input_slot_count > 1:
-                node.input_slot_count -= 1
-        
-        return {'FINISHED'}
+        if node and node.bl_idname == "SSMTNode_ObjectSwap" and node.input_slot_count > 1:
+            node.input_slot_count -= 1
+        return {"FINISHED"}
 
-
-# ============= 蓝图模型集成（处理链中的调试输出） =============
 
 class ObjectSwapDebugger:
-    """物体切换节点的调试输出生成器
-    
-    用于在日志中输出物体切换节点的详细信息，方便调试。
-    """
-    
     @staticmethod
     def _get_node_unique_key(node) -> str:
-        tree_name = node.id_data.name if hasattr(node, 'id_data') and node.id_data else ""
+        tree_name = node.id_data.name if hasattr(node, "id_data") and node.id_data else ""
         return f"{tree_name}::{node.name}"
-    
+
     @staticmethod
     def generate_chain_detail(chain, registry=None) -> list[str]:
         if not chain.swap_node_option_values:
             return []
-        
+
         lines = []
         for swap_key, option_val in chain.swap_node_option_values.items():
             swap_node = None
@@ -351,66 +274,66 @@ class ObjectSwapDebugger:
                 if ObjectSwapDebugger._get_node_unique_key(node) == swap_key:
                     swap_node = node
                     break
-            
+
             if swap_node is not None:
                 swap_key_index = 0
-                if registry and hasattr(registry, 'node_swapkey_map'):
+                if registry and hasattr(registry, "node_swapkey_map"):
                     swap_key_index = registry.node_swapkey_map.get(swap_key, 0)
                 node_index = 0
-                for idx, n in enumerate(chain.node_path):
-                    if ObjectSwapDebugger._get_node_unique_key(n) == swap_key:
+                for idx, path_node in enumerate(chain.node_path):
+                    if ObjectSwapDebugger._get_node_unique_key(path_node) == swap_key:
                         node_index = idx
                         break
-                detail = ObjectSwapDebugger.generate_debug_detail(swap_node, node_index, swap_key_index)
-                lines.extend(detail)
+                lines.extend(ObjectSwapDebugger.generate_debug_detail(swap_node, node_index, swap_key_index))
             else:
-                lines.append(f"🔄 物体切换: {swap_key} → 选项 {option_val + 1} (索引 {option_val})")
-        
+                lines.append(f"物体切换: {swap_key} -> 选项 {option_val + 1} (索引 {option_val})")
+
         return lines
 
     @staticmethod
     def generate_debug_detail(swap_node: bpy.types.Node, node_index: int, swap_key_index: int) -> list[str]:
-        """为处理链生成该节点的调试信息"""
-        custom_var_name = getattr(swap_node, 'custom_var_name', '')
-        var_name = f"${custom_var_name}" if custom_var_name else f"$swapkey{swap_key_index}"
-        
-        lines = []
-        lines.append("")
-        lines.append(f"🔄 物体切换节点 #{node_index + 1}")
-        lines.append(f"   备注: {getattr(swap_node, 'comment', '未设置')}")
-        lines.append(f"   变量: {var_name}")
-        lines.append(f"   快捷键: {getattr(swap_node, 'hotkey', 'N/A')}")
-        lines.append(f"   切换类型: {getattr(swap_node, 'swap_type', 'N/A')}")
-        lines.append(f"   选项数量: {getattr(swap_node, 'input_slot_count', 1)}")
-        
+        resolved_name = normalize_variable_name(getattr(swap_node, "custom_var_name", "") or "")
+        if not resolved_name:
+            resolved_name = normalize_variable_name(getattr(swap_node, "assigned_variable_name", "") or "")
+        var_name = f"${resolved_name}" if resolved_name else f"$swapkey{swap_key_index}"
         config = SwapKeyConfig(
             index=swap_key_index,
-            comment=getattr(swap_node, 'comment', ''),
-            custom_var_name=custom_var_name,
+            comment=getattr(swap_node, "comment", ""),
+            custom_var_name=normalize_variable_name(getattr(swap_node, "custom_var_name", "") or ""),
+            assigned_variable_name=normalize_variable_name(getattr(swap_node, "assigned_variable_name", "") or ""),
         )
-        
-        lines.append(f"")
-        lines.append(f"   配置段落:")
-        lines.append(f"   [{config.get_key_swap_section_name()}]")
+
+        lines = [
+            "",
+            f"物体切换节点 #{node_index + 1}",
+            f"   备注: {getattr(swap_node, 'comment', '未设置')}",
+            f"   变量: {var_name}",
+            f"   快捷键: {getattr(swap_node, 'hotkey', 'N/A')}",
+            f"   切换类型: {getattr(swap_node, 'swap_type', 'N/A')}",
+            f"   选项数量: {getattr(swap_node, 'input_slot_count', 1)}",
+            "",
+            "   配置段落:",
+            f"   [{config.get_key_swap_section_name()}]",
+        ]
+
         if config.comment:
             lines.append(f"   ; {config.comment}")
-        lines.append(f"   condition = $active0 == 1")
-        lines.append(f"   key = {getattr(swap_node, 'hotkey', 'N/A')}")
-        lines.append(f"   type = {getattr(swap_node, 'swap_type', 'N/A')}")
-        lines.append(f"   {var_name} = 0,{','.join(str(i) for i in range(getattr(swap_node, 'input_slot_count', 1)))},")
-        
-        lines.append(f"")
-        lines.append(f"   常量声明:")
-        lines.append(f"   {var_name} = 0")
-        
-        lines.append(f"")
-        lines.append(f"   初始化参数:")
-        lines.append(f"   post $active0 = 0")
-        
+        lines.extend(
+            [
+                "   condition = $active0 == 1",
+                f"   key = {getattr(swap_node, 'hotkey', 'N/A')}",
+                f"   type = {getattr(swap_node, 'swap_type', 'N/A')}",
+                f"   {var_name} = {','.join(str(i) for i in range(getattr(swap_node, 'input_slot_count', 1)))},",
+                "",
+                "   常量声明:",
+                f"   {var_name} = 0",
+                "",
+                "   初始化参数:",
+                "   post $active0 = 0",
+            ]
+        )
         return lines
 
-
-# ============= 注册与卸载 =============
 
 classes = (
     SSMTNode_ObjectSwap,

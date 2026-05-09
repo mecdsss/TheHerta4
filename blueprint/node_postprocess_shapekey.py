@@ -14,6 +14,26 @@ except ImportError:
 
 from .direct_export import sync_shapekey_direct_mode
 from .node_postprocess_base import SSMTNode_PostProcess_Base
+from .variable_registry import allocate_shape_key_variable_name, mark_variable_name_used, normalize_variable_name
+
+
+class ShapeKeyVariableItem(bpy.types.PropertyGroup):
+    shape_key_name: bpy.props.StringProperty(name="Shape Key Name", default="") # type: ignore
+    assigned_variable_name: bpy.props.StringProperty(name="Assigned Variable Name", default="") # type: ignore
+
+    def update_custom_variable_name(self, context):
+        normalized = normalize_variable_name(self.custom_variable_name)
+        if normalized != self.custom_variable_name:
+            self.custom_variable_name = normalized
+            return
+        if normalized:
+            mark_variable_name_used(normalized, context=context)
+
+    custom_variable_name: bpy.props.StringProperty(
+        name="Custom Variable Name",
+        default="",
+        update=update_custom_variable_name,
+    ) # type: ignore
 
 _name_mapping_cache = {}
 
@@ -31,6 +51,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
     INTENSITY_START_INDEX = 100
     VERTEX_RANGE_START_INDEX = 200
+
+    shapekey_variable_items: bpy.props.CollectionProperty(type=ShapeKeyVariableItem) # type: ignore
+    shapekey_variable_index: bpy.props.IntProperty(default=0) # type: ignore
 
     @staticmethod
     def clear_cache():
@@ -85,7 +108,128 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         return obj_name
 
+    def _iter_connected_source_object_names(self):
+        from .export_helper import BlueprintExportHelper
+
+        visited_trees = set()
+        seen_names = set()
+
+        def add_name(name):
+            clean_name = str(name or "").strip()
+            if not clean_name or clean_name in seen_names:
+                return
+            seen_names.add(clean_name)
+            yield clean_name
+
+        def walk_tree(tree):
+            if not tree or tree.name in visited_trees:
+                return
+            visited_trees.add(tree.name)
+
+            output_node = BlueprintExportHelper.get_node_from_bl_idname(tree, "SSMTNode_Result_Output")
+            for node in tree.nodes:
+                if getattr(node, "mute", False):
+                    continue
+                if output_node and not BlueprintExportHelper._is_node_connected_to_output(tree, node):
+                    continue
+
+                if node.bl_idname == "SSMTNode_Object_Info":
+                    for item in add_name(getattr(node, "object_name", "")):
+                        yield item
+                elif node.bl_idname == "SSMTNode_MultiFile_Export":
+                    for obj_item in getattr(node, "object_list", []):
+                        for name in add_name(getattr(obj_item, "object_name", "")):
+                            yield name
+                elif node.bl_idname == "SSMTNode_Blueprint_Nest":
+                    nested_name = getattr(node, "blueprint_name", "")
+                    if not nested_name or nested_name == "NONE":
+                        continue
+                    nested_tree = bpy.data.node_groups.get(nested_name)
+                    if nested_tree and getattr(nested_tree, "bl_idname", "") == "SSMTBlueprintTreeType":
+                        yield from walk_tree(nested_tree)
+
+        yield from walk_tree(self.id_data)
+
+    def _ensure_shapekey_variable_item(self, shape_key_name: str):
+        for item in self.shapekey_variable_items:
+            if item.shape_key_name == shape_key_name:
+                return item
+
+        item = self.shapekey_variable_items.add()
+        item.shape_key_name = shape_key_name
+        item.assigned_variable_name = allocate_shape_key_variable_name(shape_key_name)
+        item.custom_variable_name = ""
+        return item
+
+    def ensure_shape_key_variable_map(self, shape_key_names):
+        created_count = 0
+        for shape_key_name in sorted({str(name or "").strip() for name in shape_key_names if str(name or "").strip()}):
+            existing = None
+            for item in self.shapekey_variable_items:
+                if item.shape_key_name == shape_key_name:
+                    existing = item
+                    break
+            if existing is None:
+                self._ensure_shapekey_variable_item(shape_key_name)
+                created_count += 1
+            else:
+                if not existing.assigned_variable_name:
+                    existing.assigned_variable_name = allocate_shape_key_variable_name(
+                        shape_key_name,
+                        preferred=existing.custom_variable_name,
+                    )
+                else:
+                    mark_variable_name_used(existing.assigned_variable_name)
+                if existing.custom_variable_name:
+                    mark_variable_name_used(existing.custom_variable_name)
+        return created_count
+
+    def get_shape_key_export_variable_name(self, shape_key_name: str) -> str:
+        shape_key_name = str(shape_key_name or "").strip()
+        item = self._ensure_shapekey_variable_item(shape_key_name)
+        custom_name = normalize_variable_name(item.custom_variable_name)
+        if custom_name:
+            mark_variable_name_used(custom_name)
+            return f"${custom_name}"
+
+        assigned_name = normalize_variable_name(item.assigned_variable_name)
+        if not assigned_name:
+            assigned_name = allocate_shape_key_variable_name(shape_key_name)
+            item.assigned_variable_name = assigned_name
+        else:
+            mark_variable_name_used(assigned_name)
+        return f"${assigned_name}"
+
+    def collect_blueprint_shape_key_names(self):
+        result = set()
+        for obj_name in self._iter_connected_source_object_names():
+            obj = bpy.data.objects.get(obj_name)
+            if not obj or obj.type != "MESH" or not getattr(obj, "data", None):
+                continue
+            shape_keys = getattr(getattr(obj.data, "shape_keys", None), "key_blocks", None)
+            if not shape_keys:
+                continue
+            for index, key_block in enumerate(shape_keys):
+                if index == 0:
+                    continue
+                key_name = str(getattr(key_block, "name", "") or "").strip()
+                if key_name:
+                    result.add(key_name)
+        return sorted(result)
+
     def draw_buttons(self, context, layout):
+        layout.operator("ssmt.scan_shapekey_variables", text="预分配蓝图形态键变量", icon='FILE_REFRESH').node_name = self.name
+        if self.shapekey_variable_items:
+            box = layout.box()
+            box.label(text=f"形态键变量映射 ({len(self.shapekey_variable_items)})", icon='SHAPEKEY_DATA')
+            for item in self.shapekey_variable_items:
+                row = box.row(align=True)
+                row.label(text=item.shape_key_name)
+                value_col = row.column(align=True)
+                value_col.prop(item, "custom_variable_name", text="导出变量")
+                assigned_name = normalize_variable_name(item.assigned_variable_name)
+                value_col.label(text=f"预分配: ${assigned_name}" if assigned_name else "预分配: 未分配")
+
         layout.prop(self, "use_packed_Meshess")
         layout.prop(self, "store_deltas")
         layout.prop(self, "use_optimized_lookup")
@@ -1463,10 +1607,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             constants_content = "".join(constants_lines)
             vars_to_define = set()
 
-            existing_param_names = set()
             shapekey_freq_params = {}
             for name in all_unique_names:
-                shapekey_freq_params[name] = self._create_safe_var_name(name, prefix="$Freq_", existing_names=existing_param_names)
+                shapekey_freq_params[name] = self.get_shape_key_export_variable_name(name)
 
             constants_lines.append("\n; --- Auto-generated Shape Key Intensity Controls (Additive Blending) ---")
             for name, param in shapekey_freq_params.items():
@@ -1707,8 +1850,30 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         print("形态键配置后处理节点执行完成")
 
 
+class SSMT_OT_ScanShapeKeyVariables(bpy.types.Operator):
+    bl_idname = "ssmt.scan_shapekey_variables"
+    bl_label = "预分配蓝图形态键变量"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    node_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        tree = context.space_data.edit_tree
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None or node.bl_idname != 'SSMTNode_PostProcess_ShapeKey':
+            self.report({'WARNING'}, "未找到形态键配置节点")
+            return {'CANCELLED'}
+
+        shape_key_names = node.collect_blueprint_shape_key_names()
+        created_count = node.ensure_shape_key_variable_map(shape_key_names)
+        self.report({'INFO'}, f"已扫描 {len(shape_key_names)} 个形态键，新增预分配 {created_count} 个变量")
+        return {'FINISHED'}
+
+
 classes = (
+    ShapeKeyVariableItem,
     SSMTNode_PostProcess_ShapeKey,
+    SSMT_OT_ScanShapeKeyVariables,
 )
 
 

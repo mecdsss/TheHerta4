@@ -598,6 +598,14 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         slot_token = str(slot_label or "").replace("ps-", "").replace("-", "_").upper()
         return f"ResourceTexture_{self._object_texture_resource_token(obj)}_{slot_token}"
 
+    @staticmethod
+    def _ps_texture_material_resource_name(material):
+        material_name = str(getattr(material, "name", "") or "").strip()
+        if not material_name:
+            material_name = "Texture"
+        material_name = re.sub(r"[\r\n\[\]=]+", "_", material_name).strip("_")
+        return f"ResourceTexture_{material_name or 'Texture'}"
+
     def _get_material_candidate_objects(self, obj):
         try:
             from .preprocess_cache import PreProcessCache
@@ -1044,11 +1052,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                             generated_rabbitfx_style = True
                         resource_name_provider = None
                         if param_name.lower().startswith("ps-t"):
-                            resource_name_provider = lambda material, index, slot=param_name: (
-                                self._ps_texture_resource_name(obj, slot)
-                                if index == 0
-                                else f"{self._ps_texture_resource_name(obj, slot)}_{index}"
-                            )
+                            resource_name_provider = lambda material, index: self._ps_texture_material_resource_name(material)
                         generated_lines, next_swap_key_num = self.generate_material_lines(
                             matching_materials, param_name, texture_type, obj, texture_folder, all_sections,
                             object_to_diffuse_swapkey, material_group_to_swapkey,
@@ -1067,11 +1071,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 if not matching_materials:
                     continue
                 matched_types.append(texture_type)
-                resource_name_provider = lambda material, index, slot=param_name: (
-                    self._ps_texture_resource_name(obj, slot)
-                    if index == 0
-                    else f"{self._ps_texture_resource_name(obj, slot)}_{index}"
-                )
+                resource_name_provider = lambda material, index: self._ps_texture_material_resource_name(material)
                 generated_lines, next_swap_key_num = self.generate_material_lines(
                     matching_materials, param_name, texture_type, obj, texture_folder, all_sections,
                     object_to_diffuse_swapkey, material_group_to_swapkey,

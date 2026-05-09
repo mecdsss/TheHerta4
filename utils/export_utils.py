@@ -345,7 +345,18 @@ class ExportUtils:
                 dtype=dtype,
             )
 
-        deduplicate_element_set = GlobalProterties.get_deduplicate_element_set()
+        # These two recalculate operators historically ran on the fully split
+        # unified vertex set. If local dedup precision narrows the compared
+        # fields, vertices can merge earlier and both COLOR/TANGENT averages
+        # change. Keep the remote-compatible behavior while either recalc path
+        # is enabled.
+        recalculate_average_normal_enabled = (
+            GlobalProterties.recalculate_tangent()
+            or GlobalProterties.recalculate_color()
+            or obj.get("3DMigoto:RecalculateTANGENT", False)
+            or obj.get("3DMigoto:RecalculateCOLOR", False)
+        )
+        deduplicate_element_set = None if recalculate_average_normal_enabled else GlobalProterties.get_deduplicate_element_set()
 
         ib, _, _, unique_element_vertex_ndarray, unique_first_loop_indices = \
             ObjBufferHelper.calc_index_vertex_buffer_wwmi_v2(

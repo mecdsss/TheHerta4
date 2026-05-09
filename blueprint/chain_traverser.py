@@ -96,31 +96,47 @@ class ChainTraverser:
 
         visited_chains: Set[str] = set()
         all_chains: List[ProcessingChain] = []
+        is_ntmi_modimp_output = (
+            getattr(output_node, "bl_idname", "") == _NODE_TYPE_RESULT_OUTPUT_NTMI_MODIMP
+            or BlueprintExportHelper.runtime_result_output_node_type == _NODE_TYPE_RESULT_OUTPUT_NTMI_MODIMP
+        )
 
         for obj_node in object_info_nodes:
+            start_chains = []
             if obj_node.bl_idname == _NODE_TYPE_MULTI_FILE_EXPORT:
                 obj_list = getattr(obj_node, 'object_list', [])
                 if not obj_list:
                     continue
                 
-                current_export_index = BlueprintExportHelper.current_export_index - 1
-                if current_export_index < 0:
-                    current_export_index = 0
-                if current_export_index >= len(obj_list):
-                    current_export_index = len(obj_list) - 1
+                if is_ntmi_modimp_output:
+                    export_items = list(enumerate(obj_list))
+                else:
+                    current_export_index = BlueprintExportHelper.current_export_index - 1
+                    if current_export_index < 0:
+                        current_export_index = 0
+                    if current_export_index >= len(obj_list):
+                        current_export_index = len(obj_list) - 1
+                    export_items = [(current_export_index, obj_list[current_export_index])]
                 
-                item = obj_list[current_export_index]
-                object_name = getattr(item, 'object_name', '')
-                
-                if not object_name:
-                    continue
-                
-                chain = ProcessingChain(
-                    object_name=object_name,
-                    source_node=obj_node
-                )
-                
-                LOG.info(f"   📋 MultiFile_Export '{obj_node.name}' 索引 {current_export_index} → 物体 '{object_name}'")
+                for option_index, item in export_items:
+                    object_name = getattr(item, 'object_name', '')
+                    if not object_name:
+                        continue
+
+                    chain = ProcessingChain(
+                        object_name=object_name,
+                        source_node=obj_node
+                    )
+                    chain.multi_file_source_node_key = _get_node_unique_key(obj_node)
+                    chain.multi_file_source_node_name = obj_node.name
+                    chain.multi_file_option_index = option_index
+                    chain.multi_file_option_count = len(obj_list)
+                    start_chains.append((chain, object_name, "MultiFile_Export"))
+
+                    LOG.info(
+                        f"   MultiFile_Export '{obj_node.name}' index {option_index} -> object '{object_name}'"
+                    )
+
             else:
                 if not getattr(obj_node, 'object_name', ''):
                     continue
@@ -135,22 +151,24 @@ class ChainTraverser:
 
                 LOG.info(f"   📋 Object_Info '{obj_node.object_name}' → 开始遍历 (有效名称: '{effective_object_name}')")
 
-            completed_chains = []
-            self._traverse_forward(chain, obj_node, set(), completed_chains)
+            if obj_node.bl_idname != _NODE_TYPE_MULTI_FILE_EXPORT:
+                start_chains.append((chain, chain.object_name, "Object_Info"))
 
-            node_display_name = object_name if obj_node.bl_idname == _NODE_TYPE_MULTI_FILE_EXPORT else chain.object_name
-            node_type_name = "MultiFile_Export" if obj_node.bl_idname == _NODE_TYPE_MULTI_FILE_EXPORT else "Object_Info"
-            LOG.info(f"   📋 {node_type_name} '{node_display_name}' → 产生 {len(completed_chains)} 条链路")
-            for ci, fc in enumerate(completed_chains):
-                LOG.info(f"      链路{ci}: object_name='{fc.object_name}', valid={fc.is_valid}, reached_output={fc.reached_output}, nodes={len(fc.node_path)}")
+            for chain, node_display_name, node_type_name in start_chains:
+                completed_chains = []
+                self._traverse_forward(chain, obj_node, set(), completed_chains)
 
-            for finished_chain in completed_chains:
-                dedup_key = f"{finished_chain.object_name}@{finished_chain.get_chain_hash()}"
-                if dedup_key in visited_chains:
-                    LOG.info(f"      ⏭️ 去重跳过: dedup_key='{dedup_key[:60]}...'")
-                    continue
-                visited_chains.add(dedup_key)
-                all_chains.append(finished_chain)
+                LOG.info(f"   {node_type_name} '{node_display_name}' produced {len(completed_chains)} chain(s)")
+                for ci, fc in enumerate(completed_chains):
+                    LOG.info(f"      chain{ci}: object_name='{fc.object_name}', valid={fc.is_valid}, reached_output={fc.reached_output}, nodes={len(fc.node_path)}")
+
+                for finished_chain in completed_chains:
+                    dedup_key = f"{finished_chain.object_name}@{finished_chain.get_chain_hash()}"
+                    if dedup_key in visited_chains:
+                        LOG.info(f"      skip duplicate chain: dedup_key='{dedup_key[:60]}...'")
+                        continue
+                    visited_chains.add(dedup_key)
+                    all_chains.append(finished_chain)
 
         LOG.info(f"   📋 去重前: {len(all_chains)} 条链路")
         for ci, c in enumerate(all_chains):

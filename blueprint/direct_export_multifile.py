@@ -486,17 +486,46 @@ class DirectMultiFileGenerator:
         if local_loop_indices.size == 0:
             return full_position_bytes
 
+        mesh = getattr(obj, "data", None)
+        if mesh is None:
+            raise MultiFileDirectExportError(f"物体 '{obj.name}' 缺少网格数据")
+
+        all_loop_vertex_indices = np.empty(len(mesh.loops), dtype=np.int32)
+        mesh.loops.foreach_get("vertex_index", all_loop_vertex_indices)
+        max_target_loop_index = int(local_loop_indices.max()) if local_loop_indices.size > 0 else -1
+        if max_target_loop_index >= len(all_loop_vertex_indices):
+            raise MultiFileDirectExportError(
+                f"物体 '{obj.name}' 的导出 loop 映射越界: max_loop_index={max_target_loop_index}, loop_count={len(all_loop_vertex_indices)}"
+            )
+
         unique_first_loop_indices = getattr(buffer_result, "unique_first_loop_indices", None)
         source_loop_indices = np.asarray(unique_first_loop_indices, dtype=np.int32) if unique_first_loop_indices is not None else np.asarray([], dtype=np.int32)
+        source_loop_vertex_indices = (
+            all_loop_vertex_indices[source_loop_indices]
+            if source_loop_indices.size > 0
+            else np.asarray([], dtype=np.int32)
+        )
+        target_loop_vertex_indices = all_loop_vertex_indices[local_loop_indices]
         return self._reorder_position_bytes_by_loop_indices(
             obj_name=obj.name,
             position_bytes=full_position_bytes,
             position_stride=position_stride,
             source_loop_indices=source_loop_indices,
             target_loop_indices=local_loop_indices,
+            source_loop_vertex_indices=source_loop_vertex_indices,
+            target_loop_vertex_indices=target_loop_vertex_indices,
         )
 
-    def _reorder_position_bytes_by_loop_indices(self, obj_name: str, position_bytes: bytes, position_stride: int, source_loop_indices: np.ndarray, target_loop_indices: np.ndarray) -> bytes:
+    def _reorder_position_bytes_by_loop_indices(
+        self,
+        obj_name: str,
+        position_bytes: bytes,
+        position_stride: int,
+        source_loop_indices: np.ndarray,
+        target_loop_indices: np.ndarray,
+        source_loop_vertex_indices: np.ndarray | None = None,
+        target_loop_vertex_indices: np.ndarray | None = None,
+    ) -> bytes:
         if position_stride <= 0:
             raise MultiFileDirectExportError(f"物体 '{obj_name}' 的 Position 步长无效: {position_stride}")
 
@@ -526,14 +555,29 @@ class DirectMultiFileGenerator:
             int(loop_index): vertex_index
             for vertex_index, loop_index in enumerate(source_loop_indices.tolist())
         }
+        vertex_index_to_source_vertex_index = {}
+        if source_loop_vertex_indices is not None:
+            for source_vertex_index, vertex_id in enumerate(np.asarray(source_loop_vertex_indices, dtype=np.int32).tolist()):
+                vertex_index_to_source_vertex_index.setdefault(int(vertex_id), source_vertex_index)
 
         reordered_bytes = bytearray(expected_bytes)
         for local_index, loop_index in enumerate(target_loop_indices.tolist()):
             source_vertex_index = loop_index_to_vertex_index.get(int(loop_index))
             if source_vertex_index is None:
-                raise MultiFileDirectExportError(
-                    f"物体 '{obj_name}' 缺少导出所需 loop 映射: loop_index={loop_index}"
-                )
+                target_vertex_index = None
+                if target_loop_vertex_indices is not None and local_index < len(target_loop_vertex_indices):
+                    target_vertex_index = int(target_loop_vertex_indices[local_index])
+                    # Position 只依赖顶点坐标；当副本对象去重时选中了不同的代表 loop，
+                    # 允许回退到同一 vertex_index 对应的导出行，避免因首个 loop 不一致而报错。
+                    source_vertex_index = vertex_index_to_source_vertex_index.get(target_vertex_index)
+
+                if source_vertex_index is None:
+                    detail = f"loop_index={loop_index}"
+                    if target_vertex_index is not None:
+                        detail = f"{detail}, vertex_index={target_vertex_index}"
+                    raise MultiFileDirectExportError(
+                        f"物体 '{obj_name}' 缺少导出所需 loop 映射: {detail}"
+                    )
 
             src_start = source_vertex_index * position_stride
             src_end = src_start + position_stride
@@ -554,21 +598,47 @@ class DirectMultiFileGenerator:
         except ValueError as exc:
             raise MultiFileDirectExportError(str(exc)) from exc
 
+    def _build_canonical_resource_name(self, actual_hash: str) -> str:
+        return f"Resource_{self.config_node._hash_to_resource_prefix(actual_hash)}_Position"
+
+    def _build_legacy_resource_name(self, actual_hash: str) -> str:
+        return f"Resource{self.config_node._hash_to_resource_prefix(actual_hash)}Position"
+
     def _find_base_resource_name(self, actual_hash):
+        canonical_name = self._build_canonical_resource_name(actual_hash)
         ini_files = glob.glob(os.path.join(self.mod_export_path, "*.ini"))
         if not ini_files:
-            return f"Resource{actual_hash.replace('-', '_')}Position"
+            return canonical_name
 
         sections, _ = self.config_node._read_ini_to_ordered_dict(ini_files[0])
-        resource_pattern = re.compile(r'\[(Resource_?([a-f0-9]{8}(?:[_-][a-f0-9]+)*)_?Position)\]')
+        resource_pattern = re.compile(
+            r'\[((?:Resource_[a-f0-9]+(?:_[a-f0-9]+)*_Position)|(?:Resource[a-f0-9]+(?:_[a-f0-9]+)*Position))\]'
+        )
         for section_name in sections.keys():
             match = resource_pattern.match(section_name)
             if not match:
                 continue
-            full_name, hash_value = match.groups()
-            if hash_value.replace("_", "-") == actual_hash or actual_hash.startswith(hash_value.replace("_", "-")):
-                return full_name
-        return f"Resource{actual_hash.replace('-', '_')}Position"
+            full_name = match.group(1)
+            hash_value = full_name.removeprefix("Resource_").removeprefix("Resource")
+            hash_value = hash_value.removesuffix("_Position").removesuffix("Position")
+            normalized_hash = hash_value.replace("_", "-")
+            if normalized_hash == actual_hash or actual_hash.startswith(normalized_hash):
+                return canonical_name
+        return canonical_name
+
+    def _find_existing_base_resource_section_name(self, sections, actual_hash: str, base_resource_name: str) -> str | None:
+        legacy_base_resource_name = self._build_legacy_resource_name(actual_hash)
+        candidate_section_names = [
+            f"[{base_resource_name}]",
+            f"[{legacy_base_resource_name}]",
+            f"[{base_resource_name}_1]",
+            f"[{legacy_base_resource_name}_1]",
+        ]
+
+        for candidate_section_name in candidate_section_names:
+            if candidate_section_name in sections:
+                return candidate_section_name
+        return None
 
     def _update_ini_sections(self, sections, preserved_tail_content, target_ini_file, runtime_infos, generated_states):
         shader_source_path = self.config_node._get_shader_source_path()
@@ -600,11 +670,16 @@ class DirectMultiFileGenerator:
 
             resource_prefix = self.config_node._hash_to_resource_prefix(actual_hash)
             base_resource_name = runtime_info["base_resource_name"]
+            legacy_base_resource_name = self._build_legacy_resource_name(actual_hash)
 
             base_section_name = f"[{base_resource_name}_1]"
             if base_section_name not in sections:
-                original_section_name = f"[{base_resource_name}]"
-                original_lines = list(sections.get(original_section_name, []))
+                original_section_name = self._find_existing_base_resource_section_name(
+                    sections,
+                    runtime_info["actual_hash"],
+                    base_resource_name,
+                )
+                original_lines = list(sections.get(original_section_name, [])) if original_section_name else []
                 if original_lines:
                     sections[base_section_name] = original_lines
 
@@ -652,6 +727,8 @@ class DirectMultiFileGenerator:
             shader_lines.append("    cs-t75 = null")
             sections[shader_section] = shader_lines
 
+            legacy_post_copy_line = f"post {legacy_base_resource_name} = copy_desc {legacy_base_resource_name}_1"
+            constants_lines = [line for line in constants_lines if line != legacy_post_copy_line]
             post_copy_line = f"post {base_resource_name} = copy_desc {base_resource_name}_1"
             post_run_line = f"post run = CustomShader_{actual_hash}_1Anim"
             if post_copy_line not in constants_lines:

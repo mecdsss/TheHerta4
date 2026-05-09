@@ -50,6 +50,19 @@ def _update_parallel_preprocess_toggle(self, context):
 
 
 class GlobalProterties(bpy.types.PropertyGroup):
+    object_swap_variable_counter: bpy.props.IntProperty(
+        name="Object Swap Variable Counter",
+        default=0,
+        min=0,
+        options={'HIDDEN'},
+    ) # type: ignore
+
+    allocated_variable_names_csv: bpy.props.StringProperty(
+        name="Allocated Variable Names",
+        default="",
+        options={'HIDDEN'},
+    ) # type: ignore
+
     selected_blueprint_name: bpy.props.EnumProperty(
         name="当前蓝图",
         description="选择要打开或快捷生成 Mod 的蓝图",

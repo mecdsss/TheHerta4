@@ -254,7 +254,18 @@ def condition_from_swap_work_keys(work_key_list) -> str:
 
 
 def _chain_condition(chain) -> str:
-    return _condition_from_work_keys(getattr(chain, "shapekey_params", []) or [])
+    conditions = []
+    swap_condition = _condition_from_work_keys(getattr(chain, "shapekey_params", []) or [])
+    if swap_condition:
+        conditions.append(f"({swap_condition})" if "&&" in swap_condition or "||" in swap_condition else swap_condition)
+    explicit_condition = str(getattr(chain, "ntmi_multifile_condition", "") or "").strip()
+    if explicit_condition:
+        conditions.append(
+            f"({explicit_condition})"
+            if "&&" in explicit_condition or "||" in explicit_condition
+            else explicit_condition
+        )
+    return " && ".join(conditions)
 
 
 def _source_owner_candidates(obj: bpy.types.Object):

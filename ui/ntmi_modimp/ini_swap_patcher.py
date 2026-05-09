@@ -7,6 +7,7 @@ from pathlib import Path
 SECTION_RE = re.compile(r"^\[(?P<name>[^\]]+)\]\s*$")
 MESH_COMMENT_RE = re.compile(r"^;\s*\[mesh:(?P<object_name>[^\]]+)\]")
 DRAWINDEXED_RE = re.compile(r"^(?P<indent>\s*)drawindexed\s*=")
+ACTIVE_FLAG = "$ntmi_active0"
 
 
 def _find_section_ranges(lines: list[str]) -> list[tuple[str, int, int]]:
@@ -56,8 +57,16 @@ def _append_block(lines: list[str], block: list[str]):
         lines.append("")
 
 
+def _variable_declared(lines: list[str], variable_name: str) -> bool:
+    variable = re.escape(str(variable_name or "").strip())
+    if not variable:
+        return False
+    pattern = re.compile(rf"^\s*global(?:\s+persist)?\s+{variable}\b")
+    return any(pattern.match(line.strip()) for line in lines)
+
+
 def _ensure_constants(lines: list[str], swap_nodes: list[dict[str, object]]):
-    insert_lines = ["global $active0 = 0"]
+    insert_lines = [f"global {ACTIVE_FLAG} = 0"]
     for node in swap_nodes:
         variable_name = str(node["variable_name"])
         insert_lines.append(f"global persist {variable_name} = 0")
@@ -67,7 +76,7 @@ def _ensure_constants(lines: list[str], swap_nodes: list[dict[str, object]]):
 
 
 def _ensure_present(lines: list[str]):
-    insert_lines = ["post $active0 = 0"]
+    insert_lines = [f"post {ACTIVE_FLAG} = 0"]
     if not _insert_into_section(lines, "Present", insert_lines):
         _append_block(lines, ["[Present]", *insert_lines])
 
@@ -84,7 +93,7 @@ def _ensure_key_swap_sections(lines: list[str], swap_nodes: list[dict[str, objec
             block.append(f"; {comment}")
         block.extend(
             [
-                "condition = $active0 == 1",
+                f"condition = {ACTIVE_FLAG} == 1",
                 f"key = {node['hotkey']}",
                 f"type = {node['swap_type']}",
                 f"{node['variable_name']} = {option_sequence},",
@@ -100,10 +109,26 @@ def _inject_active_flag(lines: list[str]):
         stripped = line.strip()
         if not stripped.startswith("[TextureOverride"):
             continue
-        if index + 1 < len(lines) and lines[index + 1].strip() == "$active0 = 1":
+        if index + 1 < len(lines) and lines[index + 1].strip() == f"{ACTIVE_FLAG} = 1":
             continue
-        result.append("$active0 = 1")
+        result.append(f"{ACTIVE_FLAG} = 1")
     return result
+
+
+def _ensure_multifile_constants(lines: list[str], multifile_nodes: list[dict[str, object]]):
+    insert_lines = []
+    for node in multifile_nodes:
+        animation_variable = str(node.get("animation_variable", "") or "").strip()
+        active_variable = str(node.get("active_variable", "") or "").strip()
+        if animation_variable and not _variable_declared(lines, animation_variable):
+            insert_lines.append(f"global persist {animation_variable} = 0")
+        if active_variable and not _variable_declared(lines, active_variable):
+            insert_lines.append(f"global persist {active_variable} = 0")
+
+    if not insert_lines:
+        return
+    if not _insert_into_section(lines, "Constants", insert_lines):
+        _append_block(lines, ["[Constants]", *insert_lines])
 
 
 def _condition_for_object(object_name: str, object_conditions: dict[str, str]) -> str:
@@ -148,6 +173,7 @@ def patch_ini_file(
     *,
     swap_nodes: list[dict[str, object]],
     object_conditions: dict[str, str],
+    multifile_nodes: list[dict[str, object]] | None = None,
 ) -> bool:
     path = Path(ini_path)
     if not path.is_file():
@@ -161,6 +187,12 @@ def patch_ini_file(
         _ensure_present(lines)
         _ensure_key_swap_sections(lines, swap_nodes)
         lines = _inject_active_flag(lines)
+
+    if multifile_nodes:
+        _ensure_multifile_constants(lines, multifile_nodes)
+        if any(str(node.get("active_variable", "") or "").strip() == ACTIVE_FLAG for node in multifile_nodes):
+            _ensure_present(lines)
+            lines = _inject_active_flag(lines)
 
     if object_conditions:
         lines = _wrap_drawindexed(lines, object_conditions)

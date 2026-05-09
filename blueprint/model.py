@@ -80,6 +80,10 @@ class ProcessingChain:
     rename_history: List[dict] = field(default_factory=list)
 
     swap_node_option_values: Dict[str, int] = field(default_factory=dict)
+    multi_file_source_node_key: str = ""
+    multi_file_source_node_name: str = ""
+    multi_file_option_index: Optional[int] = None
+    multi_file_option_count: int = 0
 
     vertex_group_process_nodes: List[bpy.types.Node] = field(default_factory=list)
     vertex_group_mapping_nodes: List[bpy.types.Node] = field(default_factory=list)
@@ -209,6 +213,9 @@ class ProcessingChain:
             custom_var_name = getattr(node, 'custom_var_name', '')
             if custom_var_name:
                 params.append(f"var={custom_var_name}")
+            assigned_variable_name = getattr(node, 'assigned_variable_name', '')
+            if assigned_variable_name:
+                params.append(f"assigned={assigned_variable_name}")
             swap_type = getattr(node, 'swap_type', '')
             if swap_type:
                 params.append(f"type={swap_type}")
@@ -223,7 +230,10 @@ class ProcessingChain:
 
     def get_chain_hash(self) -> str:
         if not self.node_path:
-            return f"SINGLE:{self.object_name}"
+            suffix = ""
+            if self.multi_file_source_node_key:
+                suffix = f"|MULTIFILE:{self.multi_file_source_node_key}:{self.multi_file_option_index}"
+            return f"SINGLE:{self.object_name}{suffix}"
 
         signature_parts = []
         for i, (node, sig) in enumerate(zip(self.node_path, self.node_param_signatures)):
@@ -236,6 +246,9 @@ class ProcessingChain:
             for swap_name in sorted(self.swap_node_option_values.keys()):
                 swap_parts.append(f"{swap_name}={self.swap_node_option_values[swap_name]}")
             path_with_params += "|SWAP:" + ",".join(swap_parts)
+
+        if self.multi_file_source_node_key:
+            path_with_params += f"|MULTIFILE:{self.multi_file_source_node_key}:{self.multi_file_option_index}"
 
         return f"CHAIN:{path_with_params}"
 
@@ -262,6 +275,12 @@ class ProcessingChain:
                     detail += f"[{sk.comment}]"
                 sk_details.append(detail)
             parts.append(f"   └─ 形态键参数 ({len(self.shapekey_params)}个): {', '.join(sk_details)}")
+
+        if self.multi_file_source_node_key:
+            option_label = ""
+            if self.multi_file_option_index is not None:
+                option_label = f"{self.multi_file_option_index + 1}/{self.multi_file_option_count}"
+            parts.append(f"   -> MultiFile: {self.multi_file_source_node_name} {option_label}")
 
         if self.node_param_signatures:
             parts.append(f"   └─ 节点参数详情:")
@@ -290,6 +309,10 @@ class ProcessingChain:
         new_chain.condition_operator = self.condition_operator
         new_chain.rename_history = copy.deepcopy(self.rename_history, memo)
         new_chain.swap_node_option_values = copy.deepcopy(self.swap_node_option_values, memo)
+        new_chain.multi_file_source_node_key = self.multi_file_source_node_key
+        new_chain.multi_file_source_node_name = self.multi_file_source_node_name
+        new_chain.multi_file_option_index = self.multi_file_option_index
+        new_chain.multi_file_option_count = self.multi_file_option_count
         new_chain.vertex_group_process_nodes = list(self.vertex_group_process_nodes)
         new_chain.vertex_group_mapping_nodes = list(self.vertex_group_mapping_nodes)
         new_chain.export_object_name_override = self.export_object_name_override

@@ -4,6 +4,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 
 import bpy
@@ -11,7 +12,9 @@ import bpy
 from ...blueprint.export_helper import BlueprintExportHelper
 from ...blueprint.model import BluePrintModel
 from ...blueprint.preprocess import PreProcessHelper
+from ...blueprint.variable_registry import ensure_object_swap_variable_name, get_node_variable_name
 from ...common.global_properties import GlobalProterties
+from ...common.object_prefix_helper import ObjectPrefixHelper
 from ...utils.log_utils import LOG
 from ...utils.timer_utils import TimerUtils
 from .export_tree_builder import (
@@ -20,7 +23,7 @@ from .export_tree_builder import (
     cleanup_collections,
     condition_from_swap_work_keys,
 )
-from .ini_swap_patcher import patch_ini_file
+from .ini_swap_patcher import ACTIVE_FLAG, patch_ini_file
 from .modimp_core import (
     detect_mod_importer_dependency,
     get_export_collection_package,
@@ -36,6 +39,12 @@ COMPATIBLE_POSTPROCESS_NODE_TYPES = {
     "SSMTNode_PostProcess_ResourceMerge",
     "SSMTNode_PostProcess_WebPanel",
     "SSMTNode_PostProcess_SliderPanel",
+}
+NTMI_INTERNAL_POSTPROCESS_NODE_TYPES = {
+    "SSMTNode_PostProcess_MultiFile": (
+        "MultiFile config is consumed by the NTMI exporter to generate draw conditions; "
+        "legacy SSMT MultiFile data/INI generation is not executed."
+    ),
 }
 
 
@@ -108,8 +117,188 @@ def _object_conditions_from_blueprint_model(blueprint_model: BluePrintModel) -> 
         }
         for name in names:
             if name:
-                result[name] = condition
+                result[name] = _merge_conditions(result.get(name, ""), condition)
+    for chain in getattr(blueprint_model, "processing_chains", []) or []:
+        if not getattr(chain, "is_valid", False) or not getattr(chain, "reached_output", False):
+            continue
+        condition = _condition_from_chain(chain)
+        if not condition:
+            continue
+        names = {
+            getattr(chain, "object_name", "") or "",
+            getattr(chain, "original_object_name", "") or "",
+            getattr(chain, "virtual_object_name", "") or "",
+            getattr(chain, "export_object_name_override", "") or "",
+        }
+        get_export_object_name = getattr(chain, "get_export_object_name", None)
+        if callable(get_export_object_name):
+            try:
+                names.add(get_export_object_name() or "")
+            except Exception:
+                pass
+        for name in names:
+            if name:
+                result[name] = _merge_conditions(result.get(name, ""), condition)
     return result
+
+
+def _wrap_condition(condition: str) -> str:
+    condition = str(condition or "").strip()
+    if not condition:
+        return ""
+    if condition.startswith("(") and condition.endswith(")"):
+        return condition
+    if "&&" in condition or "||" in condition:
+        return f"({condition})"
+    return condition
+
+
+def _merge_conditions(existing: str, incoming: str) -> str:
+    existing = str(existing or "").strip()
+    incoming = str(incoming or "").strip()
+    if not existing:
+        return incoming
+    if not incoming or incoming == existing:
+        return existing
+    return f"{_wrap_condition(existing)} && {_wrap_condition(incoming)}"
+
+
+def _condition_from_chain(chain) -> str:
+    conditions = []
+    swap_condition = condition_from_swap_work_keys(getattr(chain, "shapekey_params", []) or [])
+    if swap_condition:
+        conditions.append(_wrap_condition(swap_condition))
+    multifile_condition = str(getattr(chain, "ntmi_multifile_condition", "") or "").strip()
+    if multifile_condition:
+        conditions.append(_wrap_condition(multifile_condition))
+    return " && ".join(condition for condition in conditions if condition)
+
+
+def _normalize_ini_variable(value: str, fallback: str) -> str:
+    variable = str(value or "").strip() or fallback
+    if not variable.startswith("$"):
+        variable = f"${variable}"
+    return variable
+
+
+def _parse_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _draw_ib_from_object_name(object_name: str) -> str:
+    name = str(object_name or "").strip()
+    prefix_info = ObjectPrefixHelper.extract_prefix_info(name)
+    prefix = prefix_info[0] if prefix_info else name
+    return str(ObjectPrefixHelper.parse_prefix_parts(prefix).get("draw_ib", "") or "").strip().lower()
+
+
+def _hashes_from_multifile_export_node(node) -> set[str]:
+    hashes = set()
+    for item in getattr(node, "object_list", []) or []:
+        draw_ib = _draw_ib_from_object_name(getattr(item, "object_name", ""))
+        if draw_ib:
+            hashes.add(draw_ib)
+    return hashes
+
+
+def _hashes_from_multifile_config_node(node) -> set[str]:
+    hashes = set()
+    raw_values = re.split(r"[,;\n]+", str(getattr(node, "hash_values", "") or ""))
+    for raw_value in raw_values:
+        value = raw_value.strip()
+        if not value:
+            continue
+        draw_ib = _draw_ib_from_object_name(value)
+        if draw_ib:
+            hashes.add(draw_ib)
+    return hashes
+
+
+def _multifile_config_for_export_node(postprocess_nodes, export_node):
+    config_nodes = [
+        node
+        for node in postprocess_nodes or []
+        if str(getattr(node, "bl_idname", "") or "") == "SSMTNode_PostProcess_MultiFile"
+    ]
+    if not config_nodes:
+        return None
+
+    export_hashes = _hashes_from_multifile_export_node(export_node)
+    for config_node in config_nodes:
+        config_hashes = _hashes_from_multifile_config_node(config_node)
+        if config_hashes and export_hashes and config_hashes.intersection(export_hashes):
+            return config_node
+    return config_nodes[0]
+
+
+def _multifile_node_payloads(blueprint_model: BluePrintModel) -> list[dict[str, object]]:
+    payloads = []
+    postprocess_nodes = getattr(blueprint_model, "postprocess_nodes", []) or []
+    for export_node in getattr(blueprint_model, "multi_file_export_nodes", []) or []:
+        option_count = len(getattr(export_node, "object_list", []) or [])
+        if option_count <= 1:
+            continue
+
+        config_node = _multifile_config_for_export_node(postprocess_nodes, export_node)
+        animation_variable = _normalize_ini_variable(
+            getattr(config_node, "animation_swapkey", "") if config_node else "",
+            "$swapkey100",
+        )
+        active_variable = _normalize_ini_variable(
+            getattr(config_node, "active_swapkey", "") if config_node else "",
+            ACTIVE_FLAG,
+        )
+        if active_variable == "$active0":
+            active_variable = ACTIVE_FLAG
+        active_value = _parse_int(getattr(config_node, "active_value", 1) if config_node else 1, 1)
+        node_key = f"{export_node.id_data.name}::{export_node.name}" if getattr(export_node, "id_data", None) else export_node.name
+        payloads.append(
+            {
+                "node_name": export_node.name,
+                "node_key": node_key,
+                "config_node_name": getattr(config_node, "name", "") if config_node else "",
+                "animation_variable": animation_variable,
+                "active_variable": active_variable,
+                "active_value": active_value,
+                "option_count": option_count,
+                "comment": str(getattr(config_node, "comment", "") or "") if config_node else "",
+            }
+        )
+    return payloads
+
+
+def _apply_ntmi_multifile_conditions(blueprint_model: BluePrintModel, multifile_nodes: list[dict[str, object]]):
+    payload_by_key = {str(item["node_key"]): item for item in multifile_nodes}
+    applied_count = 0
+    for chain in getattr(blueprint_model, "processing_chains", []) or []:
+        node_key = str(getattr(chain, "multi_file_source_node_key", "") or "")
+        if not node_key:
+            continue
+        payload = payload_by_key.get(node_key)
+        if not payload:
+            continue
+        option_index = getattr(chain, "multi_file_option_index", None)
+        if option_index is None:
+            continue
+        state_index = int(option_index) + 1
+        active_variable = str(payload["active_variable"])
+        animation_variable = str(payload["animation_variable"])
+        active_value = int(payload["active_value"])
+        if state_index == 1:
+            condition = (
+                f"{active_variable} != {active_value} "
+                f"|| {animation_variable} == 0 "
+                f"|| {animation_variable} == {state_index}"
+            )
+        else:
+            condition = f"{active_variable} == {active_value} && {animation_variable} == {state_index}"
+        setattr(chain, "ntmi_multifile_condition", condition)
+        applied_count += 1
+    if applied_count:
+        LOG.info(f"NTMI ModImp: applied MultiFile draw conditions to {applied_count} chain(s).")
 
 
 def _swap_node_payloads(blueprint_model: BluePrintModel) -> list[dict[str, object]]:
@@ -121,8 +310,8 @@ def _swap_node_payloads(blueprint_model: BluePrintModel) -> list[dict[str, objec
     for fallback_index, node in enumerate(getattr(registry, "swapkey_nodes", []) or []):
         node_key = f"{node.id_data.name}::{node.name}" if getattr(node, "id_data", None) else node.name
         index = getattr(registry, "node_swapkey_map", {}).get(node_key, fallback_index)
-        custom_var_name = str(getattr(node, "custom_var_name", "") or "").strip().lstrip("$")
-        variable_name = f"${custom_var_name}" if custom_var_name else f"$swapkey{index}"
+        ensure_object_swap_variable_name(node)
+        variable_name = get_node_variable_name(node)
         payloads.append(
             {
                 "node_name": node.name,
@@ -148,6 +337,7 @@ def _write_report(
     export_results: list[dict[str, object]],
     object_conditions: dict[str, str],
     swap_nodes: list[dict[str, object]],
+    multifile_nodes: list[dict[str, object]],
     requested_generate_ini: bool,
     effective_generate_ini: bool,
 ):
@@ -159,6 +349,7 @@ def _write_report(
         "export_results": export_results,
         "object_conditions": object_conditions,
         "swap_nodes": swap_nodes,
+        "multifile_nodes": multifile_nodes,
     }
     report_path = Path(output_dir) / "theherta4_ntmi_modimp_export_report.json"
     report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -169,6 +360,8 @@ def _execute_supported_postprocess_nodes(blueprint_model: BluePrintModel, output
     for node in getattr(blueprint_model, "postprocess_nodes", []) or []:
         node_type = str(getattr(node, "bl_idname", "") or "")
         if node_type not in COMPATIBLE_POSTPROCESS_NODE_TYPES:
+            if node_type in NTMI_INTERNAL_POSTPROCESS_NODE_TYPES:
+                continue
             LOG.warning(f"Skip NTMI-incompatible postprocess node: {getattr(node, 'name', '')} ({node_type})")
             continue
         compatible_nodes.append(node)
@@ -246,6 +439,8 @@ class ExportNTMIModImp:
         self.runtime_shapekey_names = str(getattr(node, "runtime_shapekey_names", "") or "").strip()
 
     def export(self) -> list[dict[str, object]]:
+        multifile_nodes = _multifile_node_payloads(self.blueprint_model)
+        _apply_ntmi_multifile_conditions(self.blueprint_model, multifile_nodes)
         build_result = build_export_tree(self.blueprint_model)
         export_results: list[dict[str, object]] = []
         effective_generate_ini = self.generate_ini
@@ -292,6 +487,7 @@ class ExportNTMIModImp:
                         ini_path,
                         swap_nodes=swap_nodes,
                         object_conditions=object_conditions,
+                        multifile_nodes=multifile_nodes,
                     )
 
             _write_report(
@@ -300,6 +496,7 @@ class ExportNTMIModImp:
                 export_results=export_results,
                 object_conditions=object_conditions,
                 swap_nodes=swap_nodes,
+                multifile_nodes=multifile_nodes,
                 requested_generate_ini=self.generate_ini,
                 effective_generate_ini=effective_generate_ini,
             )
