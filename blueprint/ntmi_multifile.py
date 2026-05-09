@@ -67,8 +67,9 @@ class NTMIDirectMultiFileGenerator(DirectMultiFileGenerator):
             source_ini_path=self.target_ini_file,
         )
         self.meshes_dir = os.path.join(mod_export_path, "Buffer")
-        self._modimp_exporter_module = _load_ntmi_exporter_module()
-        self._position_converter = _load_ntmi_position_converter(mod_export_path)
+        self.mod_importer_root = str(getattr(exporter, "mod_importer_root", "") or "").strip()
+        self._modimp_exporter_module = _load_ntmi_exporter_module(self.mod_importer_root)
+        self._position_converter = _load_ntmi_position_converter(mod_export_path, self.mod_importer_root)
         self._object_to_part_token = {}
         for part_token, part_layout in self.part_layouts.items():
             for draw_call in part_layout.draw_calls:

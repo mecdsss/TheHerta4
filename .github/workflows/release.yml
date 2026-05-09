@@ -3,7 +3,7 @@ name: Release Package
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
@@ -18,36 +18,50 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Create Release Package
         id: package
         run: |
-          # 排除的文件和目录
-          EXCLUDE_PATTERN=$(cat << 'EOF'
-            --exclude=.gitignore
-            --exclude=.github
-            --exclude=README.md
-            --exclude=README_DEV.md
-            --exclude=LICENSE.txt
-            --exclude=requirements.txt
-            --exclude=*.md
-            --exclude=docs
-            --exclude=__pycache__
-            --exclude=*.pyc
-          EOF
-          )
-
-          # 创建 zip 包，名称使用 tag 去掉 v 前缀，并将版本号的点号替换为连字符
           TAG_NAME=${GITHUB_REF#refs/tags/}
           VERSION=${TAG_NAME#v}
           VERSION=${VERSION//./-}
           ZIP_NAME="TheHerta4-${VERSION}.zip"
 
-          # 打包
-          zip -r "$ZIP_NAME" . $EXCLUDE_PATTERN
+          STAGING_DIR="$(mktemp -d)"
+          PACKAGE_ROOT="$STAGING_DIR/TheHerta4"
+          mkdir -p "$PACKAGE_ROOT"
 
-          # 计算 SHA256
+          # Keep an outer TheHerta4 folder so Blender can install the zip directly.
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.trae' \
+            --exclude='.venv' \
+            --exclude='.codex_benchmarks' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='*.pyo' \
+            --exclude='*.md' \
+            --exclude='docs' \
+            --exclude='Logs' \
+            --exclude='references' \
+            --exclude='reports' \
+            --exclude='test' \
+            --exclude='tests' \
+            --exclude='tools' \
+            --exclude='theherta4_updater' \
+            --exclude='.gitignore' \
+            --exclude='README.md' \
+            --exclude='README_DEV.md' \
+            --exclude='requirements.txt' \
+            ./ "$PACKAGE_ROOT/"
+
+          (
+            cd "$STAGING_DIR"
+            zip -r "$GITHUB_WORKSPACE/$ZIP_NAME" "TheHerta4"
+          )
+
           SHA256=$(sha256sum "$ZIP_NAME" | cut -d' ' -f1)
 
           echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
@@ -60,14 +74,14 @@ jobs:
         with:
           files: ${{ steps.package.outputs.zip_name }}
           body: |
-            ## 自动打包版本
+            ## Automated Release Package
 
             **SHA256**: `${{ steps.package.outputs.sha256 }}`
 
-            使用方法:
-            1. 下载 zip 包
-            2. 在 Blender 中打开 `编辑 > 偏好设置 > 插件 > 安装`
-            3. 选择下载的 zip 文件
+            Install:
+            1. Download the zip package.
+            2. In Blender, open `Edit > Preferences > Add-ons > Install`.
+            3. Select the downloaded zip file.
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

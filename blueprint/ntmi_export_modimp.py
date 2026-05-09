@@ -395,7 +395,7 @@ def _write_report(
     report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _execute_supported_postprocess_nodes(blueprint_model: BluePrintModel, output_dir: str):
+def _execute_supported_postprocess_nodes(blueprint_model: BluePrintModel, output_dir: str, exporter=None):
     compatible_nodes = []
     for node in getattr(blueprint_model, "postprocess_nodes", []) or []:
         node_type = str(getattr(node, "bl_idname", "") or "")
@@ -453,7 +453,7 @@ def _execute_supported_postprocess_nodes(blueprint_model: BluePrintModel, output
                 node=node,
                 output_dir=output_dir,
                 blueprint_model=blueprint_model,
-                exporter=None,
+                exporter=exporter,
             )
             continue
 
@@ -465,7 +465,7 @@ def _execute_supported_postprocess_nodes(blueprint_model: BluePrintModel, output
                 config_node=node,
                 multi_file_nodes=multi_file_export_nodes,
                 output_dir=output_dir,
-                exporter=None,
+                exporter=exporter,
             )
             continue
 
@@ -661,7 +661,11 @@ class NTMIModImpExportSession:
 
             if bool(getattr(self.node, "run_postprocess_nodes", True)):
                 TimerUtils.start_stage("NTMI-ModImp-Postprocess")
-                _execute_supported_postprocess_nodes(blueprint_model, self.output_dir)
+                _execute_supported_postprocess_nodes(
+                    blueprint_model,
+                    self.output_dir,
+                    exporter=exporter,
+                )
                 TimerUtils.end_stage("NTMI-ModImp-Postprocess")
 
             return results

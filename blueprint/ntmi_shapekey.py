@@ -46,14 +46,19 @@ class NTMIShapeKeyNodeAdapter:
 
     def _populate_draw_ranges(self):
         for part_layout in self.part_layouts.values():
+            vertex_cursor = 0
             for draw_call in part_layout.draw_calls:
                 if draw_call.vertex_count:
-                    start_vertex, end_vertex = 0, int(draw_call.vertex_count) - 1
+                    start_vertex = vertex_cursor
+                    end_vertex = vertex_cursor + int(draw_call.vertex_count) - 1
+                    vertex_cursor = end_vertex + 1
                 else:
                     start_vertex, end_vertex = self.original_node._calculate_vertex_range(
                         draw_call.ib_path,
                         draw_call.draw_params,
                     )
+                    if start_vertex is not None and end_vertex is not None:
+                        vertex_cursor = max(vertex_cursor, int(end_vertex) + 1)
                 draw_call.start_vertex = start_vertex
                 draw_call.end_vertex = end_vertex
 
@@ -332,8 +337,8 @@ def _build_minimal_position_game_type(position_stride: int) -> D3D11GameType:
     )
 
 
-def _load_ntmi_exporter_module():
-    package = ensure_mod_importer_package("")
+def _load_ntmi_exporter_module(configured_root: str = ""):
+    package = ensure_mod_importer_package(configured_root)
     return importlib.import_module(f"{package.__name__}.core.exporter")
 
 
@@ -454,8 +459,8 @@ def _resolve_ntmi_profile_id(mod_export_path: str) -> str:
     return "yihuan"
 
 
-def _load_ntmi_position_converter(mod_export_path: str):
-    package = ensure_mod_importer_package("")
+def _load_ntmi_position_converter(mod_export_path: str, configured_root: str = ""):
+    package = ensure_mod_importer_package(configured_root)
     game_data_module = importlib.import_module(f"{package.__name__}.core.game_data")
     profile_id = _resolve_ntmi_profile_id(mod_export_path)
     converter = game_data_module.get_game_data_converter(profile_id)
@@ -482,8 +487,9 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
         self.adapter_node = adapter_node
         self._sections = sections
         self._preserved_tail_content = preserved_tail_content
-        self._modimp_exporter_module = _load_ntmi_exporter_module()
-        self._position_converter = _load_ntmi_position_converter(mod_export_path)
+        self.mod_importer_root = str(getattr(exporter, "mod_importer_root", "") or "").strip()
+        self._modimp_exporter_module = _load_ntmi_exporter_module(self.mod_importer_root)
+        self._position_converter = _load_ntmi_position_converter(mod_export_path, self.mod_importer_root)
 
         super().__init__(adapter_node, mod_export_path, blueprint_model, exporter)
         self.meshes_dir = os.path.join(mod_export_path, "Buffer")
@@ -559,25 +565,34 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
             with open(base_path, "rb") as file_obj:
                 base_bytes = file_obj.read()
 
-            hinted_vertex_count = next(
-                (
-                    int(draw_call.vertex_count)
-                    for draw_call in part_layout.draw_calls
-                    if draw_call.vertex_count
-                ),
-                0,
+            total_draw_vertices = sum(
+                int(draw_call.vertex_count)
+                for draw_call in part_layout.draw_calls
+                if draw_call.vertex_count
             )
-            if hinted_vertex_count <= 0 and part_layout.draw_calls:
-                first_draw = part_layout.draw_calls[0]
-                if first_draw.start_vertex is not None and first_draw.end_vertex is not None:
-                    hinted_vertex_count = int(first_draw.end_vertex - first_draw.start_vertex + 1)
-
-            if hinted_vertex_count > 0 and len(base_bytes) % hinted_vertex_count == 0:
-                position_stride = int(len(base_bytes) / hinted_vertex_count)
-                vertex_count = hinted_vertex_count
+            if total_draw_vertices > 0 and len(base_bytes) % total_draw_vertices == 0:
+                position_stride = int(len(base_bytes) / total_draw_vertices)
+                vertex_count = total_draw_vertices
             else:
-                position_stride = 12 if len(base_bytes) % 12 == 0 else 16 if len(base_bytes) % 16 == 0 else 8
-                vertex_count = int(len(base_bytes) / position_stride) if position_stride > 0 else 0
+                hinted_vertex_count = next(
+                    (
+                        int(draw_call.vertex_count)
+                        for draw_call in part_layout.draw_calls
+                        if draw_call.vertex_count
+                    ),
+                    0,
+                )
+                if hinted_vertex_count <= 0 and part_layout.draw_calls:
+                    first_draw = part_layout.draw_calls[0]
+                    if first_draw.start_vertex is not None and first_draw.end_vertex is not None:
+                        hinted_vertex_count = int(first_draw.end_vertex - first_draw.start_vertex + 1)
+
+                if hinted_vertex_count > 0 and len(base_bytes) % hinted_vertex_count == 0:
+                    position_stride = int(len(base_bytes) / hinted_vertex_count)
+                    vertex_count = hinted_vertex_count
+                else:
+                    position_stride = 12 if len(base_bytes) % 12 == 0 else 16 if len(base_bytes) % 16 == 0 else 8
+                    vertex_count = int(len(base_bytes) / position_stride) if position_stride > 0 else 0
             if vertex_count <= 0:
                 LOG.warning(f"NTMI ShapeKey: invalid vertex count for {logical_hash}")
                 continue
