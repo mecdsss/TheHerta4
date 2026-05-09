@@ -9,26 +9,28 @@ import shutil
 
 import bpy
 
-from ...blueprint.export_helper import BlueprintExportHelper
-from ...blueprint.model import BluePrintModel
-from ...blueprint.preprocess import PreProcessHelper
-from ...blueprint.variable_registry import ensure_object_swap_variable_name, get_node_variable_name
-from ...common.global_properties import GlobalProterties
-from ...common.object_prefix_helper import ObjectPrefixHelper
-from ...utils.log_utils import LOG
-from ...utils.timer_utils import TimerUtils
-from .export_tree_builder import (
+from .export_helper import BlueprintExportHelper
+from .model import BluePrintModel
+from .preprocess import PreProcessHelper
+from .variable_registry import ensure_object_swap_variable_name, get_node_variable_name
+from ..common.global_properties import GlobalProterties
+from ..common.object_prefix_helper import ObjectPrefixHelper
+from ..utils.log_utils import LOG
+from ..utils.timer_utils import TimerUtils
+from ..ui.ntmi_modimp.export_tree_builder import (
     ExportTreeBuildResult,
     build_export_tree,
     cleanup_collections,
     condition_from_swap_work_keys,
 )
-from .ini_swap_patcher import ACTIVE_FLAG, patch_ini_file
-from .modimp_core import (
+from ..ui.ntmi_modimp.ini_swap_patcher import ACTIVE_FLAG, patch_ini_file
+from ..ui.ntmi_modimp.modimp_core import (
     detect_mod_importer_dependency,
     get_export_collection_package,
     resolve_mod_importer_root,
 )
+from .ntmi_multifile import execute_ntmi_multifile_postprocess
+from .ntmi_shapekey import execute_ntmi_shapekey_postprocess
 
 
 RESULT_NODE_TYPE = "SSMTNode_Result_Output_NTMIModImp"
@@ -36,15 +38,13 @@ MODIMP_MIRROR_FLIP_PROP = "modimp_mirror_flip"
 COMPATIBLE_POSTPROCESS_NODE_TYPES = {
     "SSMTNode_PostProcess_BufferCleanup",
     "SSMTNode_PostProcess_Material",
+    "SSMTNode_PostProcess_MultiFile",
     "SSMTNode_PostProcess_ResourceMerge",
+    "SSMTNode_PostProcess_ShapeKey",
     "SSMTNode_PostProcess_WebPanel",
     "SSMTNode_PostProcess_SliderPanel",
 }
 NTMI_INTERNAL_POSTPROCESS_NODE_TYPES = {
-    "SSMTNode_PostProcess_MultiFile": (
-        "MultiFile config is consumed by the NTMI exporter to generate draw conditions; "
-        "legacy SSMT MultiFile data/INI generation is not executed."
-    ),
 }
 
 
@@ -270,7 +270,45 @@ def _multifile_node_payloads(blueprint_model: BluePrintModel) -> list[dict[str, 
     return payloads
 
 
-def _apply_ntmi_multifile_conditions(blueprint_model: BluePrintModel, multifile_nodes: list[dict[str, object]]):
+def _collapse_ntmi_multifile_runtime_chains(blueprint_model: BluePrintModel) -> int:
+    processing_chains = list(getattr(blueprint_model, "processing_chains", []) or [])
+    if not processing_chains:
+        return 0
+
+    kept_chains = []
+    dropped_count = 0
+    for chain in processing_chains:
+        node_key = str(getattr(chain, "multi_file_source_node_key", "") or "")
+        option_index = getattr(chain, "multi_file_option_index", None)
+        if node_key and option_index is not None and int(option_index) > 0:
+            dropped_count += 1
+            continue
+        kept_chains.append(chain)
+
+    if dropped_count <= 0:
+        return 0
+
+    blueprint_model.processing_chains = kept_chains
+    merge_chains = getattr(blueprint_model, "_merge_processing_chains", None)
+    if callable(merge_chains):
+        merge_chains()
+    rebuild_draw_models = getattr(blueprint_model, "_build_draw_call_models_from_chains", None)
+    if callable(rebuild_draw_models):
+        rebuild_draw_models()
+
+    LOG.info(
+        "NTMI ModImp: collapsed MultiFile runtime draw chains to base state only; "
+        f"dropped {dropped_count} alternate chain(s)."
+    )
+    return dropped_count
+
+
+def _apply_ntmi_multifile_conditions(
+    blueprint_model: BluePrintModel,
+    multifile_nodes: list[dict[str, object]],
+    *,
+    base_draw_only: bool = False,
+):
     payload_by_key = {str(item["node_key"]): item for item in multifile_nodes}
     applied_count = 0
     for chain in getattr(blueprint_model, "processing_chains", []) or []:
@@ -287,7 +325,9 @@ def _apply_ntmi_multifile_conditions(blueprint_model: BluePrintModel, multifile_
         active_variable = str(payload["active_variable"])
         animation_variable = str(payload["animation_variable"])
         active_value = int(payload["active_value"])
-        if state_index == 1:
+        if base_draw_only and state_index == 1:
+            condition = ""
+        elif state_index == 1:
             condition = (
                 f"{active_variable} != {active_value} "
                 f"|| {animation_variable} == 0 "
@@ -387,8 +427,48 @@ def _execute_supported_postprocess_nodes(blueprint_model: BluePrintModel, output
             except Exception as exc:
                 LOG.warning(f"NTMI ModImp: postprocess node '{getattr(node, 'name', '')}' failed to apply name mapping: {exc}")
 
+    multi_file_export_nodes = [
+        node
+        for node in getattr(blueprint_model, "multi_file_export_nodes", []) or []
+        if len(getattr(node, "object_list", []) or []) > 1
+    ]
+
+    node_priority = {
+        "SSMTNode_PostProcess_MultiFile": 0,
+        "SSMTNode_PostProcess_ShapeKey": 1,
+    }
+    compatible_nodes.sort(
+        key=lambda node: (
+            node_priority.get(str(getattr(node, "bl_idname", "") or ""), 10),
+            str(getattr(node, "name", "") or ""),
+        )
+    )
+
     for node in compatible_nodes:
         execute_postprocess = getattr(node, "execute_postprocess", None)
+        node_type = str(getattr(node, "bl_idname", "") or "")
+
+        if node_type == "SSMTNode_PostProcess_ShapeKey":
+            execute_ntmi_shapekey_postprocess(
+                node=node,
+                output_dir=output_dir,
+                blueprint_model=blueprint_model,
+                exporter=None,
+            )
+            continue
+
+        if node_type == "SSMTNode_PostProcess_MultiFile":
+            if not multi_file_export_nodes:
+                LOG.info("NTMI ModImp: skip MultiFile postprocess because no multi-file export node requires animation output.")
+                continue
+            execute_ntmi_multifile_postprocess(
+                config_node=node,
+                multi_file_nodes=multi_file_export_nodes,
+                output_dir=output_dir,
+                exporter=None,
+            )
+            continue
+
         if not callable(execute_postprocess):
             LOG.warning(f"Skip unsupported postprocess node: {getattr(node, 'name', '')}")
             continue
@@ -440,7 +520,12 @@ class ExportNTMIModImp:
 
     def export(self) -> list[dict[str, object]]:
         multifile_nodes = _multifile_node_payloads(self.blueprint_model)
-        _apply_ntmi_multifile_conditions(self.blueprint_model, multifile_nodes)
+        _collapse_ntmi_multifile_runtime_chains(self.blueprint_model)
+        _apply_ntmi_multifile_conditions(
+            self.blueprint_model,
+            multifile_nodes,
+            base_draw_only=True,
+        )
         build_result = build_export_tree(self.blueprint_model)
         export_results: list[dict[str, object]] = []
         effective_generate_ini = self.generate_ini
@@ -544,9 +629,18 @@ class NTMIModImpExportSession:
             if not object_names:
                 raise NTMIModImpExportError("No mesh objects are connected to the NTMI ModImp output node.")
 
+            capture_direct_shapekeys = bool(
+                getattr(self.node, "run_postprocess_nodes", True)
+                and BlueprintExportHelper.collect_shapekey_postprocess_nodes(self.tree)
+            )
+
             TimerUtils.start_stage("NTMI-ModImp-Preprocess")
             PreProcessHelper.recover_blueprint_node_references(self.tree, nested_trees)
-            original_to_copy_map = PreProcessHelper.execute_preprocess(object_names)
+            if capture_direct_shapekeys:
+                BlueprintExportHelper.clear_direct_shapekey_position_records()
+                original_to_copy_map = PreProcessHelper.execute_preprocess_capture_shape_keys(object_names)
+            else:
+                original_to_copy_map = PreProcessHelper.execute_preprocess(object_names)
             if original_to_copy_map:
                 _sync_modimp_mirror_flags_after_preprocess(original_to_copy_map)
                 PreProcessHelper.update_blueprint_node_references(self.tree, nested_trees)

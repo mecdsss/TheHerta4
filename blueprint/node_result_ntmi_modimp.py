@@ -43,7 +43,7 @@ class SSMT_OT_GenerateNTMIModImpBlueprint(bpy.types.Operator):
         return tree, node
 
     def execute(self, context):
-        from ..ui.ntmi_modimp.export_ntmi_modimp import (
+        from .ntmi_export_modimp import (
             execute_ntmi_modimp_export,
             resolve_ntmi_modimp_output_dir,
         )
