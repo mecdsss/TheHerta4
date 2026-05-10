@@ -77,9 +77,22 @@ def _reset_output_dir(path: str):
     if output_path.is_file():
         raise NTMIModImpExportError(f"Output path is a file, not a directory: {output_path}")
 
-    if output_path.is_dir():
-        shutil.rmtree(output_path, ignore_errors=True)
     output_path.mkdir(parents=True, exist_ok=True)
+
+    buffer_dir = output_path / "Buffer"
+    if buffer_dir.is_file():
+        raise NTMIModImpExportError(f"Buffer path is a file, not a directory: {buffer_dir}")
+    if buffer_dir.is_dir():
+        shutil.rmtree(buffer_dir, ignore_errors=True)
+    buffer_dir.mkdir(parents=True, exist_ok=True)
+
+    for ini_path in output_path.glob("*.ini"):
+        if ini_path.is_file():
+            ini_path.unlink(missing_ok=True)
+
+    report_path = output_path / "theherta4_ntmi_modimp_export_report.json"
+    if report_path.is_file():
+        report_path.unlink(missing_ok=True)
 
 
 def _collect_nested_trees(tree, visited=None):
