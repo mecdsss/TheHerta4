@@ -1,21 +1,91 @@
-from .global_config import GlobalConfig
-
-from ..utils.json_utils import JsonUtils
-from ..utils.collection_utils import CollectionUtils, CollectionColor
 import os
+from dataclasses import dataclass, field
+from typing import Dict, List
+
 import bpy
-from typing import List, Dict, Union
-from dataclasses import dataclass, field, asdict
+
+from .global_config import GlobalConfig
+from ..utils.collection_utils import CollectionColor, CollectionUtils
+from ..utils.json_utils import JsonUtils
+
 
 @dataclass
 class DedupedTextureInfo:
-    original_hash:str = field(default="",init=False)
-    render_hash:str = field(default="",init=False)
-    format:str = field(default="",init=False)
-    componet_count_list_str:str = field(default="",init=False)
+    original_hash: str = field(default="", init=False)
+    render_hash: str = field(default="", init=False)
+    format: str = field(default="", init=False)
+    componet_count_list_str: str = field(default="", init=False)
 
 
 class WorkSpaceHelper:
+    @staticmethod
+    def _has_importable_content(base_folder: str) -> bool:
+        if not os.path.isdir(base_folder):
+            return False
+        if WorkSpaceHelper._get_submesh_folderpath_list_from(base_folder):
+            return True
+        if WorkSpaceHelper.get_lod_folderpath_list(base_folder):
+            return True
+        return False
+
+    @staticmethod
+    def get_workspace_partition_folderpath_list() -> List[str]:
+        workspace_folder = GlobalConfig.path_workspace_folder()
+        if not os.path.isdir(workspace_folder):
+            return []
+
+        if WorkSpaceHelper._has_importable_content(workspace_folder):
+            return []
+
+        partition_folderpath_list = []
+        for f in os.scandir(workspace_folder):
+            if not f.is_dir():
+                continue
+            if f.name == "Config":
+                continue
+            config_json_path = os.path.join(f.path, "Config.json")
+            if not os.path.exists(config_json_path):
+                continue
+            partition_folderpath_list.append(f.path)
+
+        partition_folderpath_list.sort(key=lambda path: os.path.basename(path).casefold())
+        return partition_folderpath_list
+
+    @staticmethod
+    def _compose_lod_name(lod_name: str, bare_name: str) -> str:
+        normalized_lod_name = str(lod_name or "").strip()
+        normalized_bare_name = str(bare_name or "").strip()
+        if normalized_lod_name and normalized_bare_name:
+            return normalized_lod_name + "." + normalized_bare_name
+        return normalized_bare_name
+
+    @staticmethod
+    def parse_lod_unique_str(unique_str: str) -> tuple[str, str]:
+        normalized_unique_str = str(unique_str or "").strip()
+        if normalized_unique_str.upper().startswith("LOD") and "." in normalized_unique_str:
+            dot_idx = normalized_unique_str.index(".")
+            potential_lod_name = normalized_unique_str[:dot_idx]
+            if potential_lod_name[3:].isdigit():
+                return potential_lod_name, normalized_unique_str[dot_idx + 1:]
+        return "", normalized_unique_str
+
+    @staticmethod
+    def get_submesh_folder_path(unique_str: str) -> str:
+        lod_name, bare_unique_str = WorkSpaceHelper.parse_lod_unique_str(unique_str)
+        workspace_folder = GlobalConfig.path_workspace_folder()
+        candidate_base_paths = [workspace_folder, *WorkSpaceHelper.get_workspace_partition_folderpath_list()]
+
+        for base_path in candidate_base_paths:
+            if lod_name:
+                candidate_path = os.path.join(base_path, lod_name, bare_unique_str)
+            else:
+                candidate_path = os.path.join(base_path, bare_unique_str)
+            if os.path.isdir(candidate_path):
+                return candidate_path
+
+        if lod_name:
+            return os.path.join(workspace_folder, lod_name, bare_unique_str)
+        return os.path.join(workspace_folder, bare_unique_str)
 
     @staticmethod
     def get_object_display_name(submesh_folder_name: str, drawib_aliasname_dict: Dict[str, str] | None = None) -> str:
@@ -23,8 +93,9 @@ class WorkSpaceHelper:
         if not normalized_folder_name:
             return ""
 
+        _lod_name, bare_folder_name = WorkSpaceHelper.parse_lod_unique_str(normalized_folder_name)
         drawib_aliasname_dict = drawib_aliasname_dict or WorkSpaceHelper.get_drawib_aliasname_dict()
-        folder_prefix, _, folder_alias = normalized_folder_name.partition(".")
+        folder_prefix, _, folder_alias = bare_folder_name.partition(".")
         draw_ib = folder_prefix.split("-")[0]
 
         configured_alias = str(drawib_aliasname_dict.get(draw_ib, "")).strip()
@@ -42,25 +113,25 @@ class WorkSpaceHelper:
         if not normalized_folder_name:
             return ""
 
-        name_prefix, _, existing_alias = normalized_folder_name.partition(".")
+        lod_name, bare_folder_name = WorkSpaceHelper.parse_lod_unique_str(normalized_folder_name)
+        name_prefix, _, existing_alias = bare_folder_name.partition(".")
         alias_name = WorkSpaceHelper.get_object_display_name(
-            normalized_folder_name,
+            bare_folder_name,
             drawib_aliasname_dict=drawib_aliasname_dict,
         )
         if not alias_name:
             return normalized_folder_name
 
         if existing_alias.strip() and alias_name == existing_alias.strip():
-            return normalized_folder_name
+            return WorkSpaceHelper._compose_lod_name(lod_name, bare_folder_name)
 
         if alias_name == name_prefix:
-            return name_prefix
+            return WorkSpaceHelper._compose_lod_name(lod_name, name_prefix)
 
-        return name_prefix + "." + alias_name
+        return WorkSpaceHelper._compose_lod_name(lod_name, name_prefix + "." + alias_name)
 
     @staticmethod
-    def get_ordered_gpu_cpu_import_folderpath_list(submesh_folderpath:str)-> List[str]:
-        # 导入时，要按照先GPU类型，再CPU类型进行排序
+    def get_ordered_gpu_cpu_import_folderpath_list(submesh_folderpath: str) -> List[str]:
         gpu_import_folder_path_list = []
         cpu_import_folder_path_list = []
 
@@ -68,7 +139,7 @@ class WorkSpaceHelper:
         for dirname in dirs:
             if not dirname.startswith("TYPE_"):
                 continue
-            final_import_folder_path = os.path.join(submesh_folderpath,dirname)
+            final_import_folder_path = os.path.join(submesh_folderpath, dirname)
             if dirname.startswith("TYPE_GPU"):
                 gpu_import_folder_path_list.append(final_import_folder_path)
             elif dirname.startswith("TYPE_CPU"):
@@ -84,38 +155,61 @@ class WorkSpaceHelper:
 
     @staticmethod
     def create_and_get_workspace_collection() -> bpy.types.Collection:
-        # 这里先创建以当前工作空间为名称的集合，并且链接到scene，确保它存在
-        workspace_collection = CollectionUtils.create_new_collection(collection_name=GlobalConfig.get_workspace_name(),color_tag=CollectionColor.Red)
+        workspace_collection = CollectionUtils.create_new_collection(
+            collection_name=GlobalConfig.get_workspace_name(),
+            color_tag=CollectionColor.Red,
+        )
         bpy.context.scene.collection.children.link(workspace_collection)
         return workspace_collection
 
     @staticmethod
-    def get_submesh_folderpath_list() -> List[str]:
-        '''
-        获取当前工作空间文件夹下面的所有SubMesh文件夹（仅保留名字包含至少两个 '-' 的文件夹）
-        导入时就已经确保它至少包含两个'-'，即符合命名规则
-        '''
+    def _get_submesh_folderpath_list_from(base_folder: str) -> List[str]:
         submesh_folderpath_list = []
-        for f in os.scandir(GlobalConfig.path_workspace_folder()):
+        if not os.path.isdir(base_folder):
+            return submesh_folderpath_list
+
+        for f in os.scandir(base_folder):
             if not f.is_dir():
                 continue
-            name_splits = f.name.split('-')
+            name_splits = f.name.split("-")
             if len(name_splits) >= 3:
                 submesh_folderpath_list.append(f.path)
-            
+
+        submesh_folderpath_list.sort(key=lambda path: os.path.basename(path).casefold())
         return submesh_folderpath_list
 
     @staticmethod
+    def get_lod_folderpath_list(base_folder: str | None = None) -> List[str]:
+        lod_folderpath_list = []
+        workspace_folder = base_folder or GlobalConfig.path_workspace_folder()
+        if not os.path.isdir(workspace_folder):
+            return lod_folderpath_list
+
+        for f in os.scandir(workspace_folder):
+            if not f.is_dir():
+                continue
+
+            name = f.name
+            if name.upper().startswith("LOD") and name[3:].isdigit():
+                lod_folderpath_list.append(f.path)
+
+        lod_folderpath_list.sort(key=lambda path: int(os.path.basename(path)[3:]))
+        return lod_folderpath_list
+
+    @staticmethod
+    def get_lod_submesh_folderpath_dict(base_folder: str | None = None) -> Dict[str, List[str]]:
+        lod_submesh_folderpath_dict: Dict[str, List[str]] = {}
+        for lod_folder_path in WorkSpaceHelper.get_lod_folderpath_list(base_folder):
+            lod_name = os.path.basename(lod_folder_path)
+            lod_submesh_folderpath_dict[lod_name] = WorkSpaceHelper._get_submesh_folderpath_list_from(lod_folder_path)
+        return lod_submesh_folderpath_dict
+
+    @staticmethod
+    def get_submesh_folderpath_list() -> List[str]:
+        return WorkSpaceHelper._get_submesh_folderpath_list_from(GlobalConfig.path_workspace_folder())
+
+    @staticmethod
     def get_drawib_tabname_dict() -> Dict[str, str]:
-        '''
-        从当前工作空间的 Config/Tabs 目录下读取各工作区 Tab 的配置，
-        返回 DrawIB → 工作区名称 的映射字典。
-        
-        读取流程：
-        1. 读取 Config/WorkPageTabs.json 获取 tab_id → tab_name 映射
-        2. 读取 Config/Tabs/ws-tab-*.json 获取每个 tab 包含的 DrawIB 列表
-        3. 合并为 DrawIB → tab_name 映射
-        '''
         drawib_tabname_dict = {}
 
         tabs_dir = os.path.join(GlobalConfig.path_workspace_folder(), "Config", "Tabs")
@@ -159,17 +253,13 @@ class WorkSpaceHelper:
         return drawib_tabname_dict
 
     @staticmethod
-    def get_drawib_aliasname_dict() -> Dict[str,str]:
-        '''
-        从当前工作空间目录下的Config.json里读取DrawIB和别名的对应关系
-        '''
+    def get_drawib_aliasname_dict_for_path(folder_path: str) -> Dict[str, str]:
         drawib_aliasname_dict = {}
-
-        # 如果工作空间下存在Config.json就尝试获取其别名
-        config_json_path = GlobalConfig.path_drawib_config_json_path()
+        if not folder_path:
+            return drawib_aliasname_dict
+        config_json_path = os.path.join(folder_path, "Config.json")
         if os.path.exists(config_json_path):
             config_json = JsonUtils.LoadFromFile(config_json_path)
-            # 读取每个DrawIB的别名到字典里，键是DrawIB名称，值是别名
             if isinstance(config_json, list):
                 for item in config_json:
                     if not isinstance(item, dict):
@@ -179,32 +269,50 @@ class WorkSpaceHelper:
                     if draw_ib:
                         drawib_aliasname_dict[draw_ib] = alias_name
         return drawib_aliasname_dict
-    
 
     @staticmethod
-    def get_hash_deduped_texture_info_dict(submesh_folder_name:str) -> Dict[str,DedupedTextureInfo]:
+    def get_drawib_aliasname_dict() -> Dict[str, str]:
+        drawib_aliasname_dict = {}
+        workspace_folder = GlobalConfig.path_workspace_folder()
+        for draw_ib, alias_name in WorkSpaceHelper.get_drawib_aliasname_dict_for_path(workspace_folder).items():
+            drawib_aliasname_dict[draw_ib] = alias_name
 
-        draw_ib_folder_path = GlobalConfig.path_workspace_folder() + submesh_folder_name + "\\"
-        # 接下来计算ComponentList，也就是当前DrawIB使用到这个贴图的所有Component的Count，从1开始
-        component_name__drawcall_indexlist_json_path = os.path.join(draw_ib_folder_path,"ComponentName_DrawCallIndexList.json")
-        trianglelist_deduped_filename_json_path = os.path.join(draw_ib_folder_path,"TrianglelistDedupedFileName.json")
+        for partition_folder_path in WorkSpaceHelper.get_workspace_partition_folderpath_list():
+            for draw_ib, alias_name in WorkSpaceHelper.get_drawib_aliasname_dict_for_path(partition_folder_path).items():
+                if draw_ib not in drawib_aliasname_dict:
+                    drawib_aliasname_dict[draw_ib] = alias_name
+            for lod_folder_path in WorkSpaceHelper.get_lod_folderpath_list(partition_folder_path):
+                for draw_ib, alias_name in WorkSpaceHelper.get_drawib_aliasname_dict_for_path(lod_folder_path).items():
+                    if draw_ib not in drawib_aliasname_dict:
+                        drawib_aliasname_dict[draw_ib] = alias_name
+
+        for lod_folder_path in WorkSpaceHelper.get_lod_folderpath_list():
+            for draw_ib, alias_name in WorkSpaceHelper.get_drawib_aliasname_dict_for_path(lod_folder_path).items():
+                if draw_ib not in drawib_aliasname_dict:
+                    drawib_aliasname_dict[draw_ib] = alias_name
+        return drawib_aliasname_dict
+
+    @staticmethod
+    def get_hash_deduped_texture_info_dict(submesh_folder_name: str) -> Dict[str, DedupedTextureInfo]:
+        draw_ib_folder_path = WorkSpaceHelper.get_submesh_folder_path(submesh_folder_name) + "\\"
+        component_name__drawcall_indexlist_json_path = os.path.join(draw_ib_folder_path, "ComponentName_DrawCallIndexList.json")
+        trianglelist_deduped_filename_json_path = os.path.join(draw_ib_folder_path, "TrianglelistDedupedFileName.json")
 
         component_name__drawcall_indexlist_json_dict = JsonUtils.LoadFromFile(component_name__drawcall_indexlist_json_path)
 
         drawcall_component_count_dict = {}
         for component_name, drawcall_indexlist in component_name__drawcall_indexlist_json_dict.items():
             for drawcall_index in drawcall_indexlist:
-                drawcall_component_count_dict[drawcall_index] = component_name.split(" ")[1]  # 取Component的Count部分
+                drawcall_component_count_dict[drawcall_index] = component_name.split(" ")[1]
 
         trianglelist_deduped_filename_json_dict = JsonUtils.LoadFromFile(trianglelist_deduped_filename_json_path)
 
-
         deduped_filename_drawcall_index_list_dict = {}
-        for trianglelist_deduped_filename,deduped_kv_dict in trianglelist_deduped_filename_json_dict.items():
-            deduped_filename:str = deduped_kv_dict["FALogDedupedFileName"]
-            draw_call_index:str = trianglelist_deduped_filename[0:6]
+        for trianglelist_deduped_filename, deduped_kv_dict in trianglelist_deduped_filename_json_dict.items():
+            deduped_filename: str = deduped_kv_dict["FALogDedupedFileName"]
+            draw_call_index: str = trianglelist_deduped_filename[0:6]
 
-            drawcall_index_list = deduped_filename_drawcall_index_list_dict.get(deduped_filename,[])
+            drawcall_index_list = deduped_filename_drawcall_index_list_dict.get(deduped_filename, [])
             if draw_call_index not in drawcall_index_list:
                 drawcall_index_list.append(draw_call_index)
 
@@ -218,12 +326,6 @@ class WorkSpaceHelper:
             original_hash = deduped_filename.split("_")[0]
             render_hash = deduped_filename.split("_")[1].split("-")[0]
 
-            # 从类似于 "b7ff7a6e_03d46264-R8G8B8A8_UNORM_SRGB.dds" 的文件名中
-            # 提取出 "R8G8B8A8_UNORM_SRGB" 部分：
-            # - 去掉扩展名
-            # - 找到第一个下划线 `_` 的位置
-            # - 从该下划线之后查找第一个连字符 `-`，并取其后到文件名末尾的子串
-            # - 如果找不到上述模式，则退回到以最后一个 `-` 分割并取最后一段的策略
             base_name = os.path.splitext(deduped_filename)[0]
             fmt = ""
             try:
@@ -232,36 +334,30 @@ class WorkSpaceHelper:
                     dash_after_underscore = base_name.find("-", first_underscore + 1)
                     if dash_after_underscore != -1:
                         fmt = base_name[dash_after_underscore + 1:]
-                # fallback: use last '-' part
                 if not fmt:
                     if "-" in base_name:
                         fmt = base_name.rsplit("-", 1)[-1]
                     else:
-                        # as ultimate fallback, if there is an underscore then maybe format is after the second underscore
                         parts = base_name.split("_")
                         if len(parts) > 2:
                             fmt = parts[-1]
                         else:
                             fmt = ""
-                # strip any stray whitespace
                 fmt = fmt.strip()
             except Exception:
                 fmt = ""
 
-            format = fmt
+            format_name = fmt
 
-            print(format)
+            print(format_name)
 
             for draw_call_index in drawcall_index_list:
-                matched_component_count = drawcall_component_count_dict.get(draw_call_index,"")
+                matched_component_count = drawcall_component_count_dict.get(draw_call_index, "")
                 if matched_component_count != "":
                     if matched_component_count not in used_component_count_list:
                         used_component_count_list.append(matched_component_count)
 
             used_component_count_list.sort()
-            # print(used_component_count_list)
-
-            
 
             componet_count_list_str = ""
             for unique_component_count_str in used_component_count_list:
@@ -270,9 +366,9 @@ class WorkSpaceHelper:
             deduped_texture_info = DedupedTextureInfo()
             deduped_texture_info.original_hash = original_hash
             deduped_texture_info.render_hash = render_hash
-            deduped_texture_info.format = format
+            deduped_texture_info.format = format_name
             deduped_texture_info.componet_count_list_str = componet_count_list_str
 
             hash_deduped_texture_info_dict[original_hash] = deduped_texture_info
-    
+
         return hash_deduped_texture_info_dict

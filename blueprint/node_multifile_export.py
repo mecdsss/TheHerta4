@@ -1,8 +1,60 @@
 import bpy
 import traceback
 
+from ..common.object_prefix_helper import ObjectPrefixHelper
 from .direct_export import sync_multifile_direct_mode
 from .node_base import SSMTNodeBase
+
+
+def _parse_multifile_object_name(object_name: str) -> dict:
+    result = {
+        "prefix": "",
+        "lod_name": "",
+        "draw_ib": "",
+        "index_count": "",
+        "first_index": "",
+        "alias_name": "",
+    }
+
+    normalized_object_name = str(object_name or "").strip()
+    if not normalized_object_name:
+        return result
+
+    prefix_info = ObjectPrefixHelper.extract_prefix_info(normalized_object_name)
+    if prefix_info:
+        prefix, separator = prefix_info
+        prefix_parts = ObjectPrefixHelper.parse_prefix_parts(prefix)
+        _prefix, _separator, base_name = ObjectPrefixHelper.split_name_and_prefix(
+            normalized_object_name,
+            prefix,
+            separator,
+        )
+        result.update(
+            {
+                "prefix": prefix,
+                "lod_name": prefix_parts.get("lod_name", ""),
+                "draw_ib": prefix_parts.get("draw_ib", ""),
+                "index_count": prefix_parts.get("index_count", ""),
+                "first_index": prefix_parts.get("first_index", ""),
+                "alias_name": base_name,
+            }
+        )
+        return result
+
+    prefix_candidate = normalized_object_name.split(".", 1)[0] if "." in normalized_object_name else normalized_object_name
+    prefix_parts = ObjectPrefixHelper.parse_prefix_parts(prefix_candidate)
+    result.update(
+        {
+            "prefix": prefix_candidate,
+            "lod_name": prefix_parts.get("lod_name", ""),
+            "draw_ib": prefix_parts.get("draw_ib", ""),
+            "index_count": prefix_parts.get("index_count", ""),
+            "first_index": prefix_parts.get("first_index", ""),
+        }
+    )
+    if "." in normalized_object_name:
+        result["alias_name"] = normalized_object_name.split(".", 1)[1]
+    return result
 
 
 class SSMT_OT_MultiFileExport_SplitAnimation(bpy.types.Operator):
@@ -367,10 +419,14 @@ class SSMTNode_MultiFile_Export(SSMTNodeBase):
             
             object_label = item.object_name
             if item.object_name:
-                if "-" in item.object_name:
-                    parts = item.object_name.split("-")
-                    if len(parts) >= 3:
-                        object_label = f"{parts[0]}-{parts[1]} ({parts[2]})"
+                parsed_name = _parse_multifile_object_name(item.object_name)
+                draw_ib = parsed_name.get("draw_ib", "")
+                index_count = parsed_name.get("index_count", "")
+                first_index = parsed_name.get("first_index", "")
+                lod_name = parsed_name.get("lod_name", "")
+                if draw_ib and index_count and first_index:
+                    prefix_label = f"{lod_name}.{draw_ib}" if lod_name else draw_ib
+                    object_label = f"{prefix_label}-{index_count} ({first_index})"
             
             row.label(text=f"{i + 1}. {object_label}", icon='OBJECT_DATA')
             
@@ -415,8 +471,6 @@ class SSMTNode_MultiFile_Export(SSMTNodeBase):
         row.label(text="选择一个物体后点击", icon='INFO')
     
     def get_current_object_info(self, export_index):
-        import re
-        
         if export_index < 0:
             return None
         
@@ -436,30 +490,15 @@ class SSMTNode_MultiFile_Export(SSMTNodeBase):
         }
         
         if object_name:
-            if "." in object_name:
-                obj_name_total_split = object_name.split(".")
-                obj_name_split = obj_name_total_split[0].split("-")
-                
-                if len(obj_name_split) >= 3:
-                    result["draw_ib"] = obj_name_split[0]
-                    result["index_count"] = obj_name_split[1]
-                    result["first_index"] = obj_name_split[2]
-                elif len(obj_name_split) >= 2:
-                    result["draw_ib"] = obj_name_split[0]
-                    result["index_count"] = obj_name_split[1]
-                elif len(obj_name_split) >= 1:
-                    result["draw_ib"] = obj_name_split[0]
-                
-                if len(obj_name_total_split) >= 2:
-                    result["alias_name"] = ".".join(obj_name_total_split[1:])
-                    
-            elif "-" in object_name:
-                obj_name_split = object_name.split("-")
-                result["draw_ib"] = obj_name_split[0]
-                if len(obj_name_split) >= 2:
-                    result["index_count"] = obj_name_split[1]
-                if len(obj_name_split) >= 3:
-                    result["first_index"] = obj_name_split[2]
+            parsed_name = _parse_multifile_object_name(object_name)
+            if parsed_name.get("draw_ib", ""):
+                result["draw_ib"] = parsed_name["draw_ib"]
+            if parsed_name.get("index_count", ""):
+                result["index_count"] = parsed_name["index_count"]
+            if parsed_name.get("first_index", ""):
+                result["first_index"] = parsed_name["first_index"]
+            if parsed_name.get("alias_name", ""):
+                result["alias_name"] = parsed_name["alias_name"]
         
         return result
     
@@ -474,31 +513,12 @@ class SSMTNode_MultiFile_Export(SSMTNodeBase):
         item = self.object_list.add()
         item.object_name = object_name
         item.object_id = str(obj.as_pointer())
-        
-        import re
-        if "." in object_name:
-            parts = object_name.split(".", 1)
-            prefix_part = parts[0]
-            item.alias_name = parts[1] if len(parts) > 1 else ""
-            
-            normalized_prefix = re.sub(r'[(_\[\{]', '-', prefix_part)
-            prefix_parts = normalized_prefix.split("-")
-            non_empty_parts = [p for p in prefix_parts if p.strip()]
-            
-            if len(non_empty_parts) >= 1:
-                item.draw_ib = non_empty_parts[0]
-            if len(non_empty_parts) >= 2:
-                item.index_count = non_empty_parts[1]
-            if len(non_empty_parts) >= 3:
-                item.first_index = non_empty_parts[2]
-        elif "-" in object_name:
-            prefix_parts = object_name.split("-")
-            if len(prefix_parts) >= 1:
-                item.draw_ib = prefix_parts[0]
-            if len(prefix_parts) >= 2:
-                item.index_count = prefix_parts[1]
-            if len(prefix_parts) >= 3:
-                item.first_index = prefix_parts[2]
+
+        parsed_name = _parse_multifile_object_name(object_name)
+        item.alias_name = parsed_name.get("alias_name", "")
+        item.draw_ib = parsed_name.get("draw_ib", "")
+        item.index_count = parsed_name.get("index_count", "")
+        item.first_index = parsed_name.get("first_index", "")
         
         self.update_node_width([item.object_name for item in self.object_list])
     

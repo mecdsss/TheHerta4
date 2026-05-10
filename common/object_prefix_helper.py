@@ -11,12 +11,21 @@ _KNOWN_SEPARATORS = ("__", "_", " ")
 _PREFIX_CHECK_SEPARATORS = (".", "-", "_", " ", "__")
 _BLENDER_SUFFIX_PATTERN = re.compile(r"\.\d{3,}$")
 _BLENDER_SUFFIX_INNER_PATTERN = re.compile(r"\.\d{3,}")
+_LOD_PREFIX_PATTERN = re.compile(r"^(LOD\d+)\.(.+)$", re.IGNORECASE)
 
 
 class ObjectPrefixHelper:
     @staticmethod
     def normalize_prefix(prefix: str) -> str:
         return (prefix or "").strip().strip("-_. ")
+
+    @classmethod
+    def split_lod_prefix(cls, name: str) -> tuple[str, str]:
+        clean_name = (name or "").strip()
+        match = _LOD_PREFIX_PATTERN.match(clean_name)
+        if not match:
+            return "", clean_name
+        return match.group(1), match.group(2)
 
     @staticmethod
     def _strip_blender_suffix(name: str) -> tuple[str, str]:
@@ -31,12 +40,13 @@ class ObjectPrefixHelper:
         if not clean_prefix:
             return False
 
-        parsed = cls._extract_hyphen_prefix(clean_prefix)
+        _lod_name, bare_prefix = cls.split_lod_prefix(clean_prefix)
+        parsed = cls._extract_hyphen_prefix(bare_prefix)
         if not parsed:
             return False
 
         parsed_prefix, _ = parsed
-        return parsed_prefix == clean_prefix
+        return parsed_prefix == bare_prefix
 
     @classmethod
     def _extract_hyphen_prefix(cls, object_name: str):
@@ -60,12 +70,22 @@ class ObjectPrefixHelper:
         if not clean_name:
             return None
 
-        if "." in clean_name:
-            prefix = cls.normalize_prefix(clean_name.split(".", 1)[0])
-            if cls._is_structured_prefix(prefix):
-                return prefix, "."
+        lod_name, bare_name = cls.split_lod_prefix(clean_name)
 
-        name_without_suffix, blender_suffix = cls._strip_blender_suffix(clean_name)
+        def with_lod(prefix: str, separator: str):
+            clean_prefix = cls.normalize_prefix(prefix)
+            if not clean_prefix:
+                return None
+            if lod_name:
+                return f"{lod_name}.{clean_prefix}", separator
+            return clean_prefix, separator
+
+        if "." in bare_name:
+            prefix = cls.normalize_prefix(bare_name.split(".", 1)[0])
+            if cls._is_structured_prefix(prefix):
+                return with_lod(prefix, ".")
+
+        name_without_suffix, blender_suffix = cls._strip_blender_suffix(bare_name)
 
         for separator in _KNOWN_SEPARATORS:
             if separator not in name_without_suffix:
@@ -75,9 +95,14 @@ class ObjectPrefixHelper:
                 continue
             if _BLENDER_SUFFIX_INNER_PATTERN.search(prefix_candidate):
                 continue
-            return prefix_candidate, separator
+            return with_lod(prefix_candidate, separator)
 
-        return cls._extract_hyphen_prefix(clean_name)
+        parsed = cls._extract_hyphen_prefix(bare_name)
+        if not parsed:
+            return None
+
+        prefix, separator = parsed
+        return with_lod(prefix, separator)
 
     @classmethod
     def split_name_and_prefix(cls, object_name: str, prefix: str = "", separator: str = ""):
@@ -125,8 +150,13 @@ class ObjectPrefixHelper:
     @classmethod
     def parse_prefix_parts(cls, prefix: str) -> dict:
         clean_prefix = cls.normalize_prefix(prefix)
-        parts = [part.strip() for part in clean_prefix.split("-") if part.strip()]
+        lod_name, bare_prefix = cls.split_lod_prefix(clean_prefix)
+        parts = [part.strip() for part in bare_prefix.split("-") if part.strip()]
+        unique_str = f"{lod_name}.{bare_prefix}" if lod_name else bare_prefix
         return {
+            "lod_name": lod_name,
+            "unique_str": unique_str,
+            "bare_unique_str": bare_prefix,
             "draw_ib": parts[0] if len(parts) >= 1 else "",
             "index_count": parts[1] if len(parts) >= 2 else "",
             "first_index": parts[2] if len(parts) >= 3 else "",

@@ -59,8 +59,7 @@ class M_IniHelper:
             d3d11_game_type = getattr(first_submesh_model, "d3d11_game_type", None)
             if unique_str and d3d11_game_type is not None:
                 return os.path.join(
-                    GlobalConfig.path_workspace_folder(),
-                    unique_str,
+                    WorkSpaceHelper.get_submesh_folder_path(unique_str),
                     "TYPE_" + d3d11_game_type.GameTypeName,
                     "",
                 )
@@ -87,8 +86,7 @@ class M_IniHelper:
             return ""
 
         return os.path.join(
-            GlobalConfig.path_workspace_folder(),
-            unique_str,
+            WorkSpaceHelper.get_submesh_folder_path(unique_str),
             "TYPE_" + d3d11_game_type.GameTypeName,
             "",
         )
@@ -110,8 +108,7 @@ class M_IniHelper:
                 continue
 
             candidate_source_path = os.path.join(
-                GlobalConfig.path_workspace_folder(),
-                unique_str,
+                WorkSpaceHelper.get_submesh_folder_path(unique_str),
                 "TYPE_" + d3d11_game_type.GameTypeName,
                 texture_markup_info.mark_filename,
             )

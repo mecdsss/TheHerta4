@@ -9,7 +9,21 @@ from ...common.m_ini_builder import M_IniBuilder, M_IniSection, M_SectionType
 from ...common.global_key_count_helper import GlobalKeyCountHelper
 from ...common.m_ini_helper import M_IniHelper
 from ...common.m_ini_helper_gui import M_IniHelperGUI
+from ...common.object_prefix_helper import ObjectPrefixHelper
 from ...utils.timer_utils import TimerUtils
+
+
+def _get_component_index_from_name(component_tmp_obj_name: str) -> int:
+    prefix_info = ObjectPrefixHelper.extract_prefix_info(component_tmp_obj_name)
+    prefix = prefix_info[0] if prefix_info else component_tmp_obj_name
+    component = ObjectPrefixHelper.parse_prefix_parts(prefix).get("component", "")
+    if str(component).isdigit():
+        return int(component) - 1
+
+    parts = str(component_tmp_obj_name or "").split("-")
+    if len(parts) >= 2 and parts[1].isdigit():
+        return int(parts[1]) - 1
+    return 0
 
 
 class ExportWWMI:
@@ -123,7 +137,7 @@ class ExportWWMI:
             for component_tmp_obj_name, use_remap in draw_ib_model.blend_remap_used.items():
                 if not use_remap:
                     continue
-                component_count = int(component_tmp_obj_name.split("-")[1]) - 1
+                component_count = _get_component_index_from_name(component_tmp_obj_name)
                 blend_remap_section.append("[ResourceRemappedBlendBufferComponent" + str(component_count) + "]")
                 blend_remap_section.append("[ResourceRemappedSkeletonComponent" + str(component_count) + "]")
                 blend_remap_section.append("[ResourceExtraRemappedSkeletonComponent" + str(component_count) + "]")
@@ -146,7 +160,7 @@ class ExportWWMI:
                 for component_tmp_obj_name, use_remap in draw_ib_model.blend_remap_used.items():
                     if not use_remap:
                         continue
-                    component_count = int(component_tmp_obj_name.split("-")[1]) - 1
+                    component_count = _get_component_index_from_name(component_tmp_obj_name)
                     component_count_str = str(component_count)
                     blend_remap_section.append("    $\\WWMIv1\\blend_remap_id = " + str(blend_remap_id))
                     blend_remap_section.append("    ResourceRemappedBlendBufferRW = copy ResourceBlendBufferNoStride")
@@ -175,7 +189,7 @@ class ExportWWMI:
                         continue
 
                     blend_remap_section.append("$\\WWMIv1\\blend_remap_id = " + str(blend_remap_id))
-                    component_count = int(component_tmp_obj_name.split("-")[1]) - 1
+                    component_count = _get_component_index_from_name(component_tmp_obj_name)
                     vg_count = draw_ib_model.component_real_vg_count_dict[component_count]
                     blend_remap_section.append("$\\WWMIv1\\vg_count = " + str(vg_count))
                     blend_remap_section.append("cs-t38 = ResourceMergedSkeletonRemap")

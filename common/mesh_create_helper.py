@@ -16,11 +16,22 @@ from ..utils.vertexgroup_utils import VertexGroupUtils
 from .global_config import GlobalConfig
 from .global_properties import GlobalProterties
 from .logic_name import LogicName
+from .object_prefix_helper import ObjectPrefixHelper
 from .d3d11_element import D3D11Element
 from ..ui.wwmi.extracted_object import ExtractedObjectHelper
 
 
 class MeshCreateHelper:
+    @staticmethod
+    def _get_mesh_prefix_parts(mesh_name: str) -> dict:
+        normalized_mesh_name = str(mesh_name or "").strip()
+        prefix_info = ObjectPrefixHelper.extract_prefix_info(normalized_mesh_name)
+        if prefix_info:
+            return ObjectPrefixHelper.parse_prefix_parts(prefix_info[0])
+
+        prefix_candidate = normalized_mesh_name.split(".", 1)[0] if "." in normalized_mesh_name else normalized_mesh_name
+        return ObjectPrefixHelper.parse_prefix_parts(prefix_candidate)
+
     @staticmethod
     def create_mesh_object(
         mesh_name:str,
@@ -172,8 +183,10 @@ class MeshCreateHelper:
             if os.path.exists(metadatajsonpath):
                 print("鸣潮读取Metadata.json")
                 extracted_object = ExtractedObjectHelper.read_metadata(metadatajsonpath)
-                if "-" in mesh_name:
-                    partname_count = int(mesh_name.split("-")[1]) - 1
+                prefix_parts = MeshCreateHelper._get_mesh_prefix_parts(mesh_name)
+                component_name = str(prefix_parts.get("component", "") or "").strip()
+                if component_name.isdigit():
+                    partname_count = int(component_name) - 1
                     print("import partname count: " + str(partname_count))
                     component = extracted_object.components[partname_count]
 
@@ -221,7 +234,8 @@ class MeshCreateHelper:
         bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
 
         bpy.context.view_layer.update()
-        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+        if not bpy.app.background:
+            bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
 
         TimerUtils.End("Import 3Dmigoto Raw")
         return obj
@@ -363,15 +377,13 @@ class MeshCreateHelper:
 
     @staticmethod
     def get_import_texture_paths(mesh_name: str, directory: str):
-        if "." in mesh_name:
-            mesh_name_split = str(mesh_name).split(".")[0].split("-")
-        else:
-            mesh_name_split = str(mesh_name).split("-")
-
-        if len(mesh_name_split) < 2:
+        prefix_parts = MeshCreateHelper._get_mesh_prefix_parts(mesh_name)
+        draw_ib = str(prefix_parts.get("draw_ib", "") or "").strip()
+        component = str(prefix_parts.get("component", "") or "").strip()
+        if not draw_ib or not component:
             return None, None
 
-        texture_prefix = mesh_name_split[0] + "-" + mesh_name_split[1] + "-"
+        texture_prefix = draw_ib + "-" + component + "-"
         texture_path = TextureUtils.find_texture(texture_prefix, "-DiffuseMap.dds", directory)
         normal_path = TextureUtils.find_texture(texture_prefix, "-NormalMap.dds", directory)
         return texture_path, normal_path

@@ -12,6 +12,7 @@ from ..blueprint.node_datatype import (
 from .d3d11_gametype import D3D11GameType
 from .global_config import GlobalConfig
 from .submesh_json import SubmeshJson
+from .workspace_helper import WorkSpaceHelper
 
 
 def check_and_get_submesh_json_path(unique_str: str) -> tuple[bool, str, str]:
@@ -24,7 +25,8 @@ def check_and_get_submesh_json_path(unique_str: str) -> tuple[bool, str, str]:
         (是否存在, 错误信息, JSON 文件路径)
     """
     workspace_folder = GlobalConfig.path_workspace_folder()
-    unique_str_folder = os.path.join(workspace_folder, unique_str)
+    _lod_name, bare_unique_str = WorkSpaceHelper.parse_lod_unique_str(unique_str)
+    unique_str_folder = WorkSpaceHelper.get_submesh_folder_path(unique_str)
     if not os.path.exists(unique_str_folder):
         return False, (
             f"unique_str '{unique_str}' 没有找到对应的提取数据。\n"
@@ -36,7 +38,7 @@ def check_and_get_submesh_json_path(unique_str: str) -> tuple[bool, str, str]:
     gametype_name = workspace_import_json.get(unique_str, "")
 
     if gametype_name:
-        submesh_json_path = os.path.join(unique_str_folder, "TYPE_" + gametype_name, unique_str + ".json")
+        submesh_json_path = os.path.join(unique_str_folder, "TYPE_" + gametype_name, bare_unique_str + ".json")
         if os.path.exists(submesh_json_path):
             return True, "", submesh_json_path
 
@@ -46,7 +48,7 @@ def check_and_get_submesh_json_path(unique_str: str) -> tuple[bool, str, str]:
         if not dirname.startswith("TYPE_"):
             continue
 
-        submesh_json_path = os.path.join(unique_str_folder, dirname, unique_str + ".json")
+        submesh_json_path = os.path.join(unique_str_folder, dirname, bare_unique_str + ".json")
         if os.path.exists(submesh_json_path):
             found_type_paths.append(submesh_json_path)
             found_types.append(dirname.replace("TYPE_", ""))
@@ -115,7 +117,8 @@ class SubmeshMetadata:
             D3D11GameType 对象
         """
         # 从 unique_str 中提取 draw_ib
-        draw_ib = self.unique_str.split("-")[0] if "-" in self.unique_str else self.unique_str
+        _lod_name, bare_unique_str = WorkSpaceHelper.parse_lod_unique_str(self.unique_str)
+        draw_ib = bare_unique_str.split("-")[0] if "-" in bare_unique_str else bare_unique_str
 
         # 获取数据类型节点信息
         datatype_node_info_list = BlueprintExportHelper.get_datatype_node_info()

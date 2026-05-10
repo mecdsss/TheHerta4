@@ -7,6 +7,8 @@ import bpy.utils.previews
 
 from ..common.mesh_import_helper import MigotoBinaryFile, MeshImportHelper
 from ..common.global_config import GlobalConfig
+from ..common.object_prefix_helper import ObjectPrefixHelper
+from ..common.workspace_helper import WorkSpaceHelper
 
 from ..utils.translate_utils import TR
 from ..utils.collection_utils import CollectionUtils, CollectionColor
@@ -48,18 +50,33 @@ def _load_preview_images(context, folder_path: str, target_collection_name: str 
 
 
 def _get_component_texture_folder(selected_obj_name: str) -> tuple[str, str]:
-    draw_ib = selected_obj_name.split("-")[0]
-    selected_drawib_folder_path = os.path.join(GlobalConfig.path_workspace_folder(), draw_ib + "\\")
+    prefix_info = ObjectPrefixHelper.extract_prefix_info(selected_obj_name)
+    prefix = prefix_info[0] if prefix_info else ""
+    prefix_parts = ObjectPrefixHelper.parse_prefix_parts(prefix)
+    draw_ib = str(prefix_parts.get("draw_ib", "") or "").strip()
 
-    candidates = [
-        ("DedupedTextures_jpg", os.path.join(selected_drawib_folder_path, "DedupedTextures_jpg\\")),
-        ("DedupedTextures_png", os.path.join(selected_drawib_folder_path, "DedupedTextures_png\\")),
-        ("DedupedTextures_tga", os.path.join(selected_drawib_folder_path, "DedupedTextures_tga\\")),
-    ]
+    candidate_base_paths = []
+    if prefix:
+        candidate_base_paths.append(WorkSpaceHelper.get_submesh_folder_path(prefix))
+    if draw_ib:
+        candidate_base_paths.append(os.path.join(GlobalConfig.path_workspace_folder(), draw_ib + "\\"))
 
-    for folder_name, folder_path in candidates:
-        if os.path.exists(folder_path):
-            return folder_path, folder_name
+    seen_paths = set()
+    for base_path in candidate_base_paths:
+        normalized_base_path = os.path.normpath(base_path)
+        if normalized_base_path in seen_paths:
+            continue
+        seen_paths.add(normalized_base_path)
+
+        candidates = [
+            ("DedupedTextures_jpg", os.path.join(base_path, "DedupedTextures_jpg\\")),
+            ("DedupedTextures_png", os.path.join(base_path, "DedupedTextures_png\\")),
+            ("DedupedTextures_tga", os.path.join(base_path, "DedupedTextures_tga\\")),
+        ]
+
+        for folder_name, folder_path in candidates:
+            if os.path.exists(folder_path):
+                return folder_path, folder_name
 
     return "", ""
 
@@ -179,7 +196,10 @@ class Sword_ImportTexture_WM_OT_AutoDetectTextureFolder(Operator):
         obj = selected_objects[0]
         deduped_folder_path, folder_name = _get_component_texture_folder(obj.name)
         if not deduped_folder_path:
-            self.report({'ERROR'}, TR.translate("未找到当前DrawIB: " + obj.name.split("-")[0] + "的DedupedTextures转换后的贴图文件夹，请确保此IB在当前工作空间中已经正常提取出来了"))
+            prefix_info = ObjectPrefixHelper.extract_prefix_info(obj.name)
+            prefix = prefix_info[0] if prefix_info else obj.name
+            draw_ib = ObjectPrefixHelper.parse_prefix_parts(prefix).get("draw_ib", "") or prefix
+            self.report({'ERROR'}, TR.translate("未找到当前DrawIB: " + str(draw_ib) + "的DedupedTextures转换后的贴图文件夹，请确保此IB在当前工作空间中已经正常提取出来了"))
             return {'CANCELLED'}
 
         image_count = _load_preview_images(context, deduped_folder_path)
