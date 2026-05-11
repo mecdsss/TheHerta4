@@ -125,8 +125,8 @@ class SSMT_OT_MaterialDetectAddCustomPrefix(bpy.types.Operator):
 
 class SSMT_OT_MaterialDetect(bpy.types.Operator):
     bl_idname = "ssmt.material_detect"
-    bl_label = "检测材质"
-    bl_description = "检测节点树中连接的物体是否缺少指定前缀的材质"
+    bl_label = "Material Detect"
+    bl_description = "Detect missing prefixed materials from connected objects, including nested blueprints"
     bl_options = {'INTERNAL'}
 
     node_name: bpy.props.StringProperty()
@@ -151,56 +151,100 @@ class SSMT_OT_MaterialDetect(bpy.types.Operator):
                         return result
         return None
 
-    def _collect_object_info_nodes(self, node, visited=None):
+    def _collect_object_info_nodes(self, node, visited=None, visited_trees=None):
         if visited is None:
             visited = set()
+        if visited_trees is None:
+            visited_trees = set()
+
         tree_name = node.id_data.name if hasattr(node, 'id_data') and node.id_data else ""
         node_key = f"{tree_name}::{node.name}"
         if node_key in visited:
             return []
         visited.add(node_key)
 
-        obj_info_nodes = []
-        if node.bl_idname == 'SSMTNode_Object_Info':
-            obj_info_nodes.append(node)
+        detect_nodes = []
+        if node.bl_idname in {'SSMTNode_Object_Info', 'SSMTNode_MultiFile_Export'}:
+            detect_nodes.append(node)
+
+        if node.bl_idname == 'SSMTNode_Blueprint_Nest':
+            nested_tree_name = str(getattr(node, 'blueprint_name', '') or '').strip()
+            if nested_tree_name and nested_tree_name != 'NONE' and nested_tree_name not in visited_trees:
+                nested_tree = bpy.data.node_groups.get(nested_tree_name)
+                if nested_tree and getattr(nested_tree, 'bl_idname', '') == 'SSMTBlueprintTreeType':
+                    visited_trees.add(nested_tree_name)
+                    for nested_node in nested_tree.nodes:
+                        if getattr(nested_node, 'bl_idname', '') == 'SSMTNode_Result_Output':
+                            detect_nodes.extend(
+                                self._collect_object_info_nodes(
+                                    nested_node,
+                                    visited=visited,
+                                    visited_trees=visited_trees,
+                                )
+                            )
 
         for input_socket in node.inputs:
             if input_socket.is_linked:
                 for link in input_socket.links:
-                    obj_info_nodes.extend(self._collect_object_info_nodes(link.from_node, visited))
-        return obj_info_nodes
+                    detect_nodes.extend(
+                        self._collect_object_info_nodes(
+                            link.from_node,
+                            visited=visited,
+                            visited_trees=visited_trees,
+                        )
+                    )
+        return detect_nodes
+
+    def _iter_detect_object_names(self, detect_nodes):
+        for detect_node in detect_nodes:
+            node_type = getattr(detect_node, 'bl_idname', '')
+            if node_type == 'SSMTNode_Object_Info':
+                obj_name = getattr(detect_node, 'object_name', '')
+                if obj_name:
+                    yield obj_name
+            elif node_type == 'SSMTNode_MultiFile_Export':
+                for item in getattr(detect_node, 'object_list', []):
+                    obj_name = getattr(item, 'object_name', '')
+                    if obj_name:
+                        yield obj_name
 
     def execute(self, context):
         tree = getattr(context.space_data, "edit_tree", None) or getattr(context.space_data, "node_tree", None)
         if not tree:
-            self.report({'WARNING'}, "无法获取节点树")
+            self.report({'WARNING'}, 'No active blueprint tree')
             return {'CANCELLED'}
+
         node = tree.nodes.get(self.node_name)
         if not node or node.bl_idname != 'SSMTNode_PostProcess_Material':
             return {'CANCELLED'}
 
         prefixes = [item.prefix.strip() for item in node.material_detect_prefixes if item.prefix.strip()]
         if not prefixes:
-            self.report({'WARNING'}, "请先添加至少一个检测前缀")
+            self.report({'WARNING'}, 'Add at least one material prefix first')
             return {'CANCELLED'}
 
         result_output = self._find_result_output(node)
         if not result_output:
-            self.report({'WARNING'}, "未找到连接的 Result_Output 节点")
+            self.report({'WARNING'}, 'No connected Result_Output node found')
             return {'CANCELLED'}
 
-        obj_info_nodes = self._collect_object_info_nodes(result_output)
-        if not obj_info_nodes:
-            self.report({'WARNING'}, "未找到连接的物体节点")
+        detect_nodes = self._collect_object_info_nodes(result_output)
+        if not detect_nodes:
+            self.report({'WARNING'}, 'No connected object nodes found')
             return {'CANCELLED'}
 
         node.detected_materials.clear()
 
-        missing_count = 0
-        for oi_node in obj_info_nodes:
-            obj_name = getattr(oi_node, 'object_name', '')
-            if not obj_name:
+        unique_object_names = []
+        seen_object_names = set()
+        for obj_name in self._iter_detect_object_names(detect_nodes):
+            if obj_name in seen_object_names:
                 continue
+            seen_object_names.add(obj_name)
+            unique_object_names.append(obj_name)
+
+        missing_count = 0
+        for obj_name in unique_object_names:
             obj = bpy.data.objects.get(obj_name)
             if not obj:
                 continue
@@ -213,18 +257,20 @@ class SSMT_OT_MaterialDetect(bpy.types.Operator):
                         has_prefix_material = True
                         break
 
-                if not has_prefix_material:
-                    item = node.detected_materials.add()
-                    item.object_name = obj_name
-                    item.missing_prefix = prefix
-                    missing_count += 1
+                if has_prefix_material:
+                    continue
+
+                item = node.detected_materials.add()
+                item.object_name = obj_name
+                item.missing_prefix = prefix
+                missing_count += 1
 
         node.detect_all_ok = (missing_count == 0)
 
         if missing_count > 0:
-            self.report({'WARNING'}, f"检测完成: {missing_count} 个缺失 (来自 {len(obj_info_nodes)} 个物体)")
+            self.report({'WARNING'}, f'Detection finished: {missing_count} missing entries across {len(unique_object_names)} objects')
         else:
-            self.report({'INFO'}, f"检测完成: 全部正确 ({len(obj_info_nodes)} 个物体)")
+            self.report({'INFO'}, f'Detection finished: all prefixes found across {len(unique_object_names)} objects')
         return {'FINISHED'}
 
 

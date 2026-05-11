@@ -1,13 +1,21 @@
 import bpy
 import subprocess
 import sys
-import importlib.util
+import importlib
 
 REQUIRED_DEPS = ['scipy']
 
+_IMPORT_TARGETS = {
+    'scipy': 'scipy.ndimage',
+}
+
 def is_dependency_installed(module_name):
-    spec = importlib.util.find_spec(module_name)
-    return spec is not None
+    target = _IMPORT_TARGETS.get(module_name, module_name)
+    try:
+        importlib.import_module(target)
+        return True
+    except Exception:
+        return False
 
 class TT_OT_ensure_dependencies(bpy.types.Operator):
     bl_idname = "toolkit.tt_ensure_dependencies"

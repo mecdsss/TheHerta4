@@ -3,6 +3,7 @@ import bpy
 
 from .common import global_properties
 from .common.global_config import GlobalConfig
+from .utils import texture_auto_reload
 
 
 from .ui import ui_panel_basic
@@ -24,6 +25,7 @@ importlib.reload(addon_updater_ops)
 importlib.reload(global_properties)
 importlib.reload(blueprint)
 importlib.reload(ui_prefix_quick_ops)
+importlib.reload(texture_auto_reload)
 
 bl_info = {
     "name": "TheHerta4",
@@ -159,10 +161,12 @@ def register():
     ui_func_export.register()
     
     toolkit.register()
+    texture_auto_reload.register()
 
 
 
 def unregister():
+    texture_auto_reload.unregister()
     toolkit.unregister()
     
     ui_func_export.unregister()

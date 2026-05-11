@@ -6,11 +6,20 @@ import bmesh
 from pathlib import Path
 
 BAKE_RESOLUTION_DEFAULT_RULES = [
-    {"pattern": r"(?i)(face|head)", "resolution": 4096, "enabled": True},
-    {"pattern": r"(?i)(body|torso)", "resolution": 2048, "enabled": True},
-    {"pattern": r"(?i)(hair)", "resolution": 2048, "enabled": True},
-    {"pattern": r"(?i)(eye)", "resolution": 1024, "enabled": True},
+    {"pattern": r"^DiffuseMap_high", "resolution": 4096, "enabled": True},
+    {"pattern": r"^DiffuseMap", "resolution": 2048, "enabled": True},
+    {"pattern": r"^NormalMap", "resolution": 2048, "enabled": True},
+    {"pattern": r"^MaterialMap", "resolution": 1024, "enabled": True},
+    {"pattern": r"^LightMap", "resolution": 1024, "enabled": True},
 ]
+
+
+def _pick_preview_render_engine():
+    engine_ids = {item.identifier for item in bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items}
+    for engine_id in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE', 'CYCLES'):
+        if engine_id in engine_ids:
+            return engine_id
+    return bpy.context.scene.render.engine
 
 
 class TT_OT_add_bake_resolution_rule(bpy.types.Operator):
@@ -137,8 +146,9 @@ class TT_OT_bake_color_maps(bpy.types.Operator):
             temp_scene = bpy.data.scenes.new("TempMaterialRender_Scene")
             bpy.context.window.scene = temp_scene
             temp_scene.world = original_scene.world 
-            temp_scene.render.engine = 'BLENDER_EEVEE_NEXT'
-            temp_scene.eevee.taa_render_samples = 64
+            temp_scene.render.engine = _pick_preview_render_engine()
+            if hasattr(temp_scene, "eevee"):
+                temp_scene.eevee.taa_render_samples = 64
             temp_scene.view_settings.view_transform = 'Standard'
             
             if source_obj and unfold_by_uv:
