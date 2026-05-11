@@ -85,7 +85,7 @@ class DrawIBModel:
             return
 
         first_submesh = self.submesh_model_list[0]
-        folder_name = first_submesh.unique_str
+        folder_name = getattr(first_submesh, "workspace_unique_str", "") or first_submesh.unique_str
         print("DrawIBModel: 开始读取导出元数据，DrawIB: " + self.draw_ib + "，unique_str: " + folder_name)
 
         first_submesh_metadata = SubmeshMetadataResolver.resolve(folder_name)
@@ -98,7 +98,8 @@ class DrawIBModel:
             self.match_first_index_list = [submesh_model.match_first_index for submesh_model in self.submesh_model_list]
             self.match_first_index_partname_dict = {}
             for submesh_model in self.submesh_model_list:
-                submesh_metadata = SubmeshMetadataResolver.resolve(submesh_model.unique_str)
+                workspace_unique_str = getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+                submesh_metadata = SubmeshMetadataResolver.resolve(workspace_unique_str)
                 self.match_first_index_partname_dict[int(submesh_model.match_first_index)] = submesh_metadata.part_name or submesh_model.unique_str
             self.vshash_list = list(self.import_json_dict.get("VSHashList", []))
             self.submesh_texturemarkinfolist_dict = TextureMetadataResolver.load_submesh_texture_markup_info_from_all_submeshes(

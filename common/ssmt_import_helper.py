@@ -3,6 +3,7 @@ import numpy
 import os
 
 from .d3d11_element import D3D11Element
+from .global_properties import GlobalProterties
 from .mesh_create_helper import MeshCreateHelper
 from .submesh_json import SubmeshJson, SubmeshCategoryBuffer
 from ..utils.format_utils import Fatal, FormatUtils
@@ -13,12 +14,13 @@ class SSMTImportHelper:
 	def create_mesh_from_json(json_file_path:str, import_collection:bpy.types.Collection | None = None):
 		submesh_json = SubmeshJson(json_file_path)
 
-		elements, vb_data, vb_vertex_count = SSMTImportHelper.parse_category_buffers(submesh_json)
+		elements, vb_data, vb_vertex_count, shapekey_buffers = SSMTImportHelper.parse_category_buffers(submesh_json)
 		ib_data, ib_count, ib_polygon_count = SSMTImportHelper.parse_index_buffer(submesh_json)
 
 		mesh_name = os.path.splitext(submesh_json.FileName)[0]
 		logic_name = submesh_json.GamePreset
 		gametypename = submesh_json.WorkGameType
+		wwmi_vg_map = submesh_json.VGMap if (submesh_json.VGMap and GlobalProterties.import_merged_vgmap()) else None
 
 		return MeshCreateHelper.create_mesh_object(
 			mesh_name=mesh_name,
@@ -35,6 +37,11 @@ class SSMTImportHelper:
 			local_bounding_box_max=submesh_json.LocalBoundingBoxMax,
 			vertex_compression_params=submesh_json.VertexCompressionParams,
 			import_collection=import_collection,
+			wwmi_shapekey_buffers=shapekey_buffers if shapekey_buffers else None,
+			wwmi_vertex_offset=submesh_json.VertexOffset,
+			wwmi_vertex_count=submesh_json.VertexCount,
+			wwmi_vg_map=wwmi_vg_map,
+			wwmi_vg_offset=submesh_json.VGOffset,
 		)
 
 	@staticmethod
@@ -58,6 +65,10 @@ class SSMTImportHelper:
 		ib_count = int(ib_file_size / index_stride)
 		ib_polygon_count = int(ib_count / 3)
 		ib_data = numpy.fromfile(index_buffer.FilePath, dtype=index_np_type, count=ib_count)
+
+		if submesh_json.VertexOffset > 0 and submesh_json.VertexCount > 0:
+			ib_data = ib_data.astype(numpy.int64) - submesh_json.VertexOffset
+
 		return ib_data, ib_count, ib_polygon_count
 
 	@staticmethod
@@ -65,12 +76,21 @@ class SSMTImportHelper:
 		elements = []
 		vb_data = {}
 		vb_vertex_count = 0
+		shapekey_buffers = {}
+		vertex_slice_offset = submesh_json.VertexOffset
+		vertex_slice_count = submesh_json.VertexCount
+		structured_buffer_types = {"Normal", "BlendWeight", "TangentFrame"}
+		shapekey_types = ("ShapeKeyOffset", "ShapeKeyVertexId", "ShapeKeyVertexOffset", "ShapeKeyScale")
 
 		for category_buffer in submesh_json.CategoryBufferList:
-			if category_buffer.Type != "Normal":
+			if category_buffer.Type not in structured_buffer_types:
 				continue
 
-			category_elements, category_vb_data, category_vertex_count = SSMTImportHelper.parse_normal_category_buffer(category_buffer)
+			category_elements, category_vb_data, category_vertex_count = SSMTImportHelper.parse_normal_category_buffer(
+				category_buffer=category_buffer,
+				vertex_slice_offset=vertex_slice_offset,
+				vertex_slice_count=vertex_slice_count,
+			)
 
 			if category_vertex_count > 0:
 				if vb_vertex_count == 0:
@@ -87,7 +107,12 @@ class SSMTImportHelper:
 			vb_data.update(category_vb_data)
 
 		for category_buffer in submesh_json.CategoryBufferList:
-			if category_buffer.Type == "Normal":
+			if category_buffer.Type in structured_buffer_types:
+				continue
+
+			if category_buffer.Type in shapekey_types:
+				if os.path.exists(category_buffer.FilePath) and os.path.getsize(category_buffer.FilePath) > 0:
+					shapekey_buffers[category_buffer.Type] = numpy.fromfile(category_buffer.FilePath, dtype=numpy.uint8)
 				continue
 
 			category_elements, category_vb_data, category_vertex_count = SSMTImportHelper.parse_special_category_buffer(
@@ -109,10 +134,10 @@ class SSMTImportHelper:
 		if vb_vertex_count == 0:
 			raise Fatal("No valid normal category buffer was parsed from SubmeshJson.")
 
-		return elements, vb_data, vb_vertex_count
+		return elements, vb_data, vb_vertex_count, shapekey_buffers
 
 	@staticmethod
-	def parse_normal_category_buffer(category_buffer:SubmeshCategoryBuffer):
+	def parse_normal_category_buffer(category_buffer:SubmeshCategoryBuffer, vertex_slice_offset:int=0, vertex_slice_count:int=-1):
 		if not os.path.exists(category_buffer.FilePath):
 			raise Fatal("Unable to find matching .buf file for: " + category_buffer.FileName)
 
@@ -130,6 +155,10 @@ class SSMTImportHelper:
 		vertex_count = int(file_size / category_buffer.Stride)
 		category_dtype = SSMTImportHelper.create_dtype_from_elements(category_buffer.D3D11ElementList)
 		category_buffer_data = numpy.fromfile(category_buffer.FilePath, dtype=category_dtype, count=vertex_count)
+		if vertex_slice_count > 0:
+			vertex_slice_end = vertex_slice_offset + vertex_slice_count
+			category_buffer_data = category_buffer_data[vertex_slice_offset:vertex_slice_end]
+			vertex_count = len(category_buffer_data)
 
 		category_vb_data = {}
 		for d3d11_element in category_buffer.D3D11ElementList:

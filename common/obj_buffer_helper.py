@@ -61,7 +61,7 @@ class ObjBufferHelper:
 
             if d3d11_element_name.startswith("BLENDINDICES"):
                 if not obj.vertex_groups:
-                    raise Fatal("your object [" +obj.name + "] need at leat one valid Vertex Group, Please check if your model's Vertex Group is correct.")
+                    SSMTErrorUtils.raise_fatal("your object [" +obj.name + "] need at leat one valid Vertex Group, Please check if your model's Vertex Group is correct.")
 
         if original_active_uv and obj.data.uv_layers.active != original_active_uv:
             obj.data.uv_layers.active = original_active_uv

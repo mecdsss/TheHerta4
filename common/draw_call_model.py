@@ -16,6 +16,7 @@ class DrawCallModel:
     match_index_count: str = field(init=False, repr=False, default="")
     match_first_index: str = field(init=False, repr=False, default="")
     match_unique_str: str = field(init=False, repr=False, default="")
+    match_workspace_unique_str: str = field(init=False, repr=False, default="")
     comment_alias_name: str = field(init=False, repr=False, default="")
 
     work_key_list: list[M_Key] = field(init=False, repr=False, default_factory=list)
@@ -35,7 +36,12 @@ class DrawCallModel:
         self.match_draw_ib = prefix_parts["draw_ib"]
         self.match_index_count = prefix_parts["index_count"]
         self.match_first_index = prefix_parts["first_index"]
-        self.match_unique_str = prefix_parts.get("unique_str", "") or prefix
+        self.match_unique_str = (
+            prefix_parts.get("bare_unique_str", "")
+            or prefix_parts.get("unique_str", "")
+            or prefix
+        )
+        self.match_workspace_unique_str = prefix_parts.get("unique_str", "") or self.match_unique_str
 
         if prefix_info:
             _prefix, _separator, base_name = ObjectPrefixHelper.split_name_and_prefix(
@@ -49,11 +55,18 @@ class DrawCallModel:
 
         if not self.match_unique_str and self.match_draw_ib and self.match_index_count and self.match_first_index:
             self.match_unique_str = self.match_draw_ib + "-" + self.match_index_count + "-" + self.match_first_index
+        if not self.match_workspace_unique_str:
+            self.match_workspace_unique_str = self.match_unique_str
 
     def get_unique_str(self) -> str:
         if self.match_unique_str:
             return self.match_unique_str
         return self.match_draw_ib + "-" + self.match_index_count + "-" + self.match_first_index
+
+    def get_workspace_unique_str(self) -> str:
+        if self.match_workspace_unique_str:
+            return self.match_workspace_unique_str
+        return self.get_unique_str()
 
     def get_condition_str(self) -> str:
         if len(self.work_key_list) == 0:

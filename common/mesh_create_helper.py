@@ -3,6 +3,7 @@ import itertools
 import math
 import numpy
 import os
+from types import SimpleNamespace
 
 from bpy_extras.io_utils import unpack_list, axis_conversion
 
@@ -48,6 +49,11 @@ class MeshCreateHelper:
         local_bounding_box_max:list | None = None,
         vertex_compression_params:list | None = None,
         import_collection:bpy.types.Collection | None = None,
+        wwmi_shapekey_buffers:dict | None = None,
+        wwmi_vertex_offset:int = 0,
+        wwmi_vertex_count:int = -1,
+        wwmi_vg_map:dict | None = None,
+        wwmi_vg_offset:int = 0,
     ):
         TimerUtils.Start("Import 3Dmigoto Raw")
         print("导入模型: " + mesh_name)
@@ -177,24 +183,41 @@ class MeshCreateHelper:
         MeshCreateHelper.import_uv_layers(mesh, obj, texcoords)
 
         component = None
-        if GlobalProterties.import_merged_vgmap() and (GlobalConfig.logic_name == LogicName.WWMI):
-            print("尝试读取Metadata.json")
+        if wwmi_vg_map:
+            normalized_vg_map = {}
+            for vg_key, vg_value in wwmi_vg_map.items():
+                try:
+                    normalized_vg_map[vg_key] = int(vg_value)
+                except (TypeError, ValueError):
+                    continue
+            component = SimpleNamespace(vg_map=normalized_vg_map, vg_offset=int(wwmi_vg_offset or 0))
+        elif GlobalProterties.import_merged_vgmap() and logic_name == LogicName.WWMI:
             metadatajsonpath = os.path.join(os.path.dirname(source_path), 'Metadata.json')
             if os.path.exists(metadatajsonpath):
-                print("鸣潮读取Metadata.json")
-                extracted_object = ExtractedObjectHelper.read_metadata(metadatajsonpath)
-                prefix_parts = MeshCreateHelper._get_mesh_prefix_parts(mesh_name)
-                component_name = str(prefix_parts.get("component", "") or "").strip()
-                if component_name.isdigit():
-                    partname_count = int(component_name) - 1
-                    print("import partname count: " + str(partname_count))
-                    component = extracted_object.components[partname_count]
+                try:
+                    extracted_object = ExtractedObjectHelper.read_metadata(metadatajsonpath)
+                    prefix_parts = MeshCreateHelper._get_mesh_prefix_parts(mesh_name)
+                    component_name = str(prefix_parts.get("component", "") or "").strip()
+                    if component_name.isdigit():
+                        partname_count = int(component_name) - 1
+                        if 0 <= partname_count < len(extracted_object.components):
+                            component = extracted_object.components[partname_count]
+                except Exception:
+                    pass
 
         print("导入顶点组")
         MeshCreateHelper.import_vertex_groups(mesh, obj, blend_indices, blend_weights, component)
         print("导入顶点组完毕")
 
         MeshCreateHelper.import_shapekeys(mesh, obj, shapekeys)
+        if wwmi_shapekey_buffers is not None:
+            MeshCreateHelper.import_shapekeys_wwmi(
+                mesh=mesh,
+                obj=obj,
+                shapekey_buffers=wwmi_shapekey_buffers,
+                vertex_offset=wwmi_vertex_offset,
+                vertex_count=wwmi_vertex_count,
+            )
 
         mesh.validate(verbose=False, clean_customdata=False)
         mesh.update()
@@ -309,34 +332,84 @@ class MeshCreateHelper:
 
     @staticmethod
     def import_vertex_groups(mesh, obj, blend_indices, blend_weights, component):
+        def get_mapped_group_id(vg_map:dict, local_index:int):
+            if local_index in vg_map:
+                return vg_map[local_index]
+            local_index_str = str(local_index)
+            if local_index_str in vg_map:
+                return vg_map[local_index_str]
+            return None
+
         for semantic_index, bone_indices_list in blend_indices.items():
-            arr = numpy.array(bone_indices_list)
-            arr = numpy.where(arr == 65535, -1, arr)
+            arr = numpy.asarray(bone_indices_list)
+            if arr.dtype.kind == 'f':
+                arr = numpy.rint(arr).astype(numpy.int64)
+            else:
+                arr = arr.astype(numpy.int64, copy=False)
+            arr[arr == 65535] = -1
             blend_indices[semantic_index] = arr
 
         assert len(blend_indices) == len(blend_weights)
         if blend_indices:
+            max_valid_group_id = -1
+            for bone_indices_array in blend_indices.values():
+                flattened_indices = numpy.asarray(bone_indices_array, dtype=numpy.int64).ravel()
+                non_negative_indices = flattened_indices[flattened_indices >= 0]
+                if non_negative_indices.size > 0:
+                    max_valid_group_id = max(max_valid_group_id, int(non_negative_indices.max()))
+
+            if max_valid_group_id < 0:
+                return
+
             if component is None:
-                num_vertex_groups = max(itertools.chain(*itertools.chain(*blend_indices.values()))) + 1
+                num_vertex_groups = max_valid_group_id + 1
             else:
-                num_vertex_groups = max(component.vg_map.values()) + 1
+                mapped_group_ids = set()
+                for mapped_group_id in getattr(component, "vg_map", {}).values():
+                    try:
+                        mapped_group_ids.add(int(mapped_group_id))
+                    except (TypeError, ValueError):
+                        continue
+
+                vg_offset = int(getattr(component, "vg_offset", 0) or 0)
+                max_global_group_id = max(mapped_group_ids) if mapped_group_ids else -1
+                max_global_group_id = max(max_global_group_id, vg_offset + max_valid_group_id)
+                if max_global_group_id < 0:
+                    return
+                num_vertex_groups = max_global_group_id + 1
 
             print("num_vertex_groups: " + str(num_vertex_groups))
 
             if num_vertex_groups > 10000:
                 raise Fatal("检测到在当前导入的数据类型" + obj.get('3DMigoto:GameTypeName', "") + "描述下，BLENDINDICES顶点组数量为: " + str(num_vertex_groups) + " 基本不可能是正常情况，请更换其他数据类型重新导入")
 
+            vertex_group_by_id = {}
             for i in range(num_vertex_groups):
-                obj.vertex_groups.new(name=str(i))
+                vertex_group_by_id[i] = obj.vertex_groups.new(name=str(i))
             for vertex in mesh.vertices:
                 for semantic_index in sorted(blend_indices.keys()):
                     for i, w in zip(blend_indices[semantic_index][vertex.index], blend_weights[semantic_index][vertex.index]):
-                        if w == 0.0:
+                        if i < 0 or w == 0.0:
                             continue
                         if component is None:
-                            obj.vertex_groups[i].add((vertex.index,), w, 'REPLACE')
+                            target_group_id = int(i)
                         else:
-                            obj.vertex_groups[component.vg_map[str(i)]].add((vertex.index,), w, 'REPLACE')
+                            mapped_group_id = get_mapped_group_id(component.vg_map, int(i))
+                            if mapped_group_id is None:
+                                target_group_id = int(getattr(component, "vg_offset", 0) or 0) + int(i)
+                            else:
+                                target_group_id = int(mapped_group_id)
+
+                        if target_group_id < 0:
+                            continue
+
+                        vertex_group = vertex_group_by_id.get(target_group_id)
+                        if vertex_group is None:
+                            vertex_group = obj.vertex_groups.get(str(target_group_id))
+                            if vertex_group is None:
+                                vertex_group = obj.vertex_groups.new(name=str(target_group_id))
+                            vertex_group_by_id[target_group_id] = vertex_group
+                        vertex_group.add((vertex.index,), float(w), 'REPLACE')
 
     @staticmethod
     def import_shapekeys(mesh, obj, shapekeys):
@@ -374,6 +447,89 @@ class MeshCreateHelper:
             del new_sk
 
         del basis_co, offset_arr, new_co
+
+    @staticmethod
+    def import_shapekeys_wwmi(mesh, obj, shapekey_buffers:dict, vertex_offset:int, vertex_count:int):
+        sk_offset_raw = shapekey_buffers.get("ShapeKeyOffset")
+        sk_vertex_id_raw = shapekey_buffers.get("ShapeKeyVertexId")
+        sk_vertex_offset_raw = shapekey_buffers.get("ShapeKeyVertexOffset")
+
+        if sk_offset_raw is None or sk_vertex_id_raw is None or sk_vertex_offset_raw is None:
+            return
+
+        offsets = numpy.asarray(sk_offset_raw).view(numpy.uint32)
+        if len(offsets) < 2:
+            return
+
+        vertex_id_buffer = numpy.asarray(sk_vertex_id_raw).view(numpy.uint32)
+        vertex_offset_buffer = numpy.asarray(sk_vertex_offset_raw).view(numpy.float16)
+        effective_vertex_count = vertex_count if vertex_count > 0 else len(obj.data.vertices)
+        if effective_vertex_count <= 0:
+            return
+
+        if obj.data.shape_keys is None:
+            basis = obj.shape_key_add(name='Basis')
+            basis.interpolation = 'KEY_LINEAR'
+            obj.data.shape_keys.use_relative = True
+            try:
+                basis.value = 0.0
+            except Exception:
+                pass
+        else:
+            basis = obj.data.shape_keys.key_blocks.get('Basis') or obj.data.shape_keys.key_blocks[0]
+
+        basis_co = numpy.empty(len(obj.data.vertices) * 3, dtype=numpy.float32)
+        basis.data.foreach_get('co', basis_co)
+        basis_co = basis_co.reshape(-1, 3)
+
+        shapekey_count = min(127, len(offsets) - 1)
+        for sk_id in range(shapekey_count):
+            first_entry = int(offsets[sk_id])
+            last_entry = int(offsets[sk_id + 1])
+            if last_entry <= first_entry:
+                continue
+
+            entries = numpy.arange(first_entry, last_entry, dtype=numpy.int64)
+            entries = entries[entries < len(vertex_id_buffer)]
+            if len(entries) == 0:
+                continue
+
+            global_vertex_ids = vertex_id_buffer[entries].astype(numpy.int64)
+            local_vertex_ids = global_vertex_ids - int(vertex_offset)
+            local_vertex_mask = (local_vertex_ids >= 0) & (local_vertex_ids < effective_vertex_count)
+            entries = entries[local_vertex_mask]
+            local_vertex_ids = local_vertex_ids[local_vertex_mask]
+            if len(entries) == 0:
+                continue
+
+            dx_idx = entries * 6
+            dy_idx = dx_idx + 1
+            dz_idx = dx_idx + 2
+            valid_offset_mask = dz_idx < len(vertex_offset_buffer)
+            entries = entries[valid_offset_mask]
+            local_vertex_ids = local_vertex_ids[valid_offset_mask]
+            if len(entries) == 0:
+                continue
+
+            dx_idx = entries * 6
+            dy_idx = dx_idx + 1
+            dz_idx = dx_idx + 2
+
+            new_co = basis_co.copy()
+            numpy.add.at(new_co[:, 0], local_vertex_ids, vertex_offset_buffer[dx_idx].astype(numpy.float32))
+            numpy.add.at(new_co[:, 1], local_vertex_ids, vertex_offset_buffer[dy_idx].astype(numpy.float32))
+            numpy.add.at(new_co[:, 2], local_vertex_ids, vertex_offset_buffer[dz_idx].astype(numpy.float32))
+
+            shapekey_name = f'Deform {sk_id}'
+            shapekey = None if obj.data.shape_keys is None else obj.data.shape_keys.key_blocks.get(shapekey_name)
+            if shapekey is None:
+                shapekey = obj.shape_key_add(name=shapekey_name)
+            shapekey.interpolation = 'KEY_LINEAR'
+            shapekey.data.foreach_set('co', new_co.ravel())
+            try:
+                shapekey.value = 0.0
+            except Exception:
+                pass
 
     @staticmethod
     def get_import_texture_paths(mesh_name: str, directory: str):

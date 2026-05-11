@@ -323,8 +323,9 @@ class WorkSpaceHelper:
         for deduped_filename, drawcall_index_list in deduped_filename_drawcall_index_list_dict.items():
             used_component_count_list = []
 
-            original_hash = deduped_filename.split("_")[0]
-            render_hash = deduped_filename.split("_")[1].split("-")[0]
+            filename_parts = deduped_filename.split("_")
+            original_hash = filename_parts[0] if len(filename_parts) > 0 else ""
+            render_hash = filename_parts[1].split("-")[0] if len(filename_parts) > 1 else ""
 
             base_name = os.path.splitext(deduped_filename)[0]
             fmt = ""

@@ -36,6 +36,7 @@ class DirectShapeKeyRuntimeMixin:
 
         for submesh_model in getattr(drawib_model, "submesh_model_list", []) or []:
             candidate_keys.add(getattr(submesh_model, "unique_str", ""))
+            candidate_keys.add(getattr(submesh_model, "workspace_unique_str", ""))
             candidate_keys.add(getattr(submesh_model, "match_draw_ib", ""))
 
         return {key for key in candidate_keys if key}

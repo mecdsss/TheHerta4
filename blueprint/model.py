@@ -1555,6 +1555,11 @@ class BluePrintModel:
 
         elif unknown_node.bl_idname == _NODE_TYPE_OBJECT_INFO:
             virtual_object_name = ObjectPrefixHelper.build_virtual_object_name_for_node(unknown_node, strict=True)
+            obj = bpy.data.objects.get(virtual_object_name)
+            if obj is None or obj.type != 'MESH' or obj.data is None or len(obj.data.vertices) == 0:
+                LOG.info("BluePrintModel: 跳过空网格或无效对象: " + str(virtual_object_name))
+                return
+
             obj_model = DrawCallModel(obj_name=virtual_object_name)
 
             if hasattr(unknown_node, 'original_object_name') and unknown_node.original_object_name:

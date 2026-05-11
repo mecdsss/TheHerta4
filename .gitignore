@@ -4,5 +4,8 @@ herta-blender_updater/
 theherta4_updater/
 test/
 references/
-# Codex 基准测试输出目录。
+.agents/
+docs/
+reports/
+# Codex benchmark output directory
 .codex_benchmarks/

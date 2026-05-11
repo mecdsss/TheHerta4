@@ -28,7 +28,7 @@ class FMTFile:
                 continue  # 跳过格式不正确的行
 
             key, value = parts[0].strip(), ":".join(parts[1:]).strip()
-            if key == "stride":
+            if key == "stride" or key.endswith(" stride"):
                 self.stride = int(value)
             elif key == "topology":
                 self.topology = value
@@ -45,9 +45,10 @@ class FMTFile:
             elif key.startswith("element"):
                 # 处理element块
                 if "SemanticName" in element_info:
+                    aligned_byte_offset = int(element_info["AlignedByteOffset"]) if "AlignedByteOffset" in element_info else -1
                     append_d3delement = D3D11Element(
                         SemanticName=element_info["SemanticName"], SemanticIndex=int(element_info["SemanticIndex"]),
-                        Format= element_info["Format"],AlignedByteOffset= int(element_info["AlignedByteOffset"]),
+                        Format= element_info["Format"],AlignedByteOffset= aligned_byte_offset,
                         ByteWidth=0,
                         ExtractSlot="0",ExtractTechnique="",Category="")
                     
@@ -68,9 +69,10 @@ class FMTFile:
 
         # 添加最后一个element
         if "SemanticName" in element_info:
+            aligned_byte_offset = int(element_info["AlignedByteOffset"]) if "AlignedByteOffset" in element_info else -1
             append_d3delement = D3D11Element(
                 SemanticName=element_info["SemanticName"], SemanticIndex=int(element_info["SemanticIndex"]),
-                Format= element_info["Format"],AlignedByteOffset= int(element_info["AlignedByteOffset"]),
+                Format= element_info["Format"],AlignedByteOffset= aligned_byte_offset,
                 ByteWidth=0,
                 ExtractSlot="0",ExtractTechnique="",Category=""
             )
@@ -89,6 +91,10 @@ class FMTFile:
     
     def get_dtype(self):
         fields = []
+        names = []
+        formats = []
+        offsets = []
+        use_aligned_offsets = True
         for elemnt in self.elements:
             # Numpy类型由Format决定，此时即使是WWMI的特殊R8_UINT也能得到正确的numpy.uint8
             numpy_type = FormatUtils.get_nptype_from_format(elemnt.Format)
@@ -101,9 +107,33 @@ class FMTFile:
             # print(numpy_type)
             # print(size)
             if size == 1:
-                fields.append((elemnt.ElementName, numpy_type))
+                field_format = numpy_type
             else:
-                fields.append((elemnt.ElementName, numpy_type, size))
-        dtype = numpy.dtype(fields)
+                field_format = (numpy_type, size)
+
+            fields.append((elemnt.ElementName, field_format))
+            names.append(elemnt.ElementName)
+            formats.append(field_format)
+
+            if int(elemnt.AlignedByteOffset) < 0:
+                use_aligned_offsets = False
+            else:
+                offsets.append(int(elemnt.AlignedByteOffset))
+
+        if not use_aligned_offsets:
+            return numpy.dtype(fields)
+
+        itemsize = self.stride
+        if itemsize <= 0 and self.elements:
+            itemsize = max(
+                int(elemnt.AlignedByteOffset) + int(elemnt.ByteWidth)
+                for elemnt in self.elements
+            )
+
+        dtype = numpy.dtype({
+            'names': names,
+            'formats': formats,
+            'offsets': offsets,
+            'itemsize': itemsize,
+        })
         return dtype
-    

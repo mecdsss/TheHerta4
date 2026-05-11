@@ -6,6 +6,7 @@ from ...common.global_key_count_helper import GlobalKeyCountHelper
 from ...common.m_ini_helper import M_IniHelper
 from ...common.m_ini_helper_gui import M_IniHelperGUI
 from ...common.m_ini_builder import M_IniBuilder, M_IniSection, M_SectionType
+from ...common.workspace_helper import WorkSpaceHelper
 from .drawib_export_base import DrawIBExportBase
 from ...utils.timer_utils import TimerUtils
 
@@ -13,6 +14,77 @@ from ...utils.timer_utils import TimerUtils
 class ExportIdentityV(DrawIBExportBase):
     def __init__(self, blueprint_model):
         super().__init__(blueprint_model=blueprint_model, combine_ib=False)
+
+    def _get_drawib_submesh_entries(self, drawib_model):
+        existing_submesh_dict = {}
+        for submesh_model in drawib_model.submesh_model_list:
+            try:
+                match_first_index = int(submesh_model.match_first_index)
+            except (TypeError, ValueError):
+                continue
+
+            unique_str = getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+            existing_submesh_dict[match_first_index] = {
+                "match_first_index": match_first_index,
+                "unique_str": unique_str,
+                "submesh_model": submesh_model,
+                "is_missing": False,
+            }
+
+        candidate_unique_strs = []
+        candidate_base_folder_list = [
+            GlobalConfig.path_workspace_folder(),
+            *WorkSpaceHelper.get_workspace_partition_folderpath_list(),
+        ]
+        for base_folder in candidate_base_folder_list:
+            if not os.path.isdir(base_folder):
+                continue
+
+            for submesh_folder_path in WorkSpaceHelper._get_submesh_folderpath_list_from(base_folder):
+                candidate_unique_strs.append(os.path.basename(submesh_folder_path))
+
+            for lod_name, submesh_folderpath_list in WorkSpaceHelper.get_lod_submesh_folderpath_dict(base_folder).items():
+                for submesh_folder_path in submesh_folderpath_list:
+                    candidate_unique_strs.append(
+                        WorkSpaceHelper._compose_lod_name(lod_name, os.path.basename(submesh_folder_path))
+                    )
+
+        for candidate_unique_str in candidate_unique_strs:
+            _lod_name, bare_unique_str = WorkSpaceHelper.parse_lod_unique_str(candidate_unique_str)
+            if not bare_unique_str.startswith(drawib_model.draw_ib + "-"):
+                continue
+
+            name_splits = bare_unique_str.split("-")
+            if len(name_splits) < 3:
+                continue
+
+            try:
+                match_first_index = int(name_splits[2])
+            except ValueError:
+                continue
+
+            if match_first_index in existing_submesh_dict:
+                continue
+
+            existing_submesh_dict[match_first_index] = {
+                "match_first_index": match_first_index,
+                "unique_str": candidate_unique_str,
+                "submesh_model": None,
+                "is_missing": True,
+            }
+
+        return [
+            existing_submesh_dict[match_first_index]
+            for match_first_index in sorted(existing_submesh_dict.keys())
+        ]
+
+    def _append_missing_texture_override_ib_section(self, texture_override_ib_section, draw_ib, submesh_entry):
+        texture_override_name_suffix = submesh_entry["unique_str"].replace("-", "_")
+        texture_override_ib_section.append("[TextureOverride_" + texture_override_name_suffix + "]")
+        texture_override_ib_section.append("hash = " + draw_ib)
+        texture_override_ib_section.append("match_first_index = " + str(submesh_entry["match_first_index"]))
+        texture_override_ib_section.append("handling = skip")
+        texture_override_ib_section.new_line()
 
     def add_unity_vs_texture_override_vb_sections(self, ini_builder: M_IniBuilder, drawib_model):
         d3d11_game_type = drawib_model.d3d11GameType
@@ -53,7 +125,16 @@ class ExportIdentityV(DrawIBExportBase):
         draw_ib = drawib_model.draw_ib
         d3d11_game_type = drawib_model.d3d11GameType
 
-        for submesh_model in drawib_model.submesh_model_list:
+        for submesh_entry in self._get_drawib_submesh_entries(drawib_model):
+            if submesh_entry["is_missing"]:
+                self._append_missing_texture_override_ib_section(
+                    texture_override_ib_section=texture_override_ib_section,
+                    draw_ib=draw_ib,
+                    submesh_entry=submesh_entry,
+                )
+                continue
+
+            submesh_model = submesh_entry["submesh_model"]
             texture_override_name_suffix = drawib_model.get_submesh_texture_override_suffix(submesh_model)
             ib_resource_name = drawib_model.get_submesh_ib_resource_name(submesh_model)
             backup_resource_name = "Resource_IB_" + drawib_model.get_submesh_texture_override_suffix(submesh_model) + "_Bak"
@@ -95,6 +176,7 @@ class ExportIdentityV(DrawIBExportBase):
                 texture_override_ib_section.append(drawindexed_str)
 
             texture_override_ib_section.append("ib = " + backup_resource_name)
+            texture_override_ib_section.new_line()
 
         ini_builder.append_section(texture_override_ib_section)
 

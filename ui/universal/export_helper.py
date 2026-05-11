@@ -16,7 +16,7 @@ class ExportHelper:
             source_obj_name = draw_call_model.source_obj_name or draw_call_model.get_blender_obj_name()
             if not source_obj_name:
                 continue
-            unique_str = draw_call_model.get_unique_str()
+            unique_str = draw_call_model.get_workspace_unique_str()
             source_obj_unique_str_map.setdefault(source_obj_name, set()).add(unique_str)
 
         return {
@@ -42,7 +42,7 @@ class ExportHelper:
         # 拿到BlueprintModel后，开始解析SubMeshModel列表
         for draw_call_model in blueprint_model.ordered_draw_obj_data_model_list:
             # 获取独立标识
-            unique_str = draw_call_model.get_unique_str()
+            unique_str = draw_call_model.get_workspace_unique_str()
 
             # 根据unique_str，加入到字典中，这样每个unique_str都对应一个DrawCallModel列表，用于初始化SubMeshModel
             draw_call_model_list = draw_call_model_dict.get(unique_str,[])

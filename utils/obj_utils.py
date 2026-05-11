@@ -340,7 +340,7 @@ def collection_exists(col_name):
 def assert_collection(col):
     if isinstance(col, str):
         col = get_collection(col)
-    elif col not in bpy.data.collections.values():
+    elif col.name not in bpy.data.collections:
         raise ValueError('Not of collection type: %s' % str(col))
     return col
 

@@ -101,8 +101,10 @@ class ObjectPrefixHelper:
         if not parsed:
             return None
 
-        prefix, separator = parsed
-        return with_lod(prefix, separator)
+        prefix, _separator = parsed
+        if cls.normalize_prefix(bare_name) == prefix:
+            return with_lod(prefix, ".")
+        return with_lod(prefix, "-")
 
     @classmethod
     def split_name_and_prefix(cls, object_name: str, prefix: str = "", separator: str = ""):

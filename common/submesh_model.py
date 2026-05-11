@@ -37,6 +37,7 @@ class SubMeshModel:
     match_first_index:int = field(init=False, default=-1)
     match_index_count:int = field(init=False, default=-1)
     unique_str:str = field(init=False, default="")
+    workspace_unique_str:str = field(init=False, default="")
 
     # 调用组合obj并计算ib和vb得到这些属性
     vertex_count:int = field(init=False, default=0)
@@ -59,13 +60,14 @@ class SubMeshModel:
             self.match_draw_ib = self.drawcall_model_list[0].match_draw_ib
             self.match_first_index = self.drawcall_model_list[0].match_first_index
             self.match_index_count = self.drawcall_model_list[0].match_index_count
-            self.unique_str = self.drawcall_model_list[0].get_unique_str()
-        
+            self.workspace_unique_str = self.drawcall_model_list[0].get_workspace_unique_str()
+            self.unique_str = self.workspace_unique_str or self.drawcall_model_list[0].get_unique_str()
+
         self.calc_buffer()
     
 
     def calc_buffer(self):
-        folder_name = self.unique_str
+        folder_name = self.workspace_unique_str or self.unique_str
 
         submesh_metadata = SubmeshMetadataResolver.resolve(folder_name)
         self.d3d11_game_type = submesh_metadata.d3d11_game_type

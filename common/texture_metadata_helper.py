@@ -109,10 +109,11 @@ class TextureMetadataResolver:
     @staticmethod
     def load_texture_markup_info_for_submesh(draw_ib_model, submesh_model) -> tuple[str, list]:
         unique_str = submesh_model.unique_str
+        workspace_unique_str = getattr(submesh_model, "workspace_unique_str", "") or unique_str
         part_name = TextureMetadataResolver.get_part_name_for_submesh(draw_ib_model, submesh_model)
 
         try:
-            submesh_metadata = SubmeshMetadataResolver.resolve(unique_str)
+            submesh_metadata = SubmeshMetadataResolver.resolve(workspace_unique_str)
         except Exception as ex:
             print("TextureMetadataResolver: 跳过贴图标记读取，无法解析 SubmeshJson: " + unique_str + "，错误: " + str(ex))
             return part_name, []

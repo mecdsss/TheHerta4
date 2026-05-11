@@ -55,7 +55,7 @@ class M_IniHelper:
         submesh_model_list = getattr(draw_ib_model, "submesh_model_list", [])
         if submesh_model_list:
             first_submesh_model = submesh_model_list[0]
-            unique_str = getattr(first_submesh_model, "unique_str", "")
+            unique_str = getattr(first_submesh_model, "workspace_unique_str", "") or getattr(first_submesh_model, "unique_str", "")
             d3d11_game_type = getattr(first_submesh_model, "d3d11_game_type", None)
             if unique_str and d3d11_game_type is not None:
                 return os.path.join(
@@ -81,7 +81,9 @@ class M_IniHelper:
             return ""
 
         d3d11_game_type = getattr(submesh_model, "d3d11_game_type", None)
-        unique_str = getattr(submesh_model, "unique_str", "")
+        if d3d11_game_type is None:
+            d3d11_game_type = getattr(draw_ib_model, "d3d11_game_type", getattr(draw_ib_model, "d3d11GameType", None))
+        unique_str = getattr(submesh_model, "workspace_unique_str", "") or getattr(submesh_model, "unique_str", "")
         if d3d11_game_type is None or unique_str == "":
             return ""
 
@@ -103,7 +105,9 @@ class M_IniHelper:
 
         for submesh_model in getattr(draw_ib_model, "submesh_model_list", []):
             d3d11_game_type = getattr(submesh_model, "d3d11_game_type", None)
-            unique_str = getattr(submesh_model, "unique_str", "")
+            if d3d11_game_type is None:
+                d3d11_game_type = getattr(draw_ib_model, "d3d11_game_type", getattr(draw_ib_model, "d3d11GameType", None))
+            unique_str = getattr(submesh_model, "workspace_unique_str", "") or getattr(submesh_model, "unique_str", "")
             if d3d11_game_type is None or unique_str == "":
                 continue
 
@@ -147,14 +151,14 @@ class M_IniHelper:
             print("M_IniHelper: part_name 未匹配到 submesh，DrawIB: " + draw_ib_model.draw_ib + "，Part: " + str(part_name))
             return ""
 
-        submesh_folder_name = getattr(submesh_model, "unique_str", "")
+        submesh_folder_name = getattr(submesh_model, "workspace_unique_str", "") or getattr(submesh_model, "unique_str", "")
         print("M_IniHelper: Part " + str(part_name) + " 对应 unique_str: " + submesh_folder_name)
         return submesh_folder_name
 
     @classmethod
     def _get_hash_deduped_texture_info(cls, draw_ib_model: DrawIBModel, mark_hash: str):
         for submesh_model in getattr(draw_ib_model, "submesh_model_list", []):
-            submesh_folder_name = getattr(submesh_model, "unique_str", "")
+            submesh_folder_name = getattr(submesh_model, "workspace_unique_str", "") or getattr(submesh_model, "unique_str", "")
             if not submesh_folder_name:
                 continue
 
@@ -287,7 +291,7 @@ class M_IniHelper:
                     continue
 
                 part_name = draw_ib_model.get_submesh_part_name(submesh_model)
-                submesh_folder_name = getattr(submesh_model, "unique_str", "")
+                submesh_folder_name = getattr(submesh_model, "workspace_unique_str", "") or getattr(submesh_model, "unique_str", "")
                 if not submesh_folder_name:
                     print("M_IniHelper: 跳过 Hash 贴图处理，未找到 unique_str，Part: " + str(part_name))
                     continue

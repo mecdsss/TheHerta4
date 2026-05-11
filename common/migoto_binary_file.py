@@ -42,11 +42,11 @@ class MigotoBinaryFile:
     def init_from_prefix(self,prefix:str, location_folder_path:str):
 
         self.fmt_name = prefix + ".fmt"
-        self.vb_name = prefix + ".vb"
         self.ib_name = prefix + ".ib"
 
         self.location_folder_path = location_folder_path
 
+        self.vb_name = self.resolve_vb_name(prefix, location_folder_path)
         self.vb_bin_path = os.path.join(location_folder_path, self.vb_name)
         self.ib_bin_path = os.path.join(location_folder_path, self.ib_name)
         self.fmt_path = os.path.join(location_folder_path, self.fmt_name)
@@ -71,6 +71,28 @@ class MigotoBinaryFile:
 
         self.vb_vertex_count = int(self.vb_file_size / vb_stride)
         self.vb_data = numpy.fromfile(self.vb_bin_path, dtype=fmt_dtype, count=self.vb_vertex_count)
+
+    def resolve_vb_name(self, prefix:str, location_folder_path:str) -> str:
+        exact_vb_name = prefix + ".vb"
+        exact_vb_path = os.path.join(location_folder_path, exact_vb_name)
+        if os.path.exists(exact_vb_path):
+            return exact_vb_name
+
+        prefix_lower = (prefix + ".vb").lower()
+        candidate_names = []
+        for entry_name in os.listdir(location_folder_path):
+            entry_path = os.path.join(location_folder_path, entry_name)
+            if not os.path.isfile(entry_path):
+                continue
+
+            if entry_name.lower().startswith(prefix_lower):
+                candidate_names.append(entry_name)
+
+        if not candidate_names:
+            return exact_vb_name
+
+        candidate_names.sort(key=lambda name: (len(name), name.lower()))
+        return candidate_names[0]
 
     
     def file_sanity_check(self):
