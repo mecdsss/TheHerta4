@@ -157,6 +157,12 @@ class SSMTNode_Object_Rename(SSMTNodeBase):
         description="开启后，当链路中存在顶点组处理节点时，不再按链路内立即改名，而是在该链路的顶点组处理全部完成后再统一执行重命名"
     )
 
+    filter_objects: bpy.props.BoolProperty(
+        name="对象筛选",
+        default=False,
+        description="开启后，仅当当前物体命中了至少一条重命名规则时才继续向后传递；未命中的物体会在此链路被丢弃",
+    )
+
     def init(self, context):
         self.inputs.new('SSMTSocketObject', "Input")
         self.outputs.new('SSMTSocketObject', "Output")
@@ -200,6 +206,9 @@ class SSMTNode_Object_Rename(SSMTNodeBase):
             icon='SORTTIME'
         )
 
+        filter_row = layout.row(align=True)
+        filter_row.prop(self, "filter_objects", text="对象筛选", toggle=True, icon='FILTER')
+
     @staticmethod
     def apply_to_object_name(object_name: str, node=None) -> tuple:
         """
@@ -242,7 +251,8 @@ class SSMTNode_Object_Rename(SSMTNodeBase):
         signature = SSMTNode_Object_Rename.generate_signature(
             rules_list,
             reverse_mapping,
-            defer_until_after_vertex_group_process=getattr(node, 'defer_until_after_vertex_group_process', False)
+            defer_until_after_vertex_group_process=getattr(node, 'defer_until_after_vertex_group_process', False),
+            filter_objects=getattr(node, 'filter_objects', False),
         )
 
         return (new_name, was_modified, history, signature)
@@ -347,6 +357,7 @@ class SSMTNode_Object_Rename(SSMTNodeBase):
         rename_rules: list,
         reverse_mapping: bool = False,
         defer_until_after_vertex_group_process: bool = False,
+        filter_objects: bool = False,
     ) -> str:
         """
         生成节点的参数签名（用于处理链哈希计算）
@@ -388,6 +399,9 @@ class SSMTNode_Object_Rename(SSMTNodeBase):
 
         if defer_until_after_vertex_group_process:
             params.append("after_vg=deferred")
+
+        if filter_objects:
+            params.append("filter=matched_only")
 
         return f"Rename[{','.join(params)}]" if params else "Rename[]"
 
@@ -623,6 +637,9 @@ class SSMTNode_Object_Rename(SSMTNodeBase):
             if not rule.search_str:
                 issues.append(("WARNING", f"规则 {i+1}: 未设置搜索字符串"))
 
+        if self.filter_objects and len(self.rename_rules) == 0:
+            issues.append(("WARNING", "已开启对象筛选，但当前没有任何重命名规则，后续链路将收不到物体"))
+
         return issues
 
     def get_preview_result(self, sample_name: str = "4c11c155-288-7068.自定义名称") -> dict:
@@ -647,6 +664,7 @@ class SSMTNode_Object_Rename(SSMTNodeBase):
             'modified': modified,
             'rule_count': len(self.rename_rules),
             'reverse_mapping': self.reverse_mapping,
+            'filter_objects': self.filter_objects,
             'history': history
         }
 

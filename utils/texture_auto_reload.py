@@ -6,9 +6,13 @@ from bpy.app.handlers import persistent
 
 from .log_utils import LOG
 
-_CHANGE_CHECK_INTERVAL_SECONDS = 1.0
+_CHANGE_CHECK_ACTIVE_INTERVAL_SECONDS = 1.0
+_CHANGE_CHECK_IDLE_INTERVAL_SECONDS = 5.0
+_CHANGE_CHECK_EMPTY_INTERVAL_SECONDS = 10.0
+_FAST_POLL_CYCLES_AFTER_CHANGE = 3
 _timer_handle = None
 _image_signature_cache = {}
+_fast_poll_cycles_remaining = 0
 
 
 def _get_image_cache_key(image: bpy.types.Image) -> str:
@@ -163,10 +167,11 @@ def _check_and_reload_changed_images():
 
     images = _get_images_snapshot()
     if images is None:
-        return False
+        return 0, 0
 
     active_cache_keys = set()
     reloaded_names = []
+    reloadable_count = 0
 
     for image in images:
         cache_key = _get_image_cache_key(image)
@@ -176,6 +181,7 @@ def _check_and_reload_changed_images():
         if signature is None:
             _image_signature_cache.pop(cache_key, None)
             continue
+        reloadable_count += 1
 
         previous_signature = _image_signature_cache.get(cache_key)
         if previous_signature is None:
@@ -195,15 +201,30 @@ def _check_and_reload_changed_images():
         _image_signature_cache.pop(cache_key, None)
 
     _log_reload_summary(reloaded_names)
-    return True
+    return reloadable_count, len(reloaded_names)
 
 
 def texture_auto_reload_timer_callback():
+    global _fast_poll_cycles_remaining
+
     try:
-        _check_and_reload_changed_images()
+        reloadable_count, reloaded_count = _check_and_reload_changed_images()
     except Exception as exc:
         LOG.warning(f"[TextureAutoReload] Periodic check failed: {exc}")
-    return _CHANGE_CHECK_INTERVAL_SECONDS
+        return _CHANGE_CHECK_IDLE_INTERVAL_SECONDS
+
+    if reloaded_count > 0:
+        _fast_poll_cycles_remaining = _FAST_POLL_CYCLES_AFTER_CHANGE
+        return _CHANGE_CHECK_ACTIVE_INTERVAL_SECONDS
+
+    if _fast_poll_cycles_remaining > 0:
+        _fast_poll_cycles_remaining -= 1
+        return _CHANGE_CHECK_ACTIVE_INTERVAL_SECONDS
+
+    if reloadable_count <= 0:
+        return _CHANGE_CHECK_EMPTY_INTERVAL_SECONDS
+
+    return _CHANGE_CHECK_IDLE_INTERVAL_SECONDS
 
 
 @persistent
@@ -220,13 +241,13 @@ def register():
     if not _timer_handle or not bpy.app.timers.is_registered(_timer_handle):
         _timer_handle = bpy.app.timers.register(
             texture_auto_reload_timer_callback,
-            first_interval=_CHANGE_CHECK_INTERVAL_SECONDS,
+            first_interval=_CHANGE_CHECK_ACTIVE_INTERVAL_SECONDS,
             persistent=True,
         )
 
 
 def unregister():
-    global _timer_handle, _image_signature_cache
+    global _timer_handle, _image_signature_cache, _fast_poll_cycles_remaining
 
     if load_post_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(load_post_handler)
@@ -236,3 +257,4 @@ def unregister():
 
     _timer_handle = None
     _image_signature_cache = {}
+    _fast_poll_cycles_remaining = 0

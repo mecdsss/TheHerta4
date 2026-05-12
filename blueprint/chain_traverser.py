@@ -345,6 +345,13 @@ class ChainTraverser:
                     current_node
                 )
 
+                if getattr(current_node, 'filter_objects', False) and not was_modified:
+                    LOG.debug(
+                        f"   过滤未命中重命名规则的物体: '{rename_input_name}' "
+                        f"(节点: {current_node.name})"
+                    )
+                    return
+
                 if was_modified:
                     if not chain.original_object_name:
                         chain.original_object_name = chain.object_name

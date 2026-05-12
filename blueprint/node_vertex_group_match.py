@@ -230,6 +230,12 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
         default=True
     )
 
+    clean_non_numeric_groups: bpy.props.BoolProperty(
+        name="清理非数字顶点组",
+        description="应用到原物体时，是否删除非纯数字名称的顶点组",
+        default=True
+    )
+
     target_hash: bpy.props.StringProperty(
         name="目标哈希",
         description="应用此映射表的物体哈希标识（物体名称以'哈希-'开头时匹配），留空则应用于所有物体",
@@ -313,7 +319,7 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
         
         row = box.row()
         row.prop(self, "rename_format")
-        
+
         row = box.row()
         row.prop(self, "target_hash")
         
@@ -340,6 +346,9 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
         op.node_name = self.name
         op = row.operator("ssmt.vertex_group_match_clear", text="清除映射", icon='X')
         op.node_name = self.name
+
+        row = layout.row()
+        row.prop(self, "clean_non_numeric_groups")
 
         row = layout.row(align=True)
         apply_text = "撤回应用" if self.source_mapping_applied else "应用到原物体"
@@ -903,8 +912,9 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
             renamed_count += changed_group_count
             merged_count += merged_group_count
 
-            cleaned = self._clean_non_numeric_vertex_groups(source_obj)
-            cleaned_count += cleaned
+            if self.clean_non_numeric_groups:
+                cleaned = self._clean_non_numeric_vertex_groups(source_obj)
+                cleaned_count += cleaned
 
             filled = self._fill_vertex_group_gaps(source_obj)
             filled_count += filled

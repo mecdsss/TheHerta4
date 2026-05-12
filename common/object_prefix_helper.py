@@ -7,8 +7,8 @@ from ..utils.ssmt_error_utils import SSMTErrorUtils
 
 _PREFIX_START_PATTERN = re.compile(r"^[A-Za-z0-9]{6,}$")
 _PREFIX_PART_PATTERN = re.compile(r"^[A-Za-z0-9]+$")
-_KNOWN_SEPARATORS = ("__", "_", " ")
-_PREFIX_CHECK_SEPARATORS = (".", "-", "_", " ", "__")
+_KNOWN_SEPARATORS = ()
+_PREFIX_CHECK_SEPARATORS = (".",)
 _BLENDER_SUFFIX_PATTERN = re.compile(r"\.\d{3,}$")
 _BLENDER_SUFFIX_INNER_PATTERN = re.compile(r"\.\d{3,}")
 _LOD_PREFIX_PATTERN = re.compile(r"^(LOD\d+)\.(.+)$", re.IGNORECASE)

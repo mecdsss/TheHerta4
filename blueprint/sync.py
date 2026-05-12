@@ -32,10 +32,10 @@ _msgbus_subscribed = False
 _timer_handle = None
 _next_maintenance_run_at = 0.0
 
-_SELECTION_SYNC_ACTIVE_INTERVAL = 0.2
-_SELECTION_SYNC_IDLE_INTERVAL = 1.0
-_MAINTENANCE_ACTIVE_INTERVAL = 2.0
-_MAINTENANCE_IDLE_INTERVAL = 5.0
+_SELECTION_SYNC_ACTIVE_INTERVAL = 0.5
+_SELECTION_SYNC_IDLE_INTERVAL = 2.0
+_MAINTENANCE_ACTIVE_INTERVAL = 10.0
+_MAINTENANCE_IDLE_INTERVAL = 30.0
 _VISIBILITY_AUTO_MUTE_KEY = "ssmt_auto_muted_by_visibility"
 
 _SYNC_DEBUG = False
@@ -827,7 +827,55 @@ def _sync_all_node_visibility_states():
         _log(f"_sync_all_node_visibility_states 异常: {exc}")
 
 
-def _run_periodic_reference_and_visibility_maintenance(has_active_blueprint_tree):
+def _sync_tree_reference_states(tree):
+    updated_count = 0
+
+    if not tree or getattr(tree, 'bl_idname', '') != 'SSMTBlueprintTreeType':
+        return updated_count
+
+    try:
+        for node in tree.nodes:
+            if not _is_sync_node(node):
+                continue
+
+            node_changed = False
+            for reference in _iter_node_object_references(node):
+                object_id, object_name, _, exists = _resolve_reference_state(reference)
+                if exists and _apply_reference_state(reference, object_id, object_name):
+                    updated_count += 1
+                    node_changed = True
+
+            if node_changed and node.bl_idname == 'SSMTNode_MultiFile_Export':
+                node.update_node_width([item.object_name for item in getattr(node, 'object_list', [])])
+    except Exception as exc:
+        _log(f"_sync_tree_reference_states 异常: {exc}")
+
+    return updated_count
+
+
+def _sync_tree_visibility_states(tree):
+    if not tree or getattr(tree, 'bl_idname', '') != 'SSMTBlueprintTreeType':
+        return
+
+    try:
+        for node in tree.nodes:
+            if not _is_sync_node(node):
+                continue
+
+            objects = _resolve_node_objects(node)
+            if not objects:
+                continue
+
+            any_hidden = any(
+                _object_hide_state_cache.get(str(obj.as_pointer()), bool(obj.hide_viewport or obj.hide_get()))
+                for obj in objects
+            )
+            _set_node_visibility_state(node, any_hidden)
+    except Exception as exc:
+        _log(f"_sync_tree_visibility_states 异常: {exc}")
+
+
+def _run_periodic_reference_and_visibility_maintenance(has_active_blueprint_tree, active_tree=None):
     global _next_maintenance_run_at
 
     now = time.monotonic()
@@ -838,6 +886,11 @@ def _run_periodic_reference_and_visibility_maintenance(has_active_blueprint_tree
     _next_maintenance_run_at = now + interval
     _rebuild_object_name_cache()
     _rebuild_object_hide_state_cache()
+    if has_active_blueprint_tree and active_tree is not None:
+        _sync_tree_reference_states(active_tree)
+        _sync_tree_visibility_states(active_tree)
+        return
+
     _sync_all_node_reference_states()
     _sync_all_node_visibility_states()
 
@@ -1012,7 +1065,10 @@ def selection_sync_timer_callback():
             _log(f"check_object_selection 异常: {exc}")
 
     try:
-        _run_periodic_reference_and_visibility_maintenance(has_active_blueprint_tree)
+        _run_periodic_reference_and_visibility_maintenance(
+            has_active_blueprint_tree,
+            active_tree=tree,
+        )
     except Exception as exc:
         _log(f"_run_periodic_reference_and_visibility_maintenance 异常: {exc}")
 

@@ -17,11 +17,20 @@ class PrefixQuickOpsHelper:
 
         if object_name:
             parsed_prefix, _, base_name = ObjectPrefixHelper.split_name_and_prefix(object_name, clean_prefix, ".")
-            if parsed_prefix == clean_prefix and base_name:
-                return object_name
+            if parsed_prefix == clean_prefix:
+                if base_name:
+                    return object_name
+                return clean_prefix
 
         clean_alias = (alias_name or "").strip()
         if clean_alias:
+            bare_prefix = str(ObjectPrefixHelper.parse_prefix_parts(clean_prefix).get("bare_unique_str", "") or "").strip()
+            if (
+                clean_alias == clean_prefix
+                or clean_alias == bare_prefix
+                or clean_prefix.endswith("." + clean_alias)
+            ):
+                return clean_prefix
             return f"{clean_prefix}.{clean_alias}"
 
         return clean_prefix
@@ -176,9 +185,6 @@ class PrefixQuickOpsHelper:
     @classmethod
     def resolve_display_name(cls, context, item) -> str:
         current_name = (getattr(item, "display_name", "") or "").strip()
-        if current_name and current_name != item.prefix:
-            return current_name
-
         for node in cls._iter_object_info_nodes():
             info = ObjectPrefixHelper.get_node_prefix_info(node)
             if not info:
@@ -202,6 +208,9 @@ class PrefixQuickOpsHelper:
             prefix, _ = info
             if prefix == item.prefix:
                 return cls._build_display_name(prefix, object_name=obj.name)
+
+        if current_name and current_name != item.prefix:
+            return current_name
 
         return item.prefix
 
@@ -227,11 +236,14 @@ class SSMT_OT_PrefixQuickApply(bpy.types.Operator):
         missing_node_count = 0
         for obj in selected_objects:
             linked_nodes = PrefixQuickOpsHelper._find_object_info_nodes(obj)
+            object_prefix_info = ObjectPrefixHelper.extract_prefix_info(obj.name)
             node_prefix_info = ObjectPrefixHelper.get_node_prefix_info(linked_nodes[0]) if linked_nodes else None
             old_prefix = node_prefix_info[0] if node_prefix_info else ""
             old_separator = node_prefix_info[1] if node_prefix_info else self.separator
 
             if rename_object_name:
+                old_prefix = object_prefix_info[0] if object_prefix_info else ""
+                old_separator = object_prefix_info[1] if object_prefix_info else self.separator
                 new_name = ObjectPrefixHelper.replace_prefix(
                     obj.name,
                     self.prefix,
@@ -272,7 +284,6 @@ class SSMT_OT_PrefixQuickApply(bpy.types.Operator):
                 else:
                     skipped_count += 1
 
-        PrefixQuickOpsHelper.merge_prefixes_from_nodes(context)
         if rename_object_name:
             self.report({'INFO'}, f"已更新 {updated_count} 个物体前缀，跳过 {skipped_count} 个")
         else:

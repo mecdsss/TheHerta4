@@ -136,6 +136,7 @@ class ProcessingChain:
                     [{'search_str': r.search_str, 'replace_str': r.replace_str} for r in getattr(node, 'rename_rules', [])],
                     getattr(node, 'reverse_mapping', False),
                     getattr(node, 'defer_until_after_vertex_group_process', False),
+                    getattr(node, 'filter_objects', False),
                 )
             except ImportError:
                 return "Object_Rename[unavailable]"

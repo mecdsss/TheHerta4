@@ -220,8 +220,11 @@ class ATP_PT_ShapeKeyAnimationExport(bpy.types.Panel):
         
         col.label(text="播放表格式示例:", icon='INFO')
         example_box = col.box()
-        example_box.label(text="Key_发 = 0.5,0.25,1,0.68,0.6,0.7")
-        example_box.label(text="Key_脸 = 0.0,0.3,0.5,0.8,1.0,0.5")
+        example_box.label(text="if frame == 1")
+        example_box.label(text="    Key_A = 0.50")
+        example_box.label(text="elif frame == 2")
+        example_box.label(text="    Key_A = 0.25")
+        example_box.label(text="endif")
         
         col.separator()
         

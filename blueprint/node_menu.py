@@ -133,6 +133,10 @@ def _extract_target_hash_from_name(object_name: str) -> str:
     if not object_name:
         return ""
 
+    prefix_info = ObjectPrefixHelper.extract_prefix_info(object_name)
+    if prefix_info:
+        return prefix_info[0]
+
     match = re.match(r'^([a-f0-9]{8}-[a-f0-9]+(?:-[a-f0-9]+)?)', object_name)
     if match:
         return match.group(1)

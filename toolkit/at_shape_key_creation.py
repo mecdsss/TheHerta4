@@ -121,17 +121,27 @@ class ATP_OT_ShapeKeyAnimationExport(bpy.types.Operator):
                         original_values[obj.name][key_block.name] = key_block.value
         
         frame_count = end_frame - start_frame + 1
-        shape_key_data = {name: [] for name in sorted(shape_key_names)}
+        sorted_shape_key_names = sorted(shape_key_names)
+        frame_records = []
         
         for frame in range(start_frame, end_frame + 1):
             context.scene.frame_set(frame)
-            
-            for obj in selected_objects:
-                if obj.data.shape_keys:
-                    for key_block in obj.data.shape_keys.key_blocks:
-                        if key_block.name.lower() != 'basis':
-                            if key_block.name in shape_key_data:
-                                shape_key_data[key_block.name].append(key_block.value)
+            frame_record = {}
+
+            for shape_key_name in sorted_shape_key_names:
+                object_values = []
+                for obj in selected_objects:
+                    if not obj.data.shape_keys:
+                        continue
+                    key_block = obj.data.shape_keys.key_blocks.get(shape_key_name)
+                    if key_block is None or key_block.name.lower() == 'basis':
+                        continue
+                    object_values.append((obj.name, key_block.value))
+
+                if object_values:
+                    frame_record[shape_key_name] = object_values
+
+            frame_records.append((frame, frame_record))
         
         for obj in selected_objects:
             if obj.data.shape_keys:
@@ -141,56 +151,60 @@ class ATP_OT_ShapeKeyAnimationExport(bpy.types.Operator):
                             key_block.value = original_values[obj.name][key_block.name]
         
         context.scene.frame_set(current_frame)
-        
+
         output_lines = []
-        output_lines.append(f"# 形态键动画序列播放表")
-        output_lines.append(f"# 起始帧: {start_frame}, 结束帧: {end_frame}, 总帧数: {frame_count}")
-        output_lines.append(f"# 导出物体: {', '.join([obj.name for obj in selected_objects])}")
-        output_lines.append(f"# 格式: 形态键名称 = 每一帧的参数值")
+        output_lines.append("# Shape Key Animation Sequence")
+        output_lines.append(f"# Start Frame: {start_frame}, End Frame: {end_frame}, Total Frames: {frame_count}")
+        output_lines.append(f"# Objects: {', '.join([obj.name for obj in selected_objects])}")
+        output_lines.append("# Format: if / elif / endif. Replace `frame` with your own frame variable if needed.")
         output_lines.append("")
-        
-        for shape_key_name in sorted(shape_key_data.keys()):
-            values = shape_key_data[shape_key_name]
-            
-            object_count = len(selected_objects)
-            values_per_frame = len(values) // frame_count
-            
-            if values_per_frame == 1:
-                merged_values = values
-            else:
-                merged_values = []
-                for i in range(frame_count):
-                    frame_values = values[i * values_per_frame:(i + 1) * values_per_frame]
-                    all_same = all(abs(v - frame_values[0]) < 0.0001 for v in frame_values)
-                    if all_same:
-                        merged_values.append(frame_values[0])
-                    else:
-                        merged_values.extend(frame_values)
-            
-            values_str = ",".join([f"{v:.2f}" for v in merged_values])
-            output_lines.append(f"{shape_key_name} = {values_str}")
-        
+
+        for index, (frame, frame_record) in enumerate(frame_records):
+            keyword = "if" if index == 0 else "elif"
+            output_lines.append(f"{keyword} frame == {frame}")
+
+            for shape_key_name in sorted_shape_key_names:
+                object_values = frame_record.get(shape_key_name, [])
+                if not object_values:
+                    continue
+
+                values_only = [value for _, value in object_values]
+                first_value = values_only[0]
+                all_same = all(abs(value - first_value) < 0.0001 for value in values_only)
+
+                if all_same:
+                    output_lines.append(f"    {shape_key_name} = {first_value:.2f}")
+                    continue
+
+                values_text = ",".join(f"{value:.2f}" for value in values_only)
+                object_names_text = ", ".join(obj_name for obj_name, _ in object_values)
+                output_lines.append(f"    {shape_key_name} = {values_text}")
+                output_lines.append(f"    # objects: {object_names_text}")
+
+            output_lines.append("")
+
+        output_lines.append("endif")
+
         output_text = "\n".join(output_lines)
-        
-        text_name = "形态键动画序列播放表"
+
+        text_name = "Shape_Key_Animation_Sequence"
         if text_name in bpy.data.texts:
             text_block = bpy.data.texts[text_name]
             text_block.clear()
         else:
             text_block = bpy.data.texts.new(text_name)
-        
+
         text_block.write(output_text)
-        
+
         for area in context.screen.areas:
             if area.type == 'TEXT_EDITOR':
                 for space in area.spaces:
                     if space.type == 'TEXT_EDITOR':
                         space.text = text_block
                         break
-        
+
         self.report({'INFO'}, f"已导出 {len(shape_key_names)} 个形态键的动画序列到文本编辑器")
         return {'FINISHED'}
-
 
 class ATP_OT_AddFrameShapeKeyPair(bpy.types.Operator):
     """添加帧/形态键对"""

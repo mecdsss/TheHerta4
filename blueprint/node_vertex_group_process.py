@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple, Any, Optional
 import threading
 
 from .node_base import SSMTNodeBase
+from ..common.object_prefix_helper import ObjectPrefixHelper
 
 
 class SSMTNode_VertexGroupProcess(SSMTNodeBase):
@@ -103,6 +104,47 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
 
         return mapping_nodes
 
+    @staticmethod
+    def _normalize_target_hash_variants(target_hash: str) -> tuple[str, str]:
+        clean_target_hash = str(target_hash or "").strip()
+        if not clean_target_hash:
+            return "", ""
+
+        prefix_info = ObjectPrefixHelper.extract_prefix_info(clean_target_hash)
+        normalized_prefix = prefix_info[0] if prefix_info else ObjectPrefixHelper.normalize_prefix(clean_target_hash)
+        parts = ObjectPrefixHelper.parse_prefix_parts(normalized_prefix)
+        bare_prefix = str(parts.get("bare_unique_str", "") or normalized_prefix).strip()
+        return normalized_prefix, bare_prefix
+
+    @classmethod
+    def _matches_target_hash(cls, obj_name: str, target_hash: str) -> bool:
+        clean_obj_name = str(obj_name or "").strip()
+        normalized_target_hash, bare_target_hash = cls._normalize_target_hash_variants(target_hash)
+        if not normalized_target_hash and not bare_target_hash:
+            return True
+
+        if normalized_target_hash and clean_obj_name.startswith(normalized_target_hash):
+            return True
+        if bare_target_hash and clean_obj_name.startswith(bare_target_hash):
+            return True
+
+        prefix_info = ObjectPrefixHelper.extract_prefix_info(clean_obj_name)
+        if not prefix_info:
+            return False
+
+        obj_prefix = prefix_info[0]
+        obj_parts = ObjectPrefixHelper.parse_prefix_parts(obj_prefix)
+        obj_bare_prefix = str(obj_parts.get("bare_unique_str", "") or obj_prefix).strip()
+
+        if normalized_target_hash and obj_prefix == normalized_target_hash:
+            return True
+        if bare_target_hash and obj_bare_prefix == bare_target_hash:
+            return True
+        if bare_target_hash and obj_bare_prefix.startswith(bare_target_hash + "-"):
+            return True
+
+        return False
+
     def get_merged_mapping_for_object(self, obj_name, mapping_nodes):
         merged_mapping = {}
         exact_match_found = False
@@ -123,7 +165,7 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
             if exact_match_found and not exact_match:
                 continue
 
-            if target_hash and not obj_name.startswith(target_hash):
+            if target_hash and not self._matches_target_hash(obj_name, target_hash):
                 continue
 
             if node_type == 'input':
@@ -162,7 +204,7 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
                         mapping = self.parse_mapping_text(text)
                         merged_mapping.update(mapping)
 
-            if exact_match and target_hash and obj_name.startswith(target_hash):
+            if exact_match and target_hash and self._matches_target_hash(obj_name, target_hash):
                 exact_match_found = True
 
         return merged_mapping
@@ -248,7 +290,7 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
             if exact_match_found and not exact_match:
                 continue
 
-            if target_hash and not obj_name.startswith(target_hash):
+            if target_hash and not self._matches_target_hash(obj_name, target_hash):
                 continue
 
             mapping = {}
@@ -265,7 +307,7 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
 
             merged_mapping.update(mapping)
 
-            if exact_match and target_hash and obj_name.startswith(target_hash):
+            if exact_match and target_hash and self._matches_target_hash(obj_name, target_hash):
                 exact_match_found = True
 
         return merged_mapping
