@@ -9,6 +9,22 @@ from .direct_export_shapekey_shared import ShapeKeyDirectExportError
 
 
 class DirectShapeKeyRuntimeMixin:
+    @staticmethod
+    def _resolve_range_candidate_match(candidate_matches):
+        if not candidate_matches:
+            return None
+        if len(candidate_matches) == 1:
+            return candidate_matches[0]
+
+        normalized_ranges = {
+            (int(start_v), int(end_v), str(label or ""))
+            for _mesh_name, start_v, end_v, label in candidate_matches
+        }
+        if len(normalized_ranges) == 1:
+            return candidate_matches[0]
+
+        return None
+
     def _match_drawib_model(self, actual_hash: str, logical_hash: str):
         logical_prefix = self.node._extract_hash_prefix(logical_hash)
         for drawib_model in _iter_drawib_models(self.exporter):
@@ -144,20 +160,23 @@ class DirectShapeKeyRuntimeMixin:
             obj_base_alias = self.node._strip_object_suffix(obj_alias).casefold()
 
             runtime_matches = mesh_runtime_alias_map.get((obj_prefix, obj_runtime_alias), [])
-            if len(runtime_matches) == 1:
-                _, start_v, end_v, label = runtime_matches[0]
+            resolved_match = self._resolve_range_candidate_match(runtime_matches)
+            if resolved_match is not None:
+                _, start_v, end_v, label = resolved_match
                 calculated_ranges[obj_name] = (start_v, end_v, label)
                 continue
 
             base_matches = mesh_base_alias_map.get((obj_prefix, obj_base_alias), [])
-            if len(base_matches) == 1:
-                _, start_v, end_v, label = base_matches[0]
+            resolved_match = self._resolve_range_candidate_match(base_matches)
+            if resolved_match is not None:
+                _, start_v, end_v, label = resolved_match
                 calculated_ranges[obj_name] = (start_v, end_v, label)
                 continue
 
             prefix_candidates = mesh_candidates_by_prefix.get(obj_prefix, [])
-            if len(prefix_candidates) == 1:
-                _, start_v, end_v, label = prefix_candidates[0]
+            resolved_match = self._resolve_range_candidate_match(prefix_candidates)
+            if resolved_match is not None:
+                _, start_v, end_v, label = resolved_match
                 calculated_ranges[obj_name] = (start_v, end_v, label)
 
         return calculated_ranges
@@ -215,20 +234,23 @@ class DirectShapeKeyRuntimeMixin:
             obj_base_alias = self.node._strip_object_suffix(obj_alias).casefold()
 
             runtime_matches = mesh_runtime_alias_map.get((obj_prefix, obj_runtime_alias), [])
-            if len(runtime_matches) == 1:
-                _, start_v, end_v, label = runtime_matches[0]
+            resolved_match = self._resolve_range_candidate_match(runtime_matches)
+            if resolved_match is not None:
+                _, start_v, end_v, label = resolved_match
                 calculated_ranges[obj_name] = (start_v, end_v, label)
                 continue
 
             base_matches = mesh_base_alias_map.get((obj_prefix, obj_base_alias), [])
-            if len(base_matches) == 1:
-                _, start_v, end_v, label = base_matches[0]
+            resolved_match = self._resolve_range_candidate_match(base_matches)
+            if resolved_match is not None:
+                _, start_v, end_v, label = resolved_match
                 calculated_ranges[obj_name] = (start_v, end_v, label)
                 continue
 
             prefix_candidates = mesh_candidates_by_prefix.get(obj_prefix, [])
-            if len(prefix_candidates) == 1:
-                _, start_v, end_v, label = prefix_candidates[0]
+            resolved_match = self._resolve_range_candidate_match(prefix_candidates)
+            if resolved_match is not None:
+                _, start_v, end_v, label = resolved_match
                 calculated_ranges[obj_name] = (start_v, end_v, label)
 
         return calculated_ranges

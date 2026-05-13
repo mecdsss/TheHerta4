@@ -6,6 +6,18 @@ from bpy.types import NodeTree, Node, NodeSocket
 
 from ..utils.translate_utils import TR
 from ..common.global_config import GlobalConfig
+from ..common.text_width_utils import (
+    DEFAULT_MIN_NODE_WIDTH,
+    DEFAULT_NODE_PADDING,
+    DEFAULT_TEXT_WIDTH_SAFETY_FACTOR,
+    estimate_text_width,
+    get_effective_min_width,
+)
+
+try:
+    import blf
+except ImportError:
+    blf = None
 
 
 class SSMTSocketObject(NodeSocket):
@@ -44,72 +56,49 @@ class SSMTNodeBase(Node):
     def poll(cls, ntree):
         return ntree.bl_idname == 'SSMTBlueprintTreeType'
 
-    def calculate_text_width(self, text, padding=40):
+    def _get_min_node_width(self):
+        return get_effective_min_width(getattr(self, "bl_width_min", None), DEFAULT_MIN_NODE_WIDTH)
+
+    def _measure_text_width_with_blf(self, text, padding=DEFAULT_NODE_PADDING):
+        if blf is None or not text:
+            return None
+
+        try:
+            view_preferences = getattr(getattr(bpy.context, "preferences", None), "view", None)
+            ui_scale = float(getattr(view_preferences, "ui_scale", 1.0) or 1.0)
+            font_size = max(12, int(round(12 * ui_scale)))
+
+            blf.size(0, font_size)
+
+            widest_line = 0.0
+            lines = str(text).expandtabs(4).splitlines() or [str(text)]
+            for line in lines:
+                line_width, _ = blf.dimensions(0, line)
+                widest_line = max(widest_line, line_width)
+
+            adjusted_width = widest_line * float(DEFAULT_TEXT_WIDTH_SAFETY_FACTOR)
+            return max(self._get_min_node_width(), adjusted_width + float(padding))
+        except Exception:
+            return None
+
+    def calculate_text_width(self, text, padding=DEFAULT_NODE_PADDING):
+        min_width = self._get_min_node_width()
         if not text:
-            return 200
+            return min_width
 
-        char_count = 0
-        for char in text:
-            code = ord(char)
-            is_wide = False
+        measured_width = self._measure_text_width_with_blf(text, padding=padding)
+        if measured_width is not None:
+            return measured_width
 
-            if 0x4E00 <= code <= 0x9FFF:
-                is_wide = True
-            elif 0x3400 <= code <= 0x4DBF:
-                is_wide = True
-            elif 0x20000 <= code <= 0x2A6DF:
-                is_wide = True
-            elif 0x2A700 <= code <= 0x2B73F:
-                is_wide = True
-            elif 0x2B740 <= code <= 0x2B81F:
-                is_wide = True
-            elif 0x2B820 <= code <= 0x2CEAF:
-                is_wide = True
-            elif 0x2CEB0 <= code <= 0x2EBEF:
-                is_wide = True
-            elif 0x30000 <= code <= 0x3134F:
-                is_wide = True
-            elif 0xF900 <= code <= 0xFAFF:
-                is_wide = True
-            elif 0x2E80 <= code <= 0x2EFF:
-                is_wide = True
-            elif 0x3040 <= code <= 0x309F:
-                is_wide = True
-            elif 0x30A0 <= code <= 0x30FF:
-                is_wide = True
-            elif 0xAC00 <= code <= 0xD7AF:
-                is_wide = True
-            elif 0x1100 <= code <= 0x11FF:
-                is_wide = True
-            elif 0x3130 <= code <= 0x318F:
-                is_wide = True
-            elif 0xFF00 <= code <= 0xFFEF:
-                is_wide = True
-            elif 0x3000 <= code <= 0x303F:
-                is_wide = True
-            elif 0x2190 <= code <= 0x21FF:
-                is_wide = True
-            elif 0x2200 <= code <= 0x22FF:
-                is_wide = True
-            elif 0x2500 <= code <= 0x257F:
-                is_wide = True
-            elif 0x25A0 <= code <= 0x25FF:
-                is_wide = True
-            elif 0x2600 <= code <= 0x26FF:
-                is_wide = True
-            elif 0x1F300 <= code <= 0x1F9FF:
-                is_wide = True
-
-            char_count += 2 if is_wide else 1
-
-        width = char_count * 8 + padding
-        return max(200, width)
+        return estimate_text_width(text, padding=padding, min_width=min_width)
 
     def update_node_width(self, texts):
+        min_width = self._get_min_node_width()
         if not texts:
+            self.width = min_width
             return
 
-        max_width = 200
+        max_width = min_width
         for text in texts:
             width = self.calculate_text_width(text)
             if width > max_width:

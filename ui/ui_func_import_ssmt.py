@@ -14,6 +14,7 @@ from ..utils.translate_utils import TR
 from ..common.global_config import GlobalConfig
 from ..common.global_properties import GlobalProterties
 from ..common.non_mirror_workflow import NonMirrorWorkflowHelper
+from ..common.object_prefix_helper import ObjectPrefixHelper
 from ..common.ssmt_import_helper import SSMTImportHelper
 from ..common.workspace_helper import WorkSpaceHelper
 from .ui_prefix_quick_ops import PrefixQuickOpsHelper
@@ -126,7 +127,22 @@ def ImprotFromWorkSpaceFull(self, context):
                 if imported_obj is None:
                     continue
 
-                imported_obj.name = target["display_name"]
+                display_name = target["display_name"]
+                workspace_unique_str = str(imported_obj.get("3DMigoto:WorkspaceUniqueStr", "") or "").strip()
+                if workspace_unique_str:
+                    prefix_info = ObjectPrefixHelper.extract_prefix_info(display_name)
+                    if prefix_info:
+                        display_name = ObjectPrefixHelper.replace_prefix(
+                            display_name,
+                            workspace_unique_str,
+                            ".",
+                            prefix_info[0],
+                            prefix_info[1],
+                        )
+                    else:
+                        display_name = workspace_unique_str
+
+                imported_obj.name = display_name
                 imported_obj.data.name = imported_obj.name
                 imported_objects.append(imported_obj)
                 foldername_gametypename_dict[target["import_key"]] = gametype_name

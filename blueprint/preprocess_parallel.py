@@ -579,7 +579,13 @@ def _run_worker(manifest_path: str):
         copy_names = set(copy_map.values())
 
         for obj in list(bpy.data.objects):
-            if obj.name not in copy_names:
+            if obj is None:
+                continue
+            try:
+                obj_name = obj.name
+            except (AttributeError, ReferenceError):
+                continue
+            if obj_name not in copy_names:
                 bpy.data.objects.remove(obj, do_unlink=True)
 
         ShapeKeyUtils.save_as_mainfile_with_shape_key_recovery(

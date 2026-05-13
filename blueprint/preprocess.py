@@ -1609,7 +1609,12 @@ class PreProcessHelper:
         
         copies_to_remove = []
         for obj in bpy.data.objects:
-            obj_name = obj.name
+            if obj is None:
+                continue
+            try:
+                obj_name = obj.name
+            except (AttributeError, ReferenceError):
+                continue
             if obj_name.endswith('_copy_temp') or obj_name.startswith('TEMP_SUBMESH_MERGED_'):
                 copies_to_remove.append(obj)
             elif obj_name.endswith('_copy'):

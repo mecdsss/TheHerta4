@@ -70,6 +70,7 @@ class DrawIBModelWWMI:
     obj_buffer_model_wwmi: WWMIBufferBuildResult | None = field(init=False, default=None, repr=False)
     blend_remap_maps: dict[str, BlendRemapEntry] = field(init=False, default_factory=dict, repr=False)
     blend_remap_used: dict[str, bool] = field(init=False, default_factory=dict, repr=False)
+    component_object_index_dict: dict[str, int] = field(init=False, default_factory=dict, repr=False)
     component_real_vg_count_dict: dict[int, int] = field(init=False, default_factory=dict, repr=False)
     submesh_model_list: list = field(init=False, default_factory=list, repr=False)
     match_first_index_partname_dict: dict[int, str] = field(init=False, default_factory=dict, repr=False)
@@ -287,6 +288,32 @@ class DrawIBModelWWMI:
 
         return not source_obj.name.endswith('_copy')
 
+    @staticmethod
+    def _append_candidate_name(candidate_names: list[str], name: str):
+        clean_name = str(name or "").strip()
+        if clean_name and clean_name not in candidate_names:
+            candidate_names.append(clean_name)
+
+    def _resolve_source_object(self, drawcall_model: DrawCallModel) -> tuple[str, bpy.types.Object | None, list[str]]:
+        candidate_names: list[str] = []
+        for candidate_name in (
+            drawcall_model.get_blender_obj_name(),
+            getattr(drawcall_model, "source_obj_name", "") or "",
+            getattr(drawcall_model, "obj_name", "") or "",
+        ):
+            self._append_candidate_name(candidate_names, candidate_name)
+
+            mapped_name = BluePrintModel.get_mapped_object_name(candidate_name)
+            if mapped_name != candidate_name:
+                self._append_candidate_name(candidate_names, mapped_name)
+
+        for candidate_name in candidate_names:
+            source_obj = ObjUtils.get_obj_by_name(candidate_name)
+            if source_obj is not None:
+                return candidate_name, source_obj, candidate_names
+
+        return "", None, candidate_names
+
     def build_merged_object(self, extracted_object: ExtractedObject) -> MergedObject:
         components: list[MergedObjectComponent] = []
         for _component in extracted_object.components:
@@ -300,13 +327,20 @@ class DrawIBModelWWMI:
             component_id = int(component_count) - 1
 
             for drawcall_model in component_model.final_ordered_draw_obj_model_list:
-                obj_name = drawcall_model.obj_name
-                if obj_name in processed_obj_name_list:
+                export_obj_name = drawcall_model.obj_name
+                if export_obj_name in processed_obj_name_list:
                     continue
 
-                processed_obj_name_list.append(obj_name)
+                processed_obj_name_list.append(export_obj_name)
 
-                source_obj = ObjUtils.get_obj_by_name(obj_name)
+                source_obj_name, source_obj, tried_names = self._resolve_source_object(drawcall_model)
+                if source_obj is None:
+                    raise ValueError(
+                        "WWMI 导出找不到用于合并的 Blender 物体: "
+                        f"导出名='{export_obj_name}', "
+                        f"候选名={tried_names or ['<empty>']}"
+                    )
+
                 if self._should_duplicate_source_for_merge(source_obj):
                     temp_obj = ObjUtils.copy_object(
                         bpy.context,
@@ -319,12 +353,13 @@ class DrawIBModelWWMI:
 
                 components[component_id].objects.append(
                     TempObject(
-                        name=source_obj.name,
+                        name=export_obj_name or source_obj_name,
                         object=temp_obj,
                     )
                 )
 
         self.component_real_vg_count_dict = {}
+        self.component_object_index_dict = {}
         index_offset = 0
 
         for component_id, component in enumerate(components):
@@ -403,6 +438,7 @@ class DrawIBModelWWMI:
                 component_obj.select_set(False)
 
             component.remap_key_name = component_obj.name
+            self.component_object_index_dict[component_obj.name] = component_index
             component_obj_list.append(component_obj)
             drawib_merged_object.append(component_obj)
 

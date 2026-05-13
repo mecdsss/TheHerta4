@@ -436,7 +436,7 @@ class SSMTQuickExportSelected(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        selected_meshes, skipped_count = self._collect_selected_meshes(context)
         if not selected_meshes:
             self.report({'WARNING'}, "请先选择至少一个网格物体")
             return {'CANCELLED'}
@@ -456,8 +456,10 @@ class SSMTQuickExportSelected(bpy.types.Operator):
             LOG.info("=" * 60)
             LOG.info("🚀 开始快速局部导出")
             LOG.info(f"📋 当前选择网格物体: {len(selected_meshes)} 个")
+            if skipped_count:
+                LOG.warning(f"   跳过 {skipped_count} 个已失效或非 Mesh 的选中对象")
             for obj in selected_meshes:
-                LOG.info(f"   - {obj.name}")
+                LOG.info(f"   - {self._safe_object_name(obj)}")
 
             temp_tree = self._build_temp_blueprint_tree(selected_meshes)
 
@@ -494,16 +496,58 @@ class SSMTQuickExportSelected(bpy.types.Operator):
             BlueprintExportHelper.set_current_export_index(previous_export_index)
             BlueprintExportHelper.set_current_buffer_folder_name(previous_buffer_folder_name)
 
-            if temp_tree and bpy.data.node_groups.get(temp_tree.name):
-                bpy.data.node_groups.remove(temp_tree, do_unlink=True)
+            if temp_tree:
+                try:
+                    temp_tree_name = temp_tree.name
+                except (AttributeError, ReferenceError):
+                    temp_tree_name = ""
+                if temp_tree_name and bpy.data.node_groups.get(temp_tree_name):
+                    bpy.data.node_groups.remove(temp_tree, do_unlink=True)
 
             TimerUtils.print_summary()
 
             LOG.stop_collecting()
-            if export_success:
-                log_name = LOG.save_to_text_editor()
-                if log_name:
-                    print(f"📄 快速局部导出日志已保存至文本编辑器: {log_name}")
+            log_name = LOG.save_to_text_editor("快速局部导出日志")
+            if log_name:
+                print(f"📄 快速局部导出日志已保存至文本编辑器: {log_name}")
+
+    @staticmethod
+    def _safe_object_name(obj) -> str:
+        if obj is None:
+            return ""
+        try:
+            return str(obj.name or "")
+        except (AttributeError, ReferenceError):
+            return ""
+
+    @classmethod
+    def _collect_selected_meshes(cls, context):
+        try:
+            selected_objects = list(getattr(context, "selected_objects", []) or [])
+        except (AttributeError, ReferenceError):
+            selected_objects = []
+
+        selected_meshes = []
+        skipped_count = 0
+        for obj in selected_objects:
+            if obj is None:
+                skipped_count += 1
+                continue
+            try:
+                if obj.type != 'MESH':
+                    skipped_count += 1
+                    continue
+                obj_name = obj.name
+                obj.as_pointer()
+            except (AttributeError, ReferenceError):
+                skipped_count += 1
+                continue
+            if not obj_name:
+                skipped_count += 1
+                continue
+            selected_meshes.append(obj)
+
+        return selected_meshes, skipped_count
 
     def _build_temp_blueprint_tree(self, objects):
         tree_name = f"SSMT_QuickExport_{len(bpy.data.node_groups) + 1}"
@@ -519,20 +563,33 @@ class SSMTQuickExportSelected(bpy.types.Operator):
         tree.links.new(group_node.outputs[0], output_node.inputs[0])
 
         current_y = 0
+        object_count = 0
         for obj in objects:
+            obj_name = self._safe_object_name(obj)
+            if not obj_name:
+                continue
+            try:
+                object_id = str(obj.as_pointer())
+            except (AttributeError, ReferenceError):
+                continue
+
             node = tree.nodes.new('SSMTNode_Object_Info')
-            node.object_name = obj.name
-            node.object_id = str(obj.as_pointer())
-            node.label = obj.name
+            node.object_name = obj_name
+            node.object_id = object_id
+            node.label = obj_name
             node.location = (0, current_y)
             current_y -= 180
+            object_count += 1
 
             if group_node.inputs[-1].is_linked:
                 group_node.inputs.new('SSMTSocketObject', f"Input {len(group_node.inputs) + 1}")
 
             tree.links.new(node.outputs[0], group_node.inputs[-1])
 
-        group_node.location = (300, max(0, (len(objects) - 1) * -90))
+        if object_count == 0:
+            raise ValueError("快速局部导出未能建立有效的物体节点")
+
+        group_node.location = (300, max(0, (object_count - 1) * -90))
         output_node.location = (650, group_node.location.y)
         return tree
 

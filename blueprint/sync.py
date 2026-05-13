@@ -428,19 +428,38 @@ def find_object_by_id(object_id):
             return obj
 
     for obj in bpy.data.objects:
-        if str(obj.as_pointer()) == object_id:
-            return obj
+        if obj is None:
+            continue
+        try:
+            if str(obj.as_pointer()) == object_id:
+                return obj
+        except (AttributeError, ReferenceError):
+            continue
     return None
 
 
 def _get_selected_objects(context):
     try:
-        return list(context.selected_objects)
+        selected_objects = list(context.selected_objects)
     except (AttributeError, ReferenceError):
         try:
-            return list(bpy.context.selected_objects)
+            selected_objects = list(bpy.context.selected_objects)
         except Exception:
             return []
+    except Exception:
+        return []
+
+    valid_objects = []
+    for obj in selected_objects:
+        if obj is None:
+            continue
+        try:
+            obj.as_pointer()
+            obj.name
+        except (AttributeError, ReferenceError):
+            continue
+        valid_objects.append(obj)
+    return valid_objects
 
 
 def _try_select_object(obj, context):
@@ -489,7 +508,12 @@ def _rebuild_object_name_cache():
     _object_id_to_name = {}
     try:
         for obj in bpy.data.objects:
-            _object_id_to_name[str(obj.as_pointer())] = obj.name
+            if obj is None:
+                continue
+            try:
+                _object_id_to_name[str(obj.as_pointer())] = obj.name
+            except (AttributeError, ReferenceError):
+                continue
     except (AttributeError, ReferenceError):
         pass
 
@@ -500,6 +524,8 @@ def _rebuild_object_hide_state_cache():
     _object_hide_state_cache = {}
     try:
         for obj in bpy.data.objects:
+            if obj is None:
+                continue
             try:
                 _object_hide_state_cache[str(obj.as_pointer())] = _is_object_viewport_disabled(obj)
             except (AttributeError, ReferenceError):

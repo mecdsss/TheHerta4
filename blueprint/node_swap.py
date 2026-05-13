@@ -6,8 +6,12 @@ from dataclasses import dataclass
 
 import bpy
 
+from ..common.object_prefix_helper import ObjectPrefixHelper
 from .node_base import SSMTNodeBase
 from .variable_registry import ensure_object_swap_variable_name, mark_variable_name_used, normalize_variable_name
+
+_swap_preview_hidden_state = None
+_swap_preview_session_owner = None
 
 
 @dataclass
@@ -124,6 +128,7 @@ class SSMTNode_ObjectSwap(SSMTNodeBase):
 
     def update_input_slot_count(self, context):
         self._update_input_sockets()
+        self._sanitize_preview_option_index()
 
     input_slot_count: bpy.props.IntProperty(
         name="输入口数量",
@@ -151,6 +156,24 @@ class SSMTNode_ObjectSwap(SSMTNodeBase):
         default=False,
     )
 
+    preview_option_index: bpy.props.IntProperty(
+        name="Preview Option Index",
+        default=-1,
+        options={"HIDDEN"},
+    )
+
+    preview_session_active: bpy.props.BoolProperty(
+        name="Preview Session Active",
+        default=False,
+        options={"HIDDEN"},
+    )
+
+    preview_empty_mode: bpy.props.BoolProperty(
+        name="Preview Empty Mode",
+        default=False,
+        options={"HIDDEN"},
+    )
+
     def init(self, context):
         self._ensure_initial_visible_variable_name(context=context)
         self.outputs.new("SSMTSocketObject", "Output")
@@ -161,6 +184,9 @@ class SSMTNode_ObjectSwap(SSMTNodeBase):
         self.assigned_variable_name = ""
         self.custom_var_initialized = False
         self.custom_var_name = ""
+        self.preview_option_index = -1
+        self.preview_session_active = False
+        self.preview_empty_mode = False
         self._ensure_initial_visible_variable_name()
 
     def _update_input_sockets(self):
@@ -182,8 +208,32 @@ class SSMTNode_ObjectSwap(SSMTNodeBase):
         self._ensure_initial_visible_variable_name()
         ensure_object_swap_variable_name(self)
         self._update_input_sockets()
+        self._sanitize_preview_option_index()
+
+    def _sanitize_preview_option_index(self) -> int:
+        option_count = max(1, int(getattr(self, "input_slot_count", 1) or 1))
+        current_index = int(getattr(self, "preview_option_index", -1))
+        if current_index < -1 or current_index >= option_count:
+            self.preview_option_index = -1
+            return -1
+        return current_index
+
+    def _get_preview_button_text(self, current_preview_index: int) -> str:
+        if self.preview_session_active and current_preview_index == self.input_slot_count - 1:
+            return f"退出切换预览 [当前 {current_preview_index}]"
+        if 0 <= current_preview_index < self.input_slot_count:
+            return f"预览切换物体 [当前 {current_preview_index}]"
+        return "预览切换物体 [从 0 开始]"
 
     def draw_buttons(self, context, layout):
+        current_preview_index = self._sanitize_preview_option_index()
+        layout.operator(
+            "ssmt.cycle_swap_preview",
+            text=self._get_preview_button_text(current_preview_index),
+            icon="HIDE_OFF",
+        ).node_name = self.name
+        layout.separator()
+
         layout.prop(self, "comment", text="备注")
         layout.prop(self, "custom_var_name", text="变量名")
         if not str(self.custom_var_name or "").strip() and str(self.assigned_variable_name or "").strip():
@@ -284,6 +334,438 @@ class SSMT_OT_RemoveSwapOption(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SSMT_OT_CycleSwapPreview(bpy.types.Operator):
+    bl_idname = "ssmt.cycle_swap_preview"
+    bl_label = "预览切换物体"
+    bl_description = "按 0 -> 1 -> 2 的顺序预览当前物体切换节点的选项，只显示对应分支的物体"
+    bl_options = {"REGISTER"}
+
+    _RESULT_NODE_TYPES = {
+        "SSMTNode_Result_Output",
+        "SSMTNode_Result_Output_NTMIModImp",
+    }
+
+    node_name: bpy.props.StringProperty()
+
+    @staticmethod
+    def _node_visit_key(node) -> str:
+        tree_name = node.id_data.name if hasattr(node, "id_data") and node.id_data else ""
+        node_name = getattr(node, "name", "")
+        return f"{tree_name}::{node_name}"
+
+    @staticmethod
+    def _append_object_by_name(objects_to_show, obj_name):
+        obj_name = str(obj_name or "").strip()
+        if not obj_name:
+            return
+        obj = bpy.data.objects.get(obj_name)
+        if obj:
+            objects_to_show.add(obj)
+
+    @staticmethod
+    def _lookup_node_by_key(node_key):
+        tree_name, _, node_name = str(node_key or "").partition("::")
+        if not tree_name or not node_name:
+            return None
+        tree = bpy.data.node_groups.get(tree_name)
+        if tree is None:
+            return None
+        return tree.nodes.get(node_name)
+
+    @staticmethod
+    def _find_view3d_area(context):
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != "VIEW_3D":
+                    continue
+                region = next((r for r in area.regions if r.type == "WINDOW"), None)
+                return window, area, region
+        return None, None, None
+
+    @staticmethod
+    def _is_local_view_active(area) -> bool:
+        for space in area.spaces:
+            if space.type == "VIEW_3D" and space.local_view:
+                return True
+        return False
+
+    @staticmethod
+    def _build_view3d_override(window, area, region):
+        override = {"window": window, "area": area}
+        if region is not None:
+            override["region"] = region
+        return override
+
+    @staticmethod
+    def _set_node_preview_state(node, *, active, empty_mode, option_index):
+        node.preview_session_active = active
+        node.preview_empty_mode = empty_mode
+        node.preview_option_index = option_index
+
+    def _exit_local_view_if_needed(self, context, view_3d_window, view_3d_area, region):
+        if not self._is_local_view_active(view_3d_area):
+            return
+        override = self._build_view3d_override(view_3d_window, view_3d_area, region)
+        with context.temp_override(**override):
+            bpy.ops.view3d.localview()
+
+    def _capture_hidden_state(self, context, owner_key):
+        global _swap_preview_hidden_state
+
+        state = _swap_preview_hidden_state
+        if state and state.get("owner_key") == owner_key:
+            return
+
+        hidden_states = {}
+        for obj in context.view_layer.objects:
+            try:
+                hidden_states[obj.name] = bool(obj.hide_get())
+            except Exception:
+                hidden_states[obj.name] = False
+
+        _swap_preview_hidden_state = {
+            "owner_key": owner_key,
+            "hidden_states": hidden_states,
+        }
+
+    def _restore_hidden_state(self, owner_key=None):
+        global _swap_preview_hidden_state
+
+        state = _swap_preview_hidden_state
+        if not state:
+            return
+        if owner_key is not None and state.get("owner_key") != owner_key:
+            return
+
+        for obj_name, hidden in state.get("hidden_states", {}).items():
+            obj = bpy.data.objects.get(obj_name)
+            if obj is None:
+                continue
+            try:
+                obj.hide_set(hidden)
+            except Exception:
+                continue
+
+        _swap_preview_hidden_state = None
+
+    def _clear_foreign_preview_session(self, context, current_owner_key, view_3d_window, view_3d_area, region):
+        global _swap_preview_session_owner
+
+        owner_key = _swap_preview_session_owner
+        if not owner_key or owner_key == current_owner_key:
+            return
+
+        owner_node = self._lookup_node_by_key(owner_key)
+        if owner_node is not None:
+            self._set_node_preview_state(owner_node, active=False, empty_mode=False, option_index=-1)
+
+        try:
+            self._exit_local_view_if_needed(context, view_3d_window, view_3d_area, region)
+        except Exception:
+            pass
+
+        self._restore_hidden_state(owner_key=owner_key)
+        _swap_preview_session_owner = None
+
+    def _enter_empty_preview(self, context, owner_key, node, target_option_index, view_3d_window, view_3d_area, region):
+        global _swap_preview_session_owner
+
+        self._capture_hidden_state(context, owner_key)
+        self._exit_local_view_if_needed(context, view_3d_window, view_3d_area, region)
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+
+        for selected_obj in context.selected_objects:
+            selected_obj.select_set(False)
+
+        for obj in context.view_layer.objects:
+            try:
+                obj.hide_set(True)
+            except Exception:
+                continue
+
+        self._set_node_preview_state(node, active=True, empty_mode=True, option_index=target_option_index)
+        _swap_preview_session_owner = owner_key
+        self.report({"INFO"}, f"正在预览选项 {target_option_index}（空）")
+        return {"FINISHED"}
+
+    def _enter_object_preview(self, context, owner_key, node, target_option_index, objects_to_show, view_3d_window, view_3d_area, region):
+        global _swap_preview_session_owner
+
+        if bool(getattr(node, "preview_empty_mode", False)):
+            self._restore_hidden_state(owner_key=owner_key)
+        self._capture_hidden_state(context, owner_key)
+
+        self._exit_local_view_if_needed(context, view_3d_window, view_3d_area, region)
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+
+        for selected_obj in context.selected_objects:
+            selected_obj.select_set(False)
+
+        active_obj = None
+        for obj in objects_to_show:
+            try:
+                obj.hide_set(False)
+            except Exception:
+                pass
+            obj.select_set(True)
+            if active_obj is None:
+                active_obj = obj
+
+        if active_obj is not None:
+            try:
+                context.view_layer.objects.active = active_obj
+            except Exception:
+                pass
+
+        override = self._build_view3d_override(view_3d_window, view_3d_area, region)
+        with context.temp_override(**override):
+            bpy.ops.view3d.localview()
+            bpy.ops.view3d.view_axis(type="FRONT")
+            bpy.ops.view3d.view_selected()
+            if view_3d_area.spaces.active:
+                view_3d_area.spaces.active.shading.type = "SOLID"
+
+        self._set_node_preview_state(node, active=True, empty_mode=False, option_index=target_option_index)
+        _swap_preview_session_owner = owner_key
+        self.report({"INFO"}, f"正在预览选项 {target_option_index}")
+        return {"FINISHED"}
+
+    def _finish_preview_session(self, context, owner_key, node, view_3d_window, view_3d_area, region):
+        global _swap_preview_session_owner
+
+        self._exit_local_view_if_needed(context, view_3d_window, view_3d_area, region)
+        self._restore_hidden_state(owner_key=owner_key)
+        self._set_node_preview_state(node, active=False, empty_mode=False, option_index=-1)
+        _swap_preview_session_owner = None
+        self.report({"INFO"}, "已退出切换预览")
+        return {"FINISHED"}
+
+    def _resolve_nested_swap_option_index(self, node) -> int:
+        option_count = max(1, int(getattr(node, "input_slot_count", 1) or 1))
+        preview_index = int(getattr(node, "preview_option_index", -1))
+        if 0 <= preview_index < option_count:
+            return preview_index
+        return 0
+
+    @staticmethod
+    def _get_preview_effective_object_name(node) -> str:
+        try:
+            return ObjectPrefixHelper.build_virtual_object_name_for_node(node, strict=True)
+        except Exception:
+            return str(getattr(node, "object_name", "") or "")
+
+    @staticmethod
+    def _passes_rename_filters(candidate_name: str, rename_nodes_on_path) -> bool:
+        current_name = str(candidate_name or "")
+        if not current_name or not rename_nodes_on_path:
+            return bool(current_name)
+
+        try:
+            from .node_rename import SSMTNode_Object_Rename
+        except ImportError:
+            return True
+
+        for rename_node in reversed(tuple(rename_nodes_on_path)):
+            new_name, was_modified, _history, _signature = SSMTNode_Object_Rename.apply_to_object_name(
+                current_name,
+                rename_node,
+            )
+            if getattr(rename_node, "filter_objects", False) and not was_modified:
+                return False
+            if was_modified:
+                current_name = new_name
+
+        return True
+
+    def _append_object_info_preview_object(self, node, objects_to_show, rename_nodes_on_path):
+        effective_name = self._get_preview_effective_object_name(node)
+        if not self._passes_rename_filters(effective_name, rename_nodes_on_path):
+            return
+        self._append_object_by_name(objects_to_show, getattr(node, "object_name", ""))
+
+    def _append_multifile_preview_objects(self, node, objects_to_show, rename_nodes_on_path):
+        for item in getattr(node, "object_list", []):
+            object_name = str(getattr(item, "object_name", "") or "")
+            if not self._passes_rename_filters(object_name, rename_nodes_on_path):
+                continue
+            self._append_object_by_name(objects_to_show, object_name)
+
+    def _collect_objects_for_swap_option(
+        self,
+        swap_node,
+        option_index,
+        objects_to_show,
+        visited_nodes,
+        visited_blueprints,
+        rename_nodes_on_path=(),
+    ):
+        if option_index < 0 or option_index >= len(getattr(swap_node, "inputs", [])):
+            return
+
+        option_input = swap_node.inputs[option_index]
+        if not option_input.is_linked:
+            return
+
+        for link in option_input.links:
+            from_node = getattr(link, "from_node", None)
+            if from_node is not None:
+                self._collect_preview_objects(
+                    from_node,
+                    objects_to_show,
+                    visited_nodes,
+                    visited_blueprints,
+                    rename_nodes_on_path=rename_nodes_on_path,
+                )
+
+    def _collect_preview_objects(
+        self,
+        current_node,
+        objects_to_show,
+        visited_nodes,
+        visited_blueprints,
+        rename_nodes_on_path=(),
+    ):
+        node_key = self._node_visit_key(current_node)
+        if node_key in visited_nodes:
+            return
+        visited_nodes.add(node_key)
+
+        node_type = getattr(current_node, "bl_idname", "")
+        if node_type == "SSMTNode_Object_Info":
+            self._append_object_info_preview_object(current_node, objects_to_show, rename_nodes_on_path)
+        elif node_type == "SSMTNode_MultiFile_Export":
+            self._append_multifile_preview_objects(current_node, objects_to_show, rename_nodes_on_path)
+        elif node_type == "SSMTNode_Object_Rename":
+            rename_nodes_on_path = tuple(rename_nodes_on_path) + (current_node,)
+        elif node_type == "SSMTNode_Blueprint_Nest":
+            nested_tree_name = str(getattr(current_node, "blueprint_name", "") or "").strip()
+            if nested_tree_name and nested_tree_name != "NONE" and nested_tree_name not in visited_blueprints:
+                nested_tree = bpy.data.node_groups.get(nested_tree_name)
+                if nested_tree and getattr(nested_tree, "bl_idname", "") == "SSMTBlueprintTreeType":
+                    visited_blueprints.add(nested_tree_name)
+                    for nested_node in nested_tree.nodes:
+                        if getattr(nested_node, "bl_idname", "") in self._RESULT_NODE_TYPES:
+                            self._collect_preview_objects(
+                                nested_node,
+                                objects_to_show,
+                                visited_nodes,
+                                visited_blueprints,
+                                rename_nodes_on_path=rename_nodes_on_path,
+                            )
+        elif node_type == "SSMTNode_ObjectSwap":
+            nested_option_index = self._resolve_nested_swap_option_index(current_node)
+            self._collect_objects_for_swap_option(
+                current_node,
+                nested_option_index,
+                objects_to_show,
+                visited_nodes,
+                visited_blueprints,
+                rename_nodes_on_path=rename_nodes_on_path,
+            )
+            return
+
+        if hasattr(current_node, "inputs"):
+            for input_socket in current_node.inputs:
+                if not input_socket.is_linked:
+                    continue
+                for link in input_socket.links:
+                    from_node = getattr(link, "from_node", None)
+                    if from_node is not None:
+                        self._collect_preview_objects(
+                            from_node,
+                            objects_to_show,
+                            visited_nodes,
+                            visited_blueprints,
+                            rename_nodes_on_path=rename_nodes_on_path,
+                        )
+
+    def execute(self, context):
+        tree = getattr(context.space_data, "edit_tree", None) or getattr(context.space_data, "node_tree", None)
+        if not tree:
+            return {"CANCELLED"}
+
+        node = tree.nodes.get(self.node_name)
+        if not node or node.bl_idname != "SSMTNode_ObjectSwap":
+            return {"CANCELLED"}
+
+        view_3d_window, view_3d_area, region = self._find_view3d_area(context)
+        if not view_3d_area:
+            self.report({"WARNING"}, "No 3D View found")
+            return {"CANCELLED"}
+
+        owner_key = self._node_visit_key(node)
+        self._clear_foreign_preview_session(context, owner_key, view_3d_window, view_3d_area, region)
+
+        option_count = max(1, int(getattr(node, "input_slot_count", len(node.inputs) or 1) or 1))
+        session_active = bool(getattr(node, "preview_session_active", False))
+        current_preview_index = int(getattr(node, "preview_option_index", -1))
+        if current_preview_index < -1 or current_preview_index >= option_count:
+            current_preview_index = -1
+
+        if session_active and current_preview_index >= option_count - 1:
+            return self._finish_preview_session(
+                context,
+                owner_key,
+                node,
+                view_3d_window,
+                view_3d_area,
+                region,
+            )
+
+        target_option_index = 0 if not session_active else current_preview_index + 1
+
+        objects_to_show = set()
+        visited_nodes = set()
+        visited_blueprints = set()
+        self._collect_objects_for_swap_option(
+            node,
+            target_option_index,
+            objects_to_show,
+            visited_nodes,
+            visited_blueprints,
+        )
+
+        if not objects_to_show:
+            try:
+                return self._enter_empty_preview(
+                    context,
+                    owner_key,
+                    node,
+                    target_option_index,
+                    view_3d_window,
+                    view_3d_area,
+                    region,
+                )
+            except Exception as exc:
+                self.report({"WARNING"}, f"空选项预览失败: {exc}")
+                return {"CANCELLED"}
+
+        try:
+            return self._enter_object_preview(
+                context,
+                owner_key,
+                node,
+                target_option_index,
+                objects_to_show,
+                view_3d_window,
+                view_3d_area,
+                region,
+            )
+        except Exception as exc:
+            self.report({"WARNING"}, f"预览视图设置失败: {exc}")
+            return {"CANCELLED"}
+
+
 class ObjectSwapDebugger:
     @staticmethod
     def _get_node_unique_key(node) -> str:
@@ -367,6 +849,7 @@ classes = (
     SSMTNode_ObjectSwap,
     SSMT_OT_AddSwapOption,
     SSMT_OT_RemoveSwapOption,
+    SSMT_OT_CycleSwapPreview,
 )
 
 

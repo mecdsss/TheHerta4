@@ -61,34 +61,32 @@ class ChainTraverser:
         self._duplicate_counter: Dict[str, int] = {}
 
     def traverse_all_chains(self, tree: bpy.types.NodeTree, output_node: bpy.types.Node) -> List[ProcessingChain]:
-        object_info_nodes = []
-
-        for node in BlueprintExportHelper.get_nodes_from_bl_idname(tree, _NODE_TYPE_OBJECT_INFO):
-            if not node.mute and BlueprintExportHelper._is_node_connected_to_output(tree, node):
-                object_info_nodes.append(node)
-
-        nest_object_info_nodes = self._collect_nested_object_info_nodes()
-        object_info_nodes.extend(nest_object_info_nodes)
-
-        multi_file_export_nodes = BlueprintExportHelper.get_nodes_from_bl_idname(tree, _NODE_TYPE_MULTI_FILE_EXPORT)
-        for node in multi_file_export_nodes:
-            if not node.mute and BlueprintExportHelper._is_node_connected_to_output(tree, node):
-                object_info_nodes.append(node)
+        ordered_start_nodes = BlueprintExportHelper.collect_connected_start_nodes(tree)
+        object_info_nodes = ordered_start_nodes
+        multi_file_export_nodes = [
+            node for node in ordered_start_nodes
+            if getattr(node, "id_data", None) == tree and node.bl_idname == _NODE_TYPE_MULTI_FILE_EXPORT
+        ]
 
         nested_counts = {}
-        nested_mf_count = 0
-        for n_oi in nest_object_info_nodes:
-            n_tree = n_oi.id_data
-            tree_name = n_tree.name
+        main_oi_count = 0
+        main_mf_count = 0
+        for start_node in ordered_start_nodes:
+            node_tree = getattr(start_node, "id_data", None)
+            if node_tree is None:
+                continue
+            if node_tree == tree:
+                if start_node.bl_idname == _NODE_TYPE_OBJECT_INFO:
+                    main_oi_count += 1
+                elif start_node.bl_idname == _NODE_TYPE_MULTI_FILE_EXPORT:
+                    main_mf_count += 1
+                continue
+            tree_name = node_tree.name
             if tree_name not in nested_counts:
                 nested_counts[tree_name] = 0
             nested_counts[tree_name] += 1
-            if n_oi.bl_idname == _NODE_TYPE_MULTI_FILE_EXPORT:
-                nested_mf_count += 1
 
         nested_info = ", ".join([f"{name}({count}个)" for name, count in nested_counts.items()])
-        multi_file_count = len(multi_file_export_nodes) + nested_mf_count
-        main_oi_count = len(object_info_nodes) - len(nest_object_info_nodes) - len(multi_file_export_nodes)
         if nested_info:
             LOG.info(f"🔄 正向解析: 主蓝图 {tree.name}({main_oi_count}个Object_Info, {len(multi_file_export_nodes)}个MultiFile_Export), 嵌套蓝图 {nested_info}")
         else:

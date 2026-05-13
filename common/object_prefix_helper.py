@@ -1,3 +1,4 @@
+import os
 import re
 
 import bpy
@@ -15,6 +16,14 @@ _LOD_PREFIX_PATTERN = re.compile(r"^(LOD\d+)\.(.+)$", re.IGNORECASE)
 
 
 class ObjectPrefixHelper:
+    @staticmethod
+    def _compose_lod_prefix(lod_name: str, bare_prefix: str) -> str:
+        normalized_lod_name = (lod_name or "").strip()
+        normalized_bare_prefix = (bare_prefix or "").strip()
+        if normalized_lod_name and normalized_bare_prefix:
+            return normalized_lod_name + "." + normalized_bare_prefix
+        return normalized_bare_prefix
+
     @staticmethod
     def normalize_prefix(prefix: str) -> str:
         return (prefix or "").strip().strip("-_. ")
@@ -50,7 +59,10 @@ class ObjectPrefixHelper:
 
     @classmethod
     def _extract_hyphen_prefix(cls, object_name: str):
-        parts = [part.strip() for part in object_name.split("-") if part.strip()]
+        clean_name = (object_name or "").strip()
+        name_without_suffix, _blender_suffix = cls._strip_blender_suffix(clean_name)
+        prefix_candidate = name_without_suffix.split(".", 1)[0]
+        parts = [part.strip() for part in prefix_candidate.split("-") if part.strip()]
         if len(parts) < 2:
             return None
         if not _PREFIX_START_PATTERN.fullmatch(parts[0]):
@@ -63,6 +75,91 @@ class ObjectPrefixHelper:
             prefix_parts.append(part)
 
         return "-".join(prefix_parts), "-"
+
+    @classmethod
+    def _get_workspace_unique_str_from_object(cls, object_name: str) -> str:
+        try:
+            obj = bpy.data.objects.get(object_name)
+        except Exception:
+            obj = None
+
+        if obj is None:
+            return ""
+
+        return cls.normalize_prefix(str(obj.get("3DMigoto:WorkspaceUniqueStr", "") or ""))
+
+    @classmethod
+    def _resolve_incomplete_prefix_from_workspace(cls, object_name: str, lod_name: str, prefix_candidate: str) -> str:
+        clean_prefix = cls.normalize_prefix(prefix_candidate)
+        if not clean_prefix:
+            return clean_prefix
+
+        prefix_parts = cls.parse_prefix_parts(clean_prefix)
+        draw_ib = str(prefix_parts.get("draw_ib", "") or "").strip()
+        index_count = str(prefix_parts.get("index_count", "") or "").strip()
+        first_index = str(prefix_parts.get("first_index", "") or "").strip()
+        if not draw_ib or not index_count or first_index:
+            return clean_prefix
+
+        workspace_unique_str = cls._get_workspace_unique_str_from_object(object_name)
+        if workspace_unique_str:
+            workspace_lod_name, workspace_bare_unique_str = cls.split_lod_prefix(workspace_unique_str)
+            workspace_parts = cls.parse_prefix_parts(workspace_unique_str)
+            if (
+                str(workspace_parts.get("draw_ib", "") or "").strip() == draw_ib
+                and str(workspace_parts.get("index_count", "") or "").strip() == index_count
+                and str(workspace_parts.get("first_index", "") or "").strip()
+                and (not lod_name or not workspace_lod_name or workspace_lod_name == lod_name)
+            ):
+                return workspace_bare_unique_str
+
+        try:
+            from .global_config import GlobalConfig
+            from .workspace_helper import WorkSpaceHelper
+        except Exception:
+            return clean_prefix
+
+        workspace_folder = str(GlobalConfig.path_workspace_folder() or "").strip()
+        if not workspace_folder:
+            return clean_prefix
+
+        candidate_base_paths = [workspace_folder, *WorkSpaceHelper.get_workspace_partition_folderpath_list()]
+        matched_prefixes = []
+
+        for base_path in candidate_base_paths:
+            search_roots = []
+            if lod_name:
+                search_roots.append(os.path.join(base_path, lod_name))
+            search_roots.append(base_path)
+
+            for search_root in search_roots:
+                if not os.path.isdir(search_root):
+                    continue
+
+                for submesh_folder_path in WorkSpaceHelper._get_submesh_folderpath_list_from(search_root):
+                    folder_name = os.path.basename(submesh_folder_path)
+                    folder_lod_name, folder_bare_name = cls.split_lod_prefix(folder_name)
+                    if lod_name and folder_lod_name and folder_lod_name != lod_name:
+                        continue
+
+                    folder_prefix = cls.normalize_prefix(folder_bare_name.split(".", 1)[0])
+                    folder_parts = cls.parse_prefix_parts(folder_prefix)
+                    if (
+                        str(folder_parts.get("draw_ib", "") or "").strip() != draw_ib
+                        or str(folder_parts.get("index_count", "") or "").strip() != index_count
+                        or not str(folder_parts.get("first_index", "") or "").strip()
+                    ):
+                        continue
+
+                    resolved_prefix = cls._compose_lod_prefix(lod_name or folder_lod_name, folder_prefix)
+                    if resolved_prefix not in matched_prefixes:
+                        matched_prefixes.append(resolved_prefix)
+
+        if len(matched_prefixes) != 1:
+            return clean_prefix
+
+        _resolved_lod_name, resolved_bare_prefix = cls.split_lod_prefix(matched_prefixes[0])
+        return resolved_bare_prefix
 
     @classmethod
     def extract_prefix_info(cls, object_name: str):
@@ -82,6 +179,7 @@ class ObjectPrefixHelper:
 
         if "." in bare_name:
             prefix = cls.normalize_prefix(bare_name.split(".", 1)[0])
+            prefix = cls._resolve_incomplete_prefix_from_workspace(clean_name, lod_name, prefix)
             if cls._is_structured_prefix(prefix):
                 return with_lod(prefix, ".")
 
@@ -102,6 +200,7 @@ class ObjectPrefixHelper:
             return None
 
         prefix, _separator = parsed
+        prefix = cls._resolve_incomplete_prefix_from_workspace(clean_name, lod_name, prefix)
         if cls.normalize_prefix(bare_name) == prefix:
             return with_lod(prefix, ".")
         return with_lod(prefix, "-")
@@ -246,9 +345,16 @@ class ObjectPrefixHelper:
 
         if prefix:
             for obj in bpy.data.objects:
-                if obj.name == object_name:
-                    return obj.name
-                if cls.has_prefix(obj.name, prefix):
-                    return obj.name
+                if obj is None:
+                    continue
+                try:
+                    current_name = obj.name
+                except (AttributeError, ReferenceError):
+                    continue
+
+                if current_name == object_name:
+                    return current_name
+                if cls.has_prefix(current_name, prefix):
+                    return current_name
 
         return object_name

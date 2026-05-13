@@ -13,6 +13,8 @@ def _get_node_unique_key(node) -> str:
 
 class BlueprintExportHelper:
 
+    DEFAULT_RESULT_OUTPUT_NODE_TYPE = 'SSMTNode_Result_Output'
+
     current_export_index = 1
 
     max_export_count = 1
@@ -92,7 +94,8 @@ class BlueprintExportHelper:
         preferred = BlueprintExportHelper.runtime_result_output_node_type
         if preferred:
             yield preferred
-        yield 'SSMTNode_Result_Output'
+        if preferred != BlueprintExportHelper.DEFAULT_RESULT_OUTPUT_NODE_TYPE:
+            yield BlueprintExportHelper.DEFAULT_RESULT_OUTPUT_NODE_TYPE
 
     @staticmethod
     def is_result_output_node(node) -> bool:
@@ -354,6 +357,94 @@ class BlueprintExportHelper:
         return BlueprintExportHelper.get_blueprint_tree_by_name(preferred_name)
 
     @staticmethod
+    def _iter_ordered_object_input_sources(node):
+        if not node:
+            return
+
+        for input_socket in getattr(node, "inputs", []):
+            if getattr(input_socket, "bl_idname", "") != 'SSMTSocketObject':
+                continue
+            if not input_socket.is_linked:
+                continue
+            for link in input_socket.links:
+                source_node = getattr(link, "from_node", None)
+                if source_node and source_node != node:
+                    yield source_node
+
+    @staticmethod
+    def _collect_ordered_start_nodes_from_tree(tree, ordered_nodes, emitted_node_keys, visited_trees):
+        if not BlueprintExportHelper._is_valid_blueprint_tree(tree):
+            return
+        if tree.name in visited_trees:
+            return
+        visited_trees.add(tree.name)
+
+        output_node = BlueprintExportHelper.get_result_output_node(tree)
+        if not output_node:
+            return
+
+        visiting_node_keys = set()
+
+        def append_start_node(start_node):
+            node_key = _get_node_unique_key(start_node)
+            if node_key in emitted_node_keys:
+                return
+            emitted_node_keys.add(node_key)
+            ordered_nodes.append(start_node)
+
+        def walk_node(current_node):
+            if not current_node:
+                return
+
+            node_key = _get_node_unique_key(current_node)
+            if node_key in visiting_node_keys:
+                return
+
+            visiting_node_keys.add(node_key)
+            try:
+                node_type = getattr(current_node, "bl_idname", "")
+
+                if node_type == 'SSMTNode_Blueprint_Nest':
+                    if getattr(current_node, "mute", False):
+                        return
+
+                    nested_tree_name = str(getattr(current_node, "blueprint_name", "") or "").strip()
+                    if not nested_tree_name or nested_tree_name == 'NONE':
+                        return
+
+                    nested_tree = bpy.data.node_groups.get(nested_tree_name)
+                    BlueprintExportHelper._collect_ordered_start_nodes_from_tree(
+                        nested_tree,
+                        ordered_nodes=ordered_nodes,
+                        emitted_node_keys=emitted_node_keys,
+                        visited_trees=visited_trees,
+                    )
+                    return
+
+                if node_type in {'SSMTNode_Object_Info', 'SSMTNode_MultiFile_Export'}:
+                    if not getattr(current_node, "mute", False):
+                        append_start_node(current_node)
+                    return
+
+                for source_node in BlueprintExportHelper._iter_ordered_object_input_sources(current_node):
+                    walk_node(source_node)
+            finally:
+                visiting_node_keys.remove(node_key)
+
+        walk_node(output_node)
+
+    @staticmethod
+    def collect_connected_start_nodes(tree):
+        ordered_nodes = []
+        BlueprintExportHelper._collect_ordered_start_nodes_from_tree(
+            tree,
+            ordered_nodes=ordered_nodes,
+            emitted_node_keys=set(),
+            visited_trees=set(),
+        )
+        return ordered_nodes
+
+    @staticmethod
     def collect_connected_object_names(tree) -> list[str]:
         if not tree:
             return []
@@ -361,7 +452,6 @@ class BlueprintExportHelper:
         # 这里只收集真正连到输出的物体，避免断开的节点或历史副本混入前处理。
         object_names = []
         seen_names = set()
-        visited_trees = set()
 
         def append_name(candidate_name: str):
             if not candidate_name or candidate_name in seen_names:
@@ -369,48 +459,18 @@ class BlueprintExportHelper:
             seen_names.add(candidate_name)
             object_names.append(candidate_name)
 
-        def collect_from_tree(current_tree):
-            if not BlueprintExportHelper._is_valid_blueprint_tree(current_tree):
-                return
-            if current_tree.name in visited_trees:
-                return
-            visited_trees.add(current_tree.name)
+        for node in BlueprintExportHelper.collect_connected_start_nodes(tree):
+            if node.bl_idname == 'SSMTNode_Object_Info':
+                obj_name = ObjectPrefixHelper.build_virtual_object_name_for_node(node, strict=True)
+                if not obj_name:
+                    obj_name = getattr(node, 'object_name', '')
+                append_name(obj_name)
+                continue
 
-            output_node = BlueprintExportHelper.get_node_from_bl_idname(
-                current_tree,
-                'SSMTNode_Result_Output',
-            )
+            if node.bl_idname == 'SSMTNode_MultiFile_Export':
+                for item in getattr(node, 'object_list', []):
+                    append_name(getattr(item, 'object_name', ''))
 
-            for node in current_tree.nodes:
-                if getattr(node, "mute", False):
-                    continue
-
-                if (
-                    output_node
-                    and not BlueprintExportHelper._is_node_connected_to_output(current_tree, node)
-                ):
-                    continue
-
-                if node.bl_idname == 'SSMTNode_Object_Info':
-                    obj_name = ObjectPrefixHelper.build_virtual_object_name_for_node(node, strict=True)
-                    if not obj_name:
-                        obj_name = getattr(node, 'object_name', '')
-                    append_name(obj_name)
-                    continue
-
-                if node.bl_idname == 'SSMTNode_MultiFile_Export':
-                    for item in getattr(node, 'object_list', []):
-                        append_name(getattr(item, 'object_name', ''))
-                    continue
-
-                if node.bl_idname == 'SSMTNode_Blueprint_Nest':
-                    nested_tree_name = getattr(node, 'blueprint_name', '')
-                    if not nested_tree_name or nested_tree_name == 'NONE':
-                        continue
-                    nested_tree = bpy.data.node_groups.get(nested_tree_name)
-                    collect_from_tree(nested_tree)
-
-        collect_from_tree(tree)
         return object_names
 
     @staticmethod
@@ -446,7 +506,7 @@ class BlueprintExportHelper:
     def get_node_from_bl_idname(tree, node_type:str):
         if not tree:
             return None
-        if node_type == 'SSMTNode_Result_Output':
+        if node_type == BlueprintExportHelper.DEFAULT_RESULT_OUTPUT_NODE_TYPE:
             for result_node_type in BlueprintExportHelper.iter_result_output_node_types():
                 for node in tree.nodes:
                     if node.bl_idname == result_node_type:
@@ -456,6 +516,13 @@ class BlueprintExportHelper:
             if node.bl_idname == node_type:
                 return node
         return None
+
+    @staticmethod
+    def get_result_output_node(tree):
+        return BlueprintExportHelper.get_node_from_bl_idname(
+            tree,
+            BlueprintExportHelper.DEFAULT_RESULT_OUTPUT_NODE_TYPE,
+        )
 
     @staticmethod
     def get_nodes_from_bl_idname(tree, node_type:str):
@@ -1248,10 +1315,11 @@ class BlueprintExportHelper:
                         seen.add(candidate_name)
                         yield candidate_name
 
-        def get_visible_shapekey_info(obj_name):
+        def get_shapekey_info(obj_name):
             obj = bpy.data.objects.get(obj_name)
-            if not obj or not obj.data or obj.hide_get():
+            if not obj or not obj.data:
                 return None
+            # Export participation comes from the blueprint chain, not viewport visibility.
             slot_limit = BlueprintExportHelper.max_shapekey_slot_count or None
             shapekey_info = [
                 (slot_index, shape_key_name)
@@ -1321,7 +1389,7 @@ class BlueprintExportHelper:
                     if not variant_name or variant_name in seen:
                         continue
                     seen.add(variant_name)
-                    shapekey_info = get_visible_shapekey_info(variant_name)
+                    shapekey_info = get_shapekey_info(variant_name)
                     if shapekey_info:
                         return variant_name, shapekey_info
 
@@ -1437,7 +1505,7 @@ class BlueprintExportHelper:
 
                 for candidate_name in source_candidates:
                     for variant_name in iter_name_variants(candidate_name):
-                        if get_visible_shapekey_info(variant_name):
+                        if get_shapekey_info(variant_name):
                             true_original_name = variant_name
                             break
                     if true_original_name:
@@ -1476,7 +1544,7 @@ class BlueprintExportHelper:
                         shapekey_status = "无形态键"
                 print(f"[ShapeKeyExport] 检查原始物体 '{original_obj_name}': {obj_status}, {hide_status}, {shapekey_status}")
                 
-                shapekey_info = get_visible_shapekey_info(original_obj_name)
+                shapekey_info = get_shapekey_info(original_obj_name)
                 if shapekey_info:
                     original_to_shapekeys[original_obj_name] = shapekey_info
                     print(f"[ShapeKeyExport]   从原始物体获取形态键: {shapekey_info}")
@@ -1485,7 +1553,7 @@ class BlueprintExportHelper:
                 for derived_name in original_to_derived[original_obj_name]:
                     if derived_name == original_obj_name:
                         continue
-                    shapekey_info = get_visible_shapekey_info(derived_name)
+                    shapekey_info = get_shapekey_info(derived_name)
                     if shapekey_info:
                         original_to_shapekeys[original_obj_name] = shapekey_info
                         print(f"[ShapeKeyExport] 从衍生物体 '{derived_name}' 获取形态键信息")
@@ -1501,8 +1569,6 @@ class BlueprintExportHelper:
             for obj_name in BlueprintExportHelper.shapekey_objects:
                 obj = bpy.data.objects.get(obj_name)
                 if not obj or not obj.data:
-                    continue
-                if obj.hide_viewport or obj.hide_render or obj.hide_get():
                     continue
                 slot_limit = BlueprintExportHelper.max_shapekey_slot_count or None
                 for slot_index, shape_key_name, _key_block in BlueprintExportHelper.get_exportable_shape_key_infos(obj, slot_limit=slot_limit):

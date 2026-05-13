@@ -804,7 +804,15 @@ class DirectShapeKeySamplingMixin:
         preferred_matches = []
         fallback_matches = []
         for obj in bpy.data.objects:
-            obj_alias = self.node._extract_alias_from_name(obj.name or "")
+            if obj is None:
+                continue
+            try:
+                obj_name = obj.name or ""
+                obj_data = obj.data
+            except (AttributeError, ReferenceError):
+                continue
+
+            obj_alias = self.node._extract_alias_from_name(obj_name)
             obj_alias_candidates = {
                 obj_alias.casefold(),
                 self.node._strip_runtime_copy_suffix(obj_alias).casefold(),
@@ -813,10 +821,10 @@ class DirectShapeKeySamplingMixin:
             if alias_candidates.isdisjoint(obj_alias_candidates):
                 continue
 
-            if getattr(getattr(obj.data, "shape_keys", None), "key_blocks", None):
-                preferred_matches.append(obj.name)
+            if getattr(getattr(obj_data, "shape_keys", None), "key_blocks", None):
+                preferred_matches.append(obj_name)
             else:
-                fallback_matches.append(obj.name)
+                fallback_matches.append(obj_name)
 
         if preferred_matches:
             return preferred_matches[0]

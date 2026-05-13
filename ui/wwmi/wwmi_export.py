@@ -9,21 +9,33 @@ from ...common.m_ini_builder import M_IniBuilder, M_IniSection, M_SectionType
 from ...common.global_key_count_helper import GlobalKeyCountHelper
 from ...common.m_ini_helper import M_IniHelper
 from ...common.m_ini_helper_gui import M_IniHelperGUI
-from ...common.object_prefix_helper import ObjectPrefixHelper
 from ...utils.timer_utils import TimerUtils
 
 
-def _get_component_index_from_name(component_tmp_obj_name: str) -> int:
-    prefix_info = ObjectPrefixHelper.extract_prefix_info(component_tmp_obj_name)
-    prefix = prefix_info[0] if prefix_info else component_tmp_obj_name
-    component = ObjectPrefixHelper.parse_prefix_parts(prefix).get("component", "")
-    if str(component).isdigit():
-        return int(component) - 1
+def _get_component_index(draw_ib_model: DrawIBModelWWMI, component_tmp_obj_name: str, fallback_index: int) -> int:
+    component_index = getattr(draw_ib_model, "component_object_index_dict", {}).get(component_tmp_obj_name)
+    if component_index is not None:
+        return int(component_index)
+    return int(fallback_index)
 
-    parts = str(component_tmp_obj_name or "").split("-")
-    if len(parts) >= 2 and parts[1].isdigit():
-        return int(parts[1]) - 1
-    return 0
+
+def _iter_blend_remap_components(draw_ib_model: DrawIBModelWWMI):
+    for fallback_index, (component_tmp_obj_name, use_remap) in enumerate(draw_ib_model.blend_remap_used.items()):
+        component_count = _get_component_index(draw_ib_model, component_tmp_obj_name, fallback_index)
+        yield component_tmp_obj_name, use_remap, component_count
+
+
+def _get_component_vg_count(draw_ib_model: DrawIBModelWWMI, component_tmp_obj_name: str, component_count: int) -> int:
+    vg_count = getattr(draw_ib_model, "component_real_vg_count_dict", {}).get(component_count)
+    if vg_count is None:
+        raise ValueError(
+            "WWMI BlendRemap 组件映射缺失: "
+            f"component='{component_tmp_obj_name}', "
+            f"component_index={component_count}, "
+            f"known_components={getattr(draw_ib_model, 'component_object_index_dict', {})}, "
+            f"known_vg_counts={getattr(draw_ib_model, 'component_real_vg_count_dict', {})}"
+        )
+    return int(vg_count)
 
 
 class ExportWWMI:
@@ -134,10 +146,9 @@ class ExportWWMI:
             blend_remap_section.append("[ResourceExtraRemappedSkeletonRW]")
             blend_remap_section.new_line()
 
-            for component_tmp_obj_name, use_remap in draw_ib_model.blend_remap_used.items():
+            for component_tmp_obj_name, use_remap, component_count in _iter_blend_remap_components(draw_ib_model):
                 if not use_remap:
                     continue
-                component_count = _get_component_index_from_name(component_tmp_obj_name)
                 blend_remap_section.append("[ResourceRemappedBlendBufferComponent" + str(component_count) + "]")
                 blend_remap_section.append("[ResourceRemappedSkeletonComponent" + str(component_count) + "]")
                 blend_remap_section.append("[ResourceExtraRemappedSkeletonComponent" + str(component_count) + "]")
@@ -157,10 +168,9 @@ class ExportWWMI:
                 blend_remap_section.append("  cs-t35 = ref ResourceBlendRemapVertexVGBuffer")
 
                 blend_remap_id = 0
-                for component_tmp_obj_name, use_remap in draw_ib_model.blend_remap_used.items():
+                for component_tmp_obj_name, use_remap, component_count in _iter_blend_remap_components(draw_ib_model):
                     if not use_remap:
                         continue
-                    component_count = _get_component_index_from_name(component_tmp_obj_name)
                     component_count_str = str(component_count)
                     blend_remap_section.append("    $\\WWMIv1\\blend_remap_id = " + str(blend_remap_id))
                     blend_remap_section.append("    ResourceRemappedBlendBufferRW = copy ResourceBlendBufferNoStride")
@@ -184,13 +194,12 @@ class ExportWWMI:
                 blend_remap_section.new_line()
 
                 blend_remap_id = 0
-                for component_tmp_obj_name, use_remap in draw_ib_model.blend_remap_used.items():
+                for component_tmp_obj_name, use_remap, component_count in _iter_blend_remap_components(draw_ib_model):
                     if not use_remap:
                         continue
 
                     blend_remap_section.append("$\\WWMIv1\\blend_remap_id = " + str(blend_remap_id))
-                    component_count = _get_component_index_from_name(component_tmp_obj_name)
-                    vg_count = draw_ib_model.component_real_vg_count_dict[component_count]
+                    vg_count = _get_component_vg_count(draw_ib_model, component_tmp_obj_name, component_count)
                     blend_remap_section.append("$\\WWMIv1\\vg_count = " + str(vg_count))
                     blend_remap_section.append("cs-t38 = ResourceMergedSkeletonRemap")
                     blend_remap_section.append("cs-u5 = ResourceRemappedSkeletonRW")

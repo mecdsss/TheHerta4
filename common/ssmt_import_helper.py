@@ -11,6 +11,18 @@ from ..utils.format_utils import Fatal, FormatUtils
 
 class SSMTImportHelper:
 	@staticmethod
+	def _build_workspace_unique_str_from_json_path(json_file_path:str) -> str:
+		json_dir = os.path.dirname(json_file_path)
+		submesh_dir = os.path.basename(os.path.dirname(json_dir))
+		lod_dir = os.path.basename(os.path.dirname(os.path.dirname(json_dir)))
+
+		workspace_unique_str = submesh_dir
+		if lod_dir.upper().startswith("LOD") and lod_dir[3:].isdigit():
+			workspace_unique_str = lod_dir + "." + workspace_unique_str
+
+		return workspace_unique_str
+
+	@staticmethod
 	def create_mesh_from_json(json_file_path:str, import_collection:bpy.types.Collection | None = None):
 		submesh_json = SubmeshJson(json_file_path)
 
@@ -22,7 +34,7 @@ class SSMTImportHelper:
 		gametypename = submesh_json.WorkGameType
 		wwmi_vg_map = submesh_json.VGMap if (submesh_json.VGMap and GlobalProterties.import_merged_vgmap()) else None
 
-		return MeshCreateHelper.create_mesh_object(
+		obj = MeshCreateHelper.create_mesh_object(
 			mesh_name=mesh_name,
 			source_path=submesh_json.JsonFilePath,
 			logic_name=logic_name,
@@ -43,6 +55,11 @@ class SSMTImportHelper:
 			wwmi_vg_map=wwmi_vg_map,
 			wwmi_vg_offset=submesh_json.VGOffset,
 		)
+		if obj is not None:
+			obj["3DMigoto:WorkspaceUniqueStr"] = SSMTImportHelper._build_workspace_unique_str_from_json_path(json_file_path)
+			obj["3DMigoto:MatchFirstIndex"] = int(submesh_json.JsonDict.get("IndexOffset", 0))
+			obj["3DMigoto:IndexCount"] = int(submesh_json.JsonDict.get("IndexCount", 0))
+		return obj
 
 	@staticmethod
 	def parse_index_buffer(submesh_json:SubmeshJson):

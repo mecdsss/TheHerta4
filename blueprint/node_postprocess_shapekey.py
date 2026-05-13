@@ -112,7 +112,6 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     def _iter_connected_source_object_names(self):
         from .export_helper import BlueprintExportHelper
 
-        visited_trees = set()
         seen_names = set()
 
         def add_name(name):
@@ -122,34 +121,14 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             seen_names.add(clean_name)
             yield clean_name
 
-        def walk_tree(tree):
-            if not tree or tree.name in visited_trees:
-                return
-            visited_trees.add(tree.name)
-
-            output_node = BlueprintExportHelper.get_node_from_bl_idname(tree, "SSMTNode_Result_Output")
-            for node in tree.nodes:
-                if getattr(node, "mute", False):
-                    continue
-                if output_node and not BlueprintExportHelper._is_node_connected_to_output(tree, node):
-                    continue
-
-                if node.bl_idname == "SSMTNode_Object_Info":
-                    for item in add_name(getattr(node, "object_name", "")):
-                        yield item
-                elif node.bl_idname == "SSMTNode_MultiFile_Export":
-                    for obj_item in getattr(node, "object_list", []):
-                        for name in add_name(getattr(obj_item, "object_name", "")):
-                            yield name
-                elif node.bl_idname == "SSMTNode_Blueprint_Nest":
-                    nested_name = getattr(node, "blueprint_name", "")
-                    if not nested_name or nested_name == "NONE":
-                        continue
-                    nested_tree = bpy.data.node_groups.get(nested_name)
-                    if nested_tree and getattr(nested_tree, "bl_idname", "") == "SSMTBlueprintTreeType":
-                        yield from walk_tree(nested_tree)
-
-        yield from walk_tree(self.id_data)
+        for node in BlueprintExportHelper.collect_connected_start_nodes(self.id_data):
+            if node.bl_idname == "SSMTNode_Object_Info":
+                for item in add_name(getattr(node, "object_name", "")):
+                    yield item
+            elif node.bl_idname == "SSMTNode_MultiFile_Export":
+                for obj_item in getattr(node, "object_list", []):
+                    for name in add_name(getattr(obj_item, "object_name", "")):
+                        yield name
 
     def _ensure_shapekey_variable_item(self, shape_key_name: str):
         for item in self.shapekey_variable_items:
