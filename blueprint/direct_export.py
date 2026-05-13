@@ -14,6 +14,7 @@ from .export_parallel import ExportRoundExecutor
 from .model import BluePrintModel
 from .preprocess import PreProcessHelper
 from .preprocess_parallel import ParallelPreprocessCoordinator
+from .sync import refresh_blueprint_sync_state
 from ..ui.universal.efmi import ExportEFMI
 from ..ui.universal.gimi import ExportGIMI
 from ..ui.universal.himi import ExportHIMI
@@ -112,6 +113,9 @@ def sync_shapekey_direct_mode(node, context=None):
     finally:
         _SYNC_GUARD = False
 
+    if not bool(getattr(node, "direct_export_mode", False)):
+        BlueprintExportHelper.reset_direct_export_runtime_state(clear_postprocess_caches=True)
+
 
 def sync_multifile_direct_mode(node, context=None):
     global _SYNC_GUARD
@@ -131,6 +135,9 @@ def sync_multifile_direct_mode(node, context=None):
                 linked_node.direct_export_mode = bool(node.direct_export_mode)
     finally:
         _SYNC_GUARD = False
+
+    if not bool(getattr(node, "direct_export_mode", False)):
+        BlueprintExportHelper.reset_direct_export_runtime_state(clear_postprocess_caches=True)
 
 
 def _build_exporter(blueprint_model):
@@ -526,10 +533,7 @@ class SSMT_OT_GenerateDirectModBlueprint(bpy.types.Operator):
                 self.report({'ERROR'}, "No current blueprint tree found")
                 return {'CANCELLED'}
 
-            BlueprintExportHelper.set_runtime_blueprint_tree(tree)
-
-            session = DirectExportSession(context=context, tree=tree)
-            session.run()
+            execute_direct_export(context=context, tree=tree)
 
             self.report({'INFO'}, "Generate Mod Direct Success!")
             return {'FINISHED'}
@@ -546,6 +550,7 @@ class SSMT_OT_GenerateDirectModBlueprint(bpy.types.Operator):
 
 def execute_direct_export(context, tree):
     BlueprintExportHelper.set_runtime_blueprint_tree(tree)
+    refresh_blueprint_sync_state(tree=tree, context=context, include_all_blueprints=True)
     session = DirectExportSession(context=context, tree=tree)
     session.run()
 

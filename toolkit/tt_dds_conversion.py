@@ -1,299 +1,461 @@
-import bpy
+import json
 import os
-import subprocess
+import re
 import shutil
+import subprocess
 
-TOOLSET_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'Toolset')
+import bpy
+
+TOOLSET_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "Toolset")
 
 DDS_DEFAULT_RULES = [
-    {"pattern": r"(?i)(diffuse|albedo|color|base)", "format": "bc7_unorm_srgb", "enabled": True},
-    {"pattern": r"(?i)(normal|nrm|norm)", "format": "r8g8b8a8_unorm", "enabled": True},
-    {"pattern": r"(?i)(roughness|rough|rm)", "format": "bc7_unorm", "enabled": True},
-    {"pattern": r"(?i)(metallic|metal)", "format": "bc7_unorm", "enabled": True},
-    {"pattern": r"(?i)(emissive|emit|glow)", "format": "bc7_unorm_srgb", "enabled": True},
-    {"pattern": r"(?i)(ao|ambient|occlusion)", "format": "bc7_unorm", "enabled": True},
+    {
+        "texture_type": "DiffuseMap",
+        "pattern": r"(?i)(?:^|[_\-. ])DiffuseMap(?:[_\-. ]|$)",
+        "format": "bc7_unorm_srgb",
+    },
+    {
+        "texture_type": "NormalMap",
+        "pattern": r"(?i)(?:^|[_\-. ])NormalMap(?:[_\-. ]|$)",
+        "format": "r8g8b8a8_unorm",
+    },
+    {
+        "texture_type": "LightMap",
+        "pattern": r"(?i)(?:^|[_\-. ])LightMap(?:[_\-. ]|$)",
+        "format": "bc7_unorm_srgb",
+    },
+    {
+        "texture_type": "MaterialMap",
+        "pattern": r"(?i)(?:^|[_\-. ])MaterialMap(?:[_\-. ]|$)",
+        "format": "bc7_unorm",
+    },
+    {
+        "texture_type": "RampMap",
+        "pattern": r"(?i)(?:^|[_\-. ])RampMap(?:[_\-. ]|$)",
+        "format": "bc7_unorm_srgb",
+    },
+    {
+        "texture_type": "HighLightMap",
+        "pattern": r"(?i)(?:^|[_\-. ])HighLightMap(?:[_\-. ]|$)",
+        "format": "bc7_unorm_srgb",
+    },
+    {
+        "texture_type": "StockingMap",
+        "pattern": r"(?i)(?:^|[_\-. ])StockingMap(?:[_\-. ]|$)",
+        "format": "bc7_unorm",
+    },
+    {
+        "texture_type": "Glowmap",
+        "pattern": r"(?i)(?:^|[_\-. ])Glowmap(?:[_\-. ]|$)",
+        "format": "bc7_unorm_srgb",
+    },
+    {
+        "texture_type": "FXMap",
+        "pattern": r"(?i)(?:^|[_\-. ])FXMap(?:[_\-. ]|$)",
+        "format": "bc7_unorm",
+    },
+    {
+        "texture_type": "RoughnessMap",
+        "pattern": r"(?i)(?:^|[_\-. ])RoughnessMap(?:[_\-. ]|$)",
+        "format": "bc7_unorm",
+    },
+    {
+        "texture_type": "ORMMap",
+        "pattern": r"(?i)(?:^|[_\-. ])ORMMap(?:[_\-. ]|$)",
+        "format": "bc7_unorm",
+    },
 ]
+
+_SUPPORTED_SOURCE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tif", ".tiff"}
+_SRGB_TEXTURE_TYPES = {"DiffuseMap", "LightMap", "RampMap", "HighLightMap", "Glowmap"}
 
 
 def find_texconv():
     props = bpy.context.scene.texture_tools_props
-    
-    local_path = os.path.join(TOOLSET_PATH, 'texconv.exe')
+
+    local_path = os.path.join(TOOLSET_PATH, "texconv.exe")
     if os.path.exists(local_path):
         return local_path
-    
+
     if props and props.texconv_path and os.path.exists(props.texconv_path):
         return props.texconv_path
-    
+
     system_path = shutil.which("texconv")
     if system_path:
         return system_path
-    
+
     return None
+
+
+def _get_match_targets(filename: str) -> list[str]:
+    basename = os.path.basename(filename or "")
+    stem, _ext = os.path.splitext(basename)
+    targets = []
+    for value in (stem, basename):
+        value = str(value or "").strip()
+        if value and value not in targets:
+            targets.append(value)
+    return targets
+
+
+def _pattern_matches(pattern: str, filename: str) -> bool:
+    targets = _get_match_targets(filename)
+    return any(re.search(pattern, target) for target in targets)
+
+
+def _validate_custom_rules(props) -> list[str]:
+    errors = []
+    if not getattr(props, "dds_use_custom_rules", False):
+        return errors
+
+    for index, rule in enumerate(getattr(props, "dds_rules", []) or [], start=1):
+        if not getattr(rule, "enabled", True):
+            continue
+        pattern = str(getattr(rule, "pattern", "") or "").strip()
+        if not pattern:
+            errors.append(f"规则 {index} 缺少正则表达式")
+            continue
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            errors.append(f"规则 {index} 正则无效: {exc}")
+    return errors
+
+
+def _format_is_srgb(dds_format: str) -> bool:
+    return "_srgb" in str(dds_format or "").strip().lower()
+
+
+def _texture_type_expects_srgb(texture_type: str) -> bool | None:
+    if texture_type == "default":
+        return None
+    return texture_type in _SRGB_TEXTURE_TYPES
+
+
+def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
+    if getattr(props, "dds_use_custom_rules", False):
+        for rule in getattr(props, "dds_rules", []) or []:
+            if not getattr(rule, "enabled", True):
+                continue
+            pattern = str(getattr(rule, "pattern", "") or "").strip()
+            if not pattern:
+                continue
+            try:
+                if _pattern_matches(pattern, filename):
+                    rule_format = str(getattr(rule, "format", "") or "").strip()
+                    return "custom", rule_format or "bc7_unorm", pattern
+            except re.error:
+                continue
+
+    for rule in DDS_DEFAULT_RULES:
+        try:
+            if _pattern_matches(rule["pattern"], filename):
+                texture_type = rule["texture_type"]
+                return texture_type, rule["format"], texture_type
+        except re.error:
+            continue
+
+    return "default", "bc7_unorm", "Default"
 
 
 class TT_OT_convert_to_dds(bpy.types.Operator):
     bl_idname = "toolkit.tt_convert_to_dds"
     bl_label = "批量转换为 .dds"
-    bl_description = "使用texconv.exe将输出目录的图片转换为指定DDS格式，并更新项目引用"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def _get_dds_format(self, filename, props):
-        import re
-        
-        if props.dds_use_custom_rules:
-            for rule in props.dds_rules:
-                if not rule.enabled:
-                    continue
-                try:
-                    if re.search(rule.pattern, filename):
-                        return rule.format
-                except:
-                    continue
-        
-        for rule in DDS_DEFAULT_RULES:
-            try:
-                if re.search(rule["pattern"], filename):
-                    return rule["format"]
-            except:
-                continue
-        
-        return "bc7_unorm"
-    
+    bl_description = "使用 texconv.exe 将输出目录中的贴图转换或重编码为目标 DDS 格式，并更新图片引用"
+    bl_options = {"REGISTER", "UNDO"}
+
     def execute(self, context):
         props = context.scene.texture_tools_props
         if not props.output_dir:
-            self.report({'ERROR'}, "请先设置输出目录")
-            return {'CANCELLED'}
-        
+            self.report({"ERROR"}, "请先设置输出目录")
+            return {"CANCELLED"}
+
         output_dir_abs = os.path.normpath(bpy.path.abspath(props.output_dir))
         if not os.path.isdir(output_dir_abs):
-            self.report({'ERROR'}, f"输出目录不存在: {output_dir_abs}")
-            return {'CANCELLED'}
-        
+            self.report({"ERROR"}, f"输出目录不存在: {output_dir_abs}")
+            return {"CANCELLED"}
+
+        rule_errors = _validate_custom_rules(props)
+        if rule_errors:
+            self.report({"ERROR"}, "；".join(rule_errors))
+            return {"CANCELLED"}
+
         texconv_executable = find_texconv()
         if not texconv_executable:
-            self.report({'ERROR'}, "未找到 texconv.exe。请将其放入插件目录的 'Toolset' 子文件夹，或手动指定路径。")
-            return {'CANCELLED'}
-        
-        supported_extensions = {'.png', '.jpg', '.jpeg', '.tga', '.bmp'}
+            self.report({"ERROR"}, "未找到 texconv.exe。请将其放入插件目录的 Toolset 子文件夹，或手动指定路径。")
+            return {"CANCELLED"}
+
+        supported_extensions = set(_SUPPORTED_SOURCE_EXTENSIONS)
+        if props.dds_reencode_existing_dds:
+            supported_extensions.add(".dds")
+
         conversion_map = {}
         converted_files_count = 0
-        
-        for root, _, files in os.walk(output_dir_abs):
+        skipped_files_count = 0
+        skipped_unmatched_dds_count = 0
+        color_space_mismatches = []
+
+        blend_dir = os.path.normpath(bpy.path.abspath("//"))
+
+        for root, _dirs, files in os.walk(output_dir_abs):
             for filename in files:
                 name_no_ext, ext = os.path.splitext(filename)
-                if ext.lower() not in supported_extensions:
+                ext_lower = ext.lower()
+                if ext_lower not in supported_extensions:
                     continue
-                
+
                 old_path = os.path.normpath(os.path.join(root, filename))
-                
                 if not old_path.startswith(output_dir_abs):
-                    self.report({'WARNING'}, f"跳过输出目录外的文件: {filename}")
+                    self.report({"WARNING"}, f"跳过输出目录外的文件: {filename}")
                     continue
-                
-                if os.path.normpath(old_path).startswith(os.path.normpath(bpy.path.abspath("//"))):
-                    blend_dir = os.path.normpath(bpy.path.abspath("//"))
-                    if old_path.startswith(blend_dir) and not old_path.startswith(output_dir_abs):
-                        self.report({'WARNING'}, f"跳过工程目录内的源文件: {filename}")
-                        continue
-                
+
+                if old_path.startswith(blend_dir) and not old_path.startswith(output_dir_abs):
+                    self.report({"WARNING"}, f"跳过工程目录内的源文件: {filename}")
+                    continue
+
                 new_path = os.path.normpath(os.path.join(root, f"{name_no_ext}.dds"))
-                
-                dds_format = self._get_dds_format(filename, props)
-                
-                command = [texconv_executable, "-f", dds_format, "-o", root, "-y", old_path]
-                if "_srgb" in dds_format:
-                    command.append("-srgb")
-                
-                try:
-                    process = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore')
-                    if process.returncode == 0:
-                        conversion_map[old_path] = new_path
-                        converted_files_count += 1
-                        if props.dds_delete_originals:
-                            try:
-                                os.remove(old_path)
-                            except:
-                                pass
-                    else:
-                        self.report({'WARNING'}, f"转换文件 {filename} 失败: {process.stderr}")
-                except Exception as e:
-                    self.report({'WARNING'}, f"处理文件 {filename} 时出错: {e}")
+                texture_type, dds_format, matched_by = resolve_dds_target(filename, props)
+
+                if ext_lower == ".dds" and texture_type == "default":
+                    skipped_unmatched_dds_count += 1
                     continue
-        
+
+                if not dds_format:
+                    dds_format = "bc7_unorm"
+
+                expected_srgb = _texture_type_expects_srgb(texture_type)
+                if expected_srgb is not None and expected_srgb != _format_is_srgb(dds_format):
+                    color_space_mismatches.append((filename, texture_type, dds_format))
+
+                # The DXGI *_SRGB format tag is enough to mark the output texture.
+                # Do not automatically add texconv -srgb here: it changes how texconv
+                # interprets/transforms color data and can visibly shift colors.
+                command = [texconv_executable, "-f", dds_format, "-o", root, "-y", old_path]
+
+                try:
+                    process = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        encoding="utf-8",
+                        errors="ignore",
+                    )
+                except subprocess.CalledProcessError as exc:
+                    stderr = (exc.stderr or exc.stdout or str(exc)).strip()
+                    self.report({"WARNING"}, f"转换文件 {filename} 失败: {stderr}")
+                    continue
+                except Exception as exc:
+                    self.report({"WARNING"}, f"处理文件 {filename} 时出错: {exc}")
+                    continue
+
+                if process.returncode != 0:
+                    self.report({"WARNING"}, f"转换文件 {filename} 失败: {process.stderr}")
+                    continue
+
+                conversion_map[old_path] = new_path
+                converted_files_count += 1
+
+                if props.dds_delete_originals and old_path != new_path:
+                    try:
+                        os.remove(old_path)
+                    except Exception:
+                        pass
+                else:
+                    skipped_files_count += 1 if old_path == new_path else 0
+
         if converted_files_count == 0:
-            self.report({'INFO'}, "在输出目录中未找到支持的图片文件进行转换。")
-            return {'CANCELLED'}
-        
+            self.report({"INFO"}, "在输出目录中未找到可转换的贴图文件。")
+            return {"CANCELLED"}
+
         updated_images_count = 0
         for image in bpy.data.images:
-            if image.source == 'FILE' and image.filepath:
-                try:
-                    abs_filepath = os.path.normpath(bpy.path.abspath(image.filepath_raw))
-                    if abs_filepath in conversion_map:
-                        image.filepath = conversion_map[abs_filepath]
-                        image.reload()
-                        updated_images_count += 1
-                except Exception as e:
-                    self.report({'WARNING'}, f"更新图片 '{image.name}' 的路径时出错: {e}")
-        
-        self.report({'INFO'}, f"成功将 {converted_files_count} 个图片文件转换为 .dds 格式。更新了 {updated_images_count} 个图片引用。")
-        return {'FINISHED'}
+            if image.source != "FILE" or not image.filepath:
+                continue
+            try:
+                abs_filepath = os.path.normpath(bpy.path.abspath(image.filepath_raw))
+                if abs_filepath in conversion_map:
+                    image.filepath = conversion_map[abs_filepath]
+                    image.reload()
+                    updated_images_count += 1
+            except Exception as exc:
+                self.report({"WARNING"}, f"更新图片 '{image.name}' 的路径时出错: {exc}")
+
+        self.report(
+            {"INFO"},
+            f"成功处理 {converted_files_count} 个贴图文件，更新了 {updated_images_count} 个图片引用。"
+            + (" 其中部分 DDS 为原地重编码。" if skipped_files_count else ""),
+        )
+        if skipped_unmatched_dds_count:
+            self.report(
+                {"INFO"},
+                f"跳过了 {skipped_unmatched_dds_count} 个未命中任何DDS规则的现有 DDS 文件。",
+            )
+        if color_space_mismatches:
+            preview = "；".join(
+                f"{filename} -> {texture_type}/{dds_format}"
+                for filename, texture_type, dds_format in color_space_mismatches[:3]
+            )
+            suffix = "；..." if len(color_space_mismatches) > 3 else ""
+            self.report(
+                {"WARNING"},
+                f"{len(color_space_mismatches)} 个贴图的DDS格式与贴图类型颜色空间不匹配，可能导致颜色变化：{preview}{suffix}",
+            )
+        return {"FINISHED"}
 
 
 class TT_OT_add_dds_rule(bpy.types.Operator):
     bl_idname = "toolkit.tt_add_dds_rule"
     bl_label = "添加DDS规则"
-    bl_options = {'REGISTER', 'UNDO'}
-    
+    bl_options = {"REGISTER", "UNDO"}
+
     def execute(self, context):
         props = context.scene.texture_tools_props
         rule = props.dds_rules.add()
         rule.pattern = ".*"
         rule.format = "bc7_unorm"
         rule.enabled = True
-        return {'FINISHED'}
+        props.dds_use_custom_rules = True
+        return {"FINISHED"}
 
 
 class TT_OT_remove_dds_rule(bpy.types.Operator):
     bl_idname = "toolkit.tt_remove_dds_rule"
     bl_label = "移除DDS规则"
-    bl_options = {'REGISTER', 'UNDO'}
-    
+    bl_options = {"REGISTER", "UNDO"}
+
     index: bpy.props.IntProperty()
-    
+
     def execute(self, context):
         props = context.scene.texture_tools_props
         props.dds_rules.remove(self.index)
-        return {'FINISHED'}
+        return {"FINISHED"}
 
 
 class TT_OT_reset_dds_rules(bpy.types.Operator):
     bl_idname = "toolkit.tt_reset_dds_rules"
     bl_label = "重置DDS规则"
-    bl_options = {'REGISTER', 'UNDO'}
-    
+    bl_options = {"REGISTER", "UNDO"}
+
     def execute(self, context):
         props = context.scene.texture_tools_props
         props.dds_rules.clear()
-        
+        props.dds_use_custom_rules = True
+
         for rule_data in DDS_DEFAULT_RULES:
             rule = props.dds_rules.add()
             rule.pattern = rule_data["pattern"]
             rule.format = rule_data["format"]
-            rule.enabled = rule_data["enabled"]
-        
-        return {'FINISHED'}
+            rule.enabled = True
+
+        return {"FINISHED"}
 
 
 class TT_OT_test_dds_rule(bpy.types.Operator):
     bl_idname = "toolkit.tt_test_dds_rule"
     bl_label = "测试DDS规则"
-    bl_options = {'REGISTER'}
-    
+    bl_options = {"REGISTER"}
+
     def execute(self, context):
         props = context.scene.texture_tools_props
-        import re
-        
-        test_names = ["DiffuseMap_Body", "NormalMap_Face", "RoughnessMap_Hair", "EmissiveMap_Eye"]
-        
+
+        rule_errors = _validate_custom_rules(props)
+        if rule_errors:
+            self.report({"ERROR"}, "；".join(rule_errors))
+            return {"CANCELLED"}
+
+        test_names = [
+            "DiffuseMap_Body.png",
+            "Body-DiffuseMap.dds",
+            "NormalMap_Face.dds",
+            "LightMap_Hair.tga",
+            "MaterialMap_Armor.png",
+            "Body-ORMMap.png",
+            "RampMap_Eye.png",
+            "HighLightMap_Hair.png",
+            "StockingMap_Leg.bmp",
+            "Glowmap_1_Eye.png",
+            "FXMap_Body.dds",
+            "RoughnessMap_Body.png",
+            "UnknownMask.png",
+        ]
+
         result_lines = ["DDS规则测试结果:"]
-        
         for name in test_names:
-            matched_format = "bc7_unorm"
-            
-            if props.dds_use_custom_rules:
-                for rule in props.dds_rules:
-                    if rule.enabled:
-                        try:
-                            if re.search(rule.pattern, name):
-                                matched_format = rule.format
-                                break
-                        except:
-                            pass
-            else:
-                for rule in DDS_DEFAULT_RULES:
-                    try:
-                        if re.search(rule["pattern"], name):
-                            matched_format = rule["format"]
-                            break
-                    except:
-                        pass
-            
-            result_lines.append(f"  {name} -> {matched_format}")
-        
-        self.report({'INFO'}, "\n".join(result_lines))
-        return {'FINISHED'}
+            texture_type, matched_format, matched_by = resolve_dds_target(name, props)
+            result_lines.append(f"  {name} -> {matched_format} ({texture_type} / {matched_by})")
+
+        self.report({"INFO"}, "\n".join(result_lines))
+        return {"FINISHED"}
 
 
 class TT_OT_save_dds_rules(bpy.types.Operator):
     bl_idname = "toolkit.tt_save_dds_rules"
     bl_label = "保存DDS规则"
-    bl_options = {'REGISTER'}
-    
+    bl_options = {"REGISTER"}
+
     def execute(self, context):
         props = context.scene.texture_tools_props
-        import json
-        
+
         if not props.dds_rules_file_path:
-            self.report({'ERROR'}, "请先指定规则文件路径")
-            return {'CANCELLED'}
-        
+            self.report({"ERROR"}, "请先指定规则文件路径")
+            return {"CANCELLED"}
+
         rules_data = []
         for rule in props.dds_rules:
-            rules_data.append({
-                "pattern": rule.pattern,
-                "format": rule.format,
-                "enabled": rule.enabled
-            })
-        
+            rules_data.append(
+                {
+                    "pattern": rule.pattern,
+                    "format": rule.format,
+                    "enabled": rule.enabled,
+                }
+            )
+
         try:
-            with open(props.dds_rules_file_path, 'w', encoding='utf-8') as f:
-                json.dump(rules_data, f, indent=2, ensure_ascii=False)
-            self.report({'INFO'}, f"规则已保存到: {props.dds_rules_file_path}")
-        except Exception as e:
-            self.report({'ERROR'}, f"保存失败: {str(e)}")
-            return {'CANCELLED'}
-        
-        return {'FINISHED'}
+            with open(props.dds_rules_file_path, "w", encoding="utf-8") as file_obj:
+                json.dump(rules_data, file_obj, indent=2, ensure_ascii=False)
+            self.report({"INFO"}, f"规则已保存到: {props.dds_rules_file_path}")
+        except Exception as exc:
+            self.report({"ERROR"}, f"保存失败: {exc}")
+            return {"CANCELLED"}
+
+        return {"FINISHED"}
 
 
 class TT_OT_load_dds_rules(bpy.types.Operator):
     bl_idname = "toolkit.tt_load_dds_rules"
     bl_label = "加载DDS规则"
-    bl_options = {'REGISTER'}
-    
+    bl_options = {"REGISTER"}
+
     def execute(self, context):
         props = context.scene.texture_tools_props
-        import json
-        
+
         if not props.dds_rules_file_path:
-            self.report({'ERROR'}, "请先指定规则文件路径")
-            return {'CANCELLED'}
-        
+            self.report({"ERROR"}, "请先指定规则文件路径")
+            return {"CANCELLED"}
+
         if not os.path.exists(props.dds_rules_file_path):
-            self.report({'ERROR'}, "规则文件不存在")
-            return {'CANCELLED'}
-        
+            self.report({"ERROR"}, "规则文件不存在")
+            return {"CANCELLED"}
+
         try:
-            with open(props.dds_rules_file_path, 'r', encoding='utf-8') as f:
-                rules_data = json.load(f)
-            
+            with open(props.dds_rules_file_path, "r", encoding="utf-8") as file_obj:
+                rules_data = json.load(file_obj)
+
             props.dds_rules.clear()
-            
             for rule_data in rules_data:
                 rule = props.dds_rules.add()
                 rule.pattern = rule_data.get("pattern", ".*")
                 rule.format = rule_data.get("format", "bc7_unorm")
                 rule.enabled = rule_data.get("enabled", True)
-            
-            self.report({'INFO'}, f"已加载 {len(rules_data)} 条规则")
-        except Exception as e:
-            self.report({'ERROR'}, f"加载失败: {str(e)}")
-            return {'CANCELLED'}
-        
-        return {'FINISHED'}
+            props.dds_use_custom_rules = True
+
+            self.report({"INFO"}, f"已加载 {len(rules_data)} 条规则")
+        except Exception as exc:
+            self.report({"ERROR"}, f"加载失败: {exc}")
+            return {"CANCELLED"}
+
+        return {"FINISHED"}
 
 
 tt_dds_conversion_list = (

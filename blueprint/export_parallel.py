@@ -12,6 +12,7 @@ from ..common.global_config import GlobalConfig
 from ..common.global_properties import GlobalProterties
 from ..common.logic_name import LogicName
 from ..utils.log_utils import LOG
+from ..utils.shapekey_utils import ShapeKeyUtils
 from ..utils.timer_utils import TimerUtils
 from .model import BluePrintModel
 from .export_helper import BlueprintExportHelper
@@ -272,7 +273,11 @@ class ParallelExportCoordinator:
 
         try:
             snapshot_path = os.path.join(session_dir, "snapshot.blend")
-            bpy.ops.wm.save_as_mainfile(filepath=snapshot_path, copy=True, check_existing=False)
+            ShapeKeyUtils.save_as_mainfile_with_shape_key_recovery(
+                filepath=snapshot_path,
+                copy=True,
+                check_existing=False,
+            )
 
             cache_dir = PreProcessCache.get_original_cache_dir()
             jobs = cls._build_jobs(session_dir, snapshot_path, tree.name, middle_rounds, cache_dir)

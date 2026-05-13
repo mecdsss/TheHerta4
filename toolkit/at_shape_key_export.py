@@ -7,6 +7,7 @@ import time
 import traceback
 import numpy
 from collections import defaultdict
+from ..utils.shapekey_utils import ShapeKeyUtils
 
 
 class SKE_AutomationPipeline:
@@ -192,60 +193,9 @@ class SKE_AutomationPipeline:
 
     def _safe_save_mainfile(self):
         """安全保存工程文件，自动处理损坏的形态键等无效数据"""
-        try:
-            bpy.ops.wm.save_mainfile()
-            print("  [Save] 工程文件已保存。")
-            return True
-        except RuntimeError as e:
-            err_msg = str(e)
-            if "无效的" in err_msg or "invalid" in err_msg.lower() or "指针" in err_msg:
-                print(f"  [Save] 检测到损坏数据，正在自动清理...")
-                print(f"  [Save] 错误详情: {err_msg}")
-
-                for obj in list(bpy.data.objects):
-                    if not obj.data:
-                        continue
-                    sk = getattr(obj.data, 'shape_keys', None)
-                    if not sk:
-                        continue
-                    keys_to_remove = []
-                    for kb in sk.key_blocks:
-                        try:
-                            _test = kb.name
-                            _test = kb.value
-                            _test = kb.mute
-                            _test = kb.slider_min
-                            _test = kb.slider_max
-                        except Exception:
-                            keys_to_remove.append(kb)
-
-                    for kb in keys_to_remove:
-                        key_label = "<无法获取名称>"
-                        try:
-                            key_label = kb.name
-                        except Exception:
-                            pass
-                        try:
-                            obj.shape_key_remove(kb)
-                            print(f"    [Clean] 已移除损坏形态键 '{key_label}' (物体: {obj.name})")
-                        except Exception as clean_err:
-                            print(f"    [Clean] 移除失败 '{key_label}': {clean_err}")
-
-                try:
-                    bpy.ops.outliner.orphans_purge(do_recursive=True)
-                    print("  [Clean] 已清理孤立数据。")
-                except Exception:
-                    pass
-
-                try:
-                    bpy.ops.wm.save_mainfile()
-                    print("  [Save] 清理后工程文件已保存。")
-                    return True
-                except RuntimeError as retry_err:
-                    print(f"  [Save] 清理后仍然无法保存: {retry_err}")
-                    raise
-            else:
-                raise
+        ShapeKeyUtils.save_mainfile_with_shape_key_recovery()
+        print("  [Save] 工程文件已保存。")
+        return True
 
     def _classify_and_write_shape_keys(self):
         """分类所有物体的形态键，并写入到文本编辑器"""

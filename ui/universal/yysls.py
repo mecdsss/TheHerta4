@@ -98,7 +98,8 @@ class ExportYYSLS(DrawIBExportBase):
             resource_vb_section.append("[" + ib_resource_name + "]")
             resource_vb_section.append("type = Buffer")
             resource_vb_section.append("format = DXGI_FORMAT_R32_UINT")
-            resource_vb_section.append("filename = " + buffer_folder_name + "/" + submesh_model.unique_str + "-Index.buf")
+            ib_name = getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+            resource_vb_section.append("filename = " + buffer_folder_name + "/" + ib_name + "-Index.buf")
             resource_vb_section.new_line()
         ini_builder.append_section(resource_vb_section)
 

@@ -129,6 +129,7 @@ class TT_TextureToolsProperties(bpy.types.PropertyGroup):
     alpha_extract_material_prefix: bpy.props.StringProperty(name="材质前缀", description="新创建的透明材质的名称前缀", default="FXMap_")
     texconv_path: bpy.props.StringProperty(name="texconv.exe 路径", description="指定 texconv.exe 文件的完整路径。这是进行DDS格式转换所必需的工具", subtype='FILE_PATH')
     dds_delete_originals: bpy.props.BoolProperty(name="转换后删除原图", description="在成功将图片转换为.dds格式后，删除原始的.png, .jpg等文件", default=True)
+    dds_reencode_existing_dds: bpy.props.BoolProperty(name="处理现有DDS", description="现有的 .dds 文件也会按目标格式重新编码，可用于更换DDS格式", default=False)
     dds_use_custom_rules: bpy.props.BoolProperty(name="使用自定义规则", description="启用自定义DDS转换规则，覆盖默认规则", default=False)
     dds_rules_file_path: bpy.props.StringProperty(name="规则配置文件", description="DDS转换规则的配置文件路径", subtype='FILE_PATH')
     dds_show_advanced: bpy.props.BoolProperty(name="显示高级选项", description="显示DDS转换的高级选项", default=False)

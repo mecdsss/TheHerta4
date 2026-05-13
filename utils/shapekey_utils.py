@@ -1,4 +1,5 @@
 
+import os
 import bpy
 import time
 import numpy
@@ -9,6 +10,15 @@ from .timer_utils import TimerUtils
 
 class ShapeKeyUtils:
     # Github: https://github.com/przemir/ApplyModifierForObjectWithShapeKeys
+    _AUTO_FIX_WARNING_PATTERNS = (
+        "has an invalid 'from' pointer",
+        "it will be deleted",
+    )
+    _AUTO_FIX_WARNING_TOKEN_GROUPS = (
+        ("invalid", "无效", "失效"),
+        ("pointer", "from", "指针", "shape key", "shape keys", "形态键"),
+        ("delete", "deleted", "删除", "移除"),
+    )
 
     @staticmethod
     def _get_shape_key_coordinate_snapshot(obj):
@@ -552,3 +562,50 @@ class ShapeKeyUtils:
             print(f"[ShapeKeyUtils] 共清理 {cleaned_count} 个损坏的形态键")
         
         return cleaned_count
+
+    @classmethod
+    def is_blender_auto_fix_warning(cls, error_msg: str) -> bool:
+        error_lower = (error_msg or "").lower()
+        if not error_lower:
+            return False
+
+        if all(pattern in error_lower for pattern in cls._AUTO_FIX_WARNING_PATTERNS):
+            return True
+
+        # Blender's save-time auto-fix warning is localized on some builds.
+        # Accept the warning when it carries the same semantic signals:
+        # invalid/broken data -> pointer/from/shapekey context -> auto deletion.
+        return all(
+            any(token in error_lower for token in token_group)
+            for token_group in cls._AUTO_FIX_WARNING_TOKEN_GROUPS
+        )
+
+    @classmethod
+    def save_as_mainfile_with_shape_key_recovery(cls, filepath: str, copy: bool = False, check_existing: bool = False):
+        try:
+            bpy.ops.wm.save_as_mainfile(filepath=filepath, copy=copy, check_existing=check_existing)
+            return
+        except RuntimeError as exc:
+            if not cls.is_blender_auto_fix_warning(str(exc)):
+                raise
+
+            if filepath and os.path.exists(filepath):
+                print(f"[ShapeKeyUtils] Blender auto-fixed invalid shape key pointers while saving '{filepath}'.")
+                return
+
+            cleaned_count = cls.cleanup_invalid_shapekeys()
+            print(f"[ShapeKeyUtils] Retrying save_as_mainfile after cleaning {cleaned_count} invalid shape keys.")
+            bpy.ops.wm.save_as_mainfile(filepath=filepath, copy=copy, check_existing=check_existing)
+
+    @classmethod
+    def save_mainfile_with_shape_key_recovery(cls):
+        try:
+            bpy.ops.wm.save_mainfile()
+            return
+        except RuntimeError as exc:
+            if not cls.is_blender_auto_fix_warning(str(exc)):
+                raise
+
+            cleaned_count = cls.cleanup_invalid_shapekeys()
+            print(f"[ShapeKeyUtils] Retrying save_mainfile after cleaning {cleaned_count} invalid shape keys.")
+            bpy.ops.wm.save_mainfile()

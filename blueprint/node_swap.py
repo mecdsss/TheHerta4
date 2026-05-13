@@ -46,13 +46,33 @@ class SSMTNode_ObjectSwap(SSMTNodeBase):
     bl_label = "物体切换"
     bl_icon = "SHADERFX"
 
+    def _ensure_initial_visible_variable_name(self, context=None):
+        if getattr(self, "custom_var_initialized", False):
+            return False
+
+        assigned_name = ensure_object_swap_variable_name(self, context=context)
+        if not assigned_name:
+            return False
+
+        if str(getattr(self, "custom_var_name", "") or "").strip():
+            self.custom_var_initialized = True
+            return False
+
+        self.custom_var_initialized = True
+        self.custom_var_name = assigned_name
+        return True
+
     def update_all_properties(self, context):
+        if self._ensure_initial_visible_variable_name(context=context):
+            return
+
         normalized = normalize_variable_name(self.custom_var_name)
         if normalized != str(self.custom_var_name or "").strip().lstrip("$"):
             self.custom_var_name = normalized
             return
         if normalized:
             mark_variable_name_used(normalized, context=context)
+            self.custom_var_initialized = True
         ensure_object_swap_variable_name(self, context=context)
         self.update_node_width([self.comment, self.hotkey, self.custom_var_name, self.assigned_variable_name])
 
@@ -74,6 +94,12 @@ class SSMTNode_ObjectSwap(SSMTNodeBase):
         name="Assigned Variable Name",
         description="Preallocated global variable name for this node.",
         default="",
+        options={"HIDDEN"},
+    )
+
+    custom_var_initialized: bpy.props.BoolProperty(
+        name="Custom Variable Initialized",
+        default=False,
         options={"HIDDEN"},
     )
 
@@ -126,15 +152,16 @@ class SSMTNode_ObjectSwap(SSMTNodeBase):
     )
 
     def init(self, context):
-        ensure_object_swap_variable_name(self, context=context)
+        self._ensure_initial_visible_variable_name(context=context)
         self.outputs.new("SSMTSocketObject", "Output")
         self._update_input_sockets()
         self.width = 320
 
     def copy(self, node):
         self.assigned_variable_name = ""
-        ensure_object_swap_variable_name(self)
-        self.custom_var_name = self.assigned_variable_name
+        self.custom_var_initialized = False
+        self.custom_var_name = ""
+        self._ensure_initial_visible_variable_name()
 
     def _update_input_sockets(self):
         current_count = len(self.inputs)
@@ -152,6 +179,7 @@ class SSMTNode_ObjectSwap(SSMTNodeBase):
             inp.name = f"选项_{idx}"
 
     def update(self):
+        self._ensure_initial_visible_variable_name()
         ensure_object_swap_variable_name(self)
         self._update_input_sockets()
 

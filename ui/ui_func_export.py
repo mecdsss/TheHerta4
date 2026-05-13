@@ -13,6 +13,7 @@ from ..blueprint.direct_export import execute_direct_export, has_direct_export_m
 from ..blueprint.export_helper import BlueprintExportHelper
 from ..blueprint.preprocess import PreProcessHelper
 from ..blueprint.export_parallel import ExportRoundExecutor, ParallelExportCoordinator, ParallelExportError
+from ..blueprint.sync import refresh_blueprint_sync_state
 from ..common.global_properties import GlobalProterties
 
 
@@ -104,6 +105,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
             return {'CANCELLED'}
 
         BlueprintExportHelper.set_runtime_blueprint_tree(tree)
+        BlueprintExportHelper.reset_direct_export_runtime_state(clear_postprocess_caches=True)
         TimerUtils.end_stage("蓝图验证")
 
         BluePrintModel.clear_object_name_mapping()
@@ -156,6 +158,18 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
             if export_success:
                 return {'FINISHED'}
             return {'CANCELLED'}
+
+        TimerUtils.start_stage("导出前同步")
+        refresh_summary = refresh_blueprint_sync_state(
+            tree=tree,
+            context=context,
+            include_all_blueprints=True,
+        )
+        TimerUtils.end_stage("导出前同步")
+        LOG.info(
+            f"🔄 导出前刷新同步状态: {refresh_summary['tree_count']} 个蓝图, "
+            f"{refresh_summary['updated_count']} 处节点引用更新"
+        )
 
         has_shapekey_export = BlueprintExportHelper.has_shapekey_postprocess_node(tree)
         max_shapekey_slot = 0

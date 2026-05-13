@@ -12,6 +12,7 @@ except ImportError:
     NUMPY_AVAILABLE = False
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
+from ..common.object_prefix_helper import ObjectPrefixHelper
 
 
 class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
@@ -173,15 +174,26 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
     def _parse_hash_values(self, hash_str):
         hash_list = [h.strip() for h in hash_str.split(',') if h.strip()]
 
-        ib_hashes = set()
+        ib_hashes = OrderedDict()
         for hash_value in hash_list:
-            if '-' in hash_value:
-                ib_hash = hash_value.split('-')[0]
-                ib_hashes.add(ib_hash)
-            else:
-                ib_hashes.add(hash_value)
+            prefix_info = ObjectPrefixHelper.extract_prefix_info(hash_value)
+            if prefix_info:
+                prefix_parts = ObjectPrefixHelper.parse_prefix_parts(prefix_info[0])
+                draw_ib = str(prefix_parts.get("draw_ib", "") or "").strip()
+                if draw_ib:
+                    ib_hashes[draw_ib] = True
+                    continue
 
-        return sorted(list(ib_hashes))
+            normalized_hash_value = str(hash_value or "").strip()
+            if normalized_hash_value.upper().startswith("LOD") and "." in normalized_hash_value:
+                normalized_hash_value = normalized_hash_value.split(".", 1)[1]
+
+            if '-' in normalized_hash_value:
+                ib_hashes[normalized_hash_value.split('-', 1)[0]] = True
+            elif normalized_hash_value:
+                ib_hashes[normalized_hash_value] = True
+
+        return list(ib_hashes.keys())
 
     def _read_Meshes_file(self, Meshes_path):
         try:

@@ -5,9 +5,10 @@
 2. 物体选择时自动选择对应的节点（物体→节点）- 支持多选
 3. 防循环选择机制
 4. 物体名称变化时自动更新节点引用（支持撤销/重做）
-5. 物体视图显示禁用时自动禁用对应节点（双向同步）
+5. 物体视图禁用时自动禁用对应节点（双向同步）
 """
 import time
+import gc
 
 import bpy
 from bpy.app.handlers import persistent
@@ -34,11 +35,17 @@ _next_maintenance_run_at = 0.0
 
 _SELECTION_SYNC_ACTIVE_INTERVAL = 0.5
 _SELECTION_SYNC_IDLE_INTERVAL = 2.0
-_MAINTENANCE_ACTIVE_INTERVAL = 10.0
-_MAINTENANCE_IDLE_INTERVAL = 30.0
+_MAINTENANCE_ACTIVE_INTERVAL = 5.0
+_MAINTENANCE_IDLE_INTERVAL = 8.0
 _VISIBILITY_AUTO_MUTE_KEY = "ssmt_auto_muted_by_visibility"
 
 _SYNC_DEBUG = False
+_SYNC_HANDLER_NAMES = {
+    "depsgraph_update_handler",
+    "load_post_handler",
+    "undo_post_handler",
+}
+_SYNC_TIMER_FUNCTION_NAME = "selection_sync_timer_callback"
 
 
 def _log(msg):
@@ -57,6 +64,69 @@ def _iter_sync_nodes(tree):
     if not tree:
         return []
     return [node for node in tree.nodes if _is_sync_node(node)]
+
+
+def _is_object_viewport_disabled(obj):
+    try:
+        return bool(getattr(obj, 'hide_viewport', False))
+    except (AttributeError, ReferenceError):
+        return False
+
+
+def _is_valid_blueprint_tree(tree):
+    return bool(tree and getattr(tree, 'bl_idname', '') == 'SSMTBlueprintTreeType')
+
+
+def _iter_all_blueprint_trees():
+    for tree in bpy.data.node_groups:
+        if _is_valid_blueprint_tree(tree):
+            yield tree
+
+
+def _collect_nested_blueprint_trees(root_tree):
+    collected_trees = []
+    visited_tree_names = set()
+
+    def visit(tree):
+        if not _is_valid_blueprint_tree(tree):
+            return
+
+        tree_name = getattr(tree, 'name', '')
+        if not tree_name or tree_name in visited_tree_names:
+            return
+
+        visited_tree_names.add(tree_name)
+        collected_trees.append(tree)
+
+        try:
+            for node in tree.nodes:
+                if getattr(node, 'bl_idname', '') != 'SSMTNode_Blueprint_Nest':
+                    continue
+
+                nested_tree_name = getattr(node, 'blueprint_name', '')
+                if not nested_tree_name or nested_tree_name == 'NONE':
+                    continue
+
+                visit(bpy.data.node_groups.get(nested_tree_name))
+        except (AttributeError, ReferenceError):
+            return
+
+    visit(root_tree)
+    return collected_trees
+
+
+def _collect_target_blueprint_trees(tree=None, context=None, include_all_blueprints=False):
+    if include_all_blueprints:
+        return list(_iter_all_blueprint_trees())
+
+    root_tree = tree
+    if not _is_valid_blueprint_tree(root_tree) and context is not None:
+        root_tree, _, _ = get_active_blueprint_tree(context)
+
+    if not _is_valid_blueprint_tree(root_tree):
+        return []
+
+    return _collect_nested_blueprint_trees(root_tree)
 
 
 def _node_has_object_id(node, object_id):
@@ -102,7 +172,7 @@ def _resolve_reference_state(reference):
 
         current_id = str(obj.as_pointer())
         current_name = obj.name
-        is_hidden = bool(obj.hide_viewport or obj.hide_get())
+        is_hidden = _is_object_viewport_disabled(obj)
         _object_id_to_name[current_id] = current_name
         _object_hide_state_cache[current_id] = is_hidden
         return current_id, current_name, is_hidden, True
@@ -147,25 +217,56 @@ def _resolve_reference_object(reference):
     return find_object_by_id(object_id) if object_id else None
 
 
-def _set_node_visibility_state(node, any_hidden):
+def _set_node_visibility_state(node, should_auto_mute):
     try:
         auto_muted = bool(node.get(_VISIBILITY_AUTO_MUTE_KEY, False))
+        is_muted = bool(getattr(node, 'mute', False))
 
-        if any_hidden:
-            if not node.mute:
+        if should_auto_mute:
+            if not is_muted:
                 node.mute = True
-                node[_VISIBILITY_AUTO_MUTE_KEY] = True
-                print(f"[Sync] 物体视图显示被禁用，自动禁用节点: {node.name}")
+                print(f"[Sync Visibility] monitor disabled -> mute node: {node.name}")
+            node[_VISIBILITY_AUTO_MUTE_KEY] = True
             return
 
         if auto_muted:
-            if node.mute:
+            if is_muted:
                 node.mute = False
-                print(f"[Sync] 物体视图显示已恢复，自动启用节点: {node.name}")
+                print(f"[Sync Visibility] monitor restored -> unmute node: {node.name}")
             if _VISIBILITY_AUTO_MUTE_KEY in node:
                 del node[_VISIBILITY_AUTO_MUTE_KEY]
     except (AttributeError, ReferenceError):
         return
+
+
+def _should_auto_mute_node_for_viewport_state(node, resolved_objects=None):
+    objects = resolved_objects if resolved_objects is not None else _resolve_node_objects(node)
+    if not objects:
+        return False
+
+    return any(_is_object_viewport_disabled(obj) for obj in objects)
+
+
+def _refresh_visibility_states_for_trees(trees, changed_object_ids=None):
+    changed_ids = set(changed_object_ids or ())
+
+    for tree in trees or []:
+        if not _is_valid_blueprint_tree(tree):
+            continue
+
+        for node in _iter_sync_nodes(tree):
+            resolved_objects = _resolve_node_objects(node)
+
+            if changed_ids:
+                object_ids = {str(obj.as_pointer()) for obj in resolved_objects}
+                if not object_ids.intersection(changed_ids):
+                    continue
+
+            should_auto_mute = _should_auto_mute_node_for_viewport_state(
+                node,
+                resolved_objects=resolved_objects,
+            )
+            _set_node_visibility_state(node, should_auto_mute)
 
 
 def _resolve_node_objects(node):
@@ -400,7 +501,7 @@ def _rebuild_object_hide_state_cache():
     try:
         for obj in bpy.data.objects:
             try:
-                _object_hide_state_cache[str(obj.as_pointer())] = bool(obj.hide_viewport or obj.hide_get())
+                _object_hide_state_cache[str(obj.as_pointer())] = _is_object_viewport_disabled(obj)
             except (AttributeError, ReferenceError):
                 continue
     except (AttributeError, ReferenceError):
@@ -753,38 +854,30 @@ def sync_object_visibility_for_object_ids(object_ids, previous_hide_state=None):
         return
 
     changed_ids = set(object_ids)
+    if previous_hide_state is not None:
+        changed_ids = {
+            obj_id
+            for obj_id in changed_ids
+            if previous_hide_state.get(obj_id, False) != _object_hide_state_cache.get(obj_id, False)
+        }
+
+    if not changed_ids:
+        return
 
     try:
-        for tree in bpy.data.node_groups:
-            if tree.bl_idname != 'SSMTBlueprintTreeType':
-                continue
-
-            for node in tree.nodes:
-                if not _is_sync_node(node):
-                    continue
-
-                objects = _resolve_node_objects(node)
-                if not objects:
-                    continue
-
-                obj_ids = [str(obj.as_pointer()) for obj in objects]
-                if not changed_ids.intersection(obj_ids):
-                    continue
-
-                any_hidden = any(_object_hide_state_cache.get(obj_id, False) for obj_id in obj_ids)
-                _set_node_visibility_state(node, any_hidden)
+        _refresh_visibility_states_for_trees(
+            _iter_all_blueprint_trees(),
+            changed_object_ids=changed_ids,
+        )
     except Exception as exc:
-        print(f"[Sync] sync_object_visibility_for_object_ids 异常: {exc}")
+        print(f"[Sync Visibility] partial refresh failed: {exc}")
 
 
 def _sync_all_node_reference_states():
     updated_count = 0
 
     try:
-        for tree in bpy.data.node_groups:
-            if tree.bl_idname != 'SSMTBlueprintTreeType':
-                continue
-
+        for tree in _iter_all_blueprint_trees():
             for node in tree.nodes:
                 if not _is_sync_node(node):
                     continue
@@ -806,23 +899,7 @@ def _sync_all_node_reference_states():
 
 def _sync_all_node_visibility_states():
     try:
-        for tree in bpy.data.node_groups:
-            if tree.bl_idname != 'SSMTBlueprintTreeType':
-                continue
-
-            for node in tree.nodes:
-                if not _is_sync_node(node):
-                    continue
-
-                objects = _resolve_node_objects(node)
-                if not objects:
-                    continue
-
-                any_hidden = any(
-                    _object_hide_state_cache.get(str(obj.as_pointer()), bool(obj.hide_viewport or obj.hide_get()))
-                    for obj in objects
-                )
-                _set_node_visibility_state(node, any_hidden)
+        _refresh_visibility_states_for_trees(_iter_all_blueprint_trees())
     except Exception as exc:
         _log(f"_sync_all_node_visibility_states 异常: {exc}")
 
@@ -858,21 +935,88 @@ def _sync_tree_visibility_states(tree):
         return
 
     try:
-        for node in tree.nodes:
-            if not _is_sync_node(node):
-                continue
-
-            objects = _resolve_node_objects(node)
-            if not objects:
-                continue
-
-            any_hidden = any(
-                _object_hide_state_cache.get(str(obj.as_pointer()), bool(obj.hide_viewport or obj.hide_get()))
-                for obj in objects
-            )
-            _set_node_visibility_state(node, any_hidden)
+        _refresh_visibility_states_for_trees((tree,))
     except Exception as exc:
         _log(f"_sync_tree_visibility_states 异常: {exc}")
+
+
+def _sync_reference_states_for_trees(trees):
+    updated_count = 0
+    for tree in trees or []:
+        updated_count += _sync_tree_reference_states(tree)
+    return updated_count
+
+
+def _sync_visibility_states_for_trees(trees):
+    _refresh_visibility_states_for_trees(trees)
+
+
+def refresh_blueprint_sync_state(tree=None, context=None, include_all_blueprints=False):
+    global _next_maintenance_run_at
+
+    target_trees = _collect_target_blueprint_trees(
+        tree=tree,
+        context=context,
+        include_all_blueprints=include_all_blueprints,
+    )
+
+    _rebuild_object_name_cache()
+    _rebuild_object_hide_state_cache()
+    updated_count = _sync_reference_states_for_trees(target_trees)
+    _sync_visibility_states_for_trees(target_trees)
+
+    if target_trees:
+        interval = _MAINTENANCE_ACTIVE_INTERVAL if _is_valid_blueprint_tree(tree) else _MAINTENANCE_IDLE_INTERVAL
+        _next_maintenance_run_at = time.monotonic() + interval
+
+    return {
+        "tree_count": len(target_trees),
+        "updated_count": updated_count,
+    }
+
+
+def _purge_legacy_handler_entries():
+    handler_lists = (
+        bpy.app.handlers.depsgraph_update_post,
+        bpy.app.handlers.load_post,
+        bpy.app.handlers.undo_post,
+        bpy.app.handlers.redo_post,
+    )
+
+    for handler_list in handler_lists:
+        stale_callbacks = []
+        for callback in list(handler_list):
+            callback_name = getattr(callback, "__name__", "")
+            callback_module = getattr(callback, "__module__", "")
+            if callback_module == __name__ and callback_name in _SYNC_HANDLER_NAMES:
+                stale_callbacks.append(callback)
+
+        for callback in stale_callbacks:
+            try:
+                handler_list.remove(callback)
+            except ValueError:
+                pass
+
+
+def _purge_legacy_timer_entries():
+    stale_timers = []
+
+    for candidate in gc.get_objects():
+        try:
+            if getattr(candidate, "__module__", "") != __name__:
+                continue
+            if getattr(candidate, "__name__", "") != _SYNC_TIMER_FUNCTION_NAME:
+                continue
+            if bpy.app.timers.is_registered(candidate):
+                stale_timers.append(candidate)
+        except Exception:
+            continue
+
+    for timer_callback in stale_timers:
+        try:
+            bpy.app.timers.unregister(timer_callback)
+        except Exception:
+            pass
 
 
 def _run_periodic_reference_and_visibility_maintenance(has_active_blueprint_tree, active_tree=None):
@@ -886,13 +1030,10 @@ def _run_periodic_reference_and_visibility_maintenance(has_active_blueprint_tree
     _next_maintenance_run_at = now + interval
     _rebuild_object_name_cache()
     _rebuild_object_hide_state_cache()
-    if has_active_blueprint_tree and active_tree is not None:
-        _sync_tree_reference_states(active_tree)
-        _sync_tree_visibility_states(active_tree)
-        return
-
-    _sync_all_node_reference_states()
-    _sync_all_node_visibility_states()
+    # 周期维护始终覆盖所有蓝图，避免当前活动树停留在嵌套蓝图时漏掉同级蓝图。
+    target_trees = _collect_target_blueprint_trees(include_all_blueprints=True)
+    _sync_reference_states_for_trees(target_trees)
+    _sync_visibility_states_for_trees(target_trees)
 
 
 def on_object_renamed_by_id(object_id, old_name, new_name):
@@ -958,7 +1099,7 @@ def depsgraph_update_handler(scene, depsgraph):
 
             try:
                 previous_hide_state[obj_id] = _object_hide_state_cache.get(obj_id, False)
-                _object_hide_state_cache[obj_id] = bool(obj.hide_viewport or obj.hide_get())
+                _object_hide_state_cache[obj_id] = _is_object_viewport_disabled(obj)
             except (AttributeError, ReferenceError):
                 pass
 
@@ -1315,6 +1456,8 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    _purge_legacy_handler_entries()
+    _purge_legacy_timer_entries()
     subscribe_msgbus()
 
     if depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:

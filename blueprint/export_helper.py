@@ -1,6 +1,7 @@
 import bpy
 
 from ..common.global_config import GlobalConfig
+from ..common.global_properties import GlobalProterties
 from ..common.m_key import M_Key
 from ..common.object_prefix_helper import ObjectPrefixHelper
 
@@ -31,6 +32,48 @@ class BlueprintExportHelper:
     direct_shapekey_position_records = {}
 
     MAX_EXPORT_COUNT_LIMIT = 1000
+
+    @staticmethod
+    def should_ignore_muted_shape_keys() -> bool:
+        try:
+            return bool(GlobalProterties.ignore_muted_shape_keys())
+        except Exception:
+            return False
+
+    @staticmethod
+    def get_exportable_shape_key_infos(obj, slot_limit: int | None = None) -> list[tuple[int, str, object]]:
+        if obj is None or not getattr(obj, "data", None):
+            return []
+        shape_keys = getattr(getattr(obj.data, "shape_keys", None), "key_blocks", None)
+        if not shape_keys:
+            return []
+
+        ignore_muted = BlueprintExportHelper.should_ignore_muted_shape_keys()
+        slot_infos = []
+        slot_index = 0
+        for key_index, key_block in enumerate(shape_keys):
+            if key_index == 0:
+                continue
+            if ignore_muted and getattr(key_block, "mute", False):
+                continue
+            slot_index += 1
+            if slot_limit is not None and slot_index > slot_limit:
+                break
+            slot_infos.append((slot_index, str(getattr(key_block, "name", "") or ""), key_block))
+        return slot_infos
+
+    @staticmethod
+    def get_exportable_shape_key_by_slot(obj, slot_index: int):
+        if slot_index is None or slot_index <= 0:
+            return None
+        slot_limit = BlueprintExportHelper.max_shapekey_slot_count or None
+        for dense_slot_index, _shape_key_name, key_block in BlueprintExportHelper.get_exportable_shape_key_infos(
+            obj,
+            slot_limit=slot_limit,
+        ):
+            if dense_slot_index == slot_index:
+                return key_block
+        return None
 
     @staticmethod
     def _is_valid_blueprint_tree(tree):
@@ -138,6 +181,16 @@ class BlueprintExportHelper:
     def clear_runtime_shapekey_buffer_names():
         BlueprintExportHelper.runtime_shapekey_buffer_names = []
         BlueprintExportHelper.runtime_shapekey_buffer_name_map = {}
+
+    @staticmethod
+    def reset_direct_export_runtime_state(clear_postprocess_caches: bool = False):
+        BlueprintExportHelper.clear_runtime_shapekey_buffer_names()
+        BlueprintExportHelper.set_preserve_current_shapekey_mix_for_export(False)
+        BlueprintExportHelper.set_suppress_shapekey_resource_export(False)
+        BlueprintExportHelper.set_capture_direct_shapekey_positions(False)
+        BlueprintExportHelper.clear_direct_shapekey_position_records()
+        if clear_postprocess_caches:
+            BlueprintExportHelper.clear_postprocess_caches()
 
     @staticmethod
     def set_preserve_current_shapekey_mix_for_export(enabled: bool):
@@ -891,6 +944,7 @@ class BlueprintExportHelper:
     shapekey_postprocess_nodes = []
     shapekey_objects = []
     max_shapekey_slot_count = 0
+    configured_shapekey_slot_count = 0
 
     @staticmethod
     def has_shapekey_postprocess_node(tree) -> bool:
@@ -989,35 +1043,80 @@ class BlueprintExportHelper:
         return BlueprintExportHelper.shapekey_objects
 
     @staticmethod
+    def calculate_configured_shapekey_slot_count(tree) -> int:
+        if not tree:
+            BlueprintExportHelper.configured_shapekey_slot_count = 0
+            return 0
+
+        visited_trees = set()
+        max_slot_index = 0
+
+        def collect_from_tree(current_tree):
+            nonlocal max_slot_index
+            if not BlueprintExportHelper._is_valid_blueprint_tree(current_tree):
+                return
+            if current_tree.name in visited_trees:
+                return
+            visited_trees.add(current_tree.name)
+
+            for node in current_tree.nodes:
+                if getattr(node, "mute", False):
+                    continue
+
+                if node.bl_idname == 'SSMTNode_ShapeKey_Output':
+                    linked_slot_indices = [
+                        socket_index
+                        for socket_index, socket in enumerate(getattr(node, "inputs", []), start=1)
+                        if getattr(socket, "is_linked", False)
+                    ]
+                    if linked_slot_indices:
+                        max_slot_index = max(max_slot_index, max(linked_slot_indices))
+                    continue
+
+                if node.bl_idname == 'SSMTNode_Blueprint_Nest':
+                    nested_tree_name = getattr(node, 'blueprint_name', '')
+                    if not nested_tree_name or nested_tree_name == 'NONE':
+                        continue
+                    nested_tree = bpy.data.node_groups.get(nested_tree_name)
+                    collect_from_tree(nested_tree)
+
+        collect_from_tree(tree)
+        BlueprintExportHelper.configured_shapekey_slot_count = max_slot_index
+        return max_slot_index
+
+    @staticmethod
     def calculate_max_shapekey_slot_count(tree) -> int:
         objects = BlueprintExportHelper.collect_shapekey_objects(tree)
-        
+        configured_slot_count = BlueprintExportHelper.calculate_configured_shapekey_slot_count(tree)
+
         max_slot = 0
         slot_info = []
-        
+
         for obj_name in objects:
             obj = bpy.data.objects.get(obj_name)
             if not obj or not obj.data:
                 continue
-            if not hasattr(obj.data, 'shape_keys') or not obj.data.shape_keys:
-                continue
-            
-            key_blocks = obj.data.shape_keys.key_blocks
-            num_keys = len(key_blocks)
-            if num_keys > 1:
-                slot_count = num_keys - 1
+            slot_count = len(BlueprintExportHelper.get_exportable_shape_key_infos(
+                obj,
+                slot_limit=configured_slot_count or None,
+            ))
+            if slot_count > 0:
                 slot_info.append(f"'{obj_name}':{slot_count}")
                 if slot_count > max_slot:
                     max_slot = slot_count
-        
-        BlueprintExportHelper.max_shapekey_slot_count = max_slot
-        
+
+        effective_slot_count = configured_slot_count or max_slot
+        BlueprintExportHelper.max_shapekey_slot_count = effective_slot_count
+
         if slot_info:
-            print(f"[ShapeKeyExport] 形态键槽位统计: [{', '.join(slot_info)}] → 最大值 {max_slot}")
+            print(
+                f"[ShapeKeyExport] 形态键槽位统计: [{', '.join(slot_info)}] "
+                f"→ 对象最大值 {max_slot}, 配置槽位数 {configured_slot_count}, 生效值 {effective_slot_count}"
+            )
         else:
             print(f"[ShapeKeyExport] 未检测到形态键")
-        
-        return max_slot
+
+        return effective_slot_count
 
     @staticmethod
     def set_all_shapekey_values(value: int, slot_index: int = None):
@@ -1039,17 +1138,22 @@ class BlueprintExportHelper:
             
             key_blocks = obj.data.shape_keys.key_blocks
             objects_with_keys += 1
+            target_key_block = (
+                BlueprintExportHelper.get_exportable_shape_key_by_slot(obj, slot_index)
+                if slot_index is not None
+                else None
+            )
             
-            for i, kb in enumerate(key_blocks):
-                if i == 0:
+            for key_index, kb in enumerate(key_blocks):
+                if key_index == 0:
                     continue
                 
                 if slot_index is not None:
-                    if i == slot_index:
+                    if kb == target_key_block:
                         try:
                             kb.value = 1.0
                             changed_keys += 1
-                        except Exception as e:
+                        except Exception:
                             failed_keys += 1
                     else:
                         try:
@@ -1148,15 +1252,12 @@ class BlueprintExportHelper:
             obj = bpy.data.objects.get(obj_name)
             if not obj or not obj.data or obj.hide_get():
                 return None
-            if not hasattr(obj.data, 'shape_keys') or not obj.data.shape_keys:
-                return None
-
-            key_blocks = obj.data.shape_keys.key_blocks
-            shapekey_info = []
-            for i, kb in enumerate(key_blocks):
-                if i == 0:
-                    continue
-                shapekey_info.append((i, kb.name))
+            slot_limit = BlueprintExportHelper.max_shapekey_slot_count or None
+            shapekey_info = [
+                (slot_index, shape_key_name)
+                for slot_index, shape_key_name, _key_block
+                in BlueprintExportHelper.get_exportable_shape_key_infos(obj, slot_limit=slot_limit)
+            ]
             return shapekey_info or None
 
         def resolve_chain_output_names(chain):
@@ -1403,15 +1504,8 @@ class BlueprintExportHelper:
                     continue
                 if obj.hide_viewport or obj.hide_render or obj.hide_get():
                     continue
-                if not hasattr(obj.data, 'shape_keys') or not obj.data.shape_keys:
-                    continue
-                
-                key_blocks = obj.data.shape_keys.key_blocks
-                for i, kb in enumerate(key_blocks):
-                    if i == 0:
-                        continue
-                    slot_index = i
-                    shape_key_name = kb.name
+                slot_limit = BlueprintExportHelper.max_shapekey_slot_count or None
+                for slot_index, shape_key_name, _key_block in BlueprintExportHelper.get_exportable_shape_key_infos(obj, slot_limit=slot_limit):
                     classification_data[slot_index][shape_key_name].append(obj_name)
         
         if not classification_data:

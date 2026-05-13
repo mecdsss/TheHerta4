@@ -41,7 +41,6 @@ COMPATIBLE_POSTPROCESS_NODE_TYPES = {
     "SSMTNode_PostProcess_MultiFile",
     "SSMTNode_PostProcess_ResourceMerge",
     "SSMTNode_PostProcess_ShapeKey",
-    "SSMTNode_PostProcess_WebPanel",
     "SSMTNode_PostProcess_SliderPanel",
 }
 NTMI_INTERNAL_POSTPROCESS_NODE_TYPES = {

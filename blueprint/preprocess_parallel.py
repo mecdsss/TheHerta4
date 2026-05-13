@@ -277,7 +277,11 @@ class ParallelPreprocessCoordinator:
     def _create_snapshot(cls, session_dir: str) -> str:
         snapshot_path = os.path.join(session_dir, "snapshot.blend")
         LOG.info("💾 正在创建主工程快照...")
-        bpy.ops.wm.save_as_mainfile(filepath=snapshot_path, copy=True, check_existing=False)
+        ShapeKeyUtils.save_as_mainfile_with_shape_key_recovery(
+            filepath=snapshot_path,
+            copy=True,
+            check_existing=False,
+        )
         return snapshot_path
 
     @classmethod
@@ -578,19 +582,16 @@ def _run_worker(manifest_path: str):
             if obj.name not in copy_names:
                 bpy.data.objects.remove(obj, do_unlink=True)
 
-        bpy.ops.wm.save_as_mainfile(filepath=manifest["result_blend_path"], check_existing=False)
+        ShapeKeyUtils.save_as_mainfile_with_shape_key_recovery(
+            filepath=manifest["result_blend_path"],
+            check_existing=False,
+        )
 
         result["status"] = "success"
         result["original_to_copy_map"] = copy_map
     except Exception as exc:
-        error_msg = str(exc)
-        if _is_blender_auto_fix_warning(error_msg):
-            LOG.warning(f"⚠️ Blender 自动修复了损坏的形态键，继续执行: {error_msg}")
-            result["status"] = "success"
-            result["original_to_copy_map"] = dict(PreProcessHelper.original_to_copy_map)
-        else:
-            result["error"] = error_msg
-            traceback.print_exc()
+        result["error"] = str(exc)
+        traceback.print_exc()
     finally:
         log_content = LOG.get_log_content()
         with open(manifest["log_path"], "w", encoding="utf-8") as file:
@@ -600,20 +601,6 @@ def _run_worker(manifest_path: str):
             json.dump(result, file, ensure_ascii=False, indent=2)
 
         LOG.stop_collecting()
-
-
-def _is_blender_auto_fix_warning(error_msg: str) -> bool:
-    '''
-    检查错误信息是否是 Blender 自动修复损坏形态键的警告
-    这些警告不应该导致任务失败
-    '''
-    auto_fix_patterns = [
-        "has an invalid 'from' pointer",
-        "it will be deleted",
-    ]
-    
-    error_lower = error_msg.lower()
-    return all(pattern.lower() in error_lower for pattern in auto_fix_patterns)
 
 
 def register():

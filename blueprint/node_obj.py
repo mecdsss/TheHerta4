@@ -485,6 +485,59 @@ class SSMT_OT_View_Group_Objects(bpy.types.Operator):
     
     node_name: bpy.props.StringProperty()
 
+    @staticmethod
+    def _node_visit_key(node):
+        tree_name = node.id_data.name if hasattr(node, "id_data") and node.id_data else ""
+        node_name = getattr(node, "name", "")
+        return f"{tree_name}::{node_name}"
+
+    @staticmethod
+    def _append_object_by_name(objects_to_show, obj_name):
+        obj_name = str(obj_name or "").strip()
+        if not obj_name:
+            return
+        obj = bpy.data.objects.get(obj_name)
+        if obj:
+            objects_to_show.add(obj)
+
+    def _collect_group_preview_objects(self, current_node, objects_to_show, visited_nodes, visited_blueprints):
+        node_key = self._node_visit_key(current_node)
+        if node_key in visited_nodes:
+            return
+        visited_nodes.add(node_key)
+
+        node_type = getattr(current_node, "bl_idname", "")
+        if node_type == 'SSMTNode_Object_Info':
+            self._append_object_by_name(objects_to_show, getattr(current_node, "object_name", ""))
+        elif node_type == 'SSMTNode_MultiFile_Export':
+            for item in getattr(current_node, "object_list", []):
+                self._append_object_by_name(objects_to_show, getattr(item, "object_name", ""))
+        elif node_type == 'SSMTNode_Blueprint_Nest':
+            nested_tree_name = str(getattr(current_node, "blueprint_name", "") or "").strip()
+            if nested_tree_name and nested_tree_name != 'NONE' and nested_tree_name not in visited_blueprints:
+                nested_tree = bpy.data.node_groups.get(nested_tree_name)
+                if nested_tree and getattr(nested_tree, "bl_idname", "") == 'SSMTBlueprintTreeType':
+                    visited_blueprints.add(nested_tree_name)
+                    for nested_node in nested_tree.nodes:
+                        if getattr(nested_node, "bl_idname", "") == 'SSMTNode_Result_Output':
+                            self._collect_group_preview_objects(
+                                nested_node,
+                                objects_to_show,
+                                visited_nodes,
+                                visited_blueprints,
+                            )
+
+        if hasattr(current_node, "inputs"):
+            for inp in current_node.inputs:
+                if inp.is_linked:
+                    for link in inp.links:
+                        self._collect_group_preview_objects(
+                            link.from_node,
+                            objects_to_show,
+                            visited_nodes,
+                            visited_blueprints,
+                        )
+
     def execute(self, context):
         tree = getattr(context.space_data, "edit_tree", None) or getattr(context.space_data, "node_tree", None)
         if not tree:
@@ -526,27 +579,7 @@ class SSMT_OT_View_Group_Objects(bpy.types.Operator):
         objects_to_show = set()
         checked_nodes = set()
         visited_blueprints = set()
-
-        def collect_objects(current_node):
-            if current_node in checked_nodes: 
-                return
-            checked_nodes.add(current_node)
-
-            if getattr(current_node, "bl_idname", "") == 'SSMTNode_Object_Info':
-                obj_name = getattr(current_node, "object_name", "")
-                if obj_name:
-                    obj = bpy.data.objects.get(obj_name)
-                    if obj:
-                        objects_to_show.add(obj)
-
-
-            if hasattr(current_node, "inputs"):
-                for inp in current_node.inputs:
-                    if inp.is_linked:
-                        for link in inp.links:
-                            collect_objects(link.from_node)
-
-        collect_objects(node)
+        self._collect_group_preview_objects(node, objects_to_show, checked_nodes, visited_blueprints)
         
         if not objects_to_show:
             self.report({'WARNING'}, "No objects found in this group")

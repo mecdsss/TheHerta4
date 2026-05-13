@@ -26,7 +26,8 @@ class DrawIBExportBase:
             else:
                 for submesh_model in drawib_model.submesh_model_list:
                     ib = drawib_model.submesh_ib_dict.get(submesh_model.unique_str, [])
-                    ib_filename = submesh_model.unique_str + "-Index.buf"
+                    ib_name = getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+                    ib_filename = ib_name + "-Index.buf"
                     ib_filepath = os.path.join(output_folder, ib_filename)
                     BufferExportHelper.write_buf_ib_r32_uint(ib, ib_filepath)
 

@@ -71,7 +71,7 @@ class PanelBasicInformation(bpy.types.Panel):
         )
         selected_blueprint_name = preferred_blueprint_name or getattr(global_properties, "selected_blueprint_name", "") or "__NONE__"
 
-        layout.label(text="TheHerta4 v4.3.3", icon='INFO')
+        layout.label(text="TheHerta4 v4.3.4", icon='INFO')
         layout.label(text=TR.translate("SSMT缓存文件夹路径: ") + GlobalConfig.ssmtlocation)
         layout.label(text=TR.translate("当前配置名称: ") + GlobalConfig.gamename)
         layout.label(text=TR.translate("当前游戏预设: ") + GlobalConfig.logic_name)

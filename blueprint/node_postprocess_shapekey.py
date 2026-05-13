@@ -15,6 +15,7 @@ except ImportError:
 from .direct_export import sync_shapekey_direct_mode
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 from .variable_registry import allocate_shape_key_variable_name, mark_variable_name_used, normalize_variable_name
+from ..common.object_prefix_helper import ObjectPrefixHelper
 
 
 class ShapeKeyVariableItem(bpy.types.PropertyGroup):
@@ -158,11 +159,20 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         item = self.shapekey_variable_items.add()
         item.shape_key_name = shape_key_name
         item.assigned_variable_name = allocate_shape_key_variable_name(shape_key_name)
-        item.custom_variable_name = ""
+        item.custom_variable_name = normalize_variable_name(item.assigned_variable_name)
         return item
+
+    def _backfill_shape_key_variable_input(self, item):
+        assigned_name = normalize_variable_name(getattr(item, "assigned_variable_name", "") or "")
+        custom_name = normalize_variable_name(getattr(item, "custom_variable_name", "") or "")
+        if assigned_name and not custom_name:
+            item.custom_variable_name = assigned_name
+            return True
+        return False
 
     def ensure_shape_key_variable_map(self, shape_key_names):
         created_count = 0
+        backfilled_count = 0
         for shape_key_name in sorted({str(name or "").strip() for name in shape_key_names if str(name or "").strip()}):
             existing = None
             for item in self.shapekey_variable_items:
@@ -182,7 +192,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     mark_variable_name_used(existing.assigned_variable_name)
                 if existing.custom_variable_name:
                     mark_variable_name_used(existing.custom_variable_name)
-        return created_count
+                elif self._backfill_shape_key_variable_input(existing):
+                    backfilled_count += 1
+        return created_count, backfilled_count
 
     def get_shape_key_export_variable_name(self, shape_key_name: str) -> str:
         shape_key_name = str(shape_key_name or "").strip()
@@ -386,6 +398,13 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             return None, None
 
     def _extract_hash_from_name(self, obj_name):
+        prefix_info = ObjectPrefixHelper.extract_prefix_info(obj_name)
+        if prefix_info:
+            prefix_parts = ObjectPrefixHelper.parse_prefix_parts(prefix_info[0])
+            bare_unique_str = str(prefix_parts.get("bare_unique_str", "") or "").strip()
+            if bare_unique_str:
+                return bare_unique_str
+
         match = re.match(r'^([a-f0-9]{8}-[a-f0-9]+(?:-[a-f0-9]+)?)', obj_name)
         if match:
             return match.group(1)
@@ -395,6 +414,15 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return None
 
     def _extract_alias_from_name(self, obj_name):
+        prefix_info = ObjectPrefixHelper.extract_prefix_info(obj_name)
+        if prefix_info:
+            _prefix, _separator, base_name = ObjectPrefixHelper.split_name_and_prefix(
+                obj_name,
+                prefix_info[0],
+                prefix_info[1],
+            )
+            return base_name if base_name else obj_name
+
         obj_hash = self._extract_hash_from_name(obj_name)
         if obj_hash:
             remainder = obj_name[len(obj_hash):]
@@ -465,11 +493,19 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
     def _extract_hash_prefix(self, hash_val):
         if hash_val:
-            return hash_val.split('-')[0]
+            prefix_parts = ObjectPrefixHelper.parse_prefix_parts(hash_val)
+            draw_ib = str(prefix_parts.get("draw_ib", "") or "").strip()
+            if draw_ib:
+                return draw_ib
+            normalized_hash_val = str(hash_val or "").strip()
+            if normalized_hash_val.upper().startswith("LOD") and "." in normalized_hash_val:
+                normalized_hash_val = normalized_hash_val.split(".", 1)[1]
+            return normalized_hash_val.split('-')[0]
         return None
 
     def _hash_to_resource_prefix(self, h):
-        return h.replace('-', '_')
+        bare_unique_str = str(ObjectPrefixHelper.parse_prefix_parts(h).get("bare_unique_str", "") or h or "").strip()
+        return bare_unique_str.replace('.', '_').replace('-', '_')
 
     def _should_merge_slot_files(self, use_packed=None):
         if use_packed is None:
@@ -1865,8 +1901,11 @@ class SSMT_OT_ScanShapeKeyVariables(bpy.types.Operator):
             return {'CANCELLED'}
 
         shape_key_names = node.collect_blueprint_shape_key_names()
-        created_count = node.ensure_shape_key_variable_map(shape_key_names)
-        self.report({'INFO'}, f"已扫描 {len(shape_key_names)} 个形态键，新增预分配 {created_count} 个变量")
+        created_count, backfilled_count = node.ensure_shape_key_variable_map(shape_key_names)
+        self.report(
+            {'INFO'},
+            f"已扫描 {len(shape_key_names)} 个形态键，新增预分配 {created_count} 个变量，回填变量框 {backfilled_count} 项"
+        )
         return {'FINISHED'}
 
 

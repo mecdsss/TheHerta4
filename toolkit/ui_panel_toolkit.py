@@ -584,7 +584,6 @@ class TT_DDSConversionPanel(bpy.types.Panel):
         props = context.scene.texture_tools_props
         
         import os
-        import shutil
         
         config_box = layout.box()
         config_box.label(text="转换工具配置", icon='FILE_SCRIPT')
@@ -612,20 +611,23 @@ class TT_DDSConversionPanel(bpy.types.Panel):
             col.label(text="请放置到 Toolset 文件夹或手动指定。")
         col.prop(props, "texconv_path", text="手动指定")
         col.prop(props, "dds_delete_originals")
+        col.prop(props, "dds_reencode_existing_dds")
         col.separator()
         col.operator("toolkit.tt_convert_to_dds", icon='FILE_REFRESH')
         
         rules_box = layout.box()
         rules_box.label(text="DDS转换规则", icon='SETTINGS')
         
-        rules_box.prop(props, "dds_use_custom_rules", text="使用自定义转换规则")
+        rules_box.prop(props, "dds_use_custom_rules", text="使用DDS转换规则列表")
         
         if not props.dds_use_custom_rules:
             info_box = rules_box.box()
-            info_box.label(text="当前使用默认规则:", icon='INFO')
-            info_box.label(text="- DiffuseMap -> bc7_unorm_srgb")
-            info_box.label(text="- NormalMap -> r8g8b8a8_unorm")
-            info_box.label(text="- 其他 -> bc7_unorm")
+            info_box.label(text="当前使用内置贴图类型规则:", icon='INFO')
+            info_box.label(text="- DiffuseMap / NormalMap / LightMap / MaterialMap / ORMMap")
+            info_box.label(text="- RampMap / HighLightMap / StockingMap")
+            info_box.label(text="- Glowmap / FXMap / RoughnessMap")
+            info_box.label(text="- 支持 DiffuseMap_Body 和 Body-DiffuseMap 这两类命名")
+            info_box.label(text="- 要改格式，开启上面的规则列表后点“重置默认”即可直接改。")
         else:
             list_box = rules_box.box()
             list_box.label(text="转换规则列表", icon='SETTINGS')

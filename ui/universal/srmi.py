@@ -39,7 +39,8 @@ class ExportSRMI:
             else:
                 for submesh_model in drawib_model.submesh_model_list:
                     ib = drawib_model.submesh_ib_dict.get(submesh_model.unique_str, [])
-                    ib_filename = submesh_model.unique_str + "-Index.buf"
+                    ib_name = getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+                    ib_filename = ib_name + "-Index.buf"
                     ib_filepath = os.path.join(buf_output_folder, ib_filename)
                     BufferExportHelper.write_buf_ib_r32_uint(ib, ib_filepath)
             
@@ -234,7 +235,8 @@ class ExportSRMI:
                 resource_buffer_section.append("[" + ib_resource_name + "]")
                 resource_buffer_section.append("type = Buffer")
                 resource_buffer_section.append("format = DXGI_FORMAT_R32_UINT")
-                resource_buffer_section.append("filename = " + buffer_folder_name + "\\" + submesh_model.unique_str + "-Index.buf")
+                ib_name = getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+                resource_buffer_section.append("filename = " + buffer_folder_name + "\\" + ib_name + "-Index.buf")
                 resource_buffer_section.new_line()
 
             ini_builder.append_section(resource_buffer_section)

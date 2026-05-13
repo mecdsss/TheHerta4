@@ -12,6 +12,7 @@ from ..common.logic_name import LogicName
 from ..utils.log_utils import LOG
 from ..utils.obj_utils import ObjUtils
 from ..utils.shapekey_utils import ShapeKeyUtils
+from ..utils.export_utils import ExportUtils
 from .direct_export_runtime_utils import extract_position_bytes_by_indices as _extract_position_bytes_by_indices
 from .direct_export_runtime_utils import normalize_runtime_name as _normalize_runtime_name
 from .direct_export_shapekey_shared import ShapeKeyDirectExportError
@@ -282,8 +283,19 @@ class DirectShapeKeySamplingMixin:
                         skip_reason_counts[obj_prefix]["missing_position_element"] += 1
                         continue
 
-                    position_bytes = self._format_position_bytes_from_coords(
+                    export_indices_key = tuple(int(index) for index in export_indices.tolist())
+                    base_slice = base_slice_cache.get((runtime_info["logical_hash"], export_indices_key))
+                    if base_slice is None:
+                        base_slice = _extract_position_bytes_by_indices(
+                            runtime_info["base_bytes"],
+                            runtime_info["position_stride"],
+                            export_indices,
+                        )
+                        base_slice_cache[(runtime_info["logical_hash"], export_indices_key)] = base_slice
+
+                    position_bytes = self._compose_position_bytes_with_base_slice(
                         coords[sampled_vertex_indices],
+                        base_slice,
                         position_element,
                         position_stride=runtime_info["position_stride"],
                     )
@@ -346,6 +358,9 @@ class DirectShapeKeySamplingMixin:
         return {
             "loop_vertex_indices": loop_vertex_indices,
             "position_element": position_element,
+            "d3d11_game_type": d3d11_game_type,
+            "local_loop_indices": local_loop_indices,
+            "export_indices": export_indices,
         }
 
     def _format_position_bytes_from_coords(self, sampled_coords, position_element, position_stride=12):
@@ -374,22 +389,170 @@ class DirectShapeKeySamplingMixin:
             return formatted.tobytes()
         return np.asarray(sampled_coords, dtype=np.float32).tobytes()
 
+    def _reorder_position_bytes_by_loop_indices(
+        self,
+        obj_name: str,
+        position_bytes: bytes,
+        position_stride: int,
+        source_loop_indices: np.ndarray,
+        target_loop_indices: np.ndarray,
+        source_loop_vertex_indices: np.ndarray | None = None,
+        target_loop_vertex_indices: np.ndarray | None = None,
+    ) -> bytes:
+        expected_bytes = target_loop_indices.size * position_stride
+        if target_loop_indices.size == 0:
+            return b""
+        if len(position_bytes) % position_stride != 0:
+            raise ShapeKeyDirectExportError(
+                f"物体 '{obj_name}' 的 Position 缓冲区大小异常: bytes={len(position_bytes)}, stride={position_stride}"
+            )
+
+        if source_loop_indices.size == 0:
+            if len(position_bytes) != expected_bytes:
+                raise ShapeKeyDirectExportError(
+                    f"物体 '{obj_name}' 缺少 loop 映射且 Position 大小不匹配: 期望={expected_bytes}, 实际={len(position_bytes)}"
+                )
+            return position_bytes
+
+        if source_loop_indices.size == target_loop_indices.size and np.array_equal(source_loop_indices, target_loop_indices):
+            if len(position_bytes) != expected_bytes:
+                raise ShapeKeyDirectExportError(
+                    f"物体 '{obj_name}' 的 Position 大小与导出映射不匹配: 期望={expected_bytes}, 实际={len(position_bytes)}"
+                )
+            return position_bytes
+
+        loop_index_to_vertex_index = {
+            int(loop_index): vertex_index
+            for vertex_index, loop_index in enumerate(source_loop_indices.tolist())
+        }
+        vertex_index_to_source_vertex_index = {}
+        if source_loop_vertex_indices is not None:
+            for source_vertex_index, vertex_id in enumerate(np.asarray(source_loop_vertex_indices, dtype=np.int32).tolist()):
+                vertex_index_to_source_vertex_index.setdefault(int(vertex_id), source_vertex_index)
+
+        reordered_bytes = bytearray(expected_bytes)
+        for local_index, loop_index in enumerate(target_loop_indices.tolist()):
+            source_vertex_index = loop_index_to_vertex_index.get(int(loop_index))
+            if source_vertex_index is None:
+                target_vertex_index = None
+                if target_loop_vertex_indices is not None and local_index < len(target_loop_vertex_indices):
+                    target_vertex_index = int(target_loop_vertex_indices[local_index])
+                    source_vertex_index = vertex_index_to_source_vertex_index.get(target_vertex_index)
+
+                if source_vertex_index is None:
+                    detail = f"loop_index={loop_index}"
+                    if target_vertex_index is not None:
+                        detail = f"{detail}, vertex_index={target_vertex_index}"
+                    raise ShapeKeyDirectExportError(
+                        f"物体 '{obj_name}' 缺少导出所需 loop 映射: {detail}"
+                    )
+
+            src_start = source_vertex_index * position_stride
+            src_end = src_start + position_stride
+            dst_start = local_index * position_stride
+            dst_end = dst_start + position_stride
+            reordered_bytes[dst_start:dst_end] = position_bytes[src_start:src_end]
+
+        return bytes(reordered_bytes)
+
+    def _build_position_bytes_for_sample_object(self, sample_obj, sample_context):
+        d3d11_game_type = sample_context.get("d3d11_game_type")
+        if d3d11_game_type is None:
+            raise ShapeKeyDirectExportError(f"物体 '{sample_obj.name}' 缺少导出数据类型上下文")
+
+        buffer_result = ExportUtils.build_unity_obj_buffer_result(obj=sample_obj, d3d11_game_type=d3d11_game_type)
+        position_buffer = buffer_result.category_buffer_dict.get("Position")
+        if position_buffer is None:
+            raise ShapeKeyDirectExportError(f"物体 '{sample_obj.name}' 未生成 Position 缓冲区")
+
+        full_position_bytes = position_buffer.tobytes() if hasattr(position_buffer, "tobytes") else bytes(position_buffer)
+        local_loop_indices = np.asarray(sample_context.get("local_loop_indices", []), dtype=np.int32)
+        if local_loop_indices.size == 0:
+            return full_position_bytes
+
+        mesh = getattr(sample_obj, "data", None)
+        if mesh is None:
+            raise ShapeKeyDirectExportError(f"物体 '{sample_obj.name}' 缺少网格数据")
+
+        all_loop_vertex_indices = np.empty(len(mesh.loops), dtype=np.int32)
+        mesh.loops.foreach_get("vertex_index", all_loop_vertex_indices)
+        source_loop_indices = np.asarray(getattr(buffer_result, "unique_first_loop_indices", []), dtype=np.int32)
+        source_loop_vertex_indices = (
+            all_loop_vertex_indices[source_loop_indices]
+            if source_loop_indices.size > 0
+            else np.asarray([], dtype=np.int32)
+        )
+        target_loop_vertex_indices = all_loop_vertex_indices[local_loop_indices]
+
+        return self._reorder_position_bytes_by_loop_indices(
+            obj_name=sample_obj.name,
+            position_bytes=full_position_bytes,
+            position_stride=int(sample_context.get("position_stride", 12) or 12),
+            source_loop_indices=source_loop_indices,
+            target_loop_indices=local_loop_indices,
+            source_loop_vertex_indices=source_loop_vertex_indices,
+            target_loop_vertex_indices=target_loop_vertex_indices,
+        )
+
+    def _compose_position_bytes_with_base_slice(self, sampled_coords, base_slice, position_element, position_stride=12):
+        sampled_coords = np.asarray(sampled_coords, dtype=np.float32)
+        if sampled_coords.size == 0:
+            return b""
+
+        vertex_count = int(sampled_coords.shape[0])
+        expected_size = vertex_count * int(position_stride)
+        if len(base_slice) != expected_size:
+            raise ShapeKeyDirectExportError(
+                f"POSITION 模板大小不匹配: expected={expected_size}, actual={len(base_slice)}"
+            )
+
+        offset = int(getattr(position_element, "AlignedByteOffset", 0) or 0)
+        byte_width = int(getattr(position_element, "ByteWidth", 0) or 0)
+        if byte_width <= 0:
+            byte_width = 12
+        if offset < 0 or offset + byte_width > position_stride:
+            raise ShapeKeyDirectExportError(
+                f"POSITION 元素布局越界: offset={offset}, byte_width={byte_width}, stride={position_stride}"
+            )
+
+        position_format = str(getattr(position_element, "Format", "") or "").upper()
+        if "16" in position_format and "FLOAT" in position_format:
+            component_count = max(4, byte_width // 2)
+            encoded_values = np.zeros((vertex_count, component_count), dtype=np.float16)
+            encoded_values[:, :3] = sampled_coords.astype(np.float16)
+            if component_count > 3:
+                encoded_values[:, 3] = 1.0
+            encoded_bytes = encoded_values.tobytes()
+            encoded_stride = component_count * 2
+        else:
+            component_count = max(3, byte_width // 4)
+            encoded_values = np.zeros((vertex_count, component_count), dtype=np.float32)
+            encoded_values[:, :3] = sampled_coords
+            if component_count > 3:
+                encoded_values[:, 3] = 1.0
+            encoded_bytes = encoded_values.tobytes()
+            encoded_stride = component_count * 4
+
+        output = bytearray(base_slice)
+        for vertex_index in range(vertex_count):
+            src_start = vertex_index * encoded_stride
+            src_end = src_start + byte_width
+            dst_start = vertex_index * position_stride + offset
+            dst_end = dst_start + byte_width
+            output[dst_start:dst_end] = encoded_bytes[src_start:src_end]
+        return bytes(output)
+
     def _sample_slot_position_bytes_from_restored_copy(self, copy_obj, slot_index: int, sample_context, shapekey_name: str | None = None):
         key_blocks = getattr(getattr(copy_obj.data, "shape_keys", None), "key_blocks", None)
         if not key_blocks:
             return None
 
         key_block = key_blocks.get(shapekey_name) if shapekey_name else None
-        if key_block is None and len(key_blocks) > slot_index:
-            key_block = key_blocks[slot_index]
+        if key_block is None:
+            key_block = BlueprintExportHelper.get_exportable_shape_key_by_slot(copy_obj, slot_index)
         if key_block is None:
             return None
 
-        key_index = next((idx for idx, kb in enumerate(key_blocks) if kb == key_block), -1)
-        if key_index < 0:
-            return None
-
-        sampled_vertex_indices = sample_context["loop_vertex_indices"]
         sample_obj = copy_obj.copy()
         sample_obj.name = f"{copy_obj.name}_slot_sample"
         if copy_obj.data:
@@ -402,8 +565,8 @@ class DirectShapeKeySamplingMixin:
             return None
 
         sample_key_block = sample_key_blocks.get(shapekey_name) if shapekey_name else None
-        if sample_key_block is None and len(sample_key_blocks) > slot_index:
-            sample_key_block = sample_key_blocks[slot_index]
+        if sample_key_block is None:
+            sample_key_block = BlueprintExportHelper.get_exportable_shape_key_by_slot(sample_obj, slot_index)
         if sample_key_block is None:
             sample_mesh = sample_obj.data
             bpy.data.objects.remove(sample_obj, do_unlink=True)
@@ -411,8 +574,6 @@ class DirectShapeKeySamplingMixin:
                 bpy.data.meshes.remove(sample_mesh)
             return None
 
-        evaluated_obj = None
-        evaluated_mesh = None
         original_active = bpy.context.view_layer.objects.active
         try:
             for idx, kb in enumerate(sample_key_blocks):
@@ -428,15 +589,8 @@ class DirectShapeKeySamplingMixin:
             bpy.ops.object.shape_key_remove(all=True, apply_mix=True)
             bpy.context.view_layer.update()
 
-            depsgraph = bpy.context.evaluated_depsgraph_get()
-            evaluated_obj = sample_obj.evaluated_get(depsgraph)
-            evaluated_mesh = evaluated_obj.to_mesh()
-            coords = np.empty((len(evaluated_mesh.vertices), 3), dtype=np.float32)
-            evaluated_mesh.vertices.foreach_get("co", coords.ravel())
-            sampled_coords = coords[sampled_vertex_indices]
+            position_bytes = self._build_position_bytes_for_sample_object(sample_obj, sample_context)
         finally:
-            if evaluated_obj is not None and evaluated_mesh is not None:
-                evaluated_obj.to_mesh_clear()
             try:
                 sample_obj.select_set(False)
             except Exception:
@@ -448,11 +602,6 @@ class DirectShapeKeySamplingMixin:
             if sample_mesh and sample_mesh.users == 0:
                 bpy.data.meshes.remove(sample_mesh)
 
-        position_bytes = self._format_position_bytes_from_coords(
-            sampled_coords,
-            sample_context["position_element"],
-            position_stride=sample_context.get("position_stride", 12),
-        )
         if not position_bytes:
             raise ShapeKeyDirectExportError(f"物体 '{copy_obj.name}' 未生成 Position 缓冲区")
         return position_bytes

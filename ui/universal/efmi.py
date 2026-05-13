@@ -57,7 +57,8 @@ class ExportEFMI:
         for submesh_model in self.submesh_model_list:
             print("ExportEFMI: 导出SubMeshModel，Unique标识: " + submesh_model.unique_str)
 
-            ib_filename = submesh_model.unique_str + "-Index.buf"
+            ib_name = getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+            ib_filename = ib_name + "-Index.buf"
             ib_filepath = os.path.join(buf_output_folder, ib_filename)
             BufferExportHelper.write_buf_ib_r32_uint(submesh_model.ib, ib_filepath)
 
@@ -620,7 +621,8 @@ class ExportEFMI:
             resource_buffer_section.append("[" + ib_resource_name + "]")
             resource_buffer_section.append("type = Buffer")
             resource_buffer_section.append("format = DXGI_FORMAT_R32_UINT")
-            resource_buffer_section.append("filename = " + buffer_folder_name + "\\" + submesh_model.unique_str + "-Index.buf")
+            ib_name = getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+            resource_buffer_section.append("filename = " + buffer_folder_name + "\\" + ib_name + "-Index.buf")
             resource_buffer_section.new_line()
 
             for category in submesh_model.category_buffer_dict.keys():

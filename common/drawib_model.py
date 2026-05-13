@@ -383,7 +383,8 @@ class DrawIBModel:
     def PartName_IBBufferFileName_Dict(self) -> dict:
         result = {}
         for part_name, submesh_model in self.part_name_submesh_dict.items():
-            result[part_name] = submesh_model.unique_str + "-Index.buf"
+            ib_name = getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+            result[part_name] = ib_name + "-Index.buf"
         return result
 
     @property
