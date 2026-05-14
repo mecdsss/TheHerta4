@@ -1,6 +1,34 @@
 # -*- coding: utf-8 -*-
 
 import bpy
+import numpy as np
+
+from ..utils.shapekey_rebase_utils import rebase_shape_key_coordinates
+from .at_shape_key_control import refresh_shape_key_list
+
+
+def _snapshot_shape_key_coordinates(key_blocks):
+    coordinates = {}
+    for key_block in key_blocks:
+        key_coords = np.empty(len(key_block.data) * 3, dtype=np.float32)
+        key_block.data.foreach_get("co", key_coords)
+        coordinates[key_block.name] = key_coords.reshape(-1, 3)
+    return coordinates
+
+
+def _restore_shape_key_coordinates(key_blocks, coordinates_by_name):
+    for key_block in key_blocks:
+        key_coords = coordinates_by_name.get(key_block.name)
+        if key_coords is None:
+            continue
+        key_block.data.foreach_set("co", np.asarray(key_coords, dtype=np.float32).reshape(-1))
+
+
+def _refresh_shape_key_list_from_context(context):
+    refresh_targets = list(context.selected_objects) if context.selected_objects else []
+    if context.active_object and context.active_object not in refresh_targets:
+        refresh_targets.append(context.active_object)
+    refresh_shape_key_list(context.scene.atp_props, refresh_targets)
 
 
 class ATP_OT_BatchAddShapeKey(bpy.types.Operator):
@@ -47,7 +75,7 @@ class ATP_OT_BatchAddShapeKey(bpy.types.Operator):
             report_message += f" 跳过了 {skipped_count} 个已存在同名键的物体。"
         
         self.report({'INFO'}, report_message)
-        bpy.ops.atp.refresh_shape_keys('INVOKE_DEFAULT')
+        _refresh_shape_key_list_from_context(context)
 
         return {'FINISHED'}
 
@@ -95,7 +123,7 @@ class ATP_OT_BatchRemoveShapeKey(bpy.types.Operator):
         else:
             self.report({'INFO'}, f"在选中的物体中未找到名为 '{shape_key_name_to_remove}' 的形态键。")
 
-        bpy.ops.atp.refresh_shape_keys('INVOKE_DEFAULT')
+        _refresh_shape_key_list_from_context(context)
 
         return {'FINISHED'}
 
@@ -128,7 +156,7 @@ class ATP_OT_ResetAllShapeKeys(bpy.types.Operator):
         
         if reset_count > 0:
             self.report({'INFO'}, f"成功归零了 {reset_count} 个形态键。")
-            bpy.ops.atp.refresh_shape_keys('INVOKE_DEFAULT')
+            _refresh_shape_key_list_from_context(context)
         else:
             self.report({'INFO'}, "在选中的物体中未找到任何形态键。")
             
@@ -245,10 +273,92 @@ class ATP_OT_BatchRenameShapeKey(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class ATP_OT_SetActiveShapeKeyAsBasis(bpy.types.Operator):
+    """将活动形态键重设为新的 Basis，并按原始偏移重算其他形态键。"""
+    bl_idname = "atp.set_active_shape_key_as_basis"
+    bl_label = "将活动形态键设为基态"
+    bl_description = "把当前活动形态键烘焙为新的 Basis，并让其他形态键在新 Basis 上保持原始偏移"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        active_obj = context.active_object
+        if context.mode != 'OBJECT':
+            return False
+        if active_obj is None or active_obj.type != 'MESH':
+            return False
+
+        shape_keys = getattr(active_obj.data, "shape_keys", None)
+        if shape_keys is None or len(shape_keys.key_blocks) <= 1:
+            return False
+        if not shape_keys.use_relative:
+            return False
+
+        active_shape_key = getattr(active_obj, "active_shape_key", None)
+        return active_shape_key is not None and active_shape_key != shape_keys.reference_key
+
+    def execute(self, context):
+        props = context.scene.atp_props
+        obj = context.active_object
+        shape_keys = obj.data.shape_keys
+        basis_key = shape_keys.reference_key
+        source_key = obj.active_shape_key
+
+        if basis_key is None or source_key is None:
+            self.report({'ERROR'}, "当前物体缺少可处理的形态键。")
+            return {'CANCELLED'}
+
+        if source_key == basis_key:
+            self.report({'ERROR'}, "当前活动形态键已经是 Basis。")
+            return {'CANCELLED'}
+
+        source_key_name = source_key.name
+        remove_source = props.sk_rebase_remove_source
+        coordinate_snapshot = _snapshot_shape_key_coordinates(shape_keys.key_blocks)
+
+        try:
+            rebased_coordinates = rebase_shape_key_coordinates(
+                coordinates_by_name=coordinate_snapshot,
+                basis_name=basis_key.name,
+                new_basis_name=source_key_name,
+                remove_new_basis_key=remove_source,
+            )
+        except (KeyError, ValueError) as exc:
+            self.report({'ERROR'}, f"重设基态失败: {exc}")
+            return {'CANCELLED'}
+
+        _restore_shape_key_coordinates(shape_keys.key_blocks, rebased_coordinates)
+        obj.data.update()
+
+        for key_block in shape_keys.key_blocks:
+            if key_block == basis_key:
+                continue
+            key_block.relative_key = basis_key
+
+        if remove_source:
+            refreshed_source_key = shape_keys.key_blocks.get(source_key_name)
+            if refreshed_source_key is not None and refreshed_source_key != basis_key:
+                obj.shape_key_remove(refreshed_source_key)
+        else:
+            preserved_source_key = shape_keys.key_blocks.get(source_key_name)
+            if preserved_source_key is not None:
+                preserved_source_key.relative_key = basis_key
+                preserved_source_key.value = 0.0
+
+        obj.active_shape_key_index = 0
+        obj.data.update()
+        _refresh_shape_key_list_from_context(context)
+
+        action_text = "并删除源形态键" if remove_source else "并保留零偏移源形态键"
+        self.report({'INFO'}, f"已将 '{source_key_name}' 设为新的 Basis，其他形态键已按原始偏移重算，{action_text}。")
+        return {'FINISHED'}
+
+
 at_shape_key_operations_list = (
     ATP_OT_BatchAddShapeKey,
     ATP_OT_BatchRemoveShapeKey,
     ATP_OT_ResetAllShapeKeys,
     ATP_OT_SetActiveShapeKey,
     ATP_OT_BatchRenameShapeKey,
+    ATP_OT_SetActiveShapeKeyAsBasis,
 )

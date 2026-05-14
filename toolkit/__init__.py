@@ -66,6 +66,7 @@ from .ui_panel_animation import (
     ATP_PT_AnimationFrameSplit,
     ATP_PT_Automation,
     ATP_PT_ShapeKeyOperations,
+    ATP_PT_ShapeKeyBasisRebase,
     ATP_PT_ShapeKeyCreation,
     ATP_PT_ShapeKeyAnimationExport,
     ATP_PT_AutomationShapeKeyExport,
@@ -409,6 +410,7 @@ def register():
     bpy.utils.register_class(ATP_PT_AnimationFrameSplit)
     bpy.utils.register_class(ATP_PT_Automation)
     bpy.utils.register_class(ATP_PT_ShapeKeyOperations)
+    bpy.utils.register_class(ATP_PT_ShapeKeyBasisRebase)
     bpy.utils.register_class(ATP_PT_ShapeKeyCreation)
     bpy.utils.register_class(ATP_PT_ShapeKeyAnimationExport)
     bpy.utils.register_class(ATP_PT_AutomationShapeKeyExport)
@@ -421,6 +423,7 @@ def unregister():
     bpy.utils.unregister_class(ATP_PT_AutomationShapeKeyExport)
     bpy.utils.unregister_class(ATP_PT_ShapeKeyAnimationExport)
     bpy.utils.unregister_class(ATP_PT_ShapeKeyCreation)
+    bpy.utils.unregister_class(ATP_PT_ShapeKeyBasisRebase)
     bpy.utils.unregister_class(ATP_PT_ShapeKeyOperations)
     bpy.utils.unregister_class(ATP_PT_Automation)
     bpy.utils.unregister_class(ATP_PT_AnimationFrameSplit)

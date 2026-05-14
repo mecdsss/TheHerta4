@@ -15,7 +15,7 @@ class ATP_PT_MainPanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="版本: 1.7.0")
+        layout.label(text="版本: 4.3.6")
 
 
 class ATP_PT_ShapeKeyTools(bpy.types.Panel):
@@ -104,6 +104,64 @@ class ATP_PT_ShapeKeyOperations(bpy.types.Panel):
         row.operator(at_shape_key_operations.ATP_OT_BatchRenameShapeKey.bl_idname, text="重命名", icon='OUTLINER_OB_GROUP_INSTANCE')
 
 
+class ATP_PT_ShapeKeyBasisRebase(bpy.types.Panel):
+    bl_label = "形态键基态重设"
+    bl_idname = "VIEW3D_PT_Herta_ATP_ShapeKeyBasisRebase_Panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'TheHerta4'
+    bl_parent_id = 'VIEW3D_PT_Herta_ATP_ShapeKeyTools_Panel'
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 1
+
+    def draw(self, context):
+        from . import at_shape_key_operations
+
+        layout = self.layout
+        props = context.scene.atp_props
+        box = layout.box()
+        col = box.column(align=True)
+
+        active_obj = context.active_object
+        if active_obj is None or active_obj.type != 'MESH':
+            col.label(text="请先激活一个网格物体", icon='ERROR')
+            return
+
+        shape_keys = getattr(active_obj.data, "shape_keys", None)
+        col.label(text=f"当前物体: {active_obj.name}", icon='MESH_DATA')
+
+        if shape_keys is None or len(shape_keys.key_blocks) <= 1:
+            col.label(text="当前物体没有可重设为基态的形态键", icon='INFO')
+            return
+
+        if not shape_keys.use_relative:
+            col.label(text="当前仅支持相对形态键模式", icon='ERROR')
+            return
+
+        active_shape_key = active_obj.active_shape_key
+        if active_shape_key is None:
+            col.label(text="请先在 Blender 形态键列表中选中目标键", icon='INFO')
+            return
+
+        col.label(text=f"活动形态键: {active_shape_key.name}", icon='SHAPEKEY_DATA')
+        col.prop(props, "sk_rebase_remove_source")
+        col.label(text="其他形态键会按原始偏移整体重算到新 Basis 上", icon='QUESTION')
+
+        if context.mode != 'OBJECT':
+            col.label(text="请切换到对象模式后再执行", icon='ERROR')
+            return
+
+        if active_shape_key == shape_keys.reference_key:
+            col.label(text="当前活动形态键已经是 Basis", icon='INFO')
+            return
+
+        col.operator(
+            at_shape_key_operations.ATP_OT_SetActiveShapeKeyAsBasis.bl_idname,
+            text="将活动形态键设为基态",
+            icon='KEY_HLT',
+        )
+
+
 class ATP_PT_ShapeKeyCreation(bpy.types.Panel):
     bl_label = "形状差异与帧拆分"
     bl_idname = "VIEW3D_PT_Herta_ATP_ShapeKeyCreation_Panel"
@@ -112,7 +170,7 @@ class ATP_PT_ShapeKeyCreation(bpy.types.Panel):
     bl_category = 'TheHerta4'
     bl_parent_id = 'VIEW3D_PT_Herta_ATP_ShapeKeyTools_Panel'
     bl_options = {'DEFAULT_CLOSED'}
-    bl_order = 1
+    bl_order = 2
 
     def draw(self, context):
         from . import at_shape_key_creation
@@ -195,7 +253,7 @@ class ATP_PT_ShapeKeyAnimationExport(bpy.types.Panel):
     bl_category = 'TheHerta4'
     bl_parent_id = 'VIEW3D_PT_Herta_ATP_ShapeKeyTools_Panel'
     bl_options = {'DEFAULT_CLOSED'}
-    bl_order = 2
+    bl_order = 3
 
     def draw(self, context):
         from . import at_shape_key_creation
@@ -461,6 +519,7 @@ ui_panel_animation_list = (
     ATP_PT_AnimationFrameSplit,
     ATP_PT_Automation,
     ATP_PT_ShapeKeyOperations,
+    ATP_PT_ShapeKeyBasisRebase,
     ATP_PT_ShapeKeyCreation,
     ATP_PT_ShapeKeyAnimationExport,
     ATP_PT_AutomationShapeKeyExport,

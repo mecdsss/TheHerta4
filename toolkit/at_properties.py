@@ -79,6 +79,11 @@ class ATP_Properties(bpy.types.PropertyGroup):
     sk_set_active_name: bpy.props.StringProperty(name="活动形态键名称", default="", description="要设置为活动项的形态键名称")
     sk_rename_old_name: bpy.props.StringProperty(name="原形态键名称", default="", description="要重命名的形态键的原名称")
     sk_rename_new_name: bpy.props.StringProperty(name="新形态键名称", default="", description="形态键的新名称")
+    sk_rebase_remove_source: bpy.props.BoolProperty(
+        name="删除源形态键",
+        default=True,
+        description="启用后会在设为基态后删除源形态键；关闭时会保留一个零偏移的同名形态键",
+    )
 
     anim_split_sub_prefix: bpy.props.StringProperty(name="子合集前缀", default="Frame_")
     anim_split_start_frame: bpy.props.IntProperty(name="起始帧", default=1, min=0)
