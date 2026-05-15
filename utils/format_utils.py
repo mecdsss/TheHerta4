@@ -32,6 +32,38 @@ class FormatUtils:
     components_pattern = re.compile(r'''(?<![0-9])[0-9]+(?![0-9])''')
 
     @classmethod
+    def fit_component_width(cls, input_array, component_count: int, fill_value=0):
+        """
+        Clamp or pad a per-row component array to the exact width required by a
+        packed vertex field.
+
+        `input_array` may be 1D (`shape=(rows,)`) for scalar fields or 2D
+        (`shape=(rows, cols)`) for vector fields. Wider arrays are truncated to
+        the left-most `component_count` columns; narrower arrays are padded with
+        `fill_value`.
+        """
+        if component_count <= 0:
+            raise ValueError("component_count must be positive")
+
+        arr = numpy.asarray(input_array)
+        if arr.ndim == 1:
+            if component_count == 1:
+                return arr
+            arr = arr.reshape(-1, 1)
+        elif arr.ndim != 2:
+            raise ValueError(f"expected a 1D or 2D array, got ndim={arr.ndim}")
+
+        current_count = arr.shape[1]
+        if current_count == component_count:
+            return arr
+        if current_count > component_count:
+            return arr[:, :component_count]
+
+        padded = numpy.full((arr.shape[0], component_count), fill_value, dtype=arr.dtype)
+        padded[:, :current_count] = arr
+        return padded
+
+    @classmethod
     def get_nptype_from_format(cls,fmt):
         '''
         解析DXGI Format字符串，返回numpy的数据类型

@@ -367,6 +367,10 @@ class ObjBufferHelper:
             else:
                 SSMTErrorUtils.raise_fatal("Cannot find any valid BLENDINDICES data in this model, Please check if your model's Vertex Group is correct.")
         # print(len(blendindices))
+        component_count = int(
+            d3d11_element.ByteWidth / numpy.dtype(FormatUtils.get_nptype_from_format(d3d11_element.Format)).itemsize
+        )
+        blendindices = FormatUtils.fit_component_width(blendindices, component_count)
         if d3d11_element.Format == "R32G32B32A32_SINT":
             return blendindices
         elif d3d11_element.Format == "R16G16B16A16_UINT":
@@ -427,6 +431,10 @@ class ObjBufferHelper:
             else:
                 SSMTErrorUtils.raise_fatal("Cannot find any valid BLENDWEIGHT data in this model, Please check if your model's Vertex Group is correct.")
         # print(len(blendweights))
+        component_count = int(
+            d3d11_element.ByteWidth / numpy.dtype(FormatUtils.get_nptype_from_format(d3d11_element.Format)).itemsize
+        )
+        blendweights = FormatUtils.fit_component_width(blendweights, component_count)
         if d3d11_element.Format == "R32G32B32A32_FLOAT":
             return blendweights
         elif d3d11_element.Format == "R32G32_FLOAT":

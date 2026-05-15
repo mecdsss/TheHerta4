@@ -2,6 +2,7 @@ import bpy
 import numpy as np
 import bmesh
 import math
+from ..utils.vertex_color_utils import build_vertex_color_payload
 
 
 def srgb_to_linear(srgb_value):
@@ -89,8 +90,7 @@ class BMTP_OT_SetVertexColor(bpy.types.Operator):
             self.report({'ERROR'}, "请选择至少一个网格物体")
             return {'CANCELLED'}
         
-        color_rgba_srgb = props.vc_color[:]
-        color_rgba_linear = convert_color_srgb_to_linear(color_rgba_srgb)
+        color_rgba_srgb = np.asarray(props.vc_color[:], dtype=np.float32)
         
         for obj in selected_objects:
             mesh = obj.data
@@ -100,32 +100,19 @@ class BMTP_OT_SetVertexColor(bpy.types.Operator):
             else:
                 color_attr = mesh.color_attributes.active_color
             
-            is_byte_color = (color_attr.data_type == 'BYTE_COLOR')
             num_loops = len(mesh.loops)
-            
-            if is_byte_color:
-                color_data = np.zeros(num_loops * 4, dtype=np.uint8)
-                if props.vc_mode == 'ALPHA_ONLY':
-                    temp_data = np.zeros(num_loops * 4, dtype=np.uint8)
-                    color_attr.data.foreach_get("color", temp_data)
-                    color_data[:] = temp_data
-                    alpha_val = int(round(color_rgba_linear[3] * 255))
-                    color_data[3::4] = np.clip(alpha_val, 0, 255).astype(np.uint8)
-                else:
-                    r = int(round(color_rgba_linear[0] * 255))
-                    g = int(round(color_rgba_linear[1] * 255))
-                    b = int(round(color_rgba_linear[2] * 255))
-                    a = int(round(color_rgba_linear[3] * 255))
-                    rgba_bytes = [np.clip(r, 0, 255), np.clip(g, 0, 255), 
-                                 np.clip(b, 0, 255), np.clip(a, 0, 255)]
-                    color_data = np.tile(rgba_bytes, num_loops).astype(np.uint8)
-            else:
-                color_data = np.zeros(num_loops * 4, dtype=np.float32)
-                if props.vc_mode == 'ALPHA_ONLY':
-                    color_attr.data.foreach_get("color", color_data)
-                    color_data[3::4] = color_rgba_linear[3]
-                else:
-                    color_data = np.tile(color_rgba_linear, num_loops)
+
+            existing_colors = None
+            if props.vc_mode == 'ALPHA_ONLY':
+                existing_colors = np.zeros(num_loops * 4, dtype=np.float32)
+                color_attr.data.foreach_get("color", existing_colors)
+
+            color_data = build_vertex_color_payload(
+                num_loops=num_loops,
+                color_rgba_srgb=color_rgba_srgb,
+                vc_mode=props.vc_mode,
+                existing_colors=existing_colors,
+            )
             
             color_attr.data.foreach_set("color", color_data)
             mesh.update()
