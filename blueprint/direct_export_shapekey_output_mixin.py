@@ -7,6 +7,7 @@ import numpy as np
 from ..utils.log_utils import LOG
 from .direct_export_runtime_utils import apply_position_override_in_place
 from .direct_export_runtime_utils import extract_position_bytes_by_indices as _extract_position_bytes_by_indices
+from .direct_export_runtime_utils import iter_drawib_models as _iter_drawib_models
 from .direct_export_shapekey_shared import ShapeKeyDirectExportError, _buffer_to_bytes
 
 
@@ -312,6 +313,47 @@ class DirectShapeKeyOutputMixin:
 
         if not runtime_infos:
             raise ShapeKeyDirectExportError("直出形态键未找到任何可用的基础 ShapeKey 数据")
+
+        return runtime_infos
+
+    def _build_runtime_infos_from_exporter_memory(self, unique_hashes):
+        runtime_infos = {}
+        for logical_hash in unique_hashes:
+            drawib_model = self._match_drawib_model(logical_hash, logical_hash)
+            if drawib_model is None:
+                LOG.warning(f"直出形态键跳过哈希 {logical_hash}: 无法匹配内存中的 DrawIB 模型")
+                continue
+
+            category_buffer_dict = getattr(drawib_model, "category_buffer_dict", {}) or {}
+            position_buffer = category_buffer_dict.get("Position")
+            if position_buffer is None:
+                LOG.warning(f"直出形态键跳过哈希 {logical_hash}: 内存中无 Position 缓冲")
+                continue
+
+            base_bytes = _buffer_to_bytes(position_buffer)
+
+            position_stride = self._infer_position_stride(drawib_model, base_bytes)
+            vertex_count = int(len(base_bytes) / position_stride) if position_stride > 0 else 0
+            if vertex_count <= 0:
+                LOG.warning(f"直出形态键跳过哈希 {logical_hash}: 基础 Position 顶点数无效")
+                continue
+
+            draw_ib = getattr(drawib_model, "draw_ib", logical_hash)
+            actual_hash = draw_ib if draw_ib else logical_hash
+
+            runtime_infos[logical_hash] = {
+                "logical_hash": logical_hash,
+                "actual_hash": actual_hash,
+                "base_path": "",
+                "base_bytes": base_bytes,
+                "position_stride": position_stride,
+                "vertex_count": vertex_count,
+                "drawib_model": drawib_model,
+                "object_export_context_lookup": self._build_drawib_object_context_lookup(drawib_model),
+            }
+
+        if not runtime_infos:
+            raise ShapeKeyDirectExportError("直出形态键未找到任何可用的基础 Position 数据（内存回退）")
 
         return runtime_infos
 

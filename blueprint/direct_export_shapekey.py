@@ -237,7 +237,7 @@ class DirectShapeKeyGenerator(
                 f"直出形态键: exporter ShapeKey 缓冲不可用，回退到静态副本采样路径 "
                 f"({perf_counter() - stage_start:.3f}s) - {exc}"
             )
-            runtime_infos = self._build_runtime_infos(unique_hashes)
+            runtime_infos = self._build_runtime_infos_from_exporter_memory(unique_hashes)
             calculated_ranges = self._calculate_object_ranges(runtime_infos, all_objects, sections=sections)
             unique_hashes = self._apply_merged_ranges(
                 calculated_ranges,

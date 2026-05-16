@@ -493,8 +493,10 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
     def _resolve_hash_buffer_path(self, mod_export_path, folder_name, hash_val, file_suffix, preferred_hashes=None):
         h_prefix = self._extract_hash_prefix(hash_val)
+        prefix_parts = ObjectPrefixHelper.parse_prefix_parts(hash_val)
+        unique_str_candidate = prefix_parts.get("unique_str", "")
         candidate_hashes = []
-        for candidate in list(preferred_hashes or []) + [hash_val, h_prefix]:
+        for candidate in list(preferred_hashes or []) + [hash_val, unique_str_candidate, h_prefix]:
             if candidate and candidate not in candidate_hashes:
                 candidate_hashes.append(candidate)
 
