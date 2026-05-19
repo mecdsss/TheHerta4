@@ -17,6 +17,7 @@ from ..common.d3d11_gametype import D3D11GameType
 from ..utils.log_utils import LOG
 from .ntmi_layout_adapter import iter_name_variants, parse_ntmi_part_layouts
 from ..ui.ntmi_modimp.modimp_core import ensure_mod_importer_package
+from ..ui.ntmi_modimp.ntemi_importer import _ensure_ntemi_game_data_converter
 
 
 class NTMIShapeKeyNodeAdapter:
@@ -462,6 +463,7 @@ def _resolve_ntmi_profile_id(mod_export_path: str) -> str:
 def _load_ntmi_position_converter(mod_export_path: str, configured_root: str = ""):
     package = ensure_mod_importer_package(configured_root)
     game_data_module = importlib.import_module(f"{package.__name__}.core.game_data")
+    _ensure_ntemi_game_data_converter(configured_root)
     profile_id = _resolve_ntmi_profile_id(mod_export_path)
     converter = game_data_module.get_game_data_converter(profile_id)
     LOG.info(f"NTMI ShapeKey: using game-data converter profile '{profile_id}' for sampled position overrides")

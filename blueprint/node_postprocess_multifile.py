@@ -96,7 +96,7 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
         vertex_attrs_node = self._get_vertex_attrs_node()
         if vertex_attrs_node:
             return vertex_attrs_node.get_vertex_struct_definition()
-        return None
+        return "struct VertexAttributes {\n    float3 position;\n    float3 normal;\n    float4 tangent;\n};"
 
     @staticmethod
     def parse_vertex_struct(struct_definition):

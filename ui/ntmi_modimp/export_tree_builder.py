@@ -37,6 +37,16 @@ PROP_COLLECTOR_FINISH_CONDITION = "modimp_collector_finish_condition"
 
 PROFILE_ID = "yihuan"
 
+
+def _resolve_profile_id(blueprint_model: BluePrintModel) -> str:
+    for draw_call_model in getattr(blueprint_model, "ordered_draw_obj_data_model_list", []) or []:
+        obj = bpy.data.objects.get(draw_call_model.get_blender_obj_name())
+        if obj is not None:
+            profile_id = str(obj.get("modimp_profile_id", "") or "").strip()
+            if profile_id:
+                return profile_id
+    return PROFILE_ID
+
 RUNTIME_REGION_PROPS = (
     PROP_PROFILE_ID,
     PROP_MATCH_VS_TEXCOORD_HASH,
@@ -282,12 +292,31 @@ def _source_owner_candidates(obj: bpy.types.Object):
     parsed_prefix = ObjectPrefixHelper.extract_prefix_info(obj.name)
     if parsed_prefix:
         prefix, _separator = parsed_prefix
-        for collection_name in (
-            prefix,
-            f"{prefix}_Export",
-            f"{ObjectPrefixHelper.parse_prefix_parts(prefix).get('draw_ib', '')}_Export",
-        ):
-            collection = bpy.data.collections.get(collection_name)
+        prefix_parts = ObjectPrefixHelper.parse_prefix_parts(prefix)
+        draw_ib = prefix_parts.get("draw_ib", "")
+        lod_name = prefix_parts.get("lod_name", "")
+
+        candidate_prefixes = [(prefix, False)]
+        if not lod_name:
+            candidate_prefixes.append((f"LOD0.{prefix}", True))
+
+        seen = set()
+        for candidate_prefix, _is_lod_variant in candidate_prefixes:
+            for collection_name in (
+                candidate_prefix,
+                f"{candidate_prefix}_Export",
+            ):
+                if collection_name in seen:
+                    continue
+                seen.add(collection_name)
+                collection = bpy.data.collections.get(collection_name)
+                if collection is not None:
+                    yield collection
+
+        export_collection_name = f"{draw_ib}_Export"
+        if export_collection_name not in seen:
+            seen.add(export_collection_name)
+            collection = bpy.data.collections.get(export_collection_name)
             if collection is not None:
                 yield collection
 
@@ -300,7 +329,11 @@ def _source_root_candidates(draw_ib: str):
     if not normalized:
         return
 
-    for collection_name in (normalized, f"{normalized}_Export"):
+    seen = set()
+    for collection_name in (normalized, f"{normalized}_Export", f"LOD0.{normalized}", f"LOD0.{normalized}_Export"):
+        if collection_name in seen:
+            continue
+        seen.add(collection_name)
         collection = bpy.data.collections.get(collection_name)
         if collection is not None:
             yield collection
@@ -320,6 +353,9 @@ def _source_region_candidates(draw_ib: str, index_count: int, first_index: int):
         f"{normalized}-{int(index_count)}-{int(first_index)}",
         f"{normalized}_{int(index_count)}_{int(first_index)}",
         normalized,
+        f"LOD0.{normalized}-{int(index_count)}-{int(first_index)}",
+        f"LOD0.{normalized}_{int(index_count)}_{int(first_index)}",
+        f"LOD0.{normalized}",
     )
 
     seen = set()
@@ -353,60 +389,6 @@ def _first_existing_owner(obj: bpy.types.Object):
     return obj
 
 
-def _texture_slots_from_materials(obj: bpy.types.Object) -> str:
-    slots = {}
-    if obj.type != "MESH":
-        return ""
-
-    def image_path_from_input(material, input_name: str) -> str:
-        if not material or not getattr(material, "use_nodes", False) or material.node_tree is None:
-            return ""
-        bsdf = material.node_tree.nodes.get("Principled BSDF")
-        if bsdf is None:
-            return ""
-        input_socket = bsdf.inputs.get(input_name)
-        if input_socket is None:
-            return ""
-        visited = set()
-
-        def find_image(socket):
-            for link in getattr(socket, "links", []) or []:
-                node = link.from_node
-                if id(node) in visited:
-                    continue
-                visited.add(id(node))
-                if getattr(node, "bl_idname", "") == "ShaderNodeTexImage":
-                    return getattr(node, "image", None)
-                for nested_input in getattr(node, "inputs", []) or []:
-                    image = find_image(nested_input)
-                    if image is not None:
-                        return image
-            return None
-
-        image = find_image(input_socket)
-        if image is None:
-            return ""
-        path = str(getattr(image, "filepath", "") or "").strip()
-        if not path:
-            return ""
-        try:
-            path = bpy.path.abspath(path)
-        except Exception:
-            pass
-        return path
-
-    for material_slot in getattr(obj, "material_slots", []) or []:
-        material = getattr(material_slot, "material", None)
-        base_path = image_path_from_input(material, "Base Color")
-        normal_path = image_path_from_input(material, "Normal")
-        if base_path:
-            slots.setdefault("ps-t7", {"source_path": base_path, "extension": base_path.rsplit(".", 1)[-1]})
-        if normal_path:
-            slots.setdefault("ps-t5", {"source_path": normal_path, "extension": normal_path.rsplit(".", 1)[-1]})
-
-    return json.dumps(slots, ensure_ascii=False) if slots else ""
-
-
 def _copy_runtime_contract(
     obj: bpy.types.Object,
     region_collection: bpy.types.Collection,
@@ -426,11 +408,6 @@ def _copy_runtime_contract(
             if _region_contract_status(region_collection)[0]:
                 break
 
-    if PROP_TEXTURE_SLOTS not in region_collection:
-        texture_slots = _texture_slots_from_materials(obj)
-        if texture_slots:
-            region_collection[PROP_TEXTURE_SLOTS] = texture_slots
-
 
 def _copy_collector_props(objects: list[bpy.types.Object], source_collection: bpy.types.Collection):
     owners = []
@@ -448,9 +425,9 @@ def _link_object(collection: bpy.types.Collection, obj: bpy.types.Object):
         collection.objects.link(obj)
 
 
-def _mark_source_collection(collection: bpy.types.Collection, draw_ib: str):
+def _mark_source_collection(collection: bpy.types.Collection, draw_ib: str, *, profile_id: str = ""):
     collection[PROP_KIND] = "source_ib"
-    collection[PROP_PROFILE_ID] = PROFILE_ID
+    collection[PROP_PROFILE_ID] = profile_id or PROFILE_ID
     collection[PROP_SOURCE_IB_HASH] = draw_ib.lower()
 
 
@@ -460,9 +437,10 @@ def _mark_region_collection(
     draw_ib: str,
     index_count: int,
     first_index: int,
+    profile_id: str = "",
 ):
     collection[PROP_KIND] = "region"
-    collection[PROP_PROFILE_ID] = PROFILE_ID
+    collection[PROP_PROFILE_ID] = profile_id or PROFILE_ID
     collection[PROP_SOURCE_IB_HASH] = draw_ib.lower()
     collection[PROP_REGION_HASH] = draw_ib.lower()
     collection[PROP_REGION_INDEX_COUNT] = int(index_count)
@@ -495,6 +473,7 @@ def build_export_tree(blueprint_model: BluePrintModel, tree_prefix: str = "TheHe
     warnings = []
     created_names = []
     grouped: dict[str, dict[tuple[int, int], list[tuple[DrawCallModel, bpy.types.Object, object]]]] = {}
+    resolved_profile_id = _resolve_profile_id(blueprint_model)
 
     for draw_call_model in blueprint_model.ordered_draw_obj_data_model_list:
         key = _draw_key(draw_call_model)
@@ -523,7 +502,7 @@ def build_export_tree(blueprint_model: BluePrintModel, tree_prefix: str = "TheHe
         root_name = _unique_collection_name(f"{tree_prefix}_{draw_ib}")
         root_collection = bpy.data.collections.new(root_name)
         _ensure_scene_linked(root_collection)
-        _mark_source_collection(root_collection, draw_ib)
+        _mark_source_collection(root_collection, draw_ib, profile_id=resolved_profile_id)
         created_names.append(root_collection.name)
         root_collections.append(root_collection)
 
@@ -548,6 +527,7 @@ def build_export_tree(blueprint_model: BluePrintModel, tree_prefix: str = "TheHe
                 draw_ib=draw_ib,
                 index_count=index_count,
                 first_index=first_index,
+                profile_id=resolved_profile_id,
             )
             created_names.append(region_collection.name)
 

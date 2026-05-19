@@ -652,6 +652,31 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         material_name = re.sub(r"[\r\n\[\]=]+", "_", material_name).strip("_")
         return f"ResourceTexture_{material_name or 'Texture'}"
 
+    def _collect_ntemifx_texture_slots(self, obj) -> dict[str, str]:
+        import json as _json
+        result: dict[str, str] = {}
+        raw = str(obj.get("modimp_texture_slots", "") or "").strip()
+        if not raw:
+            return result
+        try:
+            slots = _json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            return result
+        if not isinstance(slots, dict):
+            return result
+
+        for slot_label, binding in slots.items():
+            if not isinstance(binding, dict):
+                continue
+            mark_name = str(binding.get("mark_name", "") or "").strip()
+            if mark_name not in ("FXMap", "LightMap"):
+                continue
+            slot_token = str(slot_label).replace("ps-", "").replace("-", "_").upper()
+            resource_token = self._object_texture_resource_token(obj)
+            resource_name = f"ResourceTexture_{resource_token}_{slot_token}"
+            result[slot_label] = resource_name
+        return result
+
     def _get_material_candidate_objects(self, obj):
         try:
             from .preprocess_cache import PreProcessCache
@@ -1139,6 +1164,29 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                         swap_key_prefix, next_swap_key_num, used_swap_keys)
                     fxmap_lines.extend(generated_lines)
                     fxmap_lines.append("run = CommandList\\RabbitFX\\Run")
+
+            ntemifx_lines = []
+            ntemifx_texture_slots = self._collect_ntemifx_texture_slots(obj)
+            for slot_label, resource_name in ntemifx_texture_slots.items():
+                ntemifx_lines.append(f"Resource\\NTEMIFX\\FXMap = ref {resource_name}")
+                ntemifx_lines.append("run = CommandList\\NTEMIFX\\Run")
+                matched_types.append(f"NTEMIFX/{slot_label}")
+            if ntemifx_texture_slots:
+                reset_after_draw = []
+                reset_after_draw.append("Resource\\NTEMIFX\\FXMap = ref null")
+                reset_after_draw.append("run = CommandList\\NTEMIFX\\Run")
+                draw_idx = -1
+                search_end_idx = len(lines)
+                for i in range(insert_index + 1, len(lines)):
+                    if '[mesh:' in lines[i]:
+                        search_end_idx = i
+                        break
+                for i in range(insert_index + 1, search_end_idx):
+                    if 'drawindexed' in lines[i]:
+                        draw_idx = i
+                        break
+                if draw_idx != -1:
+                    lines[draw_idx + 1:draw_idx + 1] = reset_after_draw
             
             if matched_types:
                 _LOG.info(f"      找到 '{mesh_name}', 匹配材质: {', '.join(matched_types)}")
@@ -1148,6 +1196,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             if generated_zzmi_style: new_lines_for_this_mesh.append("run = CommandList\\ZZMI\\SetTextures")
             if generated_rabbitfx_style: new_lines_for_this_mesh.append("run = CommandList\\RabbitFX\\SetTextures")
             new_lines_for_this_mesh.extend(fxmap_lines)
+            new_lines_for_this_mesh.extend(ntemifx_lines)
             lines[insert_index + 1:insert_index + 1] = new_lines_for_this_mesh
             reset_lines = []
             if generated_glowmap: reset_lines.extend(["Resource\\RabbitFX\\Glowmap = ref null", r"$\RabbitFX\brightness = 0"])
