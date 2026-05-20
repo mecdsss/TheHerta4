@@ -15,6 +15,15 @@ except ImportError:
 from .direct_export import sync_shapekey_direct_mode
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 from .variable_registry import allocate_shape_key_variable_name, mark_variable_name_used, normalize_variable_name
+from ..common.mod_path_compat import collect_base_position_resource_map
+from ..common.mod_path_compat import derive_shapekey_base_resource_name
+from ..common.mod_path_compat import derive_shapekey_freq_resource_name
+from ..common.mod_path_compat import derive_shapekey_merged_data_resource_name
+from ..common.mod_path_compat import derive_shapekey_merged_map_resource_name
+from ..common.mod_path_compat import derive_shapekey_slot_map_resource_name
+from ..common.mod_path_compat import derive_shapekey_slot_resource_name
+from ..common.mod_path_compat import ensure_resource_alias_section
+from ..common.mod_path_compat import resolve_hash_buffer_candidate
 from ..common.object_prefix_helper import ObjectPrefixHelper
 
 
@@ -497,31 +506,17 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         unique_str_candidate = prefix_parts.get("unique_str", "")
         candidate_hashes = []
         for candidate in list(preferred_hashes or []) + [hash_val, unique_str_candidate, h_prefix]:
-            if candidate and candidate not in candidate_hashes:
-                candidate_hashes.append(candidate)
+            normalized_candidate = str(candidate or "").strip()
+            if normalized_candidate and normalized_candidate not in candidate_hashes:
+                candidate_hashes.append(normalized_candidate)
 
-        primary_path = os.path.join(mod_export_path, folder_name, f"{hash_val}{file_suffix}")
-        for candidate_hash in candidate_hashes:
-            candidate_path = os.path.join(mod_export_path, folder_name, f"{candidate_hash}{file_suffix}")
-            if os.path.exists(candidate_path):
-                return candidate_path, candidate_hash
-
-        if not h_prefix:
-            return primary_path, hash_val
-
-        pattern = os.path.join(mod_export_path, folder_name, f"{h_prefix}-*{file_suffix}")
-        matches = sorted(glob.glob(pattern), key=lambda item: os.path.basename(item).lower())
-        if matches:
-            preferred_names = {f"{candidate}{file_suffix}".lower() for candidate in candidate_hashes}
-            for match_path in matches:
-                if os.path.basename(match_path).lower() in preferred_names:
-                    actual_hash = os.path.basename(match_path).replace(file_suffix, "")
-                    return match_path, actual_hash
-
-            actual_hash = os.path.basename(matches[0]).replace(file_suffix, "")
-            return matches[0], actual_hash
-
-        return primary_path, hash_val
+        folder_path = os.path.join(mod_export_path, folder_name)
+        return resolve_hash_buffer_candidate(
+            folder_path,
+            hash_val,
+            file_suffix,
+            preferred_hashes=candidate_hashes,
+        )
 
     def _resolve_position_buffer_path(self, mod_export_path, folder_name, hash_val, preferred_hashes=None):
         return self._resolve_hash_buffer_path(
@@ -1418,6 +1413,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             
             mesh_name_to_range_and_ib = {}
             mesh_candidates_by_prefix = defaultdict(list)
+            hash_to_base_resources = collect_base_position_resource_map(
+                sections,
+                self._extract_hash_prefix,
+            )
+
             mesh_runtime_alias_map = defaultdict(list)
             mesh_base_alias_map = defaultdict(list)
             for mesh_name, info_list in draw_info_map.items():
@@ -1653,6 +1653,12 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 base_resources = hash_to_base_resources.get(h_prefix, [])
                 res_to_post = base_resources if base_resources else [f"Resource_{self._hash_to_resource_prefix(h)}_Position"]
                 for res_name in res_to_post:
+                    ensure_resource_alias_section(
+                        sections,
+                        res_name,
+                        "_0",
+                        source_candidates=[res_name],
+                    )
                     if f"post {res_name} = copy_desc" not in constants_content:
                         constants_lines.append(f"post {res_name} = copy_desc {res_name}_0")
                 if len(base_resources) > 1:
@@ -1704,9 +1710,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
                     t_registers_to_null = []
                     slots_for_hash = sorted(hash_slot_data.keys())
+                    base_resources = hash_to_base_resources.get(h_prefix, [])
+                    primary_base_resource = base_resources[0] if base_resources else f"Resource_{self._hash_to_resource_prefix(h)}_Position"
 
                     if not use_delta:
-                        block_lines.append(f"\n    cs-t50 = copy Resource_{self._hash_to_resource_prefix(h)}_Position0000")
+                        block_lines.append(f"\n    cs-t50 = copy {derive_shapekey_base_resource_name(primary_base_resource)}")
                         t_registers_to_null.append("cs-t50")
 
                     res_suffix = "_packed_pos_delta" if use_packed and use_delta else \
@@ -1721,42 +1729,51 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     )
                     block_lines.append(f"\n    ; --- Binding Shape Key Meshess (Mode: {mode_str}) ---")
                     if merge_slot_files:
-                        block_lines.append(f"    cs-t51 = copy {self._get_merged_data_resource_name(h, use_delta)}")
-                        block_lines.append(f"    cs-t52 = copy {self._get_merged_map_resource_name(h)}")
+                        block_lines.append(f"    cs-t51 = copy {derive_shapekey_merged_data_resource_name(primary_base_resource, use_delta)}")
+                        block_lines.append(f"    cs-t52 = copy {derive_shapekey_merged_map_resource_name(primary_base_resource)}")
                         t_registers_to_null.extend(["cs-t51", "cs-t52"])
 
                         if use_optimized:
-                            block_lines.append(f"    cs-t53 = copy Resource_{self._hash_to_resource_prefix(h)}_Position_FreqIndices")
+                            block_lines.append(f"    cs-t53 = copy {derive_shapekey_freq_resource_name(primary_base_resource)}")
                             t_registers_to_null.append("cs-t53")
                     else:
                         for slot in slots_for_hash:
-                            res_name = f"Resource_{self._hash_to_resource_prefix(h)}_Position100{slot}{res_suffix}"
-                            if not (use_packed or use_delta):
-                                res_name = f"Resource_{self._hash_to_resource_prefix(h)}_Position100{slot}"
+                            res_name = derive_shapekey_slot_resource_name(primary_base_resource, slot, res_suffix if (use_packed or use_delta) else "")
 
                             t_reg = 51 + slot - 1
                             block_lines.append(f"    cs-t{t_reg} = copy {res_name}")
                             t_registers_to_null.append(f"cs-t{t_reg}")
                             if use_packed:
                                 map_reg = 75 + slot - 1
-                                block_lines.append(f"    cs-t{map_reg} = copy Resource_{self._hash_to_resource_prefix(h)}_Position100{slot}_Map")
+                                block_lines.append(f"    cs-t{map_reg} = copy {derive_shapekey_slot_map_resource_name(primary_base_resource, slot)}")
                                 t_registers_to_null.append(f"cs-t{map_reg}")
 
                         if use_optimized:
-                            block_lines.append(f"    cs-t99 = copy Resource_{self._hash_to_resource_prefix(h)}_Position_FreqIndices")
+                            block_lines.append(f"    cs-t99 = copy {derive_shapekey_freq_resource_name(primary_base_resource)}")
                             t_registers_to_null.append("cs-t99")
 
                     block_lines.append(f"    cs = ./res/shapekey_anim_{h}.hlsl")
 
                     h_prefix = self._extract_hash_prefix(h)
-                    base_resources = hash_to_base_resources.get(h_prefix, [])
                     res_to_bind = base_resources if base_resources else [f"Resource_{self._hash_to_resource_prefix(h)}_Position"]
                     if len(res_to_bind) > 1:
                         block_lines.append(f"\n    ; --- Base Mesh Switching ---")
                         for i, res_name in enumerate(res_to_bind, 1):
+                            ensure_resource_alias_section(
+                                sections,
+                                res_name,
+                                "_0",
+                                source_candidates=[res_name],
+                            )
                             block_lines.extend([f"    if $swapkey100 == {i}", f"        cs-u5 = copy {res_name}_0", f"        {res_name} = ref cs-u5", "    endif"])
                     else:
                         res_name = res_to_bind[0]
+                        ensure_resource_alias_section(
+                            sections,
+                            res_name,
+                            "_0",
+                            source_candidates=[res_name],
+                        )
                         block_lines.extend([f"    cs-u5 = copy {res_name}_0", f"    {res_name} = ref cs-u5"])
 
                     dispatch_count = vertex_counts.get(h_prefix, 10000)
@@ -1771,7 +1788,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             for h in unique_hashes:
                 h_prefix = self._extract_hash_prefix(h)
                 actual_file_hash = hash_to_actual_file_hash.get(h, h)
-                section_name = f"[Resource_{self._hash_to_resource_prefix(h)}_Position0000]"
+                base_resources = hash_to_base_resources.get(h_prefix, [])
+                primary_base_resource = base_resources[0] if base_resources else f"Resource_{self._hash_to_resource_prefix(h)}_Position"
+                section_name = f"[{derive_shapekey_base_resource_name(primary_base_resource)}]"
                 if section_name not in sections and section_name not in generated_section_names:
                     stride = hash_to_stride.get(h_prefix, 40)
                     new_resource_lines.extend([section_name, "type = Buffer", f"stride = {stride}", f"filename = Meshes0000/{actual_file_hash}-Position.buf", ""])
@@ -1786,13 +1805,15 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     actual_file_hash = hash_to_actual_file_hash.get(h, h)
                     base_stride = hash_to_stride.get(h_prefix, 40)
                     data_stride = 12 if use_delta else base_stride
-                    data_section = f"[{self._get_merged_data_resource_name(h, use_delta)}]"
+                    base_resources = hash_to_base_resources.get(h_prefix, [])
+                    primary_base_resource = base_resources[0] if base_resources else f"Resource_{self._hash_to_resource_prefix(h)}_Position"
+                    data_section = f"[{derive_shapekey_merged_data_resource_name(primary_base_resource, use_delta)}]"
                     data_filename = f"Meshes0000/{actual_file_hash}-Position{self._get_merged_data_file_suffix(use_delta)}.buf"
                     if data_section not in sections and data_section not in generated_section_names:
                         new_resource_lines.extend([data_section, "type = Buffer", f"stride = {data_stride}", f"filename = {data_filename}", ""])
                         generated_section_names.add(data_section)
 
-                    map_section = f"[{self._get_merged_map_resource_name(h)}]"
+                    map_section = f"[{derive_shapekey_merged_map_resource_name(primary_base_resource)}]"
                     map_filename = f"Meshes0000/{actual_file_hash}-Position_merged_map.buf"
                     if map_section not in sections and map_section not in generated_section_names:
                         new_resource_lines.extend([map_section, "type = Buffer", "stride = 4", f"filename = {map_filename}", ""])
@@ -1805,6 +1826,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         if h_prefix:
                             actual_file_hash = hash_to_actual_file_hash.get(h, h)
                             base_stride = hash_to_stride.get(h_prefix, 40)
+                            base_resources = hash_to_base_resources.get(h_prefix, [])
+                            primary_base_resource = base_resources[0] if base_resources else f"Resource_{self._hash_to_resource_prefix(h)}_Position"
                             stride, filename, section_name = 0, "", ""
                             if use_delta:
                                 res_suffix = "_packed_pos_delta" if use_packed else "_pos_delta"
@@ -1817,7 +1840,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                                 stride = base_stride
 
                             if use_delta or use_packed:
-                                section_name = f"[Resource_{self._hash_to_resource_prefix(h)}_Position1{slot:03d}{res_suffix}]"
+                                section_name = f"[{derive_shapekey_slot_resource_name(primary_base_resource, slot, res_suffix)}]"
                                 folder_name = f"Meshes1{slot:03d}"
                                 filename = f"{folder_name}/{actual_file_hash}-Position{res_suffix}.buf"
                                 if section_name not in sections and section_name not in generated_section_names:
@@ -1825,7 +1848,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                                     generated_section_names.add(section_name)
 
                             if use_packed:
-                                map_section = f"[Resource_{self._hash_to_resource_prefix(h)}_Position1{slot:03d}_Map]"
+                                map_section = f"[{derive_shapekey_slot_map_resource_name(primary_base_resource, slot)}]"
                                 folder_name = f"Meshes1{slot:03d}"
                                 if map_section not in sections and map_section not in generated_section_names:
                                     new_resource_lines.extend([map_section, "type = Buffer", "stride = 4", f"filename = {folder_name}/{actual_file_hash}-Position_map.buf", ""])
@@ -1834,7 +1857,10 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             if use_optimized:
                 for h in unique_hashes:
                     actual_file_hash = hash_to_actual_file_hash.get(h, h)
-                    freq_idx_section = f"[Resource_{self._hash_to_resource_prefix(h)}_Position_FreqIndices]"
+                    h_prefix = self._extract_hash_prefix(h)
+                    base_resources = hash_to_base_resources.get(h_prefix, [])
+                    primary_base_resource = base_resources[0] if base_resources else f"Resource_{self._hash_to_resource_prefix(h)}_Position"
+                    freq_idx_section = f"[{derive_shapekey_freq_resource_name(primary_base_resource)}]"
                     if freq_idx_section not in sections and freq_idx_section not in generated_section_names:
                         new_resource_lines.extend([freq_idx_section, "type = Buffer", "stride = 4", f"filename = Meshes0000/{actual_file_hash}-Position_freq_indices.buf", ""])
                         generated_section_names.add(freq_idx_section)
@@ -1845,8 +1871,12 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             for h in unique_hashes:
                 h_prefix = self._extract_hash_prefix(h)
                 for res_name in hash_to_base_resources.get(h_prefix, [f"Resource_{self._hash_to_resource_prefix(h)}_Position"]):
-                    if f"[{res_name}]" in sections and not any(f"[{res_name}_0]" in line for line in sections[f"[{res_name}]"]):
-                        sections[f"[{res_name}]"].insert(0, f"[{res_name}_0]")
+                    ensure_resource_alias_section(
+                        sections,
+                        res_name,
+                        "_0",
+                        source_candidates=[res_name],
+                    )
 
             sections.update(compute_blocks_to_add)
             self._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content)

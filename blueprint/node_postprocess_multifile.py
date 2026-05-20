@@ -12,6 +12,8 @@ except ImportError:
     NUMPY_AVAILABLE = False
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
+from ..common.mod_path_compat import ensure_resource_alias_section
+from ..common.mod_path_compat import iter_position_buffer_candidates
 from ..common.object_prefix_helper import ObjectPrefixHelper
 
 
@@ -56,6 +58,38 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
 
     def _resource_name_from_prefix(self, resource_prefix: str) -> str:
         return f"Resource_{resource_prefix}_Position"
+
+    def _find_existing_base_resource_name(self, sections, hash_filter: str, base_name: str) -> str:
+        normalized_base_name = str(base_name or "").strip()
+        normalized_hash_filter = str(hash_filter or "").strip()
+        resource_names = []
+        for section_name in sections.keys():
+            stripped_name = str(section_name or "").strip()
+            if not stripped_name.startswith("[") or not stripped_name.endswith("]"):
+                continue
+            resource_name = stripped_name[1:-1]
+            if "Position" not in resource_name:
+                continue
+            if resource_name.endswith("_0") or resource_name.endswith("_1"):
+                continue
+            lowered = resource_name.lower()
+            variants = {
+                normalized_base_name.lower().replace(".", "_").replace("-", "_"),
+                normalized_hash_filter.lower().replace(".", "_").replace("-", "_"),
+            }
+            if any(variant and variant in lowered for variant in variants):
+                resource_names.append(resource_name)
+
+        preferred_canonical_name = self._resource_name_from_prefix(self._hash_to_resource_prefix(normalized_base_name))
+        if preferred_canonical_name in resource_names:
+            return preferred_canonical_name
+        legacy_name = f"Resource{self._hash_to_resource_prefix(normalized_hash_filter)}Position"
+        if legacy_name in resource_names:
+            return legacy_name
+        if resource_names:
+            resource_names.sort(key=str.casefold)
+            return resource_names[0]
+        return preferred_canonical_name
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "hash_values")
@@ -369,7 +403,13 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                             new_lines.append(modified_line)
 
                         if 'Position' in resource_name:
-                            sections[section_name] = [f'[{resource_name}_1]'] + new_lines
+                            sections[section_name] = new_lines
+                            ensure_resource_alias_section(
+                                sections,
+                                resource_name,
+                                "_1",
+                                source_candidates=[resource_name],
+                            )
                         else:
                             sections[section_name] = new_lines
 
@@ -596,6 +636,256 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
             print(f"多文件配置生成过程中出错: {str(e)}")
             import traceback
             traceback.print_exc()
+
+    def execute_postprocess(self, mod_export_path):
+        print(f"MultiFile postprocess start, output: {mod_export_path}")
+
+        if not NUMPY_AVAILABLE:
+            print("MultiFile postprocess requires numpy.")
+            return
+
+        hash_values = self._parse_hash_values(self.hash_values)
+        if not hash_values:
+            print("No valid hash values were provided.")
+            return
+
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(mod_export_path)
+
+            ini_files = glob.glob("*.ini")
+            if not ini_files:
+                print("No ini file found in output path.")
+                return
+
+            meshes_folders = []
+            for index in range(1, 1000):
+                folder_name = f"Meshes{index:02d}"
+                if os.path.exists(os.path.join(mod_export_path, folder_name)):
+                    meshes_folders.append(folder_name)
+                else:
+                    break
+
+            if len(meshes_folders) < 2:
+                print("At least Meshes01 and Meshes02 are required for multifile postprocess.")
+                return
+
+            shader_source_path = self._get_shader_source_path()
+            if shader_source_path and os.path.exists(shader_source_path):
+                dest_res_dir = os.path.join(mod_export_path, "res")
+                os.makedirs(dest_res_dir, exist_ok=True)
+                shader_dest_path = os.path.join(dest_res_dir, "merge_anim_packed_delta.hlsl")
+                shutil.copy2(shader_source_path, shader_dest_path)
+                self._update_shader_file(shader_dest_path)
+
+            for ini_file in ini_files:
+                ini_file_path = os.path.join(mod_export_path, ini_file)
+                self._create_cumulative_backup(ini_file_path, mod_export_path)
+                sections, preserved_tail_content = self._read_ini_to_ordered_dict(ini_file_path)
+                if not sections:
+                    continue
+
+                for section_name in list(sections.keys()):
+                    if not (section_name.startswith("[Resource") and section_name.endswith("]")):
+                        continue
+                    resource_name = section_name[1:-1]
+                    remapped_lines = []
+                    for line in sections[section_name]:
+                        updated_line = line
+                        for buf_folder in meshes_folders[1:]:
+                            old_path = f"filename = {buf_folder}/"
+                            if old_path in updated_line:
+                                updated_line = updated_line.replace(old_path, "filename = Meshes01/")
+                                break
+                        remapped_lines.append(updated_line)
+                    sections[section_name] = remapped_lines
+                    if "Position" in resource_name:
+                        ensure_resource_alias_section(
+                            sections,
+                            resource_name,
+                            "_1",
+                            source_candidates=[resource_name],
+                        )
+
+                processed_entries = []
+                meshes01_path = os.path.join(mod_export_path, "Meshes01")
+                if not os.path.exists(meshes01_path):
+                    print(f"Meshes01 folder missing: {meshes01_path}")
+                    continue
+
+                for hash_value in hash_values:
+                    try:
+                        base_candidates = iter_position_buffer_candidates(meshes01_path, hash_value)
+                    except Exception as exc:
+                        print(f"Failed to scan Meshes01 for {hash_value}: {exc}")
+                        continue
+
+                    if not base_candidates:
+                        print(f"No Position buffer matched {hash_value} under Meshes01.")
+                        continue
+
+                    base_candidate = base_candidates[0]
+                    base_position_file = base_candidate["filename"]
+                    base_name = base_candidate["stem"]
+                    hash_prefix = self._hash_to_resource_prefix(base_name)
+
+                    base_meshes_full_path = os.path.join(mod_export_path, "Meshes01", base_position_file)
+                    base_meshes = self._read_Meshes_file(base_meshes_full_path)
+                    if base_meshes is None:
+                        continue
+
+                    processed_frames = []
+                    for meshes_folder in meshes_folders[1:]:
+                        meshes_folder_path = os.path.join(mod_export_path, meshes_folder)
+                        try:
+                            target_candidates = iter_position_buffer_candidates(meshes_folder_path, hash_value)
+                        except Exception as exc:
+                            print(f"Failed to scan {meshes_folder} for {hash_value}: {exc}")
+                            continue
+
+                        if not target_candidates:
+                            continue
+
+                        target_position_file = target_candidates[0]["filename"]
+                        target_meshes_full_path = os.path.join(mod_export_path, meshes_folder, target_position_file)
+                        if not os.path.exists(target_meshes_full_path):
+                            continue
+
+                        target_meshes = self._read_Meshes_file(target_meshes_full_path)
+                        if target_meshes is None:
+                            continue
+
+                        map_array, pos_deltas_array = self._create_packed_Meshess(base_meshes, target_meshes, True)
+                        pos_output_path = os.path.join(mod_export_path, meshes_folder, f"{base_name}-Position_packed_pos_delta.buf")
+                        map_output_path = os.path.join(mod_export_path, meshes_folder, f"{base_name}-Position_map.buf")
+                        self._write_Meshes_file(pos_deltas_array, pos_output_path)
+                        self._write_Meshes_file(map_array, map_output_path)
+
+                        folder_num = int(meshes_folder.replace("Meshes", ""))
+                        sections[f"[Resource_{hash_prefix}_Position{folder_num:02d}_packed_pos_delta]"] = [
+                            "type = Buffer",
+                            "stride = 12",
+                            f"filename = {meshes_folder}/{base_name}-Position_packed_pos_delta.buf",
+                        ]
+                        sections[f"[Resource_{hash_prefix}_Position{folder_num:02d}_Map]"] = [
+                            "type = Buffer",
+                            "stride = 4",
+                            f"filename = {meshes_folder}/{base_name}-Position_map.buf",
+                        ]
+                        processed_frames.append((folder_num, meshes_folder))
+
+                    if not processed_frames:
+                        continue
+
+                    base_resource_name = self._find_existing_base_resource_name(sections, hash_value, base_name)
+                    base_resource_alias = ensure_resource_alias_section(
+                        sections,
+                        base_resource_name,
+                        "_1",
+                        source_candidates=[base_resource_name, f"{base_resource_name}_0"],
+                    )[1:-1]
+
+                    shader_section = f"[CustomShader_{base_name}_1Anim]"
+                    shader_lines = []
+                    if self.comment:
+                        shader_lines.append("; " + self.comment)
+                        shader_lines.append("")
+
+                    for state_index, (folder_num, _meshes_folder) in enumerate(processed_frames, 1):
+                        shader_lines.append(f"if {self.animation_swapkey} == {state_index}")
+                        shader_lines.append(f"      cs-t51 = copy Resource_{hash_prefix}_Position{folder_num:02d}_packed_pos_delta")
+                        shader_lines.append("endif")
+                    shader_lines.append("")
+                    for state_index, (folder_num, _meshes_folder) in enumerate(processed_frames, 1):
+                        shader_lines.append(f"if {self.animation_swapkey} == {state_index}")
+                        shader_lines.append(f"      cs-t75 = copy Resource_{hash_prefix}_Position{folder_num:02d}_Map")
+                        shader_lines.append("endif")
+
+                    shader_lines.append("")
+                    shader_lines.append("    cs = ./res/merge_anim_packed_delta.hlsl")
+                    shader_lines.append(f"    cs-u5 = copy {base_resource_alias}")
+                    shader_lines.append(f"    {base_resource_name} = ref cs-u5")
+
+                    vertex_count = self._get_vertex_count(sections, hash_value)
+                    if not vertex_count:
+                        try:
+                            file_size = os.path.getsize(base_meshes_full_path)
+                            vertex_size_bytes = self._get_vertex_size() * 4
+                            vertex_count = file_size // vertex_size_bytes
+                        except Exception:
+                            vertex_count = 100000
+                    if vertex_count == 0:
+                        vertex_count = 100000
+
+                    shader_lines.append(f"    Dispatch = {vertex_count}, 1, 1")
+                    shader_lines.append("    cs-u5 = null")
+                    shader_lines.append("    cs-t51 = null")
+                    shader_lines.append("    cs-t75 = null")
+                    sections[shader_section] = shader_lines
+
+                    processed_entries.append(
+                        {
+                            "base_name": base_name,
+                            "hash_prefix": hash_prefix,
+                            "base_resource_name": base_resource_name,
+                            "base_resource_alias": base_resource_alias,
+                        }
+                    )
+
+                constants_section = "[Constants]"
+                constants_lines = sections.get(constants_section, [])
+                if not any(self.animation_swapkey in line for line in constants_lines):
+                    constants_lines.append(f"global persist {self.animation_swapkey} = 0")
+                if not any(self.active_swapkey in line for line in constants_lines):
+                    constants_lines.append(f"global persist {self.active_swapkey} = 0")
+
+                for entry in processed_entries:
+                    legacy_base_resource_name = f"Resource{entry['hash_prefix']}Position"
+                    legacy_post_copy_line = f"post {legacy_base_resource_name} = copy_desc {legacy_base_resource_name}_1"
+                    constants_lines = [line for line in constants_lines if line != legacy_post_copy_line]
+
+                    post_copy_line = f"post {entry['base_resource_name']} = copy_desc {entry['base_resource_alias']}"
+                    post_run_line = f"post run = CustomShader_{entry['base_name']}_1Anim"
+                    if post_copy_line not in constants_lines:
+                        constants_lines.append(post_copy_line)
+                    if post_run_line not in constants_lines:
+                        constants_lines.append(post_run_line)
+                sections[constants_section] = constants_lines
+
+                present_section = "[Present]"
+                present_lines = sections.get(present_section, [])
+                active_block_start = -1
+                active_block_end = -1
+                for index, line in enumerate(present_lines):
+                    if line.strip() == f"if {self.active_swapkey} == {self.active_value}":
+                        active_block_start = index
+                    elif active_block_start >= 0 and line.strip() == "endif":
+                        active_block_end = index
+                        break
+
+                if active_block_start >= 0 and active_block_end >= 0:
+                    for entry in processed_entries:
+                        run_line = f"    run = CustomShader_{entry['base_name']}_1Anim"
+                        if run_line not in present_lines[active_block_start:active_block_end]:
+                            present_lines.insert(active_block_end, run_line)
+                else:
+                    present_lines.append("")
+                    present_lines.append(f"if {self.active_swapkey} == {self.active_value}")
+                    for entry in processed_entries:
+                        present_lines.append(f"    run = CustomShader_{entry['base_name']}_1Anim")
+                    present_lines.append("endif")
+
+                sections[present_section] = present_lines
+                self._write_ordered_dict_to_ini(sections, ini_file_path, preserved_tail_content)
+
+            print("MultiFile postprocess completed.")
+        except Exception as e:
+            print(f"MultiFile postprocess failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            if os.path.exists(original_cwd):
+                os.chdir(original_cwd)
 
 
 classes = (

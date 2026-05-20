@@ -7,6 +7,9 @@ from collections import OrderedDict, defaultdict
 import bpy
 import numpy as np
 
+from ..common.mod_path_compat import ensure_resource_alias_section
+from ..common.mod_path_compat import section_to_resource_name
+from ..common.mod_path_compat import resolve_position_buffer_candidate
 from ..utils.export_utils import ExportUtils
 from .direct_export_runtime_utils import (
     apply_position_override_in_place,
@@ -98,17 +101,7 @@ class DirectMultiFileGenerator:
         return runtime_infos
 
     def _resolve_position_buffer_path(self, hash_filter):
-        candidates = []
-        for filename in os.listdir(self.meshes_dir):
-            if not filename.endswith("-Position.buf"):
-                continue
-            if filename.startswith(hash_filter):
-                candidates.append(filename)
-        if not candidates:
-            return None, None
-        candidates.sort(key=str.casefold)
-        filename = candidates[0]
-        return os.path.join(self.meshes_dir, filename), filename.replace("-Position.buf", "")
+        return resolve_position_buffer_candidate(self.meshes_dir, hash_filter)
 
     def _match_drawib_model(self, actual_hash: str, logical_hash: str):
         logical_prefix = logical_hash.split("-")[0] if logical_hash else ""
@@ -612,19 +605,17 @@ class DirectMultiFileGenerator:
             return canonical_name
 
         sections, _ = self.config_node._read_ini_to_ordered_dict(ini_files[0])
-        resource_pattern = re.compile(
-            r'\[((?:Resource_[a-f0-9]+(?:_[a-f0-9]+)*_Position)|(?:Resource[a-f0-9]+(?:_[a-f0-9]+)*Position))\]'
-        )
         for section_name in sections.keys():
-            match = resource_pattern.match(section_name)
-            if not match:
+            if "Position" not in str(section_name or ""):
                 continue
-            full_name = match.group(1)
-            hash_value = full_name.removeprefix("Resource_").removeprefix("Resource")
-            hash_value = hash_value.removesuffix("_Position").removesuffix("Position")
-            normalized_hash = hash_value.replace("_", "-")
-            if normalized_hash == actual_hash or actual_hash.startswith(normalized_hash):
-                return canonical_name
+            full_name = section_to_resource_name(section_name)
+            lowered_name = full_name.lower().replace("_", ".")
+            actual_candidates = {
+                str(actual_hash or "").lower(),
+                str(actual_hash or "").lower().replace("-", "."),
+            }
+            if any(candidate and candidate in lowered_name for candidate in actual_candidates):
+                return full_name
         return canonical_name
 
     def _find_existing_base_resource_section_name(self, sections, actual_hash: str, base_resource_name: str) -> str | None:
@@ -673,16 +664,23 @@ class DirectMultiFileGenerator:
             base_resource_name = runtime_info["base_resource_name"]
             legacy_base_resource_name = self._build_legacy_resource_name(actual_hash)
 
-            base_section_name = f"[{base_resource_name}_1]"
-            if base_section_name not in sections:
-                original_section_name = self._find_existing_base_resource_section_name(
-                    sections,
-                    runtime_info["actual_hash"],
-                    base_resource_name,
-                )
-                original_lines = list(sections.get(original_section_name, [])) if original_section_name else []
-                if original_lines:
-                    sections[base_section_name] = original_lines
+            original_section_name = self._find_existing_base_resource_section_name(
+                sections,
+                runtime_info["actual_hash"],
+                base_resource_name,
+            )
+            base_section_name = ensure_resource_alias_section(
+                sections,
+                base_resource_name,
+                "_1",
+                source_candidates=[
+                    original_section_name[1:-1] if original_section_name else "",
+                    f"{base_resource_name}_0",
+                    f"{legacy_base_resource_name}_0",
+                    legacy_base_resource_name,
+                ],
+            )
+            base_resource_alias_name = base_section_name[1:-1]
 
             for export_index, state_info in state_outputs.items():
                 data_section = f"[Resource_{resource_prefix}_Position{export_index:02d}_packed_pos_delta]"
@@ -719,7 +717,7 @@ class DirectMultiFileGenerator:
 
             shader_lines.append("")
             shader_lines.append("    cs = ./res/merge_anim_packed_delta.hlsl")
-            shader_lines.append(f"    cs-u5 = copy {base_resource_name}_1")
+            shader_lines.append(f"    cs-u5 = copy {base_resource_alias_name}")
             shader_lines.append(f"    {base_resource_name} = ref cs-u5")
             vertex_count = runtime_info["vertex_count"] or 100000
             shader_lines.append(f"    Dispatch = {vertex_count}, 1, 1")
@@ -730,7 +728,7 @@ class DirectMultiFileGenerator:
 
             legacy_post_copy_line = f"post {legacy_base_resource_name} = copy_desc {legacy_base_resource_name}_1"
             constants_lines = [line for line in constants_lines if line != legacy_post_copy_line]
-            post_copy_line = f"post {base_resource_name} = copy_desc {base_resource_name}_1"
+            post_copy_line = f"post {base_resource_name} = copy_desc {base_resource_alias_name}"
             post_run_line = f"post run = CustomShader_{actual_hash}_1Anim"
             if post_copy_line not in constants_lines:
                 constants_lines.append(post_copy_line)
