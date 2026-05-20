@@ -22,6 +22,7 @@ from .ui_panel_toolkit import (
     TT_MaterialToolsPanel,
     TT_LightmapPanel,
     TT_MaterialPreviewPanel,
+    TT_TextureAtlasPanel,
 )
 from .vg_properties import vg_properties_list
 from .vg_backup import vg_backup_operators
@@ -47,6 +48,7 @@ from .tt_alpha_extract import tt_alpha_extract_list
 from .tt_lightmap import tt_lightmap_list
 from .tt_material_tools import tt_material_tools_list
 from .tt_material_preview import tt_material_preview_list
+from .tt_texture_atlas import tt_texture_atlas_list
 
 from .at_properties import at_properties_list
 from .at_shape_key_control import at_shape_key_control_list
@@ -95,6 +97,7 @@ __all__ = [
     'TT_MaterialToolsPanel',
     'TT_LightmapPanel',
     'TT_MaterialPreviewPanel',
+    'TT_TextureAtlasPanel',
     'model_operators_list',
     'vg_properties_list',
     'vg_backup_operators',
@@ -118,6 +121,7 @@ __all__ = [
     'tt_lightmap_list',
     'tt_material_tools_list',
     'tt_material_preview_list',
+    'tt_texture_atlas_list',
     'at_properties_list',
     'at_shape_key_control_list',
     'at_shape_key_operations_list',
@@ -317,6 +321,13 @@ def register():
         except Exception as e:
             print(f"[TheHerta4]   注册AT属性失败: {op_class.__name__} - {e}")
     
+    for op_class in tt_texture_atlas_list:
+        try:
+            bpy.utils.register_class(op_class)
+            print(f"[TheHerta4]   宸叉敞鍐孴T Texture Atlas: {op_class.__name__}")
+        except Exception as e:
+            print(f"[TheHerta4]   娉ㄥ唽TT Texture Atlas 澶辫触: {op_class.__name__} - {e}")
+
     bpy.types.Scene.atp_props = bpy.props.PointerProperty(type=at_properties_list[-1])
     
     for op_class in at_shape_key_control_list:
@@ -403,6 +414,7 @@ def register():
     bpy.utils.register_class(TT_MaterialToolsPanel)
     bpy.utils.register_class(TT_LightmapPanel)
     bpy.utils.register_class(TT_MaterialPreviewPanel)
+    bpy.utils.register_class(TT_TextureAtlasPanel)
     
     bpy.utils.register_class(ATP_PT_MainPanel)
     bpy.utils.register_class(ATP_PT_ShapeKeyTools)
@@ -431,6 +443,7 @@ def unregister():
     bpy.utils.unregister_class(ATP_PT_ShapeKeyTools)
     bpy.utils.unregister_class(ATP_PT_MainPanel)
     
+    bpy.utils.unregister_class(TT_TextureAtlasPanel)
     bpy.utils.unregister_class(TT_MaterialPreviewPanel)
     bpy.utils.unregister_class(TT_LightmapPanel)
     bpy.utils.unregister_class(TT_MaterialToolsPanel)
@@ -517,6 +530,12 @@ def unregister():
             pass
     
     for op_class in reversed(tt_material_preview_list[1:]):
+        try:
+            bpy.utils.unregister_class(op_class)
+        except Exception:
+            pass
+
+    for op_class in reversed(tt_texture_atlas_list):
         try:
             bpy.utils.unregister_class(op_class)
         except Exception:

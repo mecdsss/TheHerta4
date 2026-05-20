@@ -390,23 +390,25 @@ class ObjBufferHelper:
         elif d3d11_element.Format == 'R8G8B8A8_UNORM':
             return FormatUtils.convert_4x_float32_to_r8g8b8a8_unorm(blendindices)
         elif d3d11_element.Format == 'R8G8B8A8_UINT':
-            # TODO 这里类型截断错了吧，假如我们的全局顶点组索引是256或者300呢？
-            # 这里截断直接没了，后续我们还怎么去和remap里进行映射？
-            # 帮我在这里新加一个判断，如果blendindices里有大于255的值就不能转换为uint8
-            # print("uint8")
-            max_index = numpy.max(blendindices)
+            max_index = int(numpy.max(blendindices, initial=0))
             if max_index > 255:
-                print("BLENDINDICES大于255了,最大值是：" + str(max_index))
-            else:
-                blendindices = blendindices.astype(numpy.uint8)
+                raise Fatal(
+                    "BLENDINDICES contains values larger than 255 (max="
+                    + str(max_index)
+                    + ") and cannot be exported as R8G8B8A8_UINT."
+                )
+            blendindices = blendindices.astype(numpy.uint8)
             return blendindices
             # print(original_elementname_data_dict[d3d11_element_name].dtype)
         elif d3d11_element.Format == "R8_UINT" and d3d11_element.ByteWidth == 8:
-            max_index = numpy.max(blendindices)
+            max_index = int(numpy.max(blendindices, initial=0))
             if max_index > 255:
-                print("BLENDINDICES大于255了,最大值是：" + str(max_index))
-            else:
-                blendindices = blendindices.astype(numpy.uint8)
+                raise Fatal(
+                    "BLENDINDICES contains values larger than 255 (max="
+                    + str(max_index)
+                    + ") and cannot be exported as R8_UINT."
+                )
+            blendindices = blendindices.astype(numpy.uint8)
 
             return blendindices
             # print(original_elementname_data_dict[d3d11_element_name].dtype)
@@ -1081,7 +1083,7 @@ class ObjBufferHelper:
             stride_offset += category_stride
 
         ib = flattened_ib
-        if GlobalConfig.logic_name == LogicName.YYSLS:
+        if GlobalConfig.logic_name == LogicName.YYSLS or GlobalConfig.logic_name == LogicName.SnowBreak:
             print("导出时翻转面朝向")
 
             flipped_indices = []
@@ -1292,7 +1294,7 @@ class ObjBufferHelper:
         # 设置ib，准备返回
         ib = flattened_ib
         # YYSLS是目前除了鸣潮外，唯一需要翻转面朝向的游戏
-        if GlobalConfig.logic_name == LogicName.YYSLS:
+        if GlobalConfig.logic_name == LogicName.YYSLS or GlobalConfig.logic_name == LogicName.SnowBreak:
             flipped_indices = []
             # print(flattened_ib[0],flattened_ib[1],flattened_ib[2])
             for i in range(0, len(flattened_ib), 3):

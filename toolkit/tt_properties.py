@@ -15,7 +15,7 @@ class TT_BakeResolutionRule(bpy.types.PropertyGroup):
 
 class TT_ChannelSource(bpy.types.PropertyGroup):
     """定义单个通道的数据来源"""
-    
+
     source_type: bpy.props.EnumProperty(
         name="来源类型",
         description="选择此通道的数据来源",
@@ -36,9 +36,7 @@ class TT_ChannelSource(bpy.types.PropertyGroup):
         ],
         default='IMAGE_CHANNEL'
     )
-    
     source_image_name: bpy.props.StringProperty(name="源图像名称", description="来源图像的名称", default="")
-    
     source_channel: bpy.props.EnumProperty(
         name="源通道",
         description="从源图像中提取的通道",
@@ -51,7 +49,6 @@ class TT_ChannelSource(bpy.types.PropertyGroup):
         ],
         default='R'
     )
-    
     constant_value: bpy.props.FloatProperty(
         name="常量值",
         description="当来源为固定值时使用的数值",
@@ -59,7 +56,6 @@ class TT_ChannelSource(bpy.types.PropertyGroup):
         min=0.0,
         max=1.0
     )
-    
     invert: bpy.props.BoolProperty(
         name="反转",
         description="反转此通道的值",
@@ -69,23 +65,19 @@ class TT_ChannelSource(bpy.types.PropertyGroup):
 
 class TT_CompositeRule(bpy.types.PropertyGroup):
     """合成规则：定义如何将多个通道组合成一张输出贴图"""
-    
+
     rule_name: bpy.props.StringProperty(name="规则名称", description="此规则的名称", default="新规则")
-    
     output_name_prefix: bpy.props.StringProperty(
         name="输出前缀",
         description="输出贴图的文件名前缀",
         default="Composite_"
     )
-    
     output_channels: bpy.props.CollectionProperty(
         type=TT_ChannelSource,
         name="输出通道配置",
         description="R/G/B/A 四个通道的来源"
     )
-    
     enabled: bpy.props.BoolProperty(name="启用", description="是否启用此规则", default=True)
-    
     normal_strength: bpy.props.FloatProperty(
         name="法线强度",
         description="法线计算的强度参数",
@@ -93,7 +85,6 @@ class TT_CompositeRule(bpy.types.PropertyGroup):
         min=0.1,
         max=50.0
     )
-    
     normal_blur_radius: bpy.props.FloatProperty(
         name="高斯模糊半径",
         description="法线计算时的高斯模糊半径",
@@ -101,12 +92,18 @@ class TT_CompositeRule(bpy.types.PropertyGroup):
         min=0.0,
         max=10.0
     )
-    
     normal_invert_height: bpy.props.BoolProperty(
         name="反转高度",
         description="反转高度图",
         default=False
     )
+
+
+class TT_AtlasMaterialItem(bpy.types.PropertyGroup):
+    material: bpy.props.PointerProperty(name="图集材质", type=bpy.types.Material)
+    enabled: bpy.props.BoolProperty(name="启用", default=True)
+    source_objects: bpy.props.StringProperty(name="来源物体", default="")
+    skip_reason: bpy.props.StringProperty(name="跳过原因", default="")
 
 
 class TT_TextureToolsProperties(bpy.types.PropertyGroup):
@@ -134,11 +131,9 @@ class TT_TextureToolsProperties(bpy.types.PropertyGroup):
     dds_rules_file_path: bpy.props.StringProperty(name="规则配置文件", description="DDS转换规则的配置文件路径", subtype='FILE_PATH')
     dds_show_advanced: bpy.props.BoolProperty(name="显示高级选项", description="显示DDS转换的高级选项", default=False)
     dds_rules: bpy.props.CollectionProperty(type=TT_DDSConversionRule, name="DDS转换规则", description="DDS转换规则列表")
-    
     bake_resolution_use_rules: bpy.props.BoolProperty(name="使用分辨率规则", description="启用材质名称匹配分辨率规则，覆盖默认设置", default=False)
     bake_resolution_show_advanced: bpy.props.BoolProperty(name="显示高级选项", description="显示烘焙分辨率规则的高级选项", default=False)
     bake_resolution_rules: bpy.props.CollectionProperty(type=TT_BakeResolutionRule, name="烘焙分辨率规则", description="烘焙分辨率规则列表")
-    
     lightmap_mode: bpy.props.EnumProperty(
         name="模式",
         description="光照模板生成模式",
@@ -148,25 +143,44 @@ class TT_TextureToolsProperties(bpy.types.PropertyGroup):
         ],
         default='APPEND'
     )
-    
-    lightmap_generate_lightmap: bpy.props.BoolProperty(
-        name="生成LightMap",
-        description="生成LightMap材质模板",
-        default=True
-    )
-    
-    lightmap_generate_materialmap: bpy.props.BoolProperty(
-        name="生成MaterialMap", 
-        description="生成MaterialMap材质模板",
-        default=True
-    )
-    
+    lightmap_generate_lightmap: bpy.props.BoolProperty(name="生成LightMap", description="生成LightMap材质模板", default=True)
+    lightmap_generate_materialmap: bpy.props.BoolProperty(name="生成MaterialMap", description="生成MaterialMap材质模板", default=True)
     material_preview_pattern: bpy.props.StringProperty(name="材质名称模式", description="用于匹配材质名称的正则表达式", default=".*")
     material_preview_base_resolution: bpy.props.IntProperty(name="基础分辨率", description="基础分辨率参数（仅存储）", default=1024, min=256, max=8192)
     material_preview_active_index: bpy.props.IntProperty(name="活动索引", description="当前选中的材质预览项索引", default=0)
-    
     composite_rules: bpy.props.CollectionProperty(type=TT_CompositeRule, name="通道合成规则", description="通道合成规则列表")
     composite_active_rule_index: bpy.props.IntProperty(name="活动规则索引", description="当前选中的合成规则索引", default=-1)
+    atlas_output_name: bpy.props.StringProperty(name="图集输出名称", description="保存图集时使用的基础文件名", default="TextureAtlas")
+    atlas_padding: bpy.props.IntProperty(name="图集边距", description="图集中各贴图块之间的像素间距", default=8, min=0, max=128)
+    atlas_color_size: bpy.props.IntProperty(name="纯色兜底尺寸", description="纯色材质在图集中使用的基础尺寸", default=32, min=4, max=1024)
+    atlas_include_extra_textures: bpy.props.BoolProperty(name="包含附加贴图", description="同时尝试合并 Metallic/Roughness/Normal/Emission 贴图", default=True)
+    atlas_image_format: bpy.props.EnumProperty(
+        name="图集输出格式",
+        description="图集贴图的输出格式",
+        items=[
+            ('PNG', "PNG", "保存为 PNG"),
+            ('TGA', "TGA", "保存为 TGA"),
+            ('TIFF', "TIFF", "保存为 TIFF"),
+            ('BMP', "BMP", "保存为 BMP"),
+        ],
+        default='PNG',
+    )
+    atlas_size_mode: bpy.props.EnumProperty(
+        name="图集尺寸模式",
+        description="控制图集输出尺寸的调整方式",
+        items=[
+            ('AUTO', "自动", "使用打包后的原始尺寸"),
+            ('PO2', "二次幂", "将宽高扩展到 2 的幂"),
+            ('QUAD', "正方形", "强制输出为正方形图集"),
+            ('CUSTOM', "自定义", "使用固定的自定义尺寸"),
+        ],
+        default='PO2',
+    )
+    atlas_custom_width: bpy.props.IntProperty(name="自定义宽度", description="自定义图集输出宽度", default=2048, min=1, max=16384)
+    atlas_custom_height: bpy.props.IntProperty(name="自定义高度", description="自定义图集输出高度", default=2048, min=1, max=16384)
+    atlas_max_size: bpy.props.IntProperty(name="最大图集尺寸", description="允许生成的最大图集边长", default=16384, min=512, max=32768)
+    atlas_materials: bpy.props.CollectionProperty(type=TT_AtlasMaterialItem, name="图集材质列表", description="当前可用于生成图集的材质列表")
+    atlas_material_index: bpy.props.IntProperty(name="图集材质索引", default=0)
 
 
 tt_properties_list = (
@@ -174,5 +188,6 @@ tt_properties_list = (
     TT_BakeResolutionRule,
     TT_ChannelSource,
     TT_CompositeRule,
+    TT_AtlasMaterialItem,
     TT_TextureToolsProperties,
 )

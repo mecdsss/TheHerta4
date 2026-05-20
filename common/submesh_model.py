@@ -143,6 +143,7 @@ class SubMeshModel:
             or GlobalConfig.logic_name == LogicName.HIMI
             or GlobalConfig.logic_name == LogicName.YYSLS
             or GlobalConfig.logic_name == LogicName.IdentityV
+            or GlobalConfig.logic_name == LogicName.SnowBreak
             or GlobalConfig.logic_name == LogicName.EFMI)
 
         for i, draw_call_model in enumerate(self.drawcall_model_list):
@@ -636,6 +637,13 @@ class SubMeshModel:
             temp_obj.rotation_euler[0] = math.radians(-90)
             temp_obj.rotation_euler[1] = 0
             temp_obj.rotation_euler[2] = 0
+            ShapeKeyUtils.transform_apply_preserve_shape_keys(temp_obj, location=False, rotation=True, scale=True)
+        elif GlobalConfig.logic_name == LogicName.SnowBreak:
+            ObjUtils.select_obj(temp_obj)
+            temp_obj.rotation_euler[0] = 0
+            temp_obj.rotation_euler[1] = 0
+            temp_obj.rotation_euler[2] = math.radians(180)
+            temp_obj.scale = (100, 100, 100)
             ShapeKeyUtils.transform_apply_preserve_shape_keys(temp_obj, location=False, rotation=True, scale=True)
         elif GlobalConfig.logic_name == LogicName.EFMI:
             temp_obj.rotation_euler[0] = 0

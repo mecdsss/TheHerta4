@@ -16,6 +16,7 @@ from ..utils.collection_utils import CollectionUtils, CollectionColor
 
 preview_collections = {}
 sword_reversed_workspace_items_cache = []
+sword_workspace_lod_items_cache = []
 
 
 def _load_preview_images(context, folder_path: str, target_collection_name: str = "sword_image_list") -> int:
@@ -81,20 +82,52 @@ def _get_component_texture_folder(selected_obj_name: str) -> tuple[str, str]:
     return "", ""
 
 
-def get_workspace_preview_texture_folder():
+def _get_sword_workspace_lod_items(self, context):
+    global sword_workspace_lod_items_cache
+
+    try:
+        GlobalConfig.read_from_main_json_ssmt4()
+        lod_folder_paths = WorkSpaceHelper.get_lod_folderpath_list()
+        sword_workspace_lod_items_cache = [
+            ("", "工作空间根目录", "读取工作空间根目录下的 DedupedTextures"),
+        ]
+        sword_workspace_lod_items_cache.extend(
+            [(os.path.basename(path), os.path.basename(path), "") for path in lod_folder_paths]
+        )
+        return sword_workspace_lod_items_cache
+    except Exception:
+        sword_workspace_lod_items_cache = [
+            ("", "工作空间根目录", "读取 LOD 列表失败，回退到根目录"),
+        ]
+        return sword_workspace_lod_items_cache
+
+
+def get_workspace_preview_texture_folder(lod_name: str = ""):
     GlobalConfig.read_from_main_json_ssmt4()
 
     workspace_folder_path = GlobalConfig.path_workspace_folder()
-    preferred_folders = ["DedupedTextures"]
+    preferred_folders = []
     if bpy.app.version <= (4, 2, 0):
-        preferred_folders.insert(0, "DedupedTextures_jpg")
+        preferred_folders.extend(["DedupedTextures_jpg", "DedupedTextures_png", "DedupedTextures_tga", "DedupedTextures"])
     else:
-        preferred_folders.append("DedupedTextures_jpg")
+        preferred_folders.extend(["DedupedTextures", "DedupedTextures_jpg", "DedupedTextures_png", "DedupedTextures_tga"])
 
-    for folder_name in preferred_folders:
-        preview_folder_path = os.path.join(workspace_folder_path, folder_name + "\\")
-        if os.path.exists(preview_folder_path):
-            return preview_folder_path, folder_name
+    candidate_base_paths = []
+    if lod_name:
+        candidate_base_paths.append(os.path.join(workspace_folder_path, lod_name))
+    candidate_base_paths.append(workspace_folder_path)
+
+    seen_paths = set()
+    for base_path in candidate_base_paths:
+        normalized_base_path = os.path.normpath(base_path)
+        if normalized_base_path in seen_paths:
+            continue
+        seen_paths.add(normalized_base_path)
+
+        for folder_name in preferred_folders:
+            preview_folder_path = os.path.join(base_path, folder_name + "\\")
+            if os.path.exists(preview_folder_path):
+                return preview_folder_path, folder_name
 
     return "", preferred_folders[0]
 
@@ -172,7 +205,8 @@ class Sword_ImportTexture_WM_OT_AutoDetectWorkspaceTextureFolder(Operator):
     bl_label = "读取工作空间 DedupedTextures"
 
     def execute(self, context):
-        deduped_textures_folder_path, folder_name = get_workspace_preview_texture_folder()
+        lod_name = str(getattr(context.scene, "sword_workspace_preview_lod", "") or "").strip()
+        deduped_textures_folder_path, folder_name = get_workspace_preview_texture_folder(lod_name=lod_name)
 
         if not deduped_textures_folder_path:
             self.report({'ERROR'}, f"未找到当前工作空间下的 {folder_name} 文件夹")
@@ -204,6 +238,27 @@ class Sword_ImportTexture_WM_OT_AutoDetectTextureFolder(Operator):
 
         image_count = _load_preview_images(context, deduped_folder_path)
         self.report({'INFO'}, f"Auto-detected and loaded {image_count} images from {folder_name}.")
+        return {'FINISHED'}
+
+
+class SWORD4RefreshWorkspaceLODList(bpy.types.Operator):
+    bl_idname = "ssmt4.sword_refresh_workspace_lod_list"
+    bl_label = "Refresh workspace preview LOD list"
+    bl_description = "Refresh available workspace LOD folders for texture preview"
+
+    def execute(self, context):
+        GlobalConfig.read_from_main_json_ssmt4()
+        _get_sword_workspace_lod_items(self, context)
+
+        valid_values = {item[0] for item in sword_workspace_lod_items_cache}
+        if getattr(context.scene, "sword_workspace_preview_lod", "") not in valid_values:
+            context.scene.sword_workspace_preview_lod = ""
+
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
+
+        self.report({'INFO'}, "Workspace preview LOD list refreshed.")
         return {'FINISHED'}
 
 
@@ -427,6 +482,10 @@ class Sword_ImportTexture_VIEW3D_PT_ImageMaterialPanel(Panel):
 
         texture_box = layout.box()
         texture_box.label(text="快速贴图预览", icon='TEXTURE')
+        lod_row = texture_box.row(align=True)
+        lod_row.prop(scene, "sword_workspace_preview_lod", text="Workspace LOD")
+        lod_row.operator(SWORD4RefreshWorkspaceLODList.bl_idname, text="", icon='FILE_REFRESH')
+
         button_row = texture_box.row(align=True)
         button_row.operator("ssmt.auto_detect_workspace_texture_folder", icon='FILE_FOLDER', text="工作空间贴图")
         button_row.operator("wm.auto_detect_texture_folder", icon='OUTLINER_OB_IMAGE', text="当前组件贴图")
@@ -490,12 +549,18 @@ def register():
     bpy.utils.register_class(Sword_ImportTexture_WM_OT_ApplyImageToMaterial)
     bpy.utils.register_class(SwordImportAllReversed)
     bpy.utils.register_class(SWORD4RefreshReversedWorkspaceList)
+    bpy.utils.register_class(SWORD4RefreshWorkspaceLODList)
     bpy.utils.register_class(Sword_ExtractSubmesh)
     bpy.utils.register_class(Sword_ImportTexture_VIEW3D_PT_ImageMaterialPanel)
     bpy.utils.register_class(Sword_SplitModel_By_DrawIndexed_Panel)
 
     bpy.types.Scene.sword_image_list = CollectionProperty(type=Sword_ImportTexture_ImageListItem)
     bpy.types.Scene.sword_image_list_index = IntProperty(default=0)
+    bpy.types.Scene.sword_workspace_preview_lod = EnumProperty(
+        name="Workspace LOD",
+        description="Select the LOD folder used for workspace texture preview, empty means workspace root",
+        items=_get_sword_workspace_lod_items,
+    )
     bpy.types.Scene.submesh_start = IntProperty(name="起始索引", default=0, min=0)
     bpy.types.Scene.submesh_count = IntProperty(name="索引数量", default=0, min=0)
     bpy.types.Scene.sword_reverse_source_mode = EnumProperty(
@@ -525,6 +590,7 @@ def unregister():
     try:
         del bpy.types.Scene.sword_image_list
         del bpy.types.Scene.sword_image_list_index
+        del bpy.types.Scene.sword_workspace_preview_lod
         del bpy.types.Scene.submesh_start
         del bpy.types.Scene.submesh_count
         del bpy.types.Scene.sword_reverse_source_mode
@@ -543,6 +609,7 @@ def unregister():
     bpy.utils.unregister_class(Sword_SplitModel_By_DrawIndexed_Panel)
     bpy.utils.unregister_class(Sword_ImportTexture_VIEW3D_PT_ImageMaterialPanel)
     bpy.utils.unregister_class(Sword_ExtractSubmesh)
+    bpy.utils.unregister_class(SWORD4RefreshWorkspaceLODList)
     bpy.utils.unregister_class(SWORD4RefreshReversedWorkspaceList)
     bpy.utils.unregister_class(SwordImportAllReversed)
     bpy.utils.unregister_class(Sword_ImportTexture_WM_OT_ApplyImageToMaterial)

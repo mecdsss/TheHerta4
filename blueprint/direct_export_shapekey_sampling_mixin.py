@@ -870,6 +870,15 @@ class DirectShapeKeySamplingMixin:
             ShapeKeyUtils.transform_apply_preserve_shape_keys(copy_obj, location=False, rotation=True, scale=True)
             return
 
+        if GlobalConfig.logic_name == LogicName.SnowBreak:
+            ObjUtils.select_obj(copy_obj)
+            copy_obj.rotation_euler[0] = 0
+            copy_obj.rotation_euler[1] = 0
+            copy_obj.rotation_euler[2] = math.radians(180)
+            copy_obj.scale = (100, 100, 100)
+            ShapeKeyUtils.transform_apply_preserve_shape_keys(copy_obj, location=False, rotation=True, scale=True)
+            return
+
         if GlobalConfig.logic_name == LogicName.EFMI:
             copy_obj.rotation_euler[0] = 0
             copy_obj.rotation_euler[1] = 0

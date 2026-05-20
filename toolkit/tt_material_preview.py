@@ -4,6 +4,15 @@ import math
 import os
 from pathlib import Path
 
+
+def _pick_preview_render_engine():
+    engine_ids = {item.identifier for item in bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items}
+    for engine_id in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE', 'CYCLES'):
+        if engine_id in engine_ids:
+            return engine_id
+    return bpy.context.scene.render.engine
+
+
 class TT_MaterialPreviewItem(bpy.types.PropertyGroup):
     material: bpy.props.PointerProperty(type=bpy.types.Material, name="材质")
     plane_object: bpy.props.StringProperty(name="平面物体名称", default="")
@@ -439,7 +448,7 @@ class TT_OT_bake_atlas(bpy.types.Operator):
             temp_scene = bpy.data.scenes.new("TempAtlasBake_Scene")
             context.window.scene = temp_scene
             temp_scene.world = original_world
-            temp_scene.render.engine = 'BLENDER_EEVEE_NEXT' if (4, 1, 0) <= bpy.app.version else 'BLENDER_EEVEE'
+            temp_scene.render.engine = _pick_preview_render_engine()
             temp_scene.eevee.taa_render_samples = 64
             temp_scene.view_settings.view_transform = 'Standard'
             
@@ -528,7 +537,7 @@ class TT_OT_bake_atlas(bpy.types.Operator):
             temp_scene = bpy.data.scenes.new("TempAtlasBake_Scene")
             context.window.scene = temp_scene
             temp_scene.world = original_world
-            temp_scene.render.engine = 'BLENDER_EEVEE_NEXT' if (4, 1, 0) <= bpy.app.version else 'BLENDER_EEVEE'
+            temp_scene.render.engine = _pick_preview_render_engine()
             temp_scene.eevee.taa_render_samples = 64
             temp_scene.view_settings.view_transform = 'Standard'
             

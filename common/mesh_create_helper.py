@@ -230,7 +230,7 @@ class MeshCreateHelper:
             directory=os.path.dirname(source_path),
         )
 
-        if logic_name == LogicName.WWMI or logic_name == LogicName.NTEMI:
+        if logic_name == LogicName.WWMI or logic_name == LogicName.NTEMI or logic_name == LogicName.SnowBreak:
             obj.rotation_euler[0] = 0
             obj.rotation_euler[1] = 0
             obj.rotation_euler[2] = math.radians(180)
@@ -275,7 +275,12 @@ class MeshCreateHelper:
 
     @staticmethod
     def initialize_mesh(mesh, ib_data, ib_count:int, ib_polygon_count:int, logic_name:str, vb_vertex_count:int):
-        if logic_name == LogicName.WWMI or logic_name == LogicName.NTEMI or logic_name == LogicName.YYSLS:
+        if (
+            logic_name == LogicName.WWMI
+            or logic_name == LogicName.NTEMI
+            or logic_name == LogicName.YYSLS
+            or logic_name == LogicName.SnowBreak
+        ):
             flipped_indices = []
             for i in range(0, len(ib_data), 3):
                 triangle = ib_data[i:i + 3]

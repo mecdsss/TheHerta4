@@ -401,7 +401,7 @@ class ExportUtils:
             category_buffer_dict[cname] = post_processed_bytes[:, stride_offset:stride_offset + cstride].flatten()
             stride_offset += cstride
 
-        if GlobalConfig.logic_name == LogicName.YYSLS:
+        if GlobalConfig.logic_name == LogicName.YYSLS or GlobalConfig.logic_name == LogicName.SnowBreak:
             flat_arr = numpy.asarray(ib, dtype=numpy.int32)
             if flat_arr.size % 3 == 0:
                 ib = flat_arr.reshape(-1, 3)[:, ::-1].flatten().tolist()

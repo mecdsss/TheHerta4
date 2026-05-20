@@ -945,3 +945,65 @@ class TT_MaterialPreviewPanel(bpy.types.Panel):
                 source_names = item.source_objects.split("|")
                 source_text = f"源: {', '.join(source_names)}" if len(source_names) <= 3 else f"源: {', '.join(source_names[:3])}..."
                 row.label(text=source_text, icon='OUTLINER_OB_MESH')
+
+
+class TT_TextureAtlasPanel(bpy.types.Panel):
+    bl_label = "贴图图集"
+    bl_idname = "VIEW3D_PT_Herta_TT_TextureAtlas_Panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'TheHerta4'
+    bl_parent_id = 'VIEW3D_PT_Herta_TT_Main_Panel'
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 7
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.texture_tools_props
+
+        from .tt_texture_atlas_core import is_pillow_available
+
+        status_box = layout.box()
+        status_box.label(text="图集依赖", icon='SETTINGS')
+        if is_pillow_available():
+            status_box.label(text="Pillow：已安装", icon='CHECKMARK')
+        else:
+            status_box.label(text="Pillow：未安装", icon='ERROR')
+            status_box.operator("toolkit.tt_ensure_pillow", icon='CONSOLE')
+
+        config_box = layout.box()
+        config_box.label(text="图集设置", icon='TEXTURE')
+        config_box.prop(props, "atlas_output_name")
+        config_box.prop(props, "atlas_padding")
+        config_box.prop(props, "atlas_color_size")
+        config_box.prop(props, "atlas_include_extra_textures")
+        config_box.prop(props, "atlas_image_format")
+        config_box.prop(props, "atlas_size_mode")
+        if props.atlas_size_mode == 'CUSTOM':
+            row = config_box.row(align=True)
+            row.prop(props, "atlas_custom_width")
+            row.prop(props, "atlas_custom_height")
+        config_box.prop(props, "atlas_max_size")
+
+        materials_box = layout.box()
+        materials_box.label(text=f"图集材质 ({len(props.atlas_materials)})", icon='MATERIAL_DATA')
+        row = materials_box.row(align=True)
+        row.operator("toolkit.tt_atlas_refresh_materials", icon='FILE_REFRESH')
+        row.operator("toolkit.tt_atlas_select_all_materials", icon='CHECKBOX_HLT')
+        row.operator("toolkit.tt_atlas_select_no_materials", icon='CHECKBOX_DEHLT')
+        materials_box.template_list("TT_UL_AtlasMaterials", "", props, "atlas_materials", props, "atlas_material_index", rows=6)
+
+        if 0 <= props.atlas_material_index < len(props.atlas_materials):
+            active_item = props.atlas_materials[props.atlas_material_index]
+            if active_item.skip_reason:
+                warn_box = materials_box.box()
+                warn_box.label(text="跳过原因", icon='ERROR')
+                warn_box.label(text=active_item.skip_reason)
+            if active_item.source_objects:
+                src_box = materials_box.box()
+                src_box.label(text="来源物体", icon='OUTLINER_OB_MESH')
+                for name in active_item.source_objects.split("|")[:6]:
+                    src_box.label(text=name)
+
+        layout.separator()
+        layout.operator("toolkit.tt_atlas_generate", icon='NODE_TEXTURE')
