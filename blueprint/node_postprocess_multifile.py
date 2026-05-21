@@ -570,18 +570,13 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                 constants_lines = sections.get(constants_section, [])
 
                 animation_swapkey_defined = False
-                active_swapkey_defined = False
 
                 for line in constants_lines:
                     if self.animation_swapkey in line:
                         animation_swapkey_defined = True
-                    if self.active_swapkey in line:
-                        active_swapkey_defined = True
 
                 if not animation_swapkey_defined:
                     constants_lines.append(f"global persist {self.animation_swapkey} = 0")
-                if not active_swapkey_defined:
-                    constants_lines.append(f"global persist {self.active_swapkey} = 0")
 
                 for base_name, hash_prefix in processed_base_names:
                     base_resource_name = self._resource_name_from_prefix(hash_prefix)
@@ -601,27 +596,10 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                 present_section = '[Present]'
                 present_lines = sections.get(present_section, [])
 
-                active_block_start = -1
-                active_block_end = -1
-
-                for i, line in enumerate(present_lines):
-                    if line.strip() == f"if {self.active_swapkey} == {self.active_value}":
-                        active_block_start = i
-                    elif active_block_start >= 0 and line.strip() == "endif":
-                        active_block_end = i
-                        break
-
-                if active_block_start >= 0 and active_block_end >= 0:
-                    for base_name, hash_prefix in processed_base_names:
-                        run_line = f"    run = CustomShader_{base_name}_1Anim"
-                        if run_line not in present_lines[active_block_start:active_block_end]:
-                            present_lines.insert(active_block_end, run_line)
-                else:
-                    present_lines.append("")
-                    present_lines.append(f"if {self.active_swapkey} == {self.active_value}")
-                    for base_name, hash_prefix in processed_base_names:
-                        present_lines.append(f"    run = CustomShader_{base_name}_1Anim")
-                    present_lines.append("endif")
+                for base_name, hash_prefix in processed_base_names:
+                    run_line = f"    run = CustomShader_{base_name}_1Anim"
+                    if run_line not in present_lines:
+                        present_lines.append(run_line)
 
                 sections[present_section] = present_lines
 

@@ -22,6 +22,13 @@ from typing import Dict, List, Optional, Tuple
 
 import bpy
 
+from .runtime_cache import (
+    MODIMP_COLLECTOR_PROPS,
+    MODIMP_PATH_PROPS,
+    localize_runtime_path_props,
+    object_workspace_dir_from_type_dir,
+    object_workspace_dir_from_unique,
+)
 from .modimp_core import (
     ensure_mod_importer_package,
     resolve_mod_importer_root,
@@ -712,6 +719,90 @@ def _resolve_buf_path_in_frame_analysis(frame_analysis_dir: str, hash_value: str
 
 # ── high-level import helper ───────────────────────────────────────────
 
+def _resolve_root_vb0_path(frame_analysis_dir: str, position_hash: str) -> str:
+    if not frame_analysis_dir or not position_hash:
+        return ""
+    deduped = os.path.join(frame_analysis_dir, "deduped")
+    if not os.path.isdir(deduped):
+        return ""
+    normalized_hash = str(position_hash).lower()
+    for entry in os.scandir(deduped):
+        if entry.is_file() and normalized_hash in entry.name.lower() and not entry.name.endswith(".txt"):
+            return entry.path
+    return ""
+
+
+def _set_object_props(obj: bpy.types.Object, props: dict[str, str]):
+    for key, value in props.items():
+        if value:
+            obj[key] = value
+
+
+def _localize_object_runtime_paths(obj: bpy.types.Object, object_workspace_dir: str):
+    path_props = {
+        key: str(obj.get(key, "") or "").strip()
+        for key in MODIMP_PATH_PROPS
+    }
+    localized = localize_runtime_path_props(path_props, object_workspace_dir)
+    _set_object_props(obj, localized)
+
+
+def _build_runtime_path_props(
+    *,
+    draw_call_meta: NtemiDrawCallMeta,
+    category_hash: dict,
+    vb0_buf_path: str,
+    t5_buf_path: str,
+    weight_buf_path: str,
+    frame_buf_path: str,
+    frame_analysis_dir: str = "",
+) -> dict[str, str]:
+    ib_file = os.path.join(draw_call_meta.folder_path, f"{draw_call_meta.submesh_folder_name}.ib")
+    path_props = {
+        "modimp_ib_txt_path": ib_file if os.path.isfile(ib_file) else "",
+        "modimp_vb0_buf_path": vb0_buf_path,
+        "modimp_t5_buf_path": t5_buf_path,
+        "modimp_weight_buf_path": weight_buf_path,
+        "modimp_frame_buf_path": frame_buf_path,
+    }
+
+    if not frame_analysis_dir:
+        return path_props
+
+    ib_txt_path = _resolve_ib_txt_path(
+        frame_analysis_dir,
+        draw_call_meta.draw_ib,
+        draw_call_meta.first_index,
+        draw_call_meta.index_count,
+    )
+    if ib_txt_path:
+        path_props["modimp_ib_txt_path"] = ib_txt_path
+
+    hash_to_prop = (
+        ("Position", "modimp_vb0_buf_path"),
+        ("Texcoord", "modimp_t5_buf_path"),
+        ("Blend", "modimp_weight_buf_path"),
+        ("Normal", "modimp_frame_buf_path"),
+    )
+    for hash_key, prop_name in hash_to_prop:
+        hash_value = category_hash.get(hash_key, "")
+        if not hash_value:
+            continue
+        resolved_path = _resolve_buf_path_in_frame_analysis(frame_analysis_dir, hash_value)
+        if resolved_path:
+            path_props[prop_name] = resolved_path
+
+    vb1_layout = _resolve_vb1_layout_path(frame_analysis_dir)
+    if vb1_layout:
+        path_props["modimp_vb1_layout_path"] = vb1_layout
+
+    root_vb0_path = _resolve_root_vb0_path(frame_analysis_dir, category_hash.get("Position", ""))
+    if root_vb0_path:
+        path_props["modimp_root_vb0_path"] = root_vb0_path
+
+    return path_props
+
+
 class NTEMIImportHelper:
     @staticmethod
     def create_mesh_with_modimp_props(
@@ -778,36 +869,6 @@ class NTEMIImportHelper:
             if draw_indices is None:
                 draw_indices = component_map.get(draw_call_meta.submesh_folder_name)
 
-        if frame_analysis_dir:
-            ib_txt_path = _resolve_ib_txt_path(frame_analysis_dir, draw_call_meta.draw_ib, draw_call_meta.first_index, draw_call_meta.index_count)
-            if ib_txt_path:
-                imported_obj["modimp_ib_txt_path"] = ib_txt_path
-
-            vb0_hash = category_hash.get("Position", "")
-            if vb0_hash:
-                vb0_fa_path = _resolve_buf_path_in_frame_analysis(frame_analysis_dir, vb0_hash)
-                if vb0_fa_path:
-                    imported_obj["modimp_vb0_buf_path"] = vb0_fa_path
-            t5_hash = category_hash.get("Texcoord", "")
-            if t5_hash:
-                t5_fa_path = _resolve_buf_path_in_frame_analysis(frame_analysis_dir, t5_hash)
-                if t5_fa_path:
-                    imported_obj["modimp_t5_buf_path"] = t5_fa_path
-            blend_hash = category_hash.get("Blend", "")
-            if blend_hash:
-                blend_fa_path = _resolve_buf_path_in_frame_analysis(frame_analysis_dir, blend_hash)
-                if blend_fa_path:
-                    imported_obj["modimp_weight_buf_path"] = blend_fa_path
-            normal_hash = category_hash.get("Normal", "")
-            if normal_hash:
-                normal_fa_path = _resolve_buf_path_in_frame_analysis(frame_analysis_dir, normal_hash)
-                if normal_fa_path:
-                    imported_obj["modimp_frame_buf_path"] = normal_fa_path
-
-            vb1_layout = _resolve_vb1_layout_path(frame_analysis_dir)
-            if vb1_layout:
-                imported_obj["modimp_vb1_layout_path"] = vb1_layout
-
         _apply_ntemi_modimp_properties(
             imported_obj,
             draw_call_meta=draw_call_meta,
@@ -820,6 +881,21 @@ class NTEMIImportHelper:
             workspace_unique_str=workspace_unique_str,
             frame_analysis_dir=frame_analysis_dir,
         )
+
+        runtime_path_props = _build_runtime_path_props(
+            draw_call_meta=draw_call_meta,
+            category_hash=category_hash,
+            vb0_buf_path=vb0_buf_path,
+            t5_buf_path=t5_buf_path,
+            weight_buf_path=weight_buf_path,
+            frame_buf_path=frame_buf_path,
+            frame_analysis_dir=frame_analysis_dir,
+        )
+        localized_path_props = localize_runtime_path_props(
+            runtime_path_props,
+            object_workspace_dir_from_type_dir(draw_call_meta.folder_path),
+        )
+        _set_object_props(imported_obj, localized_path_props)
 
         return imported_obj
 
@@ -857,6 +933,10 @@ def _perform_bone_merge_postprocess(
     if collector_contract:
         seen_collections = set()
         for obj in objects:
+            for key in MODIMP_COLLECTOR_PROPS:
+                value = collector_contract.get(key)
+                if value is not None:
+                    obj[key] = value
             for coll in getattr(obj, "users_collection", []) or []:
                 if coll.name in seen_collections:
                     continue
@@ -896,5 +976,12 @@ def _perform_bone_merge_postprocess(
                 obj["modimp_match_vs_texcoord_hash"] = detected_slice.match_vs_texcoord_hash
             if detected_slice.match_vs_position_hash is not None:
                 obj["modimp_match_vs_position_hash"] = detected_slice.match_vs_position_hash
+
+            if workspace_root:
+                object_workspace_dir = object_workspace_dir_from_unique(
+                    workspace_root,
+                    str(obj.get("modimp_workspace_unique_str", "") or ""),
+                )
+                _localize_object_runtime_paths(obj, object_workspace_dir)
 
     print(f"[NTEMI BoneMerge] completed successfully")

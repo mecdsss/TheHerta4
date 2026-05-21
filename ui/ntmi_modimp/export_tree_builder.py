@@ -409,10 +409,17 @@ def _copy_runtime_contract(
                 break
 
 
-def _copy_collector_props(objects: list[bpy.types.Object], source_collection: bpy.types.Collection):
+def _copy_collector_props(
+    objects: list[bpy.types.Object],
+    source_collection: bpy.types.Collection,
+    *,
+    draw_ib: str = "",
+):
     owners = []
     for obj in objects:
         owners.extend(_source_owner_candidates(obj))
+    if draw_ib:
+        owners.extend(_source_root_candidates(draw_ib) or [])
 
     for owner in owners:
         _copy_props(owner, source_collection, COLLECTOR_PROPS)
@@ -507,7 +514,7 @@ def build_export_tree(blueprint_model: BluePrintModel, tree_prefix: str = "TheHe
         root_collections.append(root_collection)
 
         all_source_objects = [item[1] for region_items in region_map.values() for item in region_items]
-        _copy_collector_props(all_source_objects, root_collection)
+        _copy_collector_props(all_source_objects, root_collection, draw_ib=draw_ib)
         has_collector_contract, missing_collector_fields = _collector_contract_status(root_collection)
 
         source_record = SourceBuildRecord(

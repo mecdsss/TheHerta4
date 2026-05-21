@@ -1675,9 +1675,10 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             if '[Present]' not in sections:
                 sections['[Present]'] = []
             present_lines = sections['[Present]']
-            present_content = "".join(present_lines)
-            if 'if $active0 == 1' not in present_content:
-                present_lines.extend(['if $active0 == 1', *[f"    run = CustomShader_{h}_Anim" for h in unique_hashes], 'endif'])
+            for h in unique_hashes:
+                run_line = f"    run = CustomShader_{h}_Anim"
+                if run_line not in present_lines:
+                    present_lines.append(run_line)
 
             compute_blocks_to_add = OrderedDict()
             for h in unique_hashes:
