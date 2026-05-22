@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import struct
 import sys
 import traceback
@@ -22,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 
 import bpy
 
+from ...common.import_scene_settings import apply_import_render_environment
 from .runtime_cache import (
     MODIMP_COLLECTOR_PROPS,
     MODIMP_PATH_PROPS,
@@ -29,6 +31,7 @@ from .runtime_cache import (
     object_workspace_dir_from_type_dir,
     object_workspace_dir_from_unique,
 )
+from .prefix_property_cache import update_prefix_record_for_object
 from .modimp_core import (
     ensure_mod_importer_package,
     resolve_mod_importer_root,
@@ -206,27 +209,25 @@ def _build_texture_slots_from_workspace(
 
 # ── material ───────────────────────────────────────────────────────────
 
-_MARK_NAME_TO_BSDF_INPUT = {
-    "DiffuseMap": "Base Color",
-    "NormalMap": "Normal",
-    "LightMap": "Emission Color",
-    "SpecularMap": "Specular",
-    "RoughnessMap": "Roughness",
-    "MetallicMap": "Metallic",
-    "EmissionMap": "Emission Color",
-    "OpacityMap": "Alpha",
-    "AOMap": "Ambient Occlusion",
-}
-
-_NORMAL_MARK_NAMES = {"NormalMap", "Normal", "BumpMap", "Bump"}
+_DIFFUSE_MARK_NAMES = {"DiffuseMap"}
 
 
-def _apply_material_from_texture_slots(obj: bpy.types.Object, texture_slots: dict):
-    if not texture_slots:
-        _ensure_material(obj)
-        return
+def _safe_material_name_token(value: str) -> str:
+    token = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(value or "").strip())
+    token = token.strip("_.-")
+    return token or "Texture"
 
-    mat_name = f"{obj.name}_Material"
+
+def _material_name_for_texture_slot(obj_name: str, mark_name: str, slot_name: str) -> str:
+    safe_mark = _safe_material_name_token(mark_name)
+    safe_obj = _safe_material_name_token(obj_name)
+    safe_slot = _safe_material_name_token(slot_name)
+    if safe_slot:
+        return f"{safe_mark}_{safe_obj}_{safe_slot}"
+    return f"{safe_mark}_{safe_obj}"
+
+
+def _ensure_texture_slot_material(obj: bpy.types.Object, mat_name: str):
     material = bpy.data.materials.get(mat_name)
     if material is None:
         material = bpy.data.materials.new(mat_name)
@@ -235,66 +236,99 @@ def _apply_material_from_texture_slots(obj: bpy.types.Object, texture_slots: dic
     if not material.use_nodes:
         material.use_nodes = True
 
-    bsdf = None
-    for node in material.node_tree.nodes:
-        if node.bl_idname == 'ShaderNodeBsdfPrincipled':
-            bsdf = node
-            break
-    if bsdf is None:
-        bsdf = material.node_tree.nodes.new(type='ShaderNodeBsdfPrincipled')
-        bsdf.location = (0, 0)
-        output = None
-        for node in material.node_tree.nodes:
-            if node.bl_idname == 'ShaderNodeOutputMaterial':
-                output = node
-                break
-        if output is None:
-            output = material.node_tree.nodes.new(type='ShaderNodeOutputMaterial')
-            output.location = (300, 0)
-        material.node_tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+    if material.name not in [slot.material.name for slot in obj.material_slots if slot.material]:
+        obj.data.materials.append(material)
 
-    offset_x = -400
-    offset_y = 0
+    return material
+
+
+def _clear_material_nodes(material):
+    for node in list(material.node_tree.nodes):
+        try:
+            material.node_tree.nodes.remove(node)
+        except Exception:
+            continue
+
+
+def _create_diffuse_material_graph(material, texture_image):
+    _clear_material_nodes(material)
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+
+    tex_node = nodes.new('ShaderNodeTexImage')
+    tex_node.image = texture_image
+    tex_node.location = (-400, 0)
+
+    diffuse_node = nodes.new('ShaderNodeBsdfDiffuse')
+    diffuse_node.location = (-100, 0)
+
+    output_node = nodes.new('ShaderNodeOutputMaterial')
+    output_node.location = (180, 0)
+
+    links.new(tex_node.outputs['Color'], diffuse_node.inputs['Color'])
+    links.new(diffuse_node.outputs['BSDF'], output_node.inputs['Surface'])
+
+
+def _create_transparent_material_graph(material, texture_image):
+    _clear_material_nodes(material)
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+
+    tex_node = nodes.new('ShaderNodeTexImage')
+    tex_node.image = texture_image
+    tex_node.location = (-520, 0)
+
+    transparent_node = nodes.new('ShaderNodeBsdfTransparent')
+    transparent_node.location = (-180, 140)
+
+    diffuse_node = nodes.new('ShaderNodeBsdfDiffuse')
+    diffuse_node.location = (-180, -80)
+
+    mix_shader = nodes.new('ShaderNodeMixShader')
+    mix_shader.location = (100, 0)
+
+    output_node = nodes.new('ShaderNodeOutputMaterial')
+    output_node.location = (360, 0)
+
+    links.new(tex_node.outputs['Color'], diffuse_node.inputs['Color'])
+    links.new(tex_node.outputs['Alpha'], mix_shader.inputs[0])
+    links.new(transparent_node.outputs['BSDF'], mix_shader.inputs[1])
+    links.new(diffuse_node.outputs['BSDF'], mix_shader.inputs[2])
+    links.new(mix_shader.outputs['Shader'], output_node.inputs['Surface'])
+
+
+def _apply_material_from_texture_slots(obj: bpy.types.Object, texture_slots: dict):
+    if not texture_slots:
+        _ensure_material(obj)
+        return
+
     for slot_name, slot_data in sorted(texture_slots.items()):
         source_path = str(slot_data.get("source_path", "") or "").strip()
         mark_name = str(slot_data.get("mark_name", "") or "").strip()
         if not source_path or not os.path.isfile(source_path):
             continue
-
-        tex_node = material.node_tree.nodes.new('ShaderNodeTexImage')
-        try:
-            tex_node.image = bpy.data.images.load(source_path)
-        except Exception:
-            material.node_tree.nodes.remove(tex_node)
+        if mark_name not in _DIFFUSE_MARK_NAMES:
             continue
-        tex_node.location.x = offset_x
-        tex_node.location.y = offset_y
-        offset_y -= 300
 
-        is_normal = mark_name in _NORMAL_MARK_NAMES or "normal" in mark_name.lower() or "bump" in mark_name.lower()
-        if is_normal:
-            tex_node.image.colorspace_settings.is_data = True
-            tex_node.image.colorspace_settings.name = 'Non-Color'
-            norm_map = material.node_tree.nodes.new('ShaderNodeNormalMap')
-            norm_map.location.x = offset_x + 300
-            norm_map.location.y = tex_node.location.y
-            material.node_tree.links.new(norm_map.inputs['Color'], tex_node.outputs['Color'])
-            material.node_tree.links.new(bsdf.inputs['Normal'], norm_map.outputs['Normal'])
+        mat_name = _material_name_for_texture_slot(obj.name, mark_name, slot_name)
+        material = _ensure_texture_slot_material(obj, mat_name)
+
+        try:
+            texture_image = bpy.data.images.load(source_path)
+        except Exception:
+            continue
+
+        has_alpha = False
+        try:
+            has_alpha = bool(getattr(texture_image, "depth", 0) == 32)
+        except Exception:
+            has_alpha = False
+
+        if has_alpha:
+            _create_transparent_material_graph(material, texture_image)
         else:
-            bsdf_input_name = _MARK_NAME_TO_BSDF_INPUT.get(mark_name, "")
-            if bsdf_input_name and bsdf_input_name in bsdf.inputs:
-                if bsdf_input_name == "Base Color":
-                    material.node_tree.links.new(bsdf.inputs['Base Color'], tex_node.outputs['Color'])
-                    material.node_tree.links.new(bsdf.inputs['Alpha'], tex_node.outputs['Alpha'])
-                elif bsdf_input_name == "Alpha":
-                    material.node_tree.links.new(bsdf.inputs['Alpha'], tex_node.outputs['Color'])
-                else:
-                    material.node_tree.links.new(bsdf.inputs[bsdf_input_name], tex_node.outputs['Color'])
-            else:
-                material.node_tree.links.new(bsdf.inputs['Base Color'], tex_node.outputs['Color'])
-
-    if not obj.material_slots:
-        obj.data.materials.append(material)
+            _create_diffuse_material_graph(material, texture_image)
+        break
 
 
 def _ensure_material(obj: bpy.types.Object):
@@ -304,7 +338,6 @@ def _ensure_material(obj: bpy.types.Object):
     mat = bpy.data.materials.get(mat_name)
     if mat is None:
         mat = bpy.data.materials.new(mat_name)
-        mat.use_nodes = True
     obj.data.materials.append(mat)
 
 
@@ -419,6 +452,7 @@ def _import_slice_ntemi(
     shade_smooth: bool = True,
     store_orig_vertex_id: bool = True,
 ) -> tuple:
+    apply_import_render_environment()
     converter = _ensure_ntemi_game_data_converter()
 
     positions = _read_vb0_positions(vb0_buf_path)
@@ -896,6 +930,7 @@ class NTEMIImportHelper:
             object_workspace_dir_from_type_dir(draw_call_meta.folder_path),
         )
         _set_object_props(imported_obj, localized_path_props)
+        update_prefix_record_for_object(imported_obj, extra_owners=getattr(imported_obj, "users_collection", []) or ())
 
         return imported_obj
 
@@ -983,5 +1018,6 @@ def _perform_bone_merge_postprocess(
                     str(obj.get("modimp_workspace_unique_str", "") or ""),
                 )
                 _localize_object_runtime_paths(obj, object_workspace_dir)
+            update_prefix_record_for_object(obj, extra_owners=getattr(obj, "users_collection", []) or [])
 
     print(f"[NTEMI BoneMerge] completed successfully")

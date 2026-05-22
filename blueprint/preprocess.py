@@ -16,7 +16,7 @@ from ..common.object_prefix_helper import ObjectPrefixHelper
 
 class PreProcessHelper:
     PRESERVE_SHAPEKEY_CACHE_PREFIX = "preserve_shapekeys_v4__"
-    DIRECT_SHAPEKEY_CACHE_PREFIX = "direct_shapekeys_v1__"
+    DIRECT_SHAPEKEY_CACHE_PREFIX = "direct_shapekeys_v2__"
     DIRECT_SHAPEKEY_RECORDS_SUFFIX = "direct_shapekey_records.pkl"
     _TRANSFORM_TOLERANCE = 1e-6
     _SHAPEKEY_VALUE_TOLERANCE = 1e-8
@@ -860,6 +860,17 @@ class PreProcessHelper:
                     key_block.value = 0.0
                 bpy.context.view_layer.update()
 
+                evaluated_obj = obj.evaluated_get(depsgraph)
+                evaluated_mesh = evaluated_obj.to_mesh()
+                try:
+                    basis_coords = numpy.empty((len(evaluated_mesh.vertices), 3), dtype=numpy.float32)
+                    evaluated_mesh.vertices.foreach_get("co", basis_coords.ravel())
+                finally:
+                    evaluated_obj.to_mesh_clear()
+
+                if GlobalProterties.enable_non_mirror_workflow():
+                    basis_coords[:, 0] *= -1.0
+
                 for target_key_block in non_basis_key_blocks:
                     if active_key_block is not None:
                         active_key_block.value = 0.0
@@ -883,6 +894,7 @@ class PreProcessHelper:
                         target_key_block.name,
                         coords,
                         all_loop_vertex_indices,
+                        basis_coords=basis_coords,
                     )
                     object_key_count += 1
             finally:

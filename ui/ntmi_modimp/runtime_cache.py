@@ -58,6 +58,16 @@ def object_workspace_dir_from_unique(workspace_root: str, workspace_unique_str: 
     return str(root / unique)
 
 
+def prefix_identity_matches(target_identity: tuple[str, str], source_identity: tuple[str, str]) -> bool:
+    target_lod, target_bare = target_identity
+    source_lod, source_bare = source_identity
+    if target_bare != source_bare:
+        return False
+    if target_lod:
+        return source_lod in {"", target_lod}
+    return source_lod in {"", "lod0"}
+
+
 def _safe_label(label: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]+", "_", str(label or "")).strip("_")
 

@@ -110,11 +110,38 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
         if not clean_target_hash:
             return "", ""
 
-        prefix_info = ObjectPrefixHelper.extract_prefix_info(clean_target_hash)
-        normalized_prefix = prefix_info[0] if prefix_info else ObjectPrefixHelper.normalize_prefix(clean_target_hash)
-        parts = ObjectPrefixHelper.parse_prefix_parts(normalized_prefix)
-        bare_prefix = str(parts.get("bare_unique_str", "") or normalized_prefix).strip()
-        return normalized_prefix, bare_prefix
+        normalized_target_hash = ObjectPrefixHelper.normalize_prefix(clean_target_hash)
+        lod_name, bare_target_hash = ObjectPrefixHelper.split_lod_prefix(normalized_target_hash)
+        if lod_name and bare_target_hash:
+            return normalized_target_hash, bare_target_hash
+        return normalized_target_hash, normalized_target_hash
+
+    @staticmethod
+    def _target_hash_has_numeric_variant(target_hash: str) -> bool:
+        clean_target_hash = str(target_hash or "").strip()
+        if "." not in clean_target_hash:
+            return False
+        return clean_target_hash.rsplit(".", 1)[-1].isdigit()
+
+    @classmethod
+    def _matches_target_hash_prefix(cls, obj_name: str, target_hash: str) -> bool:
+        clean_obj_name = str(obj_name or "").strip()
+        clean_target_hash = str(target_hash or "").strip()
+        if not clean_target_hash or not clean_obj_name.startswith(clean_target_hash):
+            return False
+
+        remainder = clean_obj_name[len(clean_target_hash):]
+        if not remainder:
+            return True
+        if not remainder.startswith("."):
+            return True
+
+        # "29187.00裙子" 这种对象应只命中更具体的 ".00" 目标哈希，
+        # 不应再回退命中父级 "29187"。
+        if not cls._target_hash_has_numeric_variant(clean_target_hash):
+            if len(remainder) > 1 and remainder[1].isdigit():
+                return False
+        return True
 
     @classmethod
     def _matches_target_hash(cls, obj_name: str, target_hash: str) -> bool:
@@ -123,9 +150,9 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
         if not normalized_target_hash and not bare_target_hash:
             return True
 
-        if normalized_target_hash and clean_obj_name.startswith(normalized_target_hash):
+        if normalized_target_hash and cls._matches_target_hash_prefix(clean_obj_name, normalized_target_hash):
             return True
-        if bare_target_hash and clean_obj_name.startswith(bare_target_hash):
+        if bare_target_hash and cls._matches_target_hash_prefix(clean_obj_name, bare_target_hash):
             return True
 
         prefix_info = ObjectPrefixHelper.extract_prefix_info(clean_obj_name)
@@ -147,7 +174,6 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
 
     def get_merged_mapping_for_object(self, obj_name, mapping_nodes):
         merged_mapping = {}
-        exact_match_found = False
 
         def get_node_priority(node_info):
             node = node_info['node']
@@ -161,9 +187,6 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
             target_hash = node_info['target_hash']
             node_type = node_info.get('type', 'match')
             exact_match = getattr(node, 'exact_hash_match', False)
-
-            if exact_match_found and not exact_match:
-                continue
 
             if target_hash and not self._matches_target_hash(obj_name, target_hash):
                 continue
@@ -205,7 +228,7 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
                         merged_mapping.update(mapping)
 
             if exact_match and target_hash and self._matches_target_hash(obj_name, target_hash):
-                exact_match_found = True
+                break
 
         return merged_mapping
 
@@ -275,7 +298,6 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
         text_cache: Dict[str, Dict[str, str]]
     ) -> Dict[str, str]:
         merged_mapping = {}
-        exact_match_found = False
 
         def get_node_priority(node_data):
             return (0 if node_data['exact_match'] else 1, node_data['index'])
@@ -286,9 +308,6 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
             target_hash = node_data['target_hash']
             exact_match = node_data['exact_match']
             node_type = node_data['type']
-
-            if exact_match_found and not exact_match:
-                continue
 
             if target_hash and not self._matches_target_hash(obj_name, target_hash):
                 continue
@@ -308,7 +327,7 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
             merged_mapping.update(mapping)
 
             if exact_match and target_hash and self._matches_target_hash(obj_name, target_hash):
-                exact_match_found = True
+                break
 
         return merged_mapping
 

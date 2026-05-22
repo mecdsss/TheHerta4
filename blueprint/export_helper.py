@@ -1,3 +1,5 @@
+import hashlib
+
 import bpy
 
 from ..common.global_config import GlobalConfig
@@ -34,6 +36,8 @@ class BlueprintExportHelper:
     direct_shapekey_position_records = {}
 
     MAX_EXPORT_COUNT_LIMIT = 1000
+    BLUEPRINT_NONE_IDENTIFIER = "__NONE__"
+    BLUEPRINT_NONE_ENUM_NUMBER = 0
 
     @staticmethod
     def should_ignore_muted_shape_keys() -> bool:
@@ -148,6 +152,85 @@ class BlueprintExportHelper:
         return ""
 
     @staticmethod
+    def _stable_blueprint_enum_number(identifier: str, used_numbers: set[int]) -> int:
+        if identifier == BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER:
+            used_numbers.add(BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER)
+            return BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER
+
+        digest = hashlib.blake2s(str(identifier).encode("utf-8"), digest_size=4).digest()
+        number = int.from_bytes(digest, "little") & 0x7FFFFFFF
+        if number == BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER:
+            number = 1
+        while number in used_numbers:
+            number += 1
+            if number > 0x7FFFFFFF:
+                number = 1
+        used_numbers.add(number)
+        return number
+
+    @staticmethod
+    def _enum_item_number(item, fallback_index: int) -> int:
+        try:
+            if len(item) >= 5:
+                return int(item[4])
+        except Exception:
+            pass
+        return int(fallback_index)
+
+    @staticmethod
+    def ensure_valid_selected_blueprint_name(context=None) -> str:
+        scene = getattr(context, "scene", None) if context else getattr(bpy.context, "scene", None)
+        global_properties = getattr(scene, "global_properties", None)
+        if global_properties is None:
+            return ""
+
+        items = BlueprintExportHelper.get_blueprint_enum_items(context=context)
+        identifiers = [item[0] for item in items]
+        identifier_set = set(identifiers)
+        number_to_identifier = {
+            BlueprintExportHelper._enum_item_number(item, index): item[0]
+            for index, item in enumerate(items)
+        }
+
+        raw_value = None
+        raw_value_available = False
+        try:
+            raw_value = global_properties.get("selected_blueprint_name")
+            raw_value_available = True
+        except Exception:
+            pass
+
+        if isinstance(raw_value, str) and raw_value in identifier_set:
+            return raw_value
+
+        try:
+            raw_number = int(raw_value)
+            if raw_number in number_to_identifier:
+                selected_identifier = number_to_identifier[raw_number]
+                global_properties.selected_blueprint_name = selected_identifier
+                return selected_identifier
+        except Exception:
+            pass
+
+        if not raw_value_available:
+            try:
+                current_identifier = str(getattr(global_properties, "selected_blueprint_name", "") or "")
+                if current_identifier in identifier_set:
+                    return current_identifier
+            except Exception:
+                pass
+
+        preferred_name = BlueprintExportHelper.get_preferred_blueprint_name(context=context)
+        if preferred_name not in identifier_set:
+            preferred_name = identifiers[0] if identifiers else BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
+
+        try:
+            global_properties.selected_blueprint_name = preferred_name
+        except Exception:
+            pass
+        return preferred_name
+
+    @staticmethod
     def set_runtime_shapekey_buffer_names(shapekey_names):
         BlueprintExportHelper.runtime_shapekey_buffer_names = list(dict.fromkeys(
             name for name in (shapekey_names or []) if name
@@ -224,7 +307,13 @@ class BlueprintExportHelper:
         BlueprintExportHelper.direct_shapekey_position_records = {}
 
     @staticmethod
-    def register_direct_shapekey_position_record(object_aliases, shapekey_name, coords, loop_vertex_indices):
+    def register_direct_shapekey_position_record(
+        object_aliases,
+        shapekey_name,
+        coords,
+        loop_vertex_indices,
+        basis_coords=None,
+    ):
         if not shapekey_name or coords is None or loop_vertex_indices is None:
             return
 
@@ -239,6 +328,8 @@ class BlueprintExportHelper:
                 },
             )
             record["loop_vertex_indices"] = loop_vertex_indices
+            if basis_coords is not None:
+                record["basis_coords"] = basis_coords
             record.setdefault("shape_keys", {})[shapekey_name] = coords
 
     @staticmethod
@@ -265,6 +356,8 @@ class BlueprintExportHelper:
             )
             if record.get("loop_vertex_indices") is not None:
                 target["loop_vertex_indices"] = record.get("loop_vertex_indices")
+            if record.get("basis_coords") is not None:
+                target["basis_coords"] = record.get("basis_coords")
             target.setdefault("shape_keys", {}).update(record.get("shape_keys", {}) or {})
 
     @staticmethod
@@ -275,13 +368,21 @@ class BlueprintExportHelper:
     def get_blueprint_enum_items(context=None):
         items = []
         preferred_name = BlueprintExportHelper.get_preferred_blueprint_name(context=context)
+        used_numbers = set()
 
         for tree in BlueprintExportHelper.get_all_blueprint_trees():
             description = "当前默认蓝图" if tree.name == preferred_name else "选择该蓝图进行打开或生成 Mod"
-            items.append((tree.name, tree.name, description))
+            enum_number = BlueprintExportHelper._stable_blueprint_enum_number(tree.name, used_numbers)
+            items.append((tree.name, tree.name, description, 0, enum_number))
 
         if not items:
-            items.append(("__NONE__", "当前没有蓝图", "当前没有可选蓝图，请先打开蓝图界面或执行一键导入"))
+            items.append((
+                BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER,
+                "当前没有蓝图",
+                "当前没有可选蓝图，请先打开蓝图界面或执行一键导入",
+                0,
+                BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER,
+            ))
 
         return items
 
@@ -345,7 +446,7 @@ class BlueprintExportHelper:
     @staticmethod
     def get_selected_blueprint_tree(selected_name="", context=None):
         requested_name = str(selected_name or "").strip()
-        if requested_name == "__NONE__":
+        if requested_name == BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER:
             return None
         if requested_name:
             return BlueprintExportHelper.get_blueprint_tree_by_name(requested_name)

@@ -10,6 +10,7 @@ import bpy
 from ...blueprint.model import BluePrintModel
 from ...common.draw_call_model import DrawCallModel
 from ...common.object_prefix_helper import ObjectPrefixHelper
+from .prefix_property_cache import get_prefix_record_props
 
 
 PROP_KIND = "modimp_kind"
@@ -148,6 +149,20 @@ def _copy_props(source, target, keys: Iterable[str]):
         value = _optional_str(source, key)
         if value:
             target[key] = value
+
+
+def _ensure_prefix_custom_props(obj: bpy.types.Object) -> int:
+    copied = 0
+    cached_props = get_prefix_record_props(obj.name)
+    for key, value in cached_props.items():
+        if key in obj:
+            continue
+        try:
+            obj[key] = value
+            copied += 1
+        except Exception:
+            continue
+    return copied
 
 
 def _unique_collection_name(base_name: str) -> str:
@@ -495,6 +510,8 @@ def build_export_tree(blueprint_model: BluePrintModel, tree_prefix: str = "TheHe
         if obj.type != "MESH":
             warnings.append(f"Skip non-mesh object: {obj.name}")
             continue
+
+        _ensure_prefix_custom_props(obj)
 
         draw_ib, index_count, first_index = key
         chain = _find_chain_for_draw(blueprint_model, draw_call_model)

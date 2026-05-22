@@ -15,7 +15,11 @@ from .direct_export_shapekey import DirectShapeKeyGenerator
 from .direct_export_shapekey_shared import ShapeKeyDirectExportError
 from ..common.d3d11_gametype import D3D11GameType
 from ..utils.log_utils import LOG
-from .ntmi_layout_adapter import iter_name_variants, parse_ntmi_part_layouts
+from .ntmi_layout_adapter import (
+    iter_name_variants,
+    local_loop_indices_for_export_range,
+    parse_ntmi_part_layouts,
+)
 from ..ui.ntmi_modimp.modimp_core import ensure_mod_importer_package
 from ..ui.ntmi_modimp.ntemi_importer import _ensure_ntemi_game_data_converter
 
@@ -496,7 +500,7 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
         super().__init__(adapter_node, mod_export_path, blueprint_model, exporter)
         self.meshes_dir = os.path.join(mod_export_path, "Buffer")
 
-    def _format_position_bytes_from_coords(self, sampled_coords, position_element, position_stride=12):
+    def _convert_position_coords_for_export(self, sampled_coords):
         coords = np.asarray(sampled_coords, dtype=np.float32)
         if coords.size > 0:
             converted = np.empty_like(coords, dtype=np.float32)
@@ -505,11 +509,10 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
                     (float(x_value), float(y_value), float(z_value))
                 )
             coords = converted
-        return super()._format_position_bytes_from_coords(
-            coords,
-            position_element,
-            position_stride=position_stride,
-        )
+        return coords
+
+    def _convert_position_deltas_for_export(self, sampled_deltas):
+        return self._convert_position_coords_for_export(sampled_deltas)
 
     def _match_drawib_model(self, actual_hash: str, logical_hash: str):
         del actual_hash, logical_hash
@@ -539,8 +542,11 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
                         default_mirror_flip=bool(getattr(self.exporter, "default_mirror_flip", False)),
                     )
                     loop_index_cache[cache_key] = exported_loop_indices
-                if exported_loop_indices.size > 0 and int(export_indices.max(initial=-1)) < exported_loop_indices.size:
-                    local_loop_indices = exported_loop_indices[export_indices]
+                local_loop_indices = local_loop_indices_for_export_range(
+                    exported_loop_indices,
+                    export_indices,
+                    draw_call.start_vertex,
+                )
             context = {
                 "export_indices": export_indices,
                 "local_loop_indices": local_loop_indices,

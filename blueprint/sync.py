@@ -1164,6 +1164,11 @@ def load_post_handler(scene):
     _rebuild_object_name_cache()
     _rebuild_object_hide_state_cache()
     subscribe_msgbus()
+    try:
+        from .export_helper import BlueprintExportHelper
+        BlueprintExportHelper.ensure_valid_selected_blueprint_name()
+    except Exception:
+        pass
     _sync_all_node_reference_states()
     _sync_all_node_visibility_states()
 

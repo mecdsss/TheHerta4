@@ -31,7 +31,7 @@ bl_info = {
     "name": "TheHerta4",
     "description": "Blender Plugin of SSMT4",
     "blender": (4, 5, 0),
-    "version": (4, 3, 12),
+    "version": (4, 4, 0),
     "location": "View3D",
     "category": "Generic"
 }
@@ -162,6 +162,12 @@ def register():
     
     toolkit.register()
     texture_auto_reload.register()
+
+    try:
+        from .blueprint.export_helper import BlueprintExportHelper
+        BlueprintExportHelper.ensure_valid_selected_blueprint_name()
+    except Exception:
+        pass
 
 
 

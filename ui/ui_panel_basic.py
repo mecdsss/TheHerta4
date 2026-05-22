@@ -65,13 +65,16 @@ class PanelBasicInformation(bpy.types.Panel):
 
         GlobalConfig.read_from_main_json_ssmt4()
 
-        preferred_blueprint_name = BlueprintExportHelper.get_preferred_blueprint_name(
-            selected_name=getattr(global_properties, "selected_blueprint_name", ""),
-            context=context,
+        selected_blueprint_name = (
+            BlueprintExportHelper.get_preferred_blueprint_name(
+                selected_name=getattr(global_properties, "selected_blueprint_name", ""),
+                context=context,
+            )
+            or getattr(global_properties, "selected_blueprint_name", "")
+            or BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
         )
-        selected_blueprint_name = preferred_blueprint_name or getattr(global_properties, "selected_blueprint_name", "") or "__NONE__"
 
-        layout.label(text="TheHerta4 v4.3.12", icon='INFO')
+        layout.label(text="TheHerta4 v4.4.0", icon='INFO')
         layout.label(text=TR.translate("SSMT缓存文件夹路径: ") + GlobalConfig.ssmtlocation)
         layout.label(text=TR.translate("当前配置名称: ") + GlobalConfig.gamename)
         layout.label(text=TR.translate("当前游戏预设: ") + GlobalConfig.logic_name)
@@ -131,14 +134,22 @@ class PanelBasicInformation(bpy.types.Panel):
             text="",
             icon='NODETREE',
         )
-        open_operator.blueprint_name = selected_blueprint_name if selected_blueprint_name != "__NONE__" else ""
+        open_operator.blueprint_name = (
+            selected_blueprint_name
+            if selected_blueprint_name != BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
+            else ""
+        )
 
         open_current = blueprint_box.operator(
             "theherta3.open_persistent_blueprint",
             text="打开蓝图界面",
             icon='NODETREE',
         )
-        open_current.blueprint_name = selected_blueprint_name if selected_blueprint_name != "__NONE__" else ""
+        open_current.blueprint_name = (
+            selected_blueprint_name
+            if selected_blueprint_name != BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
+            else ""
+        )
 
         generate_operator = blueprint_box.operator(
             SSMTGenerateModBlueprint.bl_idname,

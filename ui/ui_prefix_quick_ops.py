@@ -185,33 +185,8 @@ class PrefixQuickOpsHelper:
     @classmethod
     def resolve_display_name(cls, context, item) -> str:
         current_name = (getattr(item, "display_name", "") or "").strip()
-        for node in cls._iter_object_info_nodes():
-            info = ObjectPrefixHelper.get_node_prefix_info(node)
-            if not info:
-                continue
-
-            prefix, _ = info
-            if prefix != item.prefix:
-                continue
-
-            return cls._build_display_name(
-                prefix,
-                object_name=ObjectPrefixHelper.build_virtual_object_name_for_node(node),
-                alias_name=getattr(node, "alias_name", ""),
-            )
-
-        for obj in context.scene.objects:
-            info = cls.extract_prefix_info(getattr(obj, "name", ""))
-            if not info:
-                continue
-
-            prefix, _ = info
-            if prefix == item.prefix:
-                return cls._build_display_name(prefix, object_name=obj.name)
-
-        if current_name and current_name != item.prefix:
+        if current_name:
             return current_name
-
         return item.prefix
 
 

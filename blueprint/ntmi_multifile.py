@@ -11,7 +11,11 @@ import numpy as np
 from .direct_export_multifile import DirectMultiFileGenerator, MultiFileDirectExportError
 from ..common.d3d11_gametype import D3D11GameType
 from ..ui.ntmi_modimp.ini_swap_patcher import ACTIVE_FLAG
-from .ntmi_layout_adapter import iter_name_variants, parse_ntmi_part_layouts
+from .ntmi_layout_adapter import (
+    iter_name_variants,
+    local_loop_indices_for_export_range,
+    parse_ntmi_part_layouts,
+)
 from .ntmi_shapekey import _build_exported_loop_indices, _load_ntmi_exporter_module, _load_ntmi_position_converter
 
 
@@ -146,8 +150,11 @@ class NTMIDirectMultiFileGenerator(DirectMultiFileGenerator):
                         default_mirror_flip=bool(getattr(self.exporter, "default_mirror_flip", False)),
                     )
                     loop_index_cache[cache_key] = exported_loop_indices
-                if exported_loop_indices.size > 0 and int(export_indices.max(initial=-1)) < exported_loop_indices.size:
-                    local_loop_indices = exported_loop_indices[export_indices]
+                local_loop_indices = local_loop_indices_for_export_range(
+                    exported_loop_indices,
+                    export_indices,
+                    start_v,
+                )
             context = {
                 "export_indices": export_indices,
                 "local_loop_indices": local_loop_indices,

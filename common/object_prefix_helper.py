@@ -13,6 +13,19 @@ _PREFIX_CHECK_SEPARATORS = (".",)
 _BLENDER_SUFFIX_PATTERN = re.compile(r"\.\d{3,}$")
 _BLENDER_SUFFIX_INNER_PATTERN = re.compile(r"\.\d{3,}")
 _LOD_PREFIX_PATTERN = re.compile(r"^(LOD\d+)\.(.+)$", re.IGNORECASE)
+_RUNTIME_SUFFIX_PATTERNS = (
+    re.compile(r"_chain\d+_dup\d+_copy_temp$"),
+    re.compile(r"_chain\d+_dup\d+_copy$"),
+    re.compile(r"_chain\d+_dup\d+$"),
+    re.compile(r"_chain\d+_copy_temp$"),
+    re.compile(r"_chain\d+_copy$"),
+    re.compile(r"_chain\d+$"),
+    re.compile(r"_dup\d+_copy_temp$"),
+    re.compile(r"_dup\d+_copy$"),
+    re.compile(r"_dup\d+$"),
+    re.compile(r"_copy_temp$"),
+    re.compile(r"_copy$"),
+)
 
 
 class ObjectPrefixHelper:
@@ -43,6 +56,14 @@ class ObjectPrefixHelper:
             return name[:match.start()], match.group()
         return name, ""
 
+    @staticmethod
+    def _strip_runtime_suffix(name: str) -> tuple[str, str]:
+        for pattern in _RUNTIME_SUFFIX_PATTERNS:
+            match = pattern.search(name)
+            if match:
+                return name[:match.start()], match.group()
+        return name, ""
+
     @classmethod
     def _is_structured_prefix(cls, prefix_candidate: str) -> bool:
         clean_prefix = cls.normalize_prefix(prefix_candidate)
@@ -61,6 +82,7 @@ class ObjectPrefixHelper:
     def _extract_hyphen_prefix(cls, object_name: str):
         clean_name = (object_name or "").strip()
         name_without_suffix, _blender_suffix = cls._strip_blender_suffix(clean_name)
+        name_without_suffix, _runtime_suffix = cls._strip_runtime_suffix(name_without_suffix)
         prefix_candidate = name_without_suffix.split(".", 1)[0]
         parts = [part.strip() for part in prefix_candidate.split("-") if part.strip()]
         if len(parts) < 2:
@@ -201,7 +223,11 @@ class ObjectPrefixHelper:
 
         prefix, _separator = parsed
         prefix = cls._resolve_incomplete_prefix_from_workspace(clean_name, lod_name, prefix)
-        if cls.normalize_prefix(bare_name) == prefix:
+        bare_name_without_runtime_suffix, _runtime_suffix = cls._strip_runtime_suffix(bare_name)
+        if (
+            cls.normalize_prefix(bare_name) == prefix
+            or cls.normalize_prefix(bare_name_without_runtime_suffix) == prefix
+        ):
             return with_lod(prefix, ".")
         return with_lod(prefix, "-")
 

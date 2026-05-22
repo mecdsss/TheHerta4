@@ -4,6 +4,7 @@ import os
 
 from .d3d11_element import D3D11Element
 from .global_properties import GlobalProterties
+from .import_scene_settings import apply_import_render_environment
 from .mesh_create_helper import MeshCreateHelper
 from .submesh_json import SubmeshJson, SubmeshCategoryBuffer
 from ..utils.format_utils import Fatal, FormatUtils
@@ -24,6 +25,7 @@ class SSMTImportHelper:
 
 	@staticmethod
 	def create_mesh_from_json(json_file_path:str, import_collection:bpy.types.Collection | None = None):
+		apply_import_render_environment()
 		submesh_json = SubmeshJson(json_file_path)
 
 		elements, vb_data, vb_vertex_count, shapekey_buffers = SSMTImportHelper.parse_category_buffers(submesh_json)

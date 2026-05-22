@@ -7,6 +7,8 @@ import os
 import re
 from typing import Iterable
 
+import numpy as np
+
 
 _RESOURCE_PART_POSITION_RE = re.compile(r"^\[ResourcePart_(?P<token>.+)_Position\]$")
 _RESOURCE_PART_IB_RE = re.compile(r"^\[ResourcePart_(?P<token>.+)_IB\]$")
@@ -68,6 +70,27 @@ def iter_name_variants(name: str) -> Iterable[str]:
         variants[stripped_x] = True
 
     return variants.keys()
+
+
+def local_loop_indices_for_export_range(
+    exported_loop_indices,
+    export_indices,
+    start_vertex: int | None,
+) -> np.ndarray:
+    exported_loop_indices = np.asarray(exported_loop_indices, dtype=np.int32)
+    export_indices = np.asarray(export_indices, dtype=np.int64)
+    if exported_loop_indices.size == 0 or export_indices.size == 0:
+        return np.asarray([], dtype=np.int32)
+
+    local_vertex_indices = export_indices - int(start_vertex or 0)
+    if local_vertex_indices.size == 0:
+        return np.asarray([], dtype=np.int32)
+    if int(local_vertex_indices.min()) < 0:
+        return np.asarray([], dtype=np.int32)
+    if int(local_vertex_indices.max()) >= exported_loop_indices.size:
+        return np.asarray([], dtype=np.int32)
+
+    return exported_loop_indices[local_vertex_indices.astype(np.intp)].astype(np.int32, copy=False)
 
 
 def normalize_resource_path(base_dir: str, resource_filename: str) -> str:

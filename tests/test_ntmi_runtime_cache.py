@@ -6,6 +6,7 @@ from ui.ntmi_modimp.runtime_cache import (
     MODIMP_RUNTIME_DIR_NAME,
     localize_runtime_path_props,
     object_workspace_dir_from_unique,
+    prefix_identity_matches,
 )
 
 
@@ -58,6 +59,28 @@ class NTMIRuntimeCacheTests(unittest.TestCase):
         result = object_workspace_dir_from_unique(workspace_root, "LOD0.abc-3-0")
 
         self.assertEqual(result, os.path.join(workspace_root, "LOD0", "abc-3-0"))
+
+    def test_prefix_identity_matches_treats_bare_prefix_as_lod0_compatible(self):
+        self.assertTrue(
+            prefix_identity_matches(
+                ("", "abc12345-12-0"),
+                ("lod0", "abc12345-12-0"),
+            )
+        )
+        self.assertTrue(
+            prefix_identity_matches(
+                ("lod0", "abc12345-12-0"),
+                ("", "abc12345-12-0"),
+            )
+        )
+
+    def test_prefix_identity_matches_rejects_different_slice_prefix(self):
+        self.assertFalse(
+            prefix_identity_matches(
+                ("lod0", "abc12345-12-0"),
+                ("lod0", "abc12345-12-12"),
+            )
+        )
 
 
 if __name__ == "__main__":

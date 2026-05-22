@@ -22,150 +22,68 @@ from ..utils.timer_utils import TimerUtils
 
 def _strip_material_texture_nodes(objects: list[bpy.types.Object]) -> list[dict]:
     saved = []
-    seen_materials = set()
+    seen_meshes = set()
 
     for obj in objects:
-        if obj.type != "MESH":
+        if obj is None or obj.type != "MESH" or not getattr(obj, "data", None):
             continue
-        for slot in obj.material_slots:
-            mat = slot.material
-            if mat is None or not mat.use_nodes or mat.name in seen_materials:
-                continue
-            seen_materials.add(mat.name)
-
-            tex_nodes = [
-                node for node in mat.node_tree.nodes
-                if node.bl_idname == "ShaderNodeTexImage"
-            ]
-            if not tex_nodes:
-                continue
-
-            nodes_to_remove = []
-            for tex_node in tex_nodes:
-                tex_payload = {
-                    "material": mat.name,
-                    "node_type": "ShaderNodeTexImage",
-                    "name": tex_node.name,
-                    "label": tex_node.label,
-                    "location": (tex_node.location.x, tex_node.location.y),
-                    "image_filepath": "",
-                    "colorspace": "",
-                    "outgoing_links": [],
-                }
-                if tex_node.image:
-                    tex_payload["image_filepath"] = tex_node.image.filepath
-                    tex_payload["colorspace"] = tex_node.image.colorspace_settings.name
-
-                linked_normal_nodes = []
-                for link in list(mat.node_tree.links):
-                    if link.from_node != tex_node:
-                        continue
-                    tex_payload["outgoing_links"].append({
-                        "from_socket_name": link.from_socket.name,
-                        "to_node": link.to_node.name,
-                        "to_socket_name": link.to_socket.name,
-                    })
-                    if link.to_node.bl_idname == "ShaderNodeNormalMap":
-                        linked_normal_nodes.append(link.to_node)
-
-                saved.append(tex_payload)
-                nodes_to_remove.append(tex_node)
-
-                for normal_node in linked_normal_nodes:
-                    normal_payload = {
-                        "material": mat.name,
-                        "node_type": "ShaderNodeNormalMap",
-                        "name": normal_node.name,
-                        "label": normal_node.label,
-                        "location": (normal_node.location.x, normal_node.location.y),
-                        "incoming_links": [],
-                        "outgoing_links": [],
+        mesh = obj.data
+        mesh_key = mesh.name_full if getattr(mesh, "name_full", "") else str(id(mesh))
+        if mesh_key in seen_meshes:
+            continue
+        seen_meshes.add(mesh_key)
+        materials = list(mesh.materials)
+        if not materials:
+            continue
+        saved.append(
+            {
+                "mesh": mesh,
+                "materials": materials,
+                "objects": [
+                    {
+                        "object": candidate,
+                        "active_material_index": int(getattr(candidate, "active_material_index", 0) or 0),
                     }
-                    for link in list(mat.node_tree.links):
-                        if link.to_node == normal_node:
-                            normal_payload["incoming_links"].append({
-                                "from_node": link.from_node.name,
-                                "from_socket_name": link.from_socket.name,
-                                "to_socket_name": link.to_socket.name,
-                            })
-                        if link.from_node == normal_node:
-                            normal_payload["outgoing_links"].append({
-                                "from_socket_name": link.from_socket.name,
-                                "to_node": link.to_node.name,
-                                "to_socket_name": link.to_socket.name,
-                            })
-                    saved.append(normal_payload)
-                    nodes_to_remove.append(normal_node)
-
-            for node in {id(node): node for node in nodes_to_remove}.values():
-                try:
-                    mat.node_tree.nodes.remove(node)
-                except Exception:
-                    continue
+                    for candidate in objects
+                    if candidate is not None and getattr(candidate, "data", None) == mesh
+                ],
+            }
+        )
+        mesh.materials.clear()
 
     return saved
 
 
 def _restore_material_texture_nodes(saved: list[dict]):
-    created_nodes: dict[tuple[str, str], bpy.types.Node] = {}
-    pending_links = []
-
     for payload in saved:
-        mat = bpy.data.materials.get(payload["material"])
-        if mat is None or not mat.use_nodes:
-            continue
-
-        node_type = payload.get("node_type", "ShaderNodeTexImage")
-        node = mat.node_tree.nodes.new(node_type)
-        node.name = payload.get("name", node.name)
-        node.label = payload.get("label", "")
-        node.location.x = payload["location"][0]
-        node.location.y = payload["location"][1]
-        created_nodes[(mat.name, node.name)] = node
-
-        if node_type == "ShaderNodeTexImage":
-            filepath = payload.get("image_filepath", "")
-            if filepath:
-                try:
-                    node.image = bpy.data.images.load(filepath)
-                except Exception:
-                    pass
-            colorspace = payload.get("colorspace", "")
-            if colorspace and getattr(node, "image", None):
-                try:
-                    node.image.colorspace_settings.name = colorspace
-                except Exception:
-                    pass
-
-        for link_info in payload.get("incoming_links", []):
-            pending_links.append((mat.name, link_info))
-        for link_info in payload.get("outgoing_links", []):
-            pending_links.append((
-                mat.name,
-                {
-                    "from_node": node.name,
-                    "from_socket_name": link_info.get("from_socket_name", ""),
-                    "to_node": link_info.get("to_node", ""),
-                    "to_socket_name": link_info.get("to_socket_name", ""),
-                },
-            ))
-
-    for material_name, link_info in pending_links:
-        mat = bpy.data.materials.get(material_name)
-        if mat is None or not mat.use_nodes:
-            continue
-        from_node = created_nodes.get((material_name, link_info.get("from_node", ""))) or mat.node_tree.nodes.get(link_info.get("from_node", ""))
-        to_node = created_nodes.get((material_name, link_info.get("to_node", ""))) or mat.node_tree.nodes.get(link_info.get("to_node", ""))
-        if from_node is None or to_node is None:
-            continue
-        from_socket = from_node.outputs.get(link_info.get("from_socket_name", ""))
-        to_socket = to_node.inputs.get(link_info.get("to_socket_name", ""))
-        if from_socket is None or to_socket is None:
+        mesh = payload.get("mesh")
+        if mesh is None:
             continue
         try:
-            mat.node_tree.links.new(from_socket, to_socket)
-        except Exception:
+            mesh.materials.clear()
+            for material in payload.get("materials", []) or []:
+                mesh.materials.append(material)
+        except ReferenceError:
             continue
+        except Exception as exc:
+            LOG.warning(f"NTMI ModImp: failed to restore material slots: {exc}")
+
+        for object_payload in payload.get("objects", []) or []:
+            obj = object_payload.get("object")
+            if obj is None:
+                continue
+            try:
+                slot_count = len(getattr(obj, "material_slots", []) or [])
+                if slot_count <= 0:
+                    continue
+                obj.active_material_index = max(
+                    0,
+                    min(int(object_payload.get("active_material_index", 0) or 0), slot_count - 1),
+                )
+            except ReferenceError:
+                continue
+            except Exception:
+                continue
 from ..ui.ntmi_modimp.export_tree_builder import (
     ExportTreeBuildResult,
     build_export_tree,
@@ -663,6 +581,35 @@ def _sync_modimp_mirror_flags_after_preprocess(original_to_copy_map: dict[str, s
         )
 
 
+def _numeric_vertex_group_names(obj: bpy.types.Object) -> list[str]:
+    return [
+        str(getattr(vertex_group, "name", "") or "")
+        for vertex_group in getattr(obj, "vertex_groups", []) or []
+        if str(getattr(vertex_group, "name", "") or "").isdigit()
+    ]
+
+
+def _validate_modimp_export_objects(export_objects: list[bpy.types.Object]):
+    missing_numeric_groups = []
+    for obj in export_objects:
+        if obj is None or obj.type != "MESH":
+            continue
+        if _numeric_vertex_group_names(obj):
+            continue
+        missing_numeric_groups.append(obj.name)
+
+    if missing_numeric_groups:
+        preview = ", ".join(missing_numeric_groups[:8])
+        remaining = len(missing_numeric_groups) - 8
+        if remaining > 0:
+            preview = f"{preview}, ... (+{remaining})"
+        raise NTMIModImpExportError(
+            "NTMI ModImp export requires numeric vertex groups for skin weights. "
+            "The following export object(s) have no numeric vertex groups: "
+            f"{preview}. Run vertex-group mapping/process before export, or remove static/non-skinned meshes from this NTMI export path."
+        )
+
+
 class ExportNTMIModImp:
     def __init__(self, blueprint_model: BluePrintModel, node=None, output_dir: str = ""):
         self.blueprint_model = blueprint_model
@@ -715,8 +662,9 @@ class ExportNTMIModImp:
                 for obj in root_col.all_objects
                 if obj.type == "MESH"
             ]
+            _validate_modimp_export_objects(export_objects)
             saved_texture_nodes = _strip_material_texture_nodes(export_objects)
-            LOG.info(f"NTMI ModImp: stripped texture nodes from {len(export_objects)} object(s) before export")
+            LOG.info(f"NTMI ModImp: detached material slots from {len(export_objects)} object(s) before export")
 
             try:
                 for root_collection in build_result.root_collections:
@@ -732,7 +680,7 @@ class ExportNTMIModImp:
                     export_results.append(dict(result))
             finally:
                 _restore_material_texture_nodes(saved_texture_nodes)
-                LOG.info("NTMI ModImp: restored material texture nodes after export")
+                LOG.info("NTMI ModImp: restored material slots after export")
 
             object_conditions = _object_conditions_from_blueprint_model(self.blueprint_model)
             swap_nodes = _swap_node_payloads(self.blueprint_model)

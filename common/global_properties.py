@@ -475,6 +475,11 @@ class GlobalProterties(bpy.types.PropertyGroup):
 def register():
     bpy.utils.register_class(GlobalProterties)
     bpy.types.Scene.global_properties = bpy.props.PointerProperty(type=GlobalProterties)
+    try:
+        from ..blueprint.export_helper import BlueprintExportHelper
+        BlueprintExportHelper.ensure_valid_selected_blueprint_name()
+    except Exception:
+        pass
 
 
 def unregister():

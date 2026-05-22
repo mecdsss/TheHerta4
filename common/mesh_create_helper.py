@@ -559,56 +559,76 @@ class MeshCreateHelper:
         return output
 
     @staticmethod
-    def get_principled_bsdf_node(material):
-        nodes = material.node_tree.nodes
-        links = material.node_tree.links
-
-        bsdf = nodes.get("原理化 BSDF")
-        if not bsdf:
-            bsdf = nodes.get("原理化BSDF")
-        if not bsdf:
-            bsdf = nodes.get("Principled BSDF")
-        if not bsdf:
-            bsdf = next((node for node in nodes if node.bl_idname == 'ShaderNodeBsdfPrincipled'), None)
-        if not bsdf:
-            bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
-            bsdf.location = (0, 0)
-            output = MeshCreateHelper.get_material_output_node(nodes)
-            if not any(link.from_node == bsdf and link.to_node == output for link in links):
-                links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
-
-        return bsdf
+    def clear_material_nodes(node_tree):
+        for node in list(node_tree.nodes):
+            try:
+                node_tree.nodes.remove(node)
+            except Exception:
+                continue
 
     @staticmethod
-    def apply_diffuse_texture(node_tree, bsdf, texture_path: str, use_alpha: bool = True):
+    def create_diffuse_material_graph(node_tree, texture_path: str):
+        MeshCreateHelper.clear_material_nodes(node_tree)
         tex_image = node_tree.nodes.new('ShaderNodeTexImage')
         tex_image.image = bpy.data.images.load(texture_path)
         tex_image.image.alpha_mode = "NONE"
-        tex_image.location.x = bsdf.location.x - 400
-        tex_image.location.y = bsdf.location.y
-        node_tree.links.new(bsdf.inputs['Base Color'], tex_image.outputs['Color'])
-        if use_alpha:
-            node_tree.links.new(bsdf.inputs['Alpha'], tex_image.outputs['Alpha'])
-        return tex_image
+        tex_image.location = (-400, 0)
+
+        diffuse = node_tree.nodes.new('ShaderNodeBsdfDiffuse')
+        diffuse.location = (-100, 0)
+
+        output = MeshCreateHelper.get_material_output_node(node_tree.nodes)
+        output.location = (180, 0)
+
+        node_tree.links.new(tex_image.outputs['Color'], diffuse.inputs['Color'])
+        node_tree.links.new(diffuse.outputs['BSDF'], output.inputs['Surface'])
+        return tex_image, diffuse
 
     @staticmethod
-    def create_identity_v_normal_map(node_tree, bsdf, normal_path: str):
+    def create_transparent_material_graph(node_tree, texture_path: str):
+        MeshCreateHelper.clear_material_nodes(node_tree)
+        tex_image = node_tree.nodes.new('ShaderNodeTexImage')
+        tex_image.image = bpy.data.images.load(texture_path)
+        tex_image.image.alpha_mode = "NONE"
+        tex_image.location = (-520, 0)
+
+        transparent = node_tree.nodes.new('ShaderNodeBsdfTransparent')
+        transparent.location = (-180, 140)
+
+        diffuse = node_tree.nodes.new('ShaderNodeBsdfDiffuse')
+        diffuse.location = (-180, -80)
+
+        mix_shader = node_tree.nodes.new('ShaderNodeMixShader')
+        mix_shader.location = (100, 0)
+
+        output = MeshCreateHelper.get_material_output_node(node_tree.nodes)
+        output.location = (360, 0)
+
+        node_tree.links.new(tex_image.outputs['Color'], diffuse.inputs['Color'])
+        node_tree.links.new(tex_image.outputs['Alpha'], mix_shader.inputs[0])
+        node_tree.links.new(transparent.outputs['BSDF'], mix_shader.inputs[1])
+        node_tree.links.new(diffuse.outputs['BSDF'], mix_shader.inputs[2])
+        node_tree.links.new(mix_shader.outputs['Shader'], output.inputs['Surface'])
+        return tex_image, diffuse
+
+    @staticmethod
+    def create_identity_v_normal_map(node_tree, diffuse, normal_path: str):
         norm_image = node_tree.nodes.new('ShaderNodeTexImage')
         norm_image.image = bpy.data.images.load(normal_path)
-        norm_image.location.x = bsdf.location.x - 1200
-        norm_image.location.y = bsdf.location.y - 300
+        norm_image.location.x = diffuse.location.x - 1100
+        norm_image.location.y = diffuse.location.y - 300
         norm_image.image.colorspace_settings.is_data = True
         norm_image.image.colorspace_settings.name = 'Non-Color'
 
         norm_separate = node_tree.nodes.new('ShaderNodeSeparateColor')
-        norm_separate.location.x = bsdf.location.x - 800
-        norm_separate.location.y = bsdf.location.y - 450
+        norm_separate.location.x = diffuse.location.x - 700
+        norm_separate.location.y = diffuse.location.y - 450
         if hasattr(norm_separate, 'mode'):
             norm_separate.mode = 'RGB'
 
         rgb_curve = node_tree.nodes.new('ShaderNodeRGBCurve')
-        rgb_curve.location.x = bsdf.location.x - 800
-        rgb_curve.location.y = bsdf.location.y - 100
+        rgb_curve.location.x = diffuse.location.x - 700
+        rgb_curve.location.y = diffuse.location.y - 100
         if 'Fac' in rgb_curve.inputs:
             rgb_curve.inputs['Fac'].default_value = 1.0
         if hasattr(rgb_curve, 'mapping'):
@@ -620,8 +640,8 @@ class MeshCreateHelper:
             rgb_curve.mapping.update()
 
         norm_map = node_tree.nodes.new('ShaderNodeNormalMap')
-        norm_map.location.x = bsdf.location.x - 400
-        norm_map.location.y = bsdf.location.y - 100
+        norm_map.location.x = diffuse.location.x - 300
+        norm_map.location.y = diffuse.location.y - 100
         norm_map.uv_map = "TEXCOORD.xy"
         if hasattr(norm_map, 'space'):
             norm_map.space = 'TANGENT'
@@ -630,74 +650,75 @@ class MeshCreateHelper:
 
         node_tree.links.new(norm_separate.inputs['Color'], norm_image.outputs['Color'])
         node_tree.links.new(rgb_curve.inputs['Color'], norm_image.outputs['Color'])
-        node_tree.links.new(bsdf.inputs['Alpha'], norm_separate.outputs['Blue'])
         node_tree.links.new(norm_map.inputs['Color'], rgb_curve.outputs['Color'])
-        node_tree.links.new(bsdf.inputs['Normal'], norm_map.outputs['Normal'])
+        node_tree.links.new(diffuse.inputs['Normal'], norm_map.outputs['Normal'])
+        return norm_map, norm_separate
 
     @staticmethod
-    def create_standard_normal_map(node_tree, bsdf, normal_path: str):
+    def create_standard_normal_map(node_tree, diffuse, normal_path: str):
         norm_image = node_tree.nodes.new('ShaderNodeTexImage')
         norm_image.image = bpy.data.images.load(normal_path)
-        norm_image.location.x = bsdf.location.x - 800
-        norm_image.location.y = bsdf.location.y - 400
+        norm_image.location.x = diffuse.location.x - 700
+        norm_image.location.y = diffuse.location.y - 400
         norm_image.image.colorspace_settings.is_data = True
         norm_image.image.colorspace_settings.name = 'Non-Color'
 
         norm_map = node_tree.nodes.new('ShaderNodeNormalMap')
-        norm_map.location.x = bsdf.location.x - 400
-        norm_map.location.y = bsdf.location.y - 400
+        norm_map.location.x = diffuse.location.x - 300
+        norm_map.location.y = diffuse.location.y - 400
         norm_map.uv_map = "TEXCOORD.xy"
         node_tree.links.new(norm_map.inputs['Color'], norm_image.outputs['Color'])
-        node_tree.links.new(bsdf.inputs['Normal'], norm_map.outputs['Normal'])
+        node_tree.links.new(diffuse.inputs['Normal'], norm_map.outputs['Normal'])
+        return norm_map
 
     @staticmethod
-    def create_zzmi_gimi_normal_map(node_tree, bsdf, normal_path: str):
+    def create_zzmi_gimi_normal_map(node_tree, diffuse, normal_path: str):
         norm_image = node_tree.nodes.new('ShaderNodeTexImage')
         norm_image.image = bpy.data.images.load(normal_path)
-        norm_image.location.x = bsdf.location.x - 1200
-        norm_image.location.y = bsdf.location.y - 400
+        norm_image.location.x = diffuse.location.x - 1100
+        norm_image.location.y = diffuse.location.y - 400
         norm_image.image.colorspace_settings.is_data = True
         norm_image.image.colorspace_settings.name = 'Non-Color'
 
         norm_separate = node_tree.nodes.new('ShaderNodeSeparateColor')
-        norm_separate.location.x = bsdf.location.x - 800
-        norm_separate.location.y = bsdf.location.y - 400
+        norm_separate.location.x = diffuse.location.x - 700
+        norm_separate.location.y = diffuse.location.y - 400
         node_tree.links.new(norm_separate.inputs['Color'], norm_image.outputs['Color'])
 
         norm_combine = node_tree.nodes.new('ShaderNodeCombineColor')
-        norm_combine.location.x = bsdf.location.x - 600
-        norm_combine.location.y = bsdf.location.y - 400
+        norm_combine.location.x = diffuse.location.x - 500
+        norm_combine.location.y = diffuse.location.y - 400
         node_tree.links.new(norm_combine.inputs['Red'], norm_separate.outputs['Red'])
         node_tree.links.new(norm_combine.inputs['Green'], norm_separate.outputs['Green'])
 
         norm_math = node_tree.nodes.new('ShaderNodeMath')
-        norm_math.location.x = bsdf.location.x - 400
-        norm_math.location.y = bsdf.location.y - 600
+        norm_math.location.x = diffuse.location.x - 300
+        norm_math.location.y = diffuse.location.y - 600
         norm_math.operation = 'SQRT'
         norm_math.use_clamp = True
 
         norm_math_2 = node_tree.nodes.new('ShaderNodeMath')
-        norm_math_2.location.x = bsdf.location.x - 600
-        norm_math_2.location.y = bsdf.location.y - 800
+        norm_math_2.location.x = diffuse.location.x - 500
+        norm_math_2.location.y = diffuse.location.y - 800
         norm_math_2.operation = 'SUBTRACT'
         norm_math_2.inputs[0].default_value = 1.0
         norm_math_2.use_clamp = True
 
         norm_math_r2 = node_tree.nodes.new('ShaderNodeMath')
-        norm_math_r2.location.x = bsdf.location.x - 800
-        norm_math_r2.location.y = bsdf.location.y - 600
+        norm_math_r2.location.x = diffuse.location.x - 700
+        norm_math_r2.location.y = diffuse.location.y - 600
         norm_math_r2.operation = 'POWER'
         norm_math_r2.inputs[1].default_value = 2.0
 
         norm_math_g2 = node_tree.nodes.new('ShaderNodeMath')
-        norm_math_g2.location.x = bsdf.location.x - 800
-        norm_math_g2.location.y = bsdf.location.y - 800
+        norm_math_g2.location.x = diffuse.location.x - 700
+        norm_math_g2.location.y = diffuse.location.y - 800
         norm_math_g2.operation = 'POWER'
         norm_math_g2.inputs[1].default_value = 2.0
 
         norm_math_add_r_g = node_tree.nodes.new('ShaderNodeMath')
-        norm_math_add_r_g.location.x = bsdf.location.x - 600
-        norm_math_add_r_g.location.y = bsdf.location.y - 600
+        norm_math_add_r_g.location.x = diffuse.location.x - 500
+        norm_math_add_r_g.location.y = diffuse.location.y - 600
         norm_math_add_r_g.operation = 'ADD'
 
         node_tree.links.new(norm_math_r2.inputs[0], norm_separate.outputs['Red'])
@@ -709,23 +730,24 @@ class MeshCreateHelper:
         node_tree.links.new(norm_combine.inputs['Blue'], norm_math.outputs['Value'])
 
         norm_map = node_tree.nodes.new('ShaderNodeNormalMap')
-        norm_map.location.x = bsdf.location.x - 400
-        norm_map.location.y = bsdf.location.y - 400
+        norm_map.location.x = diffuse.location.x - 300
+        norm_map.location.y = diffuse.location.y - 400
         norm_map.uv_map = "TEXCOORD.xy"
         node_tree.links.new(norm_map.inputs['Color'], norm_combine.outputs['Color'])
-        node_tree.links.new(bsdf.inputs['Normal'], norm_map.outputs['Normal'])
+        node_tree.links.new(diffuse.inputs['Normal'], norm_map.outputs['Normal'])
+        return norm_map
 
     @staticmethod
-    def apply_normal_texture(node_tree, bsdf, normal_path: str, logic_name: str):
+    def apply_normal_texture(node_tree, diffuse, normal_path: str, logic_name: str):
         if logic_name == LogicName.IdentityV:
-            MeshCreateHelper.create_identity_v_normal_map(node_tree, bsdf, normal_path)
+            MeshCreateHelper.create_identity_v_normal_map(node_tree, diffuse, normal_path)
             return
 
         if logic_name not in (LogicName.ZZMI, LogicName.GIMI):
-            MeshCreateHelper.create_standard_normal_map(node_tree, bsdf, normal_path)
+            MeshCreateHelper.create_standard_normal_map(node_tree, diffuse, normal_path)
             return
 
-        MeshCreateHelper.create_zzmi_gimi_normal_map(node_tree, bsdf, normal_path)
+        MeshCreateHelper.create_zzmi_gimi_normal_map(node_tree, diffuse, normal_path)
 
     @staticmethod
     def assign_material(obj, material):
@@ -747,18 +769,21 @@ class MeshCreateHelper:
         material = bpy.data.materials.new(name=material_name)
         material.use_nodes = True
 
-        bsdf = MeshCreateHelper.get_principled_bsdf_node(material)
-        MeshCreateHelper.apply_diffuse_texture(
-            node_tree=material.node_tree,
-            bsdf=bsdf,
-            texture_path=texture_path,
-            use_alpha=logic_name != LogicName.IdentityV,
-        )
+        if logic_name != LogicName.IdentityV:
+            _tex_node, diffuse = MeshCreateHelper.create_transparent_material_graph(
+                node_tree=material.node_tree,
+                texture_path=texture_path,
+            )
+        else:
+            _tex_node, diffuse = MeshCreateHelper.create_diffuse_material_graph(
+                node_tree=material.node_tree,
+                texture_path=texture_path,
+            )
 
         if normal_path is not None and GlobalProterties.use_normal_map():
             MeshCreateHelper.apply_normal_texture(
                 node_tree=material.node_tree,
-                bsdf=bsdf,
+                diffuse=diffuse,
                 normal_path=normal_path,
                 logic_name=logic_name,
             )
