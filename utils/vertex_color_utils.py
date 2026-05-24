@@ -44,3 +44,21 @@ def build_vertex_color_payload(num_loops, color_rgba_srgb, vc_mode, existing_col
 
     color_data[3::4] = color_rgba_linear[3]
     return color_data
+
+
+def ensure_color_attribute(color_attributes, attr_name, attr_domain, attr_data_type):
+    """Get or recreate a Blender color attribute with the requested shape."""
+    color_attr = color_attributes.get(attr_name)
+    if color_attr is not None:
+        if color_attr.domain != attr_domain or color_attr.data_type != attr_data_type:
+            color_attributes.remove(color_attr)
+            color_attr = None
+
+    if color_attr is None:
+        color_attr = color_attributes.new(
+            name=attr_name,
+            type=attr_data_type,
+            domain=attr_domain,
+        )
+
+    return color_attr

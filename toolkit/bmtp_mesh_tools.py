@@ -2,7 +2,7 @@ import bpy
 import numpy as np
 import bmesh
 import math
-from ..utils.vertex_color_utils import build_vertex_color_payload
+from ..utils.vertex_color_utils import build_vertex_color_payload, ensure_color_attribute
 
 
 def srgb_to_linear(srgb_value):
@@ -89,26 +89,35 @@ class BMTP_OT_SetVertexColor(bpy.types.Operator):
         if not selected_objects:
             self.report({'ERROR'}, "请选择至少一个网格物体")
             return {'CANCELLED'}
+
+        attr_name = props.vc_attr_name.strip() or "COLOR"
+        attr_domain = props.vc_attr_domain
+        attr_data_type = props.vc_attr_data_type
         
         color_rgba_srgb = np.asarray(props.vc_color[:], dtype=np.float32)
         
         for obj in selected_objects:
             mesh = obj.data
             
-            if not mesh.color_attributes.active_color:
-                color_attr = mesh.color_attributes.new(name="COLOR", type='BYTE_COLOR', domain='CORNER')
+            color_attr = ensure_color_attribute(
+                color_attributes=mesh.color_attributes,
+                attr_name=attr_name,
+                attr_domain=attr_domain,
+                attr_data_type=attr_data_type,
+            )
+
+            if attr_domain == 'CORNER':
+                element_count = len(mesh.loops)
             else:
-                color_attr = mesh.color_attributes.active_color
-            
-            num_loops = len(mesh.loops)
+                element_count = len(mesh.vertices)
 
             existing_colors = None
             if props.vc_mode == 'ALPHA_ONLY':
-                existing_colors = np.zeros(num_loops * 4, dtype=np.float32)
+                existing_colors = np.zeros(element_count * 4, dtype=np.float32)
                 color_attr.data.foreach_get("color", existing_colors)
 
             color_data = build_vertex_color_payload(
-                num_loops=num_loops,
+                num_loops=element_count,
                 color_rgba_srgb=color_rgba_srgb,
                 vc_mode=props.vc_mode,
                 existing_colors=existing_colors,

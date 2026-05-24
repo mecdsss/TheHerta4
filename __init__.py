@@ -27,11 +27,53 @@ importlib.reload(blueprint)
 importlib.reload(ui_prefix_quick_ops)
 importlib.reload(texture_auto_reload)
 
+_ORIGINAL_NODE_SELECTED_COLOR = None
+
+
+def _refresh_blueprint_node_colors_safe():
+    try:
+        from .blueprint.node_base import refresh_all_blueprint_node_colors_and_redraw
+        refresh_all_blueprint_node_colors_and_redraw()
+    except Exception:
+        pass
+
+
+def _schedule_blueprint_node_color_refresh():
+    def _timer_callback():
+        _refresh_blueprint_node_colors_safe()
+        return None
+
+    try:
+        bpy.app.timers.register(_timer_callback, first_interval=0.1, persistent=False)
+    except Exception:
+        _refresh_blueprint_node_colors_safe()
+
+
+def _set_node_selected_theme_color(color):
+    global _ORIGINAL_NODE_SELECTED_COLOR
+
+    try:
+        theme = bpy.context.preferences.themes[0]
+        node_editor = theme.node_editor
+    except Exception:
+        return
+
+    if _ORIGINAL_NODE_SELECTED_COLOR is None:
+        try:
+            _ORIGINAL_NODE_SELECTED_COLOR = tuple(node_editor.node_selected)
+        except Exception:
+            _ORIGINAL_NODE_SELECTED_COLOR = None
+
+    try:
+        node_editor.node_selected = color
+    except Exception:
+        pass
+
 bl_info = {
     "name": "TheHerta4",
     "description": "Blender Plugin of SSMT4",
     "blender": (4, 5, 0),
-    "version": (4, 4, 0),
+    "version": (4, 4, 1),
     "location": "View3D",
     "category": "Generic"
 }
@@ -138,6 +180,7 @@ class HertaUpdatePreference(bpy.types.AddonPreferences):
 def register():
     global_properties.register()
     GlobalConfig.read_from_main_json_ssmt4()
+    _set_node_selected_theme_color((0.78, 0.41, 0.10))
     
     bpy.types.Scene.herta_show_toolkit = bpy.props.BoolProperty(
         name="显示工具集",
@@ -153,6 +196,7 @@ def register():
     bpy.utils.register_class(HertaUpdatePreference)
 
     blueprint.register()
+    _schedule_blueprint_node_color_refresh()
     ui_prefix_quick_ops.register()
     ui_panel_basic.register()
     ui_panel_sword.register()
@@ -172,6 +216,12 @@ def register():
 
 
 def unregister():
+    global _ORIGINAL_NODE_SELECTED_COLOR
+
+    if _ORIGINAL_NODE_SELECTED_COLOR is not None:
+        _set_node_selected_theme_color(_ORIGINAL_NODE_SELECTED_COLOR)
+        _ORIGINAL_NODE_SELECTED_COLOR = None
+
     texture_auto_reload.unregister()
     toolkit.unregister()
     

@@ -51,10 +51,87 @@ class SSMTBlueprintTree(NodeTree):
     bl_icon = 'NODETREE'
 
 
+_NODE_COLOR_INPUT_SOURCE = (0.38, 0.39, 0.40)
+_NODE_COLOR_GROUP = (0.15, 0.16, 0.17)
+_NODE_COLOR_SWITCH = (0.22, 0.65, 0.34)
+_NODE_COLOR_VERTEX_GROUP = (0.53, 0.76, 0.95)
+_NODE_COLOR_POSTPROCESS = (0.78, 0.41, 0.10)
+_NODE_COLOR_OUTPUT = (0.82, 0.26, 0.26)
+_NODE_COLOR_SHAPEKEY = (0.94, 0.57, 0.15)
+_NODE_COLOR_BLUEPRINT = (0.55, 0.39, 0.76)
+_NODE_COLOR_SPECIALIZED = (0.67, 0.39, 0.66)
+_NODE_COLOR_HIGHLIGHT = (0.92, 0.74, 0.18)
+
+
 class SSMTNodeBase(Node):
+    @classmethod
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls._wrap_color_lifecycle_hook("init")
+        cls._wrap_color_lifecycle_hook("copy")
+
+    @classmethod
+    def _wrap_color_lifecycle_hook(cls, method_name):
+        original_method = cls.__dict__.get(method_name)
+        if original_method is None or getattr(original_method, "_ssmt_node_color_wrapped", False):
+            return
+
+        if method_name == "init":
+            def wrapped(self, context):
+                original_method(self, context)
+                type(self).apply_default_node_color(self)
+        else:
+            def wrapped(self, node):
+                original_method(self, node)
+                type(self).apply_default_node_color(self)
+
+        wrapped._ssmt_node_color_wrapped = True
+        setattr(cls, method_name, wrapped)
+
     @classmethod
     def poll(cls, ntree):
         return ntree.bl_idname == 'SSMTBlueprintTreeType'
+
+    @classmethod
+    def get_default_node_color(cls, node_or_bl_idname):
+        if isinstance(node_or_bl_idname, str):
+            bl_idname = node_or_bl_idname
+        else:
+            bl_idname = getattr(node_or_bl_idname, "bl_idname", "")
+
+        if bl_idname in {'SSMTNode_Object_Info', 'SSMTNode_MultiFile_Export'}:
+            return _NODE_COLOR_INPUT_SOURCE
+        if bl_idname == 'SSMTNode_Object_Group':
+            return _NODE_COLOR_GROUP
+        if bl_idname == 'SSMTNode_ObjectSwap':
+            return _NODE_COLOR_SWITCH
+        if bl_idname in {'SSMTNode_VertexGroupMappingInput', 'SSMTNode_VertexGroupMatch', 'SSMTNode_VertexGroupProcess'}:
+            return _NODE_COLOR_VERTEX_GROUP
+        if bl_idname in {'SSMTNode_ShapeKey', 'SSMTNode_ShapeKey_Output', 'SSMTNode_PostProcess_ShapeKey'}:
+            return _NODE_COLOR_SHAPEKEY
+        if bl_idname in {'SSMTNode_Blueprint_Nest', 'SSMTNode_ModPanel'}:
+            return _NODE_COLOR_BLUEPRINT
+        if bl_idname in {'SSMTNode_Result_Output', 'SSMTNode_Result_Output_NTMIModImp'}:
+            return _NODE_COLOR_OUTPUT
+        if bl_idname.startswith('SSMTNode_PostProcess_'):
+            return _NODE_COLOR_POSTPROCESS
+        if bl_idname.startswith('SSMTNode_'):
+            return _NODE_COLOR_SPECIALIZED
+        return None
+
+    @classmethod
+    def apply_default_node_color(cls, node):
+        color = cls.get_default_node_color(node)
+        if color is None:
+            return False
+
+        node.use_custom_color = True
+        node.color = color
+        return True
+
+    @classmethod
+    def get_highlight_color(cls):
+        return _NODE_COLOR_HIGHLIGHT
 
     def _get_min_node_width(self):
         return get_effective_min_width(getattr(self, "bl_width_min", None), DEFAULT_MIN_NODE_WIDTH)
@@ -105,6 +182,46 @@ class SSMTNodeBase(Node):
                 max_width = width
 
         self.width = max_width
+
+
+def refresh_blueprint_node_colors(tree):
+    if not tree or getattr(tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
+        return 0
+
+    updated_count = 0
+    for node in getattr(tree, "nodes", []):
+        if SSMTNodeBase.apply_default_node_color(node):
+            updated_count += 1
+    return updated_count
+
+
+def refresh_all_blueprint_node_colors():
+    updated_count = 0
+    for tree in bpy.data.node_groups:
+        if getattr(tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
+            continue
+        updated_count += refresh_blueprint_node_colors(tree)
+    return updated_count
+
+
+def tag_blueprint_editors_redraw():
+    window_manager = getattr(bpy.context, "window_manager", None)
+    if not window_manager:
+        return
+
+    for window in window_manager.windows:
+        screen = getattr(window, "screen", None)
+        if not screen:
+            continue
+        for area in screen.areas:
+            if area.type == 'NODE_EDITOR':
+                area.tag_redraw()
+
+
+def refresh_all_blueprint_node_colors_and_redraw():
+    updated_count = refresh_all_blueprint_node_colors()
+    tag_blueprint_editors_redraw()
+    return updated_count
 
 
 class THEHERTA3_OT_OpenPersistentBlueprint(bpy.types.Operator):

@@ -28,6 +28,7 @@ class _FakeImage:
         self.filepath = filepath
         self.name = os.path.basename(filepath)
         self.colorspace_settings = types.SimpleNamespace(is_data=False, name="")
+        self.alpha_mode = ""
         self.depth = 24
 
 
@@ -54,6 +55,9 @@ class _FakeNode:
             "ShaderNodeBsdfPrincipled": "BSDF_PRINCIPLED",
             "ShaderNodeOutputMaterial": "OUTPUT_MATERIAL",
             "ShaderNodeTexImage": "TEX_IMAGE",
+            "ShaderNodeBsdfTransparent": "BSDF_TRANSPARENT",
+            "ShaderNodeBsdfDiffuse": "BSDF_DIFFUSE",
+            "ShaderNodeMixShader": "MIX_SHADER",
             "ShaderNodeNormalMap": "NORMAL_MAP",
         }.get(bl_idname, bl_idname)
         self.inputs = _FakeSocketMap()
@@ -91,6 +95,8 @@ class _FakeMaterial:
         self.name = name
         self.use_nodes = False
         self.node_tree = _FakeNodeTree()
+        self.blend_method = ""
+        self.use_transparency_overlap = True
 
 
 class _FakeMaterialCollection(dict):
@@ -141,6 +147,10 @@ _install_module(
     update_prefix_record_for_object=lambda *_args, **_kwargs: None,
 )
 _install_module(
+    f"{PKG}.ui.ntmi_modimp.texture_slot_refresh",
+    build_texture_slots_from_workspace_unique=lambda _workspace_unique_str="": {},
+)
+_install_module(
     f"{PKG}.common.import_scene_settings",
     apply_import_render_environment=lambda *_args, **_kwargs: None,
 )
@@ -185,6 +195,18 @@ class NTEMIImporterMaterialTests(unittest.TestCase):
             self.assertIn("DiffuseMap_LOD0.fd054d1d-30030-0.Body_ps-t0", material_names)
             self.assertNotIn("LightMap_LOD0.fd054d1d-30030-0.Body_ps-t1", material_names)
             self.assertEqual(len(material_names), 1)
+            material = obj.material_slots[0].material
+            node_types = [node.bl_idname for node in material.node_tree.nodes]
+            self.assertIn("ShaderNodeTexImage", node_types)
+            self.assertIn("ShaderNodeBsdfTransparent", node_types)
+            self.assertIn("ShaderNodeBsdfDiffuse", node_types)
+            self.assertIn("ShaderNodeMixShader", node_types)
+            self.assertNotIn("ShaderNodeBsdfPrincipled", node_types)
+            self.assertEqual(material.blend_method, "BLEND")
+            self.assertFalse(material.use_transparency_overlap)
+            tex_node = next(node for node in material.node_tree.nodes if node.bl_idname == "ShaderNodeTexImage")
+            self.assertEqual(tex_node.image.colorspace_settings.name, "sRGB")
+            self.assertEqual(tex_node.image.alpha_mode, "CHANNEL_PACKED")
 
 
 if __name__ == "__main__":

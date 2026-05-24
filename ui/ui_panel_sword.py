@@ -281,6 +281,8 @@ class Sword_ImportTexture_WM_OT_ApplyImageToMaterial(Operator):
         selected_image = scene.sword_image_list[selected_index]
         image_path = selected_image.filepath
         image_data = bpy.data.images.load(image_path, check_existing=True)
+        image_data.colorspace_settings.name = 'sRGB'
+        image_data.alpha_mode = 'CHANNEL_PACKED'
 
         selected_objects = context.selected_objects
         if not selected_objects:
@@ -304,30 +306,34 @@ class Sword_ImportTexture_WM_OT_ApplyImageToMaterial(Operator):
             mat.use_nodes = True
             nodes = mat.node_tree.nodes
             links = mat.node_tree.links
-
-            bsdf_node = nodes.get("Principled BSDF")
-            if not bsdf_node:
-                bsdf_node = nodes.get("鍘熺悊鍖?BSDF")
-            if not bsdf_node:
-                bsdf_node = nodes.get("鍘熺悊鍖朆SDF")
-
-            if not bsdf_node:
-                bsdf_node = nodes.new(type='ShaderNodeBsdfPrincipled')
-                bsdf_node.location = (0, 0)
-
-                output_node = nodes.get("Material Output")
-                if not output_node:
-                    output_node = nodes.new(type='ShaderNodeOutputMaterial')
-                    output_node.location = (400, 0)
-
-                links.new(bsdf_node.outputs['BSDF'], output_node.inputs['Surface'])
+            nodes.clear()
 
             tex_image = nodes.new('ShaderNodeTexImage')
             tex_image.image = image_data
-            tex_image.location = (-300, 0)
+            tex_image.location = (-500, 0)
 
-            links.new(tex_image.outputs['Color'], bsdf_node.inputs['Base Color'])
-            links.new(tex_image.outputs['Alpha'], bsdf_node.inputs['Alpha'])
+            transparent_node = nodes.new(type='ShaderNodeBsdfTransparent')
+            transparent_node.location = (-220, 120)
+
+            diffuse_node = nodes.new(type='ShaderNodeBsdfDiffuse')
+            diffuse_node.location = (-220, -80)
+
+            mix_shader = nodes.new(type='ShaderNodeMixShader')
+            mix_shader.location = (20, 0)
+
+            output_node = nodes.new(type='ShaderNodeOutputMaterial')
+            output_node.location = (260, 0)
+
+            mat.blend_method = 'BLEND'
+            if hasattr(mat, "use_transparency_overlap"):
+                mat.use_transparency_overlap = False
+            elif hasattr(mat, "show_transparent_back"):
+                mat.show_transparent_back = False
+            links.new(tex_image.outputs['Color'], diffuse_node.inputs['Color'])
+            links.new(tex_image.outputs['Alpha'], mix_shader.inputs['Fac'])
+            links.new(transparent_node.outputs['BSDF'], mix_shader.inputs[1])
+            links.new(diffuse_node.outputs['BSDF'], mix_shader.inputs[2])
+            links.new(mix_shader.outputs['Shader'], output_node.inputs['Surface'])
             applied_count += 1
 
         self.report({'INFO'}, f"Applied {selected_image.name} to {applied_count} object(s).")

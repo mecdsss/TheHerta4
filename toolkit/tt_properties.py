@@ -64,37 +64,52 @@ class TT_ChannelSource(bpy.types.PropertyGroup):
 
 
 class TT_CompositeRule(bpy.types.PropertyGroup):
-    """合成规则：定义如何将多个通道组合成一张输出贴图"""
+    """通道合成规则：定义如何将多个通道组合成一张输出贴图"""
 
-    rule_name: bpy.props.StringProperty(name="规则名称", description="此规则的名称", default="新规则")
+    rule_name: bpy.props.StringProperty(name="规则名称", description="用于标识当前通道合成规则的名称", default="新建规则")
+    input_source_mode: bpy.props.EnumProperty(
+        name="输入来源",
+        description="选择当前规则使用基础贴图、上一条输出还是指定规则输出作为输入",
+        items=[
+            ('BASE_COLOR', "基础贴图", "使用当前材质解析到的基础颜色贴图作为输入"),
+            ('PREVIOUS_OUTPUT', "上一条输出", "使用上一条成功执行的规则输出作为输入"),
+            ('NAMED_OUTPUT', "指定规则输出", "使用指定规则名称对应的输出结果作为输入"),
+        ],
+        default='BASE_COLOR',
+    )
+    input_rule_name: bpy.props.StringProperty(
+        name="引用规则",
+        description="当输入来源为指定规则输出时，填写要引用的规则名称",
+        default="",
+    )
     output_name_prefix: bpy.props.StringProperty(
         name="输出前缀",
-        description="输出贴图的文件名前缀",
+        description="生成文件时附加在材质名之前的输出前缀",
         default="Composite_"
     )
     output_channels: bpy.props.CollectionProperty(
         type=TT_ChannelSource,
         name="输出通道配置",
-        description="R/G/B/A 四个通道的来源"
+        description="R/G/B/A 四个通道的来源配置"
     )
-    enabled: bpy.props.BoolProperty(name="启用", description="是否启用此规则", default=True)
+    enabled: bpy.props.BoolProperty(name="启用", description="控制当前规则是否参与通道合成执行", default=True)
     normal_strength: bpy.props.FloatProperty(
         name="法线强度",
-        description="法线计算的强度参数",
+        description="使用高度图生成法线时的强度参数",
         default=5.0,
         min=0.1,
         max=50.0
     )
     normal_blur_radius: bpy.props.FloatProperty(
-        name="高斯模糊半径",
-        description="法线计算时的高斯模糊半径",
+        name="法线模糊",
+        description="法线生成前对高度信息进行模糊，减轻噪点",
         default=1.0,
         min=0.0,
         max=10.0
     )
     normal_invert_height: bpy.props.BoolProperty(
         name="反转高度",
-        description="反转高度图",
+        description="生成法线时反转高度方向",
         default=False
     )
 
@@ -143,8 +158,11 @@ class TT_TextureToolsProperties(bpy.types.PropertyGroup):
         ],
         default='APPEND'
     )
-    lightmap_generate_lightmap: bpy.props.BoolProperty(name="生成LightMap", description="生成LightMap材质模板", default=True)
-    lightmap_generate_materialmap: bpy.props.BoolProperty(name="生成MaterialMap", description="生成MaterialMap材质模板", default=True)
+    lightmap_generate_lightmap: bpy.props.BoolProperty(name="生成LightMap", description="生成LightMap材质模板", default=False)
+    lightmap_generate_highlightmap: bpy.props.BoolProperty(name="生成HighLightMap", description="生成HighLightMap材质模板", default=False)
+    lightmap_generate_rampmap: bpy.props.BoolProperty(name="生成RampMap", description="生成RampMap材质模板", default=False)
+    lightmap_generate_materialmap: bpy.props.BoolProperty(name="生成MaterialMap", description="生成MaterialMap材质模板", default=False)
+    lightmap_generate_stockingmap: bpy.props.BoolProperty(name="生成StockingMap", description="生成StockingMap材质模板", default=False)
     material_preview_pattern: bpy.props.StringProperty(name="材质名称模式", description="用于匹配材质名称的正则表达式", default=".*")
     material_preview_base_resolution: bpy.props.IntProperty(name="基础分辨率", description="基础分辨率参数（仅存储）", default=1024, min=256, max=8192)
     material_preview_active_index: bpy.props.IntProperty(name="活动索引", description="当前选中的材质预览项索引", default=0)

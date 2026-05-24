@@ -1,3 +1,4 @@
+﻿# -*- coding: utf-8 -*-
 import importlib.util
 import json
 import os
@@ -18,7 +19,7 @@ def _install_module(name, **attrs):
 
 
 PKG = "_node_postprocess_material_htmi_test_pkg"
-for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.utils"):
+for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.utils", f"{PKG}.common"):
     package = _install_module(package_name)
     package.__path__ = []
 
@@ -48,6 +49,25 @@ _install_module(
         info=lambda *_args, **_kwargs: None,
         warning=lambda *_args, **_kwargs: None,
     ),
+)
+_prefix_cache_state = {"props": {}}
+_install_module(
+    f"{PKG}.ui",
+)
+_install_module(
+    f"{PKG}.ui.ntmi_modimp",
+)
+_install_module(
+    f"{PKG}.ui.ntmi_modimp.prefix_property_cache",
+    get_prefix_record_props=lambda _name: dict(_prefix_cache_state["props"]),
+)
+_install_module(
+    f"{PKG}.common.global_config",
+    GlobalConfig=types.SimpleNamespace(logic_name="HTMI"),
+)
+_install_module(
+    f"{PKG}.common.logic_name",
+    LogicName=types.SimpleNamespace(NTEMI="NTEMI"),
 )
 
 
@@ -108,6 +128,32 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
     def setUp(self):
         _fake_bpy.data.objects.clear()
         node_postprocess_material.clear_name_mapping_cache()
+        _prefix_cache_state["props"] = {}
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HTMI"
+
+    def test_material_detect_accepts_ntmi_modimp_result_output(self):
+        class _FakeSocket:
+            bl_idname = "SSMTSocketPostProcess"
+
+            def __init__(self, linked_node=None):
+                self.is_linked = linked_node is not None
+                self.links = []
+                if linked_node is not None:
+                    self.links.append(types.SimpleNamespace(from_node=linked_node))
+
+        class _FakeNode(dict):
+            def __init__(self, name, bl_idname, inputs=None):
+                super().__init__()
+                self.name = name
+                self.bl_idname = bl_idname
+                self.inputs = inputs or []
+
+        object_info = _FakeNode("ObjectInfo", "SSMTNode_Object_Info")
+        object_info.object_name = "LOD0.fd054d1d-30030-0.Body"
+        result_output = _FakeNode("ResultOutput", "SSMTNode_Result_Output_NTMIModImp", [_FakeSocket(object_info)])
+        material_node = node_postprocess_material.SSMT_OT_MaterialDetect()
+
+        self.assertIs(material_node._find_result_output(result_output), result_output)
 
     def test_htmi_texture_slots_drive_ps_resources_and_only_fxmap_material_drives_ntemifx(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -128,7 +174,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                     file_obj.write(f"slot-{mark_name}".encode("ascii"))
                 source_paths[mark_name] = path
                 if mark_name == "DiffuseMap":
-                    material_filename = "袖 12540_light.png"
+                    material_filename = "DiffuseMap_衣服00.png"
                 else:
                     material_filename = f"material-{mark_name}.dds"
                 material_path = os.path.join(material_dir, material_filename)
@@ -160,7 +206,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                 "LOD0.fd054d1d-30030-0.Body",
                 texture_slots,
                 [
-                    ("DiffuseMap_衣服00", material_paths["DiffuseMap"]),
+                    ("DiffuseMap_琛ｆ湇00", material_paths["DiffuseMap"]),
                     ("LightMap_Body", material_paths["LightMap"]),
                     ("FXMap_Body", material_paths["FXMap"]),
                 ],
@@ -200,37 +246,140 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             )
 
             override_lines = sections["[TextureOverride_Test]"]
-            self.assertIn("ps-t0 = Resource-DiffuseMap_衣服00", override_lines)
-            self.assertIn("ps-t1 = Resource-LightMap_Body", override_lines)
-            self.assertIn("ps-t2 = Resource-FXMap_Body", override_lines)
-            self.assertIn("Resource\\NTEMIFX\\FXMap = ref Resource-FXMap_Body", override_lines)
-            self.assertNotIn("Resource\\NTEMIFX\\FXMap = ref Resource-DiffuseMap_衣服00", override_lines)
+            self.assertIn("ps-t0 = Resource_DiffuseMap_琛ｆ湇00", override_lines)
+            self.assertIn("ps-t1 = Resource_LightMap_Body", override_lines)
+            self.assertNotIn("ps-t2 = Resource-FXMap_Body", override_lines)
+            self.assertNotIn("ps-t2 = ResourceTexture_FXMap_Body", override_lines)
+            self.assertIn("Resource\\RabbitFX\\FXMap = ref Resource_FXMap_Body", override_lines)
+            self.assertNotIn("Resource\\NTEMIFX\\FXMap = ref Resource_DiffuseMap_琛ｆ湇00", override_lines)
             self.assertNotIn("Resource\\NTEMIFX\\FXMap = ref Resource-LightMap_Body", override_lines)
 
             self.assertEqual(
-                sections["[Resource-DiffuseMap_衣服00]"],
-                ["filename = Textures/DiffuseMap_衣服00.png"],
+                sections["[Resource_DiffuseMap_琛ｆ湇00]"],
+                ["filename = Textures/DiffuseMap_琛ｆ湇00.png"],
             )
             self.assertEqual(
-                sections["[Resource-LightMap_Body]"],
+                sections["[Resource_LightMap_Body]"],
                 ["filename = Textures/LightMap_Body.dds"],
             )
             self.assertEqual(
-                sections["[Resource-FXMap_Body]"],
+                sections["[Resource_FXMap_Body]"],
                 ["filename = Textures/FXMap_Body.dds"],
             )
 
-            texture_dir = os.path.join(temp_dir, "Textures")
-            copied_by_mark = {
-                "DiffuseMap": "DiffuseMap_衣服00.png",
-                "LightMap": "LightMap_Body.dds",
-                "FXMap": "FXMap_Body.dds",
-            }
-            for mark_name, copied_filename in copied_by_mark.items():
-                copied_path = os.path.join(texture_dir, copied_filename)
-                self.assertTrue(os.path.isfile(copied_path))
-                with open(copied_path, "rb") as file_obj:
-                    self.assertEqual(file_obj.read(), f"material-{mark_name}".encode("ascii"))
+    def test_ntemi_fxmap_uses_ntemifx_namespace(self):
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "NTEMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_dir = os.path.join(temp_dir, "sources")
+            os.makedirs(source_dir)
+            fx_path = os.path.join(source_dir, "fx.dds")
+            with open(fx_path, "wb") as file_obj:
+                file_obj.write(b"fx")
+
+            obj = _FakeObject(
+                "GenericMesh",
+                [],
+                [("FXMap_Generic", fx_path)],
+            )
+            _fake_bpy.data.objects[obj.name] = obj
+            sections = OrderedDict(
+                [
+                    (
+                        "[TextureOverride_Generic]",
+                        [
+                            f"[mesh:{obj.name}]",
+                            "hash = 12345678",
+                            "drawindexed = 3, 0, 0",
+                        ],
+                    ),
+                    ("_config_path", temp_dir),
+                ]
+            )
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+
+            node.process_texture_override_section(
+                "[TextureOverride_Generic]",
+                sections,
+                material_group_to_swapkey={},
+                swap_key_prefix="$swapkey",
+                next_swap_key_num=150,
+                used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            override_lines = sections["[TextureOverride_Generic]"]
+            self.assertIn("Resource\\NTEMIFX\\FXMap = ref Resource_FXMap_Generic", override_lines)
+            self.assertIn("run = CommandList\\NTEMIFX\\Run", override_lines)
+            self.assertNotIn("Resource\\RabbitFX\\FXMap = ref Resource_FXMap_Generic", override_lines)
+
+    def test_ntemi_fxmap_reset_is_emitted_after_conditional_block(self):
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "NTEMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_dir = os.path.join(temp_dir, "sources")
+            os.makedirs(source_dir)
+            fx_path = os.path.join(source_dir, "fx.dds")
+            with open(fx_path, "wb") as file_obj:
+                file_obj.write(b"fx")
+
+            obj = _FakeObject(
+                "LOD0.ae1ab184-71202-29187.袜子_copy",
+                [],
+                [("FXMap_DiffuseMap_袜子", fx_path)],
+            )
+            _fake_bpy.data.objects[obj.name] = obj
+            sections = OrderedDict(
+                [
+                    (
+                        "[TextureOverride_Generic]",
+                        [
+                            f"[mesh:{obj.name}]",
+                            "hash = ae1ab184",
+                            "if $swapkey9 == 0 && $swapkey1 == 0",
+                            "drawindexed = 5676,3090522,0",
+                            "endif",
+                        ],
+                    ),
+                    ("_config_path", temp_dir),
+                ]
+            )
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+
+            node.process_texture_override_section(
+                "[TextureOverride_Generic]",
+                sections,
+                material_group_to_swapkey={},
+                swap_key_prefix="$swapkey",
+                next_swap_key_num=150,
+                used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            override_lines = sections["[TextureOverride_Generic]"]
+            fx_ref_index = override_lines.index("Resource\\NTEMIFX\\FXMap = ref Resource_FXMap_DiffuseMap_袜子")
+            first_run_index = override_lines.index("run = CommandList\\NTEMIFX\\Run")
+            if_index = override_lines.index("if $swapkey9 == 0 && $swapkey1 == 0")
+            draw_index = override_lines.index("drawindexed = 5676,3090522,0")
+            endif_index = override_lines.index("endif")
+            reset_ref_index = override_lines.index("Resource\\NTEMIFX\\FXMap = ref null")
+            reset_run_index = len(override_lines) - 1 - override_lines[::-1].index("run = CommandList\\NTEMIFX\\Run")
+
+            self.assertLess(fx_ref_index, if_index)
+            self.assertLess(first_run_index, if_index)
+            self.assertLess(if_index, draw_index)
+            self.assertLess(draw_index, endif_index)
+            self.assertLess(endif_index, reset_ref_index)
+            self.assertLess(reset_ref_index, reset_run_index)
+
+
+
 
     def test_htmi_fx_slot_without_fxmap_prefix_material_does_not_write_ntemifx(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -287,7 +436,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             )
 
             override_lines = sections["[TextureOverride_Test]"]
-            self.assertNotIn("Resource\\NTEMIFX\\FXMap = ref Resource-FXMap", override_lines)
+            self.assertNotIn("ps-t5 = Resource-old-FXMap", override_lines)
 
     def test_htmi_texture_slot_can_be_inferred_from_workspace_filename(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -339,9 +488,9 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             )
 
             override_lines = sections["[TextureOverride_Test]"]
-            self.assertIn("ps-t5 = Resource-DiffuseMap_Body", override_lines)
+            self.assertIn("ps-t5 = Resource_DiffuseMap_Body", override_lines)
             self.assertEqual(
-                sections["[Resource-DiffuseMap_Body]"],
+                sections["[Resource_DiffuseMap_Body]"],
                 ["filename = Textures/DiffuseMap_Body.dds"],
             )
             self.assertTrue(
@@ -400,9 +549,9 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             override_lines = sections["[TextureOverride_Test]"]
             for index in range(30):
                 material_name = f"DiffuseMap_Part{index:02d}"
-                self.assertIn(f"ps-t0 = Resource-{material_name}", override_lines)
+                self.assertIn(f"ps-t0 = Resource_{material_name}", override_lines)
                 self.assertEqual(
-                    sections[f"[Resource-{material_name}]"],
+                    sections[f"[Resource_{material_name}]"],
                     [f"filename = Textures/{material_name}.png"],
                 )
                 copied_path = os.path.join(temp_dir, "Textures", f"{material_name}.png")
@@ -456,9 +605,9 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertIn("ps-t0 = ResourceTexture_DiffuseMap_Generic", override_lines)
             self.assertEqual(
                 sections["[ResourceTexture_DiffuseMap_Generic]"],
-                ["filename = Texture/DiffuseMap_Generic.png"],
+                ["filename = Textures/DiffuseMap_Generic.png"],
             )
-            self.assertTrue(os.path.isfile(os.path.join(temp_dir, "Texture", "DiffuseMap_Generic.png")))
+            self.assertTrue(os.path.isfile(os.path.join(temp_dir, "Textures", "DiffuseMap_Generic.png")))
 
     def test_non_htmi_generic_path_still_handles_rabbitfx_and_zzmi_refs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -515,15 +664,15 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertIn("Resource\\ZZMI\\DiffuseMap = ref Resource_DiffuseMap_Generic", override_lines)
             self.assertEqual(
                 sections["[ResourceTexture_DiffuseMap_Generic]"],
-                ["filename = Texture/DiffuseMap_Generic.png"],
+                ["filename = Textures/DiffuseMap_Generic.png"],
             )
             self.assertEqual(
                 sections["[Resource_Glowmap_5_Generic]"],
-                ["filename = Texture/Glowmap_5_Generic.png"],
+                ["filename = Textures/Glowmap_5_Generic.png"],
             )
             self.assertEqual(
                 sections["[Resource_DiffuseMap_Generic]"],
-                ["filename = Texture/DiffuseMap_Generic.png"],
+                ["filename = Textures/DiffuseMap_Generic.png"],
             )
 
     def test_htmi_uses_current_object_material_before_source_candidate(self):
@@ -587,15 +736,216 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             )
 
             override_lines = sections["[TextureOverride_Test]"]
-            self.assertIn("ps-t0 = Resource-DiffuseMap_Current", override_lines)
-            self.assertNotIn("ps-t0 = Resource-DiffuseMap_Source", override_lines)
+            self.assertIn("ps-t0 = Resource_DiffuseMap_Current", override_lines)
+            self.assertNotIn("ps-t0 = Resource_DiffuseMap_Source", override_lines)
             self.assertEqual(
-                sections["[Resource-DiffuseMap_Current]"],
+                sections["[Resource_DiffuseMap_Current]"],
                 ["filename = Textures/DiffuseMap_Current.png"],
             )
             with open(os.path.join(temp_dir, "Textures", "DiffuseMap_Current.png"), "rb") as file_obj:
                 self.assertEqual(file_obj.read(), b"correct-current")
 
+    def test_htmi_workspace_slot_multiple_materials_reuse_existing_if_switch_rules(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            obj_name = "LOD0.fd054d1d-30030-0.Body"
+            slot_texture_a = os.path.join(temp_dir, "diffuse-a.png")
+            slot_texture_b = os.path.join(temp_dir, "diffuse-b.png")
+            for path, payload in ((slot_texture_a, b"a"), (slot_texture_b, b"b")):
+                with open(path, "wb") as file_obj:
+                    file_obj.write(payload)
+
+            obj = _FakeObject(
+                obj_name,
+                {
+                    "ps-t0": {
+                        "source_path": slot_texture_a,
+                        "mark_name": "DiffuseMap",
+                        "mark_type": "Slot",
+                        "mark_slot": "ps-t0",
+                        "mark_filename": "fd054d1d-30030-0-DiffuseMap.dds",
+                    },
+                },
+                [
+                    ("DiffuseMap_Body_A", slot_texture_a),
+                    ("DiffuseMap_Body_B", slot_texture_b),
+                ],
+            )
+            _fake_bpy.data.objects[obj.name] = obj
+
+            sections = OrderedDict(
+                [
+                    (
+                        "[TextureOverride_Test]",
+                        [
+                            f"[mesh:{obj.name}]",
+                            "hash = fd054d1d",
+                            "ps-t0 = Resource-old-DiffuseMap",
+                            "drawindexed = 3, 0, 0",
+                        ],
+                    ),
+                    ("_config_path", temp_dir),
+                ]
+            )
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+
+            node.process_texture_override_section(
+                "[TextureOverride_Test]",
+                sections,
+                material_group_to_swapkey={},
+                swap_key_prefix="$swapkey",
+                next_swap_key_num=150,
+                used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            override_lines = sections["[TextureOverride_Test]"]
+            joined = "\n".join(override_lines)
+            self.assertIn("if $swapkey150 == 0", joined)
+            self.assertIn("if $swapkey150 == 1", joined)
+            self.assertIn("ps-t0 = Resource_DiffuseMap_Body_A", joined)
+            self.assertIn("ps-t0 = Resource_DiffuseMap_Body_B", joined)
+
+    def test_material_resource_names_replace_spaces_with_underscores(self):
+        material = _FakeMaterial("Highlight Metal 12261 01", os.path.join("/tmp", "tex.png"))
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        self.assertEqual(node._workspace_material_resource_name(material), "Resource-Highlight_Metal_12261_01")
+        self.assertEqual(node._ps_texture_material_resource_name(material), "ResourceTexture_Highlight_Metal_12261_01")
+
+    def test_generic_resource_entry_replaces_spaces_with_underscores(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            texture_path = os.path.join(temp_dir, "tex with spaces.png")
+            with open(texture_path, "wb") as file_obj:
+                file_obj.write(b"generic")
+
+            obj = _FakeObject(
+                "GenericMesh",
+                {},
+                [("LightMap_kk metal 12261 01", texture_path)],
+            )
+            _fake_bpy.data.objects[obj.name] = obj
+            sections = OrderedDict(
+                [
+                    (
+                        "[TextureOverride_Generic]",
+                        [
+                            f"[mesh:{obj.name}]",
+                            "hash = 12345678",
+                            "ps-t8 = Resource-old-LightMap",
+                            "drawindexed = 3, 0, 0",
+                        ],
+                    ),
+                    ("_config_path", temp_dir),
+                ]
+            )
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+
+            node.process_texture_override_section(
+                "[TextureOverride_Generic]",
+                sections,
+                material_group_to_swapkey={},
+                swap_key_prefix="$swapkey",
+                next_swap_key_num=150,
+                used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            override_lines = sections["[TextureOverride_Generic]"]
+            self.assertIn("ps-t8 = ResourceTexture_LightMap_kk_metal_12261_01", override_lines)
+
+    def test_htmi_prefers_prefix_cache_texture_slots_over_stale_object_prop(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diffuse_path = os.path.join(temp_dir, "diffuse.png")
+            light_path = os.path.join(temp_dir, "light.png")
+            for path, payload in ((diffuse_path, b"diffuse"), (light_path, b"light")):
+                with open(path, "wb") as file_obj:
+                    file_obj.write(payload)
+
+            obj_name = "LOD0.fd054d1d-30030-0.Body"
+            obj = _FakeObject(
+                obj_name,
+                {
+                    "ps-t0": {
+                        "mark_name": "DiffuseMap",
+                        "mark_type": "Slot",
+                        "mark_slot": "ps-t0",
+                        "mark_filename": "stale-DiffuseMap.dds",
+                    },
+                },
+                [
+                    ("DiffuseMap_Body", diffuse_path),
+                    ("LightMap_Body", light_path),
+                ],
+            )
+            _prefix_cache_state["props"] = {
+                "modimp_profile_id": "yihuan",
+                "modimp_workspace_unique_str": "LOD0.fd054d1d-30030-0",
+                "modimp_texture_slots": json.dumps(
+                    {
+                        "ps-t0": {
+                            "mark_name": "DiffuseMap",
+                            "mark_type": "Slot",
+                            "mark_slot": "ps-t0",
+                            "mark_filename": "fresh-DiffuseMap.dds",
+                        },
+                        "ps-t1": {
+                            "mark_name": "LightMap",
+                            "mark_type": "Slot",
+                            "mark_slot": "ps-t1",
+                            "mark_filename": "fresh-LightMap.dds",
+                        },
+                    }
+                ),
+            }
+            _fake_bpy.data.objects[obj.name] = obj
+
+            sections = OrderedDict(
+                [
+                    (
+                        "[TextureOverride_Test]",
+                        [
+                            f"[mesh:{obj.name}]",
+                            "hash = fd054d1d",
+                            "ps-t0 = Resource-old-DiffuseMap",
+                            "ps-t1 = Resource-old-LightMap",
+                            "drawindexed = 3, 0, 0",
+                        ],
+                    ),
+                    ("_config_path", temp_dir),
+                ]
+            )
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+
+            node.process_texture_override_section(
+                "[TextureOverride_Test]",
+                sections,
+                material_group_to_swapkey={},
+                swap_key_prefix="$swapkey",
+                next_swap_key_num=150,
+                used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            override_lines = sections["[TextureOverride_Test]"]
+            self.assertIn("ps-t0 = Resource_DiffuseMap_Body", override_lines)
+            self.assertIn("ps-t1 = Resource_LightMap_Body", override_lines)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+
+

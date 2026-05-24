@@ -25,6 +25,7 @@ from ..ui.universal.unity import ExportUnity
 from ..ui.wwmi.wwmi_export import ExportWWMI
 from ..ui.universal.yysls import ExportYYSLS
 from ..ui.universal.zzmi import ExportZZMI
+from ..common.logic_name import LogicName
 
 
 _SYNC_GUARD = False
@@ -439,6 +440,16 @@ class DirectExportSession:
                 self.ordered_postprocess_nodes,
                 base_name_mapping,
             )
+            if GlobalConfig.logic_name == LogicName.NTEMI:
+                from ..ui.ntmi_modimp.texture_slot_refresh import refresh_texture_slots_for_objects
+                refresh_texture_slots_for_objects(
+                    [
+                        obj
+                        for draw_call_model in getattr(self.base_blueprint_model, "ordered_draw_obj_data_model_list", []) or []
+                        for obj in [bpy.data.objects.get(draw_call_model.get_blender_obj_name())]
+                        if obj is not None and obj.type == "MESH"
+                    ]
+                )
 
             if has_shapekey and self._needs_standard_shapekey_rounds():
                 # 只有存在未启用直出的 ShapeKey 后处理节点时，才补跑传统附加轮次。

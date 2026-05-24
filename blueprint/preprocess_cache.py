@@ -341,6 +341,8 @@ class PreProcessCache:
 
             if hasattr(mesh, 'color_attributes'):
                 for color_attr in mesh.color_attributes:
+                    if not cls._should_hash_color_attribute(color_attr):
+                        continue
                     hasher.update(color_attr.name.encode('utf-8'))
                     if n_loops > 0:
                         color_data = numpy.empty(n_loops * 4, dtype=numpy.float32)
@@ -385,6 +387,11 @@ class PreProcessCache:
             cls._hash_rna_properties(hasher, constraint)
 
         return hasher.hexdigest()
+
+    @classmethod
+    def _should_hash_color_attribute(cls, color_attr) -> bool:
+        attr_name = str(getattr(color_attr, "name", "") or "")
+        return attr_name.startswith("COLOR")
 
     @classmethod
     def _hash_rna_properties(cls, hasher, rna_obj):

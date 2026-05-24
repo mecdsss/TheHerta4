@@ -462,40 +462,43 @@ def create_texture_node(node_tree, image_path, label, location, non_color=False)
     node.location = location
     if non_color:
         node.image.colorspace_settings.name = "Non-Color"
+    else:
+        node.image.colorspace_settings.name = "sRGB"
+        node.image.alpha_mode = "CHANNEL_PACKED"
     return node
 
 
 def create_atlas_material(saved_paths, atlas_name):
     material = bpy.data.materials.new(name=f"{ATLAS_MATERIAL_PREFIX}{atlas_name}")
     material.use_nodes = True
-    material.blend_method = "CLIP"
+    material.blend_method = "BLEND"
+    if hasattr(material, "use_transparency_overlap"):
+        material.use_transparency_overlap = False
+    elif hasattr(material, "show_transparent_back"):
+        material.show_transparent_back = False
     material.use_backface_culling = True
     node_tree = material.node_tree
-    principled = next((node for node in node_tree.nodes if node.bl_idname == "ShaderNodeBsdfPrincipled"), None)
-    if not principled:
-        raise AtlasError("failed to create Principled BSDF node")
-        
+    node_tree.nodes.clear()
+
+    transparent_node = node_tree.nodes.new(type="ShaderNodeBsdfTransparent")
+    transparent_node.location = (-250, 120)
+
+    diffuse_node = node_tree.nodes.new(type="ShaderNodeBsdfDiffuse")
+    diffuse_node.location = (-250, -80)
+
+    mix_shader = node_tree.nodes.new(type="ShaderNodeMixShader")
+    mix_shader.location = (0, 0)
+
+    output_node = node_tree.nodes.new(type="ShaderNodeOutputMaterial")
+    output_node.location = (240, 0)
 
     albedo_node = create_texture_node(node_tree, saved_paths["albedo"], "Atlas Albedo", (-600, 300))
-    node_tree.links.new(albedo_node.outputs["Color"], principled.inputs["Base Color"])
-    node_tree.links.new(albedo_node.outputs["Alpha"], principled.inputs["Alpha"])
+    node_tree.links.new(albedo_node.outputs["Color"], diffuse_node.inputs["Color"])
+    node_tree.links.new(albedo_node.outputs["Alpha"], mix_shader.inputs["Fac"])
+    node_tree.links.new(transparent_node.outputs["BSDF"], mix_shader.inputs[1])
+    node_tree.links.new(diffuse_node.outputs["BSDF"], mix_shader.inputs[2])
+    node_tree.links.new(mix_shader.outputs["Shader"], output_node.inputs["Surface"])
 
-    if "metallic" in saved_paths:
-        metallic_node = create_texture_node(node_tree, saved_paths["metallic"], "Atlas Metallic", (-600, 20), non_color=True)
-        node_tree.links.new(metallic_node.outputs["Color"], principled.inputs["Metallic"])
-    if "roughness" in saved_paths:
-        roughness_node = create_texture_node(node_tree, saved_paths["roughness"], "Atlas Roughness", (-600, -260), non_color=True)
-        node_tree.links.new(roughness_node.outputs["Color"], principled.inputs["Roughness"])
-    if "emission" in saved_paths:
-        emission_node = create_texture_node(node_tree, saved_paths["emission"], "Atlas Emission", (-600, -540))
-        node_tree.links.new(emission_node.outputs["Color"], principled.inputs["Emission Color"])
-        principled.inputs["Emission Strength"].default_value = 1.0
-    if "normal_map" in saved_paths:
-        normal_tex = create_texture_node(node_tree, saved_paths["normal_map"], "Atlas Normal", (-900, -820), non_color=True)
-        normal_map = node_tree.nodes.new(type="ShaderNodeNormalMap")
-        normal_map.location = (-600, -820)
-        node_tree.links.new(normal_tex.outputs["Color"], normal_map.inputs["Color"])
-        node_tree.links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
     return material
 
 

@@ -256,6 +256,7 @@ def _find_chain_for_draw(blueprint_model: BluePrintModel, draw_call_model: DrawC
 
 def _condition_from_work_keys(work_key_list) -> str:
     conditions = []
+    seen = set()
     for work_key in work_key_list or []:
         if not bool(getattr(work_key, "is_swapkey", False)):
             continue
@@ -264,6 +265,9 @@ def _condition_from_work_keys(work_key_list) -> str:
             continue
         value = getattr(work_key, "tmp_value", 0)
         condition = f"{key_name} == {value}"
+        if condition in seen:
+            continue
+        seen.add(condition)
         if not conditions:
             conditions.append(condition)
         else:
@@ -276,6 +280,116 @@ def _condition_from_work_keys(work_key_list) -> str:
 
 def condition_from_swap_work_keys(work_key_list) -> str:
     return _condition_from_work_keys(work_key_list)
+
+
+def _normalize_condition_clause(condition: str) -> str:
+    clause = str(condition or "").strip()
+    while _is_fully_wrapped_condition(clause):
+        inner = clause[1:-1].strip()
+        if not inner or inner == clause:
+            break
+        clause = inner
+    return clause
+
+
+def _is_fully_wrapped_condition(condition: str) -> bool:
+    text = str(condition or "").strip()
+    if len(text) < 2 or not text.startswith("(") or not text.endswith(")"):
+        return False
+
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+            if depth == 0 and index != len(text) - 1:
+                return False
+
+    return depth == 0
+
+
+def _split_top_level_or_clauses(condition: str) -> list[str]:
+    text = str(condition or "").strip()
+    if not text:
+        return []
+
+    clauses: list[str] = []
+    depth = 0
+    start = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and text[index:index + 2] == "||":
+            clause = text[start:index].strip()
+            if clause:
+                clauses.append(clause)
+            start = index + 2
+            index += 1
+        index += 1
+
+    tail = text[start:].strip()
+    if tail:
+        clauses.append(tail)
+    return clauses
+
+
+def _wrap_condition_clause(condition: str) -> str:
+    clause = _normalize_condition_clause(condition)
+    if not clause:
+        return ""
+    return clause
+
+
+def _format_condition_clause_for_or(condition: str) -> str:
+    clause = _wrap_condition_clause(condition)
+    if not clause:
+        return ""
+    if "&&" in clause or "||" in clause:
+        return f"({clause})"
+    return clause
+
+
+def merge_object_conditions(existing: str, incoming: str) -> str:
+    clauses: list[str] = []
+    seen = set()
+
+    for raw_condition in (existing, incoming):
+        raw_condition = str(raw_condition or "").strip()
+        if not raw_condition:
+            continue
+
+        for clause in _split_top_level_or_clauses(raw_condition):
+            normalized = _normalize_condition_clause(clause)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            clauses.append(normalized)
+
+    if not clauses:
+        return ""
+    if len(clauses) == 1:
+        return _wrap_condition_clause(clauses[0])
+    return " || ".join(_format_condition_clause_for_or(clause) for clause in clauses)
+
+
+def collect_object_conditions(build_result: ExportTreeBuildResult) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for source_record in getattr(build_result, "source_records", []) or []:
+        for region_record in getattr(source_record, "region_records", []) or []:
+            for object_name, condition in (getattr(region_record, "object_conditions", {}) or {}).items():
+                object_name = str(object_name or "").strip()
+                condition = str(condition or "").strip()
+                if not object_name or not condition:
+                    continue
+                result[object_name] = merge_object_conditions(result.get(object_name, ""), condition)
+    return result
 
 
 def _chain_condition(chain) -> str:
@@ -575,7 +689,7 @@ def build_export_tree(blueprint_model: BluePrintModel, tree_prefix: str = "TheHe
                 if not condition and chain is not None:
                     condition = _chain_condition(chain)
                 if condition:
-                    object_conditions[obj.name] = condition
+                    object_conditions[obj.name] = merge_object_conditions(object_conditions.get(obj.name, ""), condition)
             source_record.region_records.append(
                 RegionBuildRecord(
                     draw_ib=draw_ib,

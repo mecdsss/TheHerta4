@@ -230,25 +230,37 @@ class TT_OT_bake_color_maps(bpy.types.Operator):
             material.use_nodes = True
         
         preview_image = bpy.data.images.load(preview_path, check_existing=True)
+        preview_image.colorspace_settings.name = 'sRGB'
+        preview_image.alpha_mode = 'CHANNEL_PACKED'
         node_tree = material.node_tree
-        output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and getattr(n, 'is_active_output', False)), None)
-        if not output_node:
-            output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
-        if not output_node:
-            output_node = node_tree.nodes.new('ShaderNodeOutputMaterial')
-            output_node.location = (300, 0)
-        
-        surface_input = output_node.inputs.get('Surface')
-        if not surface_input:
-            return
-        
-        for link in list(surface_input.links):
-            node_tree.links.remove(link)
-        
+        node_tree.nodes.clear()
+
         tex_node = node_tree.nodes.new('ShaderNodeTexImage')
         tex_node.image = preview_image
-        tex_node.location = (output_node.location.x - 250, output_node.location.y)
-        node_tree.links.new(tex_node.outputs['Color'], surface_input)
+        tex_node.location = (-500, 0)
+
+        transparent_node = node_tree.nodes.new('ShaderNodeBsdfTransparent')
+        transparent_node.location = (-220, 120)
+
+        diffuse_node = node_tree.nodes.new('ShaderNodeBsdfDiffuse')
+        diffuse_node.location = (-220, -80)
+
+        mix_shader = node_tree.nodes.new('ShaderNodeMixShader')
+        mix_shader.location = (20, 0)
+
+        output_node = node_tree.nodes.new('ShaderNodeOutputMaterial')
+        output_node.location = (260, 0)
+
+        material.blend_method = 'BLEND'
+        if hasattr(material, "use_transparency_overlap"):
+            material.use_transparency_overlap = False
+        elif hasattr(material, "show_transparent_back"):
+            material.show_transparent_back = False
+        node_tree.links.new(tex_node.outputs['Color'], diffuse_node.inputs['Color'])
+        node_tree.links.new(tex_node.outputs['Alpha'], mix_shader.inputs['Fac'])
+        node_tree.links.new(transparent_node.outputs['BSDF'], mix_shader.inputs[1])
+        node_tree.links.new(diffuse_node.outputs['BSDF'], mix_shader.inputs[2])
+        node_tree.links.new(mix_shader.outputs['Shader'], output_node.inputs['Surface'])
 
     def execute(self, context):
         props = context.scene.texture_tools_props

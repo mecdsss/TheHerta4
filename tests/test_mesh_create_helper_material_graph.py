@@ -121,6 +121,8 @@ class _FakeMaterial:
         self.name = name
         self.use_nodes = False
         self.node_tree = _FakeNodeTree()
+        self.blend_method = ""
+        self.use_transparency_overlap = True
 
 
 class _FakeMaterialCollection(dict):
@@ -224,10 +226,18 @@ class MeshCreateHelperMaterialGraphTests(unittest.TestCase):
                     self.assertNotIn("ShaderNodeBsdfPrincipled", node_types)
                     self.assertIn("ShaderNodeBsdfDiffuse", node_types)
                     self.assertIn("ShaderNodeOutputMaterial", node_types)
+                    image_nodes = [node for node in material.node_tree.nodes if node.bl_idname == "ShaderNodeTexImage"]
+                    self.assertEqual(len(image_nodes), 1)
+                    self.assertEqual(image_nodes[0].image.colorspace_settings.name, "sRGB")
+                    expected_alpha_mode = "NONE" if logic_name == "IdentityV" else "CHANNEL_PACKED"
+                    self.assertEqual(image_nodes[0].image.alpha_mode, expected_alpha_mode)
                     if logic_name == "IdentityV":
+                        self.assertEqual(material.blend_method, "OPAQUE")
                         self.assertNotIn("ShaderNodeMixShader", node_types)
                         self.assertNotIn("ShaderNodeBsdfTransparent", node_types)
                     else:
+                        self.assertEqual(material.blend_method, "BLEND")
+                        self.assertFalse(material.use_transparency_overlap)
                         self.assertIn("ShaderNodeMixShader", node_types)
                         self.assertIn("ShaderNodeBsdfTransparent", node_types)
 

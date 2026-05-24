@@ -132,6 +132,37 @@ def _texture_type_expects_srgb(texture_type: str) -> bool | None:
     return texture_type in _SRGB_TEXTURE_TYPES
 
 
+def _infer_texture_type_from_rule_pattern(pattern: str, filename: str) -> str:
+    candidates = [rule["texture_type"] for rule in DDS_DEFAULT_RULES]
+    haystacks = [str(pattern or ""), *(_get_match_targets(filename))]
+    for candidate in candidates:
+        needle = candidate.lower()
+        for haystack in haystacks:
+            if needle in str(haystack or "").lower():
+                return candidate
+    return "custom"
+
+
+def _texconv_colorspace_flags(texture_type: str) -> list[str]:
+    expected_srgb = _texture_type_expects_srgb(texture_type)
+    if expected_srgb is True:
+        return ["--srgb-in"]
+    if expected_srgb is False:
+        return ["--ignore-srgb"]
+    return []
+
+
+def _apply_image_colorspace(image, texture_type: str):
+    expected_srgb = _texture_type_expects_srgb(texture_type)
+    try:
+        if expected_srgb is True:
+            image.colorspace_settings.name = "sRGB"
+        elif expected_srgb is False:
+            image.colorspace_settings.name = "Non-Color"
+    except Exception:
+        pass
+
+
 def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
     if getattr(props, "dds_use_custom_rules", False):
         for rule in getattr(props, "dds_rules", []) or []:
@@ -143,7 +174,8 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
             try:
                 if _pattern_matches(pattern, filename):
                     rule_format = str(getattr(rule, "format", "") or "").strip()
-                    return "custom", rule_format or "bc7_unorm", pattern
+                    texture_type = _infer_texture_type_from_rule_pattern(pattern, filename)
+                    return texture_type, rule_format or "bc7_unorm", pattern
             except re.error:
                 continue
 
@@ -214,7 +246,7 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
                     continue
 
                 new_path = os.path.normpath(os.path.join(root, f"{name_no_ext}.dds"))
-                texture_type, dds_format, matched_by = resolve_dds_target(filename, props)
+                texture_type, dds_format, _matched_by = resolve_dds_target(filename, props)
 
                 if ext_lower == ".dds" and texture_type == "default":
                     skipped_unmatched_dds_count += 1
@@ -227,10 +259,9 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
                 if expected_srgb is not None and expected_srgb != _format_is_srgb(dds_format):
                     color_space_mismatches.append((filename, texture_type, dds_format))
 
-                # The DXGI *_SRGB format tag is enough to mark the output texture.
-                # Do not automatically add texconv -srgb here: it changes how texconv
-                # interprets/transforms color data and can visibly shift colors.
-                command = [texconv_executable, "-f", dds_format, "-o", root, "-y", old_path]
+                command = [texconv_executable, "-f", dds_format]
+                command.extend(_texconv_colorspace_flags(texture_type))
+                command.extend(["-o", root, "-y", old_path])
 
                 try:
                     process = subprocess.run(
@@ -253,7 +284,7 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
                     self.report({"WARNING"}, f"转换文件 {filename} 失败: {process.stderr}")
                     continue
 
-                conversion_map[old_path] = new_path
+                conversion_map[old_path] = (new_path, texture_type)
                 converted_files_count += 1
 
                 if props.dds_delete_originals and old_path != new_path:
@@ -275,8 +306,10 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
             try:
                 abs_filepath = os.path.normpath(bpy.path.abspath(image.filepath_raw))
                 if abs_filepath in conversion_map:
-                    image.filepath = conversion_map[abs_filepath]
+                    new_path, texture_type = conversion_map[abs_filepath]
+                    image.filepath = new_path
                     image.reload()
+                    _apply_image_colorspace(image, texture_type)
                     updated_images_count += 1
             except Exception as exc:
                 self.report({"WARNING"}, f"更新图片 '{image.name}' 的路径时出错: {exc}")
@@ -289,7 +322,7 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
         if skipped_unmatched_dds_count:
             self.report(
                 {"INFO"},
-                f"跳过了 {skipped_unmatched_dds_count} 个未命中任何DDS规则的现有 DDS 文件。",
+                f"跳过了 {skipped_unmatched_dds_count} 个未命中任何 DDS 规则的现有 DDS 文件。",
             )
         if color_space_mismatches:
             preview = "；".join(
@@ -299,7 +332,7 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
             suffix = "；..." if len(color_space_mismatches) > 3 else ""
             self.report(
                 {"WARNING"},
-                f"{len(color_space_mismatches)} 个贴图的DDS格式与贴图类型颜色空间不匹配，可能导致颜色变化：{preview}{suffix}",
+                f"{len(color_space_mismatches)} 个贴图的 DDS 格式与贴图类型颜色空间不匹配，可能导致颜色变化：{preview}{suffix}",
             )
         return {"FINISHED"}
 

@@ -32,6 +32,7 @@ from .runtime_cache import (
     object_workspace_dir_from_unique,
 )
 from .prefix_property_cache import update_prefix_record_for_object
+from .texture_slot_refresh import build_texture_slots_from_workspace_unique
 from .modimp_core import (
     ensure_mod_importer_package,
     resolve_mod_importer_root,
@@ -257,25 +258,8 @@ def _create_diffuse_material_graph(material, texture_image):
 
     tex_node = nodes.new('ShaderNodeTexImage')
     tex_node.image = texture_image
-    tex_node.location = (-400, 0)
-
-    diffuse_node = nodes.new('ShaderNodeBsdfDiffuse')
-    diffuse_node.location = (-100, 0)
-
-    output_node = nodes.new('ShaderNodeOutputMaterial')
-    output_node.location = (180, 0)
-
-    links.new(tex_node.outputs['Color'], diffuse_node.inputs['Color'])
-    links.new(diffuse_node.outputs['BSDF'], output_node.inputs['Surface'])
-
-
-def _create_transparent_material_graph(material, texture_image):
-    _clear_material_nodes(material)
-    nodes = material.node_tree.nodes
-    links = material.node_tree.links
-
-    tex_node = nodes.new('ShaderNodeTexImage')
-    tex_node.image = texture_image
+    texture_image.colorspace_settings.name = "sRGB"
+    texture_image.alpha_mode = "CHANNEL_PACKED"
     tex_node.location = (-520, 0)
 
     transparent_node = nodes.new('ShaderNodeBsdfTransparent')
@@ -295,7 +279,7 @@ def _create_transparent_material_graph(material, texture_image):
     links.new(transparent_node.outputs['BSDF'], mix_shader.inputs[1])
     links.new(diffuse_node.outputs['BSDF'], mix_shader.inputs[2])
     links.new(mix_shader.outputs['Shader'], output_node.inputs['Surface'])
-
+    
 
 def _apply_material_from_texture_slots(obj: bpy.types.Object, texture_slots: dict):
     if not texture_slots:
@@ -318,16 +302,12 @@ def _apply_material_from_texture_slots(obj: bpy.types.Object, texture_slots: dic
         except Exception:
             continue
 
-        has_alpha = False
-        try:
-            has_alpha = bool(getattr(texture_image, "depth", 0) == 32)
-        except Exception:
-            has_alpha = False
-
-        if has_alpha:
-            _create_transparent_material_graph(material, texture_image)
-        else:
-            _create_diffuse_material_graph(material, texture_image)
+        material.blend_method = "BLEND"
+        if hasattr(material, "use_transparency_overlap"):
+            material.use_transparency_overlap = False
+        elif hasattr(material, "show_transparent_back"):
+            material.show_transparent_back = False
+        _create_diffuse_material_graph(material, texture_image)
         break
 
 
@@ -884,13 +864,15 @@ class NTEMIImportHelper:
 
         category_hash = json_dict.get("CategoryHash", {})
 
-        texture_marks = json_dict.get("TextureMarkUpInfoList", [])
-        workspace_slots = _build_texture_slots_from_workspace(
-            draw_call_meta.folder_path,
-            draw_call_meta.submesh_folder_name,
-            deduped_texture_dir,
-            texture_marks,
-        )
+        workspace_slots = build_texture_slots_from_workspace_unique(workspace_unique_str) if workspace_unique_str else {}
+        if not workspace_slots:
+            texture_marks = json_dict.get("TextureMarkUpInfoList", [])
+            workspace_slots = _build_texture_slots_from_workspace(
+                draw_call_meta.folder_path,
+                draw_call_meta.submesh_folder_name,
+                deduped_texture_dir,
+                texture_marks,
+            )
         if workspace_slots:
             imported_obj["modimp_texture_slots"] = json.dumps(workspace_slots, ensure_ascii=False)
 

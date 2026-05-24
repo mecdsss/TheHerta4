@@ -329,6 +329,7 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
         created_materials_count = 0
         skipped_materials = []
         failed_rules = []
+        generated_paths_by_material = {}
 
         material_map = {}
         for obj in selected_objects:
@@ -358,20 +359,46 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
                 skipped_materials.append(f"{material.name}: failed to read pixels from {base_texture.name}")
                 continue
 
+            outputs_by_rule = {}
+            last_pixels = base_pixels
+            last_width = width
+            last_height = height
+            generated_paths = []
+
             for rule in active_rules:
                 try:
-                    result_path = self._apply_composite_rule(
+                    input_pixels = self._resolve_rule_input_pixels(
                         rule=rule,
-                        material=material,
+                        outputs_by_rule=outputs_by_rule,
                         base_pixels=base_pixels,
                         width=width,
                         height=height,
+                        fallback_pixels=last_pixels,
+                        fallback_width=last_width,
+                        fallback_height=last_height,
+                    )
+                    if input_pixels is None:
+                        skipped_materials.append(f"{material.name}/{rule.rule_name}: missing input source")
+                        continue
+
+                    input_pixels, input_width, input_height = input_pixels
+                    result_path, result_pixels = self._apply_composite_rule(
+                        rule=rule,
+                        material=material,
+                        base_pixels=input_pixels,
+                        width=input_width,
+                        height=input_height,
                         processor=processor,
                         output_dir=output_dir,
                     )
                     if not result_path:
                         continue
 
+                    outputs_by_rule[rule.rule_name] = (result_pixels, input_width, input_height)
+                    last_pixels = result_pixels
+                    last_width = input_width
+                    last_height = input_height
+                    generated_paths.append(Path(result_path))
                     processed_count += 1
 
                     if props.normal_map_create_materials:
@@ -386,6 +413,27 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
                     failed_rules.append(f"{material.name}/{rule.rule_name}: {exc}")
                     print(f"[TT Channel Composite] Failed: {material.name}/{rule.rule_name}: {exc}")
                     traceback.print_exc()
+
+            generated_paths_by_material[material.name] = generated_paths
+
+        keep_paths = set()
+        for paths in generated_paths_by_material.values():
+            if not paths:
+                continue
+            if props.normal_map_create_materials:
+                keep_paths.update(path.resolve() for path in paths)
+            else:
+                keep_paths.add(paths[-1].resolve())
+        for paths in generated_paths_by_material.values():
+            for path in paths[:-1]:
+                try:
+                    resolved_path = path.resolve()
+                    if resolved_path in keep_paths:
+                        continue
+                    if path.exists():
+                        path.unlink()
+                except Exception as exc:
+                    print(f"[TT Channel Composite] Failed to cleanup intermediate file {path}: {exc}")
 
         if skipped_materials:
             print("[TT Channel Composite] Skipped materials:")
@@ -450,7 +498,23 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
 
         return fallback_image
 
-    def _apply_composite_rule(self, rule, material, base_pixels, width, height, processor, output_dir):
+    def _resolve_rule_input_pixels(self, rule, outputs_by_rule, base_pixels, width, height, fallback_pixels, fallback_width, fallback_height):
+        mode = getattr(rule, "input_source_mode", "BASE_COLOR") or "BASE_COLOR"
+        if mode == "BASE_COLOR":
+            return base_pixels, width, height
+        if mode == "PREVIOUS_OUTPUT":
+            return fallback_pixels, fallback_width, fallback_height
+        if mode == "NAMED_OUTPUT":
+            ref_name = str(getattr(rule, "input_rule_name", "") or "").strip()
+            if not ref_name:
+                return None
+            matched = outputs_by_rule.get(ref_name)
+            if not matched:
+                return None
+            return matched
+        return base_pixels, width, height
+
+    def _compose_rule_pixels(self, rule, base_pixels, width, height, processor):
         channels_data = [None, None, None, None]
 
         for i, ch_config in enumerate(rule.output_channels):
@@ -465,6 +529,10 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
         output = np.zeros((height, width, 4), dtype=np.float32)
         for i in range(4):
             output[:, :, i] = channels_data[i] if channels_data[i] is not None else 1.0
+        return output
+
+    def _apply_composite_rule(self, rule, material, base_pixels, width, height, processor, output_dir):
+        output = self._compose_rule_pixels(rule, base_pixels, width, height, processor)
 
         safe_mat_name = "".join(c for c in material.name if c.isalnum() or c in ("-", "_", ".")).rstrip()
         output_name = f"{rule.output_name_prefix}{safe_mat_name}"
@@ -476,7 +544,7 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
         blender_img.file_format = "PNG"
         blender_img.save()
         bpy.data.images.remove(blender_img)
-        return str(output_path)
+        return str(output_path), output
 
     def _resolve_channel(self, ch_config, base_pixels, width, height, processor, rule):
         source_type = ch_config.source_type
@@ -533,12 +601,13 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
         image = bpy.data.images.load(composite_image_path, check_existing=True)
         tex_node.image = image
         image.colorspace_settings.name = "sRGB"
+        image.alpha_mode = "CHANNEL_PACKED"
 
         transparent_bsdf = node_tree.nodes.new("ShaderNodeBsdfTransparent")
         transparent_bsdf.location = (-250, 120)
 
-        principled_bsdf = node_tree.nodes.new("ShaderNodeBsdfPrincipled")
-        principled_bsdf.location = (-250, -80)
+        diffuse_bsdf = node_tree.nodes.new("ShaderNodeBsdfDiffuse")
+        diffuse_bsdf.location = (-250, -80)
 
         mix_shader = node_tree.nodes.new("ShaderNodeMixShader")
         mix_shader.location = (0, 0)
@@ -546,10 +615,15 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
         output_node = node_tree.nodes.new("ShaderNodeOutputMaterial")
         output_node.location = (220, 0)
 
-        node_tree.links.new(tex_node.outputs["Color"], principled_bsdf.inputs["Base Color"])
+        mat.blend_method = "BLEND"
+        if hasattr(mat, "use_transparency_overlap"):
+            mat.use_transparency_overlap = False
+        elif hasattr(mat, "show_transparent_back"):
+            mat.show_transparent_back = False
+        node_tree.links.new(tex_node.outputs["Color"], diffuse_bsdf.inputs["Color"])
         node_tree.links.new(tex_node.outputs["Alpha"], mix_shader.inputs["Fac"])
         node_tree.links.new(transparent_bsdf.outputs["BSDF"], mix_shader.inputs[1])
-        node_tree.links.new(principled_bsdf.outputs["BSDF"], mix_shader.inputs[2])
+        node_tree.links.new(diffuse_bsdf.outputs["BSDF"], mix_shader.inputs[2])
         node_tree.links.new(mix_shader.outputs["Shader"], output_node.inputs["Surface"])
 
         return mat, created_new

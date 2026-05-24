@@ -1,4 +1,5 @@
 import re
+from collections import Counter
 from typing import Iterable, Optional
 
 import bpy
@@ -33,25 +34,95 @@ def _join_csv(values: Iterable[str]) -> str:
     return ",".join(values)
 
 
-def get_used_variable_names(context=None) -> set[str]:
+def _iter_blueprint_nodes():
+    node_groups = getattr(getattr(bpy, "data", None), "node_groups", None)
+    if not node_groups:
+        return
+
+    for tree in node_groups:
+        if getattr(tree, "bl_idname", "") != "SSMTBlueprintTreeType":
+            continue
+        for node in getattr(tree, "nodes", []):
+            yield node
+
+
+def _iter_node_variable_names(node):
+    custom_name = normalize_variable_name(getattr(node, "custom_var_name", "") or "")
+    assigned_name = normalize_variable_name(getattr(node, "assigned_variable_name", "") or "")
+    if custom_name:
+        yield custom_name
+    if assigned_name:
+        yield assigned_name
+
+
+def _iter_shapekey_item_variable_names(item):
+    custom_name = normalize_variable_name(getattr(item, "custom_variable_name", "") or "")
+    assigned_name = normalize_variable_name(getattr(item, "assigned_variable_name", "") or "")
+    if custom_name:
+        yield custom_name
+    if assigned_name:
+        yield assigned_name
+
+
+def _collect_used_variable_name_counts(context=None) -> Counter:
+    counts = Counter()
+
+    for node in _iter_blueprint_nodes() or ():
+        bl_idname = getattr(node, "bl_idname", "")
+        if bl_idname == "SSMTNode_ObjectSwap":
+            counts.update(_iter_node_variable_names(node))
+        elif bl_idname == "SSMTNode_PostProcess_ShapeKey":
+            for item in getattr(node, "shapekey_variable_items", []):
+                counts.update(_iter_shapekey_item_variable_names(item))
+
+    _sync_variable_usage_cache(counts, context=context)
+    return counts
+
+
+def _sync_variable_usage_cache(counts: Counter, context=None):
     props = _get_scene_global_properties(context)
     if props is None:
-        return set()
-    return set(_split_csv(getattr(props, "allocated_variable_names_csv", "")))
+        return
+
+    props.allocated_variable_names_csv = _join_csv(sorted(counts.keys()))
+
+    next_index = 0
+    while counts.get(f"{OBJECT_SWAP_PREFIX}{next_index}", 0) > 0:
+        next_index += 1
+    props.object_swap_variable_counter = next_index
+
+
+def _normalize_owned_counts(owned_names: Optional[Iterable[str]] = None) -> Counter:
+    counts = Counter()
+    if not owned_names:
+        return counts
+
+    for name in owned_names:
+        normalized = normalize_variable_name(name)
+        if normalized:
+            counts[normalized] += 1
+    return counts
+
+
+def _is_name_used_by_other_owner(name: str, used_counts: Counter, owned_counts: Optional[Counter] = None) -> bool:
+    normalized = normalize_variable_name(name)
+    if not normalized:
+        return False
+    owned_count = owned_counts.get(normalized, 0) if owned_counts else 0
+    return used_counts.get(normalized, 0) > owned_count
+
+
+def get_used_variable_names(context=None) -> set[str]:
+    return set(_collect_used_variable_name_counts(context).keys())
 
 
 def mark_variable_name_used(var_name: str, context=None):
     normalized = normalize_variable_name(var_name)
     if not normalized:
         return
-    props = _get_scene_global_properties(context)
-    if props is None:
-        return
-    used_names = get_used_variable_names(context)
-    if normalized in used_names:
-        return
-    used_names.add(normalized)
-    props.allocated_variable_names_csv = _join_csv(sorted(used_names))
+    counts = _collect_used_variable_name_counts(context)
+    counts[normalized] += 1
+    _sync_variable_usage_cache(counts, context=context)
 
 
 def normalize_variable_name(var_name: str) -> str:
@@ -64,50 +135,46 @@ def normalize_variable_name(var_name: str) -> str:
 def ensure_object_swap_variable_name(node, context=None) -> str:
     current = normalize_variable_name(getattr(node, "assigned_variable_name", ""))
     if current:
-        mark_variable_name_used(current, context=context)
+        _collect_used_variable_name_counts(context)
         return current
 
-    props = _get_scene_global_properties(context)
-    if props is None:
-        current = f"{OBJECT_SWAP_PREFIX}0"
-        node.assigned_variable_name = current
-        return current
-
-    next_index = int(getattr(props, "object_swap_variable_counter", 0) or 0)
-    used_names = get_used_variable_names(context)
+    used_counts = _collect_used_variable_name_counts(context)
+    next_index = 0
     while True:
         candidate = f"{OBJECT_SWAP_PREFIX}{next_index}"
         next_index += 1
-        if candidate in used_names:
+        if _is_name_used_by_other_owner(candidate, used_counts):
             continue
-        used_names.add(candidate)
-        props.object_swap_variable_counter = next_index
-        props.allocated_variable_names_csv = _join_csv(sorted(used_names))
         node.assigned_variable_name = candidate
+        used_counts[candidate] += 1
+        _sync_variable_usage_cache(used_counts, context=context)
         return candidate
 
 
-def allocate_shape_key_variable_name(shape_key_name: str, *, preferred: Optional[str] = None, context=None) -> str:
-    props = _get_scene_global_properties(context)
+def allocate_shape_key_variable_name(
+    shape_key_name: str,
+    *,
+    preferred: Optional[str] = None,
+    context=None,
+    owned_names: Optional[Iterable[str]] = None,
+) -> str:
     preferred_normalized = normalize_variable_name(preferred or "")
-    used_names = get_used_variable_names(context)
+    used_counts = _collect_used_variable_name_counts(context)
+    owned_counts = _normalize_owned_counts(owned_names)
 
     if preferred_normalized:
-        if preferred_normalized not in used_names:
-            mark_variable_name_used(preferred_normalized, context=context)
-        return preferred_normalized
+        if not _is_name_used_by_other_owner(preferred_normalized, used_counts, owned_counts):
+            return preferred_normalized
 
     base_name = _sanitize_name(shape_key_name, fallback="shape")
     candidate = f"{SHAPEKEY_PREFIX}{base_name}"
-    if candidate not in used_names:
-        mark_variable_name_used(candidate, context=context)
+    if not _is_name_used_by_other_owner(candidate, used_counts, owned_counts):
         return candidate
 
     suffix = 1
     while True:
         indexed = f"{candidate}_{suffix}"
-        if indexed not in used_names:
-            mark_variable_name_used(indexed, context=context)
+        if not _is_name_used_by_other_owner(indexed, used_counts, owned_counts):
             return indexed
         suffix += 1
 

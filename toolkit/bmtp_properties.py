@@ -20,6 +20,29 @@ class BMTP_Properties(bpy.types.PropertyGroup):
     )
     vc_color: bpy.props.FloatVectorProperty(name="颜色", subtype='COLOR_GAMMA', size=4, default=(1.0, 0.25, 0.25, 0.5),
                                             min=0.0, max=1.0)
+    vc_attr_name: bpy.props.StringProperty(
+        name="颜色名称",
+        default="COLOR",
+        description="要添加的颜色属性名称"
+    )
+    vc_attr_domain: bpy.props.EnumProperty(
+        name="颜色域",
+        items=[
+            ('CORNER', "CORNER", "按循环/面角写入颜色"),
+            ('POINT', "POINT", "按顶点写入颜色"),
+        ],
+        default='CORNER',
+        description="颜色属性的域"
+    )
+    vc_attr_data_type: bpy.props.EnumProperty(
+        name="颜色类型",
+        items=[
+            ('BYTE_COLOR', "BYTE_COLOR", "8位量化颜色"),
+            ('FLOAT_COLOR', "FLOAT_COLOR", "32位浮点颜色"),
+        ],
+        default='BYTE_COLOR',
+        description="颜色属性的数据类型"
+    )
 
     uv_delete_pattern: bpy.props.StringProperty(name="匹配模式", default=r'^TEXCOORD\d*\.xy$',
                                                 description="用于匹配要删除的UV贴图名称的正则表达式")

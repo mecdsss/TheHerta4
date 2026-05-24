@@ -15,6 +15,7 @@ from ..blueprint.preprocess import PreProcessHelper
 from ..blueprint.export_parallel import ExportRoundExecutor, ParallelExportCoordinator, ParallelExportError
 from ..blueprint.sync import refresh_blueprint_sync_state
 from ..common.global_properties import GlobalProterties
+from ..common.logic_name import LogicName
 
 
 def _raise_for_unknown_logic_name() -> None:
@@ -279,6 +280,16 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
             LOG.info("-" * 40)
             TimerUtils.start_stage("后处理节点")
             mod_export_path = GlobalConfig.path_generate_mod_folder()
+            if GlobalConfig.logic_name == LogicName.NTEMI:
+                from ..ui.ntmi_modimp.texture_slot_refresh import refresh_texture_slots_for_objects
+                refresh_texture_slots_for_objects(
+                    [
+                        obj
+                        for draw_call_model in getattr(blueprint_model, "ordered_draw_obj_data_model_list", []) or []
+                        for obj in [bpy.data.objects.get(draw_call_model.get_blender_obj_name())]
+                        if obj is not None and obj.type == "MESH"
+                    ]
+                )
             blueprint_model.execute_postprocess_nodes(mod_export_path)
             TimerUtils.end_stage("后处理节点")
             export_success = True

@@ -177,6 +177,12 @@ class DirectShapeKeyGenerator(
         slot_to_name_to_objects = copy.deepcopy(slot_to_name_to_objects)
         hash_to_objects = {hash_value: list(objects) for hash_value, objects in hash_to_objects.items()}
         all_objects = list(all_objects)
+        LOG.info(
+            "Direct ShapeKey: parsed classification "
+            f"slots={sorted(slot_to_name_to_objects.keys())}, hashes={unique_hashes}, object_count={len(all_objects)}"
+        )
+        for slot_index, names_data in sorted(slot_to_name_to_objects.items()):
+            LOG.info(f"Direct ShapeKey: slot {slot_index} classification -> {dict(names_data)}")
 
         shader_source_path = self.node._get_shader_source_path()
         if not shader_source_path or not os.path.exists(shader_source_path):
@@ -191,12 +197,18 @@ class DirectShapeKeyGenerator(
                 runtime_infos = self._build_runtime_infos(unique_hashes)
             else:
                 runtime_infos = self._build_runtime_infos_from_exporter_buffers(unique_hashes)
+            LOG.info(f"Direct ShapeKey: runtime infos hashes -> {list(runtime_infos.keys())}")
             calculated_ranges = self._calculate_object_ranges(runtime_infos, all_objects, sections=sections)
+            LOG.info(f"Direct ShapeKey: calculated ranges -> {calculated_ranges}")
             unique_hashes = self._apply_merged_ranges(
                 calculated_ranges,
                 slot_to_name_to_objects,
                 hash_to_objects,
                 all_objects,
+            )
+            LOG.info(
+                "Direct ShapeKey: merged ranges "
+                f"hashes={unique_hashes}, objects={all_objects}, merged_members={self.merged_name_members}"
             )
             if use_preprocess_records:
                 slot_position_overrides = self._build_slot_position_overrides_from_preprocess_records(
@@ -211,6 +223,10 @@ class DirectShapeKeyGenerator(
                     calculated_ranges=calculated_ranges,
                     runtime_infos=runtime_infos,
                 )
+            LOG.info(
+                "Direct ShapeKey: slot position overrides -> "
+                f"{ {slot_index: sorted(slot_data.keys()) for slot_index, slot_data in slot_position_overrides.items()} }"
+            )
             _, _, dropped_slots = self._analyze_hash_slot_filters(
                 unique_hashes=unique_hashes,
                 slot_to_name_to_objects=slot_to_name_to_objects,
@@ -244,6 +260,10 @@ class DirectShapeKeyGenerator(
                 slot_to_name_to_objects,
                 hash_to_objects,
                 all_objects,
+            )
+            LOG.info(
+                "Direct ShapeKey: merged ranges "
+                f"hashes={unique_hashes}, objects={all_objects}, merged_members={self.merged_name_members}"
             )
             LOG.info(f"直出形态键: 构建 runtime infos + ranges {perf_counter() - stage_start:.3f}s")
             static_copy_map = self._create_static_shapekey_copies(slot_to_name_to_objects, source_object_map, runtime_infos)
@@ -321,6 +341,7 @@ class DirectShapeKeyGenerator(
         LOG.info(f"直出形态键: Position 缓冲写出完成 {perf_counter() - stage_start:.3f}s")
 
         processed_hashes = [logical_hash for logical_hash in unique_hashes if logical_hash in hash_to_actual_file_hash]
+        LOG.info(f"Direct ShapeKey: processed hashes -> {processed_hashes}")
         hash_to_base_resources = self._parse_hash_to_base_resources(sections)
         all_unique_names = list(
             OrderedDict.fromkeys(name for slot_data in slot_to_name_to_objects.values() for name in slot_data.keys())
@@ -370,6 +391,9 @@ class DirectShapeKeyGenerator(
             if use_optimized:
                 logical_prefix = self.node._extract_hash_prefix(logical_hash)
                 vertex_count = hash_to_vertex_count.get(logical_prefix, 0)
+                LOG.info(
+                    f"Direct ShapeKey: write freq indices hash={logical_hash}, names={hash_unique_names}, objects={hash_unique_objects}, vertex_count={vertex_count}"
+                )
                 self._write_freq_indices(
                     logical_hash=logical_hash,
                     actual_hash=hash_to_actual_file_hash.get(logical_hash, logical_hash),

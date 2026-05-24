@@ -1165,6 +1165,11 @@ def load_post_handler(scene):
     _rebuild_object_hide_state_cache()
     subscribe_msgbus()
     try:
+        from .node_base import refresh_all_blueprint_node_colors_and_redraw
+        refresh_all_blueprint_node_colors_and_redraw()
+    except Exception:
+        pass
+    try:
         from .export_helper import BlueprintExportHelper
         BlueprintExportHelper.ensure_valid_selected_blueprint_name()
     except Exception:

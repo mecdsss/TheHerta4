@@ -7,7 +7,7 @@ from bpy.props import StringProperty
 from ..common.global_config import GlobalConfig
 from ..common.object_prefix_helper import ObjectPrefixHelper
 
-from .node_base import SSMTBlueprintTree, SSMTNodeBase
+from .node_base import SSMTBlueprintTree, SSMTNodeBase, refresh_blueprint_node_colors
 
 
 _RESULT_OUTPUT_NODE_TYPES = {
@@ -961,10 +961,11 @@ class SSMT_OT_ViewChain(bpy.types.Operator):
         for node in tree.nodes:
             node.select = False
 
+        highlight_color = SSMTNodeBase.get_highlight_color()
         for node in chain_nodes:
             node.select = True
             node.use_custom_color = True
-            node.color = (0.0, 1.0, 0.2)
+            node.color = highlight_color
 
         chain_count = len(chain_nodes) - 1
         self.report({'INFO'}, f"链路高亮: {start_node.name} → 输出 ({chain_count} 个中间节点)，再次点击恢复")
@@ -1012,6 +1013,7 @@ class SSMT_OT_ViewChain(bpy.types.Operator):
                 node.use_custom_color = state['use_custom_color']
                 node.color = state['color']
 
+        refresh_blueprint_node_colors(tree)
         self.report({'INFO'}, "已恢复链路高亮")
 
 

@@ -5,6 +5,8 @@ import re
 from collections import OrderedDict
 import shutil
 
+from ..common.global_config import GlobalConfig
+from ..common.logic_name import LogicName
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
 _name_mapping_cache = {}
@@ -131,6 +133,13 @@ class SSMT_OT_MaterialDetect(bpy.types.Operator):
 
     node_name: bpy.props.StringProperty()
 
+    @staticmethod
+    def _is_result_output_node(node) -> bool:
+        return getattr(node, "bl_idname", "") in {
+            "SSMTNode_Result_Output",
+            "SSMTNode_Result_Output_NTMIModImp",
+        }
+
     def _find_result_output(self, node, visited=None):
         if visited is None:
             visited = set()
@@ -140,7 +149,7 @@ class SSMT_OT_MaterialDetect(bpy.types.Operator):
             return None
         visited.add(node_key)
 
-        if node.bl_idname == 'SSMTNode_Result_Output':
+        if self._is_result_output_node(node):
             return node
 
         for input_socket in node.inputs:
@@ -174,7 +183,7 @@ class SSMT_OT_MaterialDetect(bpy.types.Operator):
                 if nested_tree and getattr(nested_tree, 'bl_idname', '') == 'SSMTBlueprintTreeType':
                     visited_trees.add(nested_tree_name)
                     for nested_node in nested_tree.nodes:
-                        if getattr(nested_node, 'bl_idname', '') == 'SSMTNode_Result_Output':
+                        if self._is_result_output_node(nested_node):
                             detect_nodes.extend(
                                 self._collect_object_info_nodes(
                                     nested_node,
@@ -594,7 +603,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         material_name = str(getattr(material, "name", "") or "").strip()
         if not material_name:
             material_name = "Texture"
-        stem = re.sub(r'[\r\n\[\]=<>:"/\\|?*]+', "_", material_name).strip()
+        stem = re.sub(r'[\r\n\[\]=<>:"/\\|?*\s]+', "_", material_name).strip()
         return stem.strip("._") or "Texture"
 
     @staticmethod
@@ -690,17 +699,37 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
     @staticmethod
     def _ps_texture_material_resource_name(material):
-        material_name = str(getattr(material, "name", "") or "").strip()
-        if not material_name:
-            material_name = "Texture"
-        material_name = re.sub(r"[\r\n\[\]=]+", "_", material_name).strip("_")
-        return f"ResourceTexture_{material_name or 'Texture'}"
+        return f"ResourceTexture_{SSMTNode_PostProcess_Material._material_resource_stem(material)}"
+
+    def _collect_ntmi_cached_texture_slots_raw(self, obj):
+        if obj is None:
+            return ""
+        try:
+            from ..ui.ntmi_modimp.prefix_property_cache import get_prefix_record_props
+        except Exception:
+            return ""
+
+        try:
+            cached_props = get_prefix_record_props(getattr(obj, "name", ""))
+        except Exception:
+            return ""
+        if not isinstance(cached_props, dict):
+            return ""
+
+        workspace_unique_str = str(cached_props.get("modimp_workspace_unique_str", "") or "").strip()
+        profile_id = str(cached_props.get("modimp_profile_id", "") or "").strip().lower()
+        if not workspace_unique_str and profile_id not in {"yihuan", "ntemi"}:
+            return ""
+
+        return str(cached_props.get("modimp_texture_slots", "") or "").strip()
 
     def _collect_modimp_texture_slots(self, obj):
         import json as _json
 
         result = OrderedDict()
-        raw = str(obj.get("modimp_texture_slots", "") or "").strip()
+        raw = self._collect_ntmi_cached_texture_slots_raw(obj)
+        if not raw:
+            raw = str(obj.get("modimp_texture_slots", "") or "").strip()
         if not raw:
             return result
         try:
@@ -743,34 +772,40 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
     def _workspace_material_resource_name(self, material):
         return f"Resource-{self._material_resource_stem(material)}"
 
-    def _find_workspace_slot_material(self, obj, slot_info):
+    def _find_workspace_slot_materials(self, obj, slot_info):
         mark_name = str(slot_info.get("mark_name", "") or "").strip()
         if not mark_name:
-            return None
+            return []
 
         texture_type_lower = mark_name.lower()
-        matching_materials = OrderedDict()
-        for material_slot in getattr(obj, "material_slots", []):
-            material = material_slot.material
-            if not material:
-                continue
-            material_name = str(getattr(material, "name", "") or "")
-            if texture_type_lower == "fxmap" and not material_name.lower().startswith("fxmap_"):
-                continue
-            if not material_name.lower().startswith(texture_type_lower):
-                continue
-            material_first_word = material_name.split('_')[0].lower()
-            if material_first_word != texture_type_lower:
-                continue
-            signature = self._build_material_signature(material)
-            if signature not in matching_materials:
-                matching_materials[signature] = material
-        if matching_materials:
-            return next(iter(matching_materials.values()))
-        return None
+        candidate_objects = [obj] if obj else []
+        for candidate_obj in self._get_material_candidate_objects(obj):
+            if candidate_obj not in candidate_objects:
+                candidate_objects.append(candidate_obj)
+
+        for candidate_obj in candidate_objects:
+            matching_materials = OrderedDict()
+            for material_slot in getattr(candidate_obj, "material_slots", []):
+                material = material_slot.material
+                if not material:
+                    continue
+                material_name = str(getattr(material, "name", "") or "")
+                if texture_type_lower == "fxmap" and not material_name.lower().startswith("fxmap_"):
+                    continue
+                if not material_name.lower().startswith(texture_type_lower):
+                    continue
+                material_first_word = material_name.split('_')[0].lower()
+                if material_first_word != texture_type_lower:
+                    continue
+                signature = self._build_material_signature(material)
+                if signature not in matching_materials:
+                    matching_materials[signature] = material
+            if matching_materials:
+                return list(matching_materials.values())
+        return []
 
     def _create_workspace_texture_resource_entry(self, obj, slot_info, texture_folder, all_sections, texture_ini_folder="Textures"):
-        material = self._find_workspace_slot_material(obj, slot_info)
+        material = next(iter(self._find_workspace_slot_materials(obj, slot_info)), None)
         if not material:
             return None, None
         texture_image = self.get_texture_from_material(material)
@@ -835,7 +870,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             mark_name = str(slot_info.get("mark_name", "") or "").strip()
             if mark_name != "FXMap":
                 continue
-            material = self._find_workspace_slot_material(obj, slot_info)
+            material = next(iter(self._find_workspace_slot_materials(obj, slot_info)), None)
             if material:
                 result[slot_label] = self._workspace_material_resource_name(material)
         return result
@@ -958,9 +993,6 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     signature = self._build_material_signature(material)
                     if signature not in matching_materials:
                         matching_materials[signature] = material
-
-            if matching_materials:
-                break
 
         return list(matching_materials.values())
 
@@ -1148,7 +1180,10 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         cached_entry = _material_resource_cache.get(cache_key)
 
         if cached_entry:
-            resource_name = cached_entry.get("resource_name", resource_name_override or f"Resource_{material.name}")
+            resource_name = cached_entry.get(
+                "resource_name",
+                resource_name_override or f"Resource_{self._material_resource_stem(material)}",
+            )
             copied_filename = self.copy_texture_file(
                 texture_image,
                 texture_folder,
@@ -1157,7 +1192,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             )
         else:
             copied_filename = self.copy_texture_file(texture_image, texture_folder, material)
-            resource_name = resource_name_override or f"Resource_{material.name}"
+            resource_name = resource_name_override or f"Resource_{self._material_resource_stem(material)}"
             if copied_filename:
                 _material_resource_cache[cache_key] = {
                     "resource_name": resource_name,
@@ -1166,7 +1201,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
         if not copied_filename: return None
         resource_section_name = f"[{resource_name}]"
-        desired_line = f"filename = Texture/{copied_filename}".replace("\\", "/")
+        desired_line = f"filename = Textures/{copied_filename}".replace("\\", "/")
         existing_lines = all_sections.get(resource_section_name, [])
         existing_normalized = {
             line.strip().replace("\\", "/")
@@ -1217,6 +1252,36 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
         return line.strip().startswith(f"if {base_var} ")
 
+    def _find_mesh_block_reset_insert_index(self, lines, mesh_start_index: int) -> int:
+        search_end_idx = len(lines)
+        for i in range(mesh_start_index + 1, len(lines)):
+            if '[mesh:' in lines[i]:
+                search_end_idx = i
+                break
+
+        draw_idx = -1
+        for i in range(mesh_start_index + 1, search_end_idx):
+            if 'drawindexed' in lines[i]:
+                draw_idx = i
+                break
+        if draw_idx == -1:
+            return -1
+
+        block_depth = 0
+        last_endif_idx = -1
+        for i in range(mesh_start_index + 1, search_end_idx):
+            stripped = lines[i].strip()
+            if stripped.startswith("if "):
+                block_depth += 1
+            elif stripped == "endif":
+                if block_depth > 0:
+                    block_depth -= 1
+                last_endif_idx = i
+
+        if last_endif_idx > draw_idx:
+            return last_endif_idx + 1
+        return draw_idx + 1
+
     def _strip_generated_material_lines(self, lines):
         cleaned_lines = []
         inside_mesh_block = False
@@ -1256,7 +1321,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         config_path = os.path.normpath(all_sections.get('_config_path', ''))
         workspace_texture_ini_folder = "Textures"
         workspace_texture_folder = os.path.join(config_path, workspace_texture_ini_folder)
-        texture_folder = os.path.join(config_path, "Texture")
+        texture_folder = os.path.join(config_path, "Textures")
         object_to_diffuse_swapkey = {}
 
         mesh_lines_info_phase1 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
@@ -1276,23 +1341,24 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
             workspace_resource_by_slot = OrderedDict()
             for param_name, slot_info in self._collect_modimp_texture_slots(obj).items():
-                new_line, resource_name = self._create_workspace_texture_resource_entry(
-                    obj,
-                    slot_info,
-                    workspace_texture_folder,
-                    all_sections,
-                    texture_ini_folder=workspace_texture_ini_folder,
-                )
-                if not new_line or not resource_name:
+                texture_type = str(slot_info.get("mark_name", "") or "").strip()
+                if not texture_type or texture_type == "FXMap":
                     continue
-                new_lines_for_this_mesh.append(new_line)
-                generated_ps_slots.add(param_name.lower())
-                mark_name = str(slot_info.get("mark_name", "") or "").strip()
-                if mark_name:
-                    matched_types.append(mark_name)
-                slot_info = dict(slot_info)
-                slot_info["resource_name"] = resource_name
-                workspace_resource_by_slot[param_name] = slot_info
+                matching_materials = self._find_workspace_slot_materials(obj, slot_info)
+                if not matching_materials:
+                    continue
+                matched_types.append(texture_type)
+                generated_lines, next_swap_key_num = self.generate_material_lines(
+                    matching_materials, param_name, texture_type, obj, workspace_texture_folder, all_sections,
+                    object_to_diffuse_swapkey, material_group_to_swapkey,
+                    swap_key_prefix, next_swap_key_num, used_swap_keys)
+                if generated_lines:
+                    new_lines_for_this_mesh.extend(generated_lines)
+                    generated_ps_slots.add(param_name.lower())
+                    workspace_resource_by_slot[param_name] = {
+                        **dict(slot_info),
+                        "resource_name": self._workspace_material_resource_name(matching_materials[0]),
+                    }
 
             is_pst_style = any(k.lower().startswith("ps-t") for k in ini_mapping.keys())
             is_zzmi_style = any(k.lower().startswith("resource\\zzmi\\") for k in ini_mapping.keys())
@@ -1303,6 +1369,8 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     is_rabbitfx_param = param_name.lower().startswith("resource\\rabbitfx\\")
 
                     if not is_zzmi_param and not is_rabbitfx_param and not param_name.lower().startswith("ps-t"):
+                        continue
+                    if texture_type == "FXMap" and param_name.lower().startswith("ps-t"):
                         continue
                     if param_name.lower() in generated_ps_slots:
                         continue
@@ -1347,7 +1415,8 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 matching_materials = self.find_matching_materials(obj, texture_type)
                 if matching_materials:
                     matched_types.append(texture_type)
-                    param_name = f"Resource\\RabbitFX\\{texture_type}"
+                    fx_namespace = "NTEMIFX" if GlobalConfig.logic_name == LogicName.NTEMI else "RabbitFX"
+                    param_name = f"Resource\\{fx_namespace}\\{texture_type}"
                     if texture_type == 'Glowmap': generated_glowmap = True
                     if texture_type == 'FXMap': generated_fxmap = True
                     generated_lines, next_swap_key_num = self.generate_material_lines(
@@ -1355,7 +1424,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                         object_to_diffuse_swapkey, material_group_to_swapkey,
                         swap_key_prefix, next_swap_key_num, used_swap_keys)
                     fxmap_lines.extend(generated_lines)
-                    fxmap_lines.append("run = CommandList\\RabbitFX\\Run")
+                    fxmap_lines.append(f"run = CommandList\\{fx_namespace}\\Run")
 
             ntemifx_lines = []
             ntemifx_texture_slots = self._collect_ntemifx_texture_slots(obj, workspace_resource_by_slot)
@@ -1367,18 +1436,9 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 reset_after_draw = []
                 reset_after_draw.append("Resource\\NTEMIFX\\FXMap = ref null")
                 reset_after_draw.append("run = CommandList\\NTEMIFX\\Run")
-                draw_idx = -1
-                search_end_idx = len(lines)
-                for i in range(insert_index + 1, len(lines)):
-                    if '[mesh:' in lines[i]:
-                        search_end_idx = i
-                        break
-                for i in range(insert_index + 1, search_end_idx):
-                    if 'drawindexed' in lines[i]:
-                        draw_idx = i
-                        break
-                if draw_idx != -1:
-                    lines[draw_idx + 1:draw_idx + 1] = reset_after_draw
+                reset_insert_idx = self._find_mesh_block_reset_insert_index(lines, insert_index)
+                if reset_insert_idx != -1:
+                    lines[reset_insert_idx:reset_insert_idx] = reset_after_draw
             
             if matched_types:
                 _LOG.info(f"      找到 '{mesh_name}', 匹配材质: {', '.join(matched_types)}")
@@ -1391,22 +1451,21 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             new_lines_for_this_mesh.extend(ntemifx_lines)
             lines[insert_index + 1:insert_index + 1] = new_lines_for_this_mesh
             reset_lines = []
-            if generated_glowmap: reset_lines.extend(["Resource\\RabbitFX\\Glowmap = ref null", r"$\RabbitFX\brightness = 0"])
-            if generated_fxmap: reset_lines.append("Resource\\RabbitFX\\FXMap = ref null")
+            if GlobalConfig.logic_name == LogicName.NTEMI:
+                if generated_glowmap:
+                    reset_lines.extend(["Resource\\NTEMIFX\\Glowmap = ref null", r"$\NTEMIFX\brightness = 0"])
+                if generated_fxmap:
+                    reset_lines.append("Resource\\NTEMIFX\\FXMap = ref null")
+            else:
+                if generated_glowmap:
+                    reset_lines.extend(["Resource\\RabbitFX\\Glowmap = ref null", r"$\RabbitFX\brightness = 0"])
+                if generated_fxmap:
+                    reset_lines.append("Resource\\RabbitFX\\FXMap = ref null")
             if reset_lines:
-                reset_lines.append("run = CommandList\\RabbitFX\\Run")
-                draw_idx = -1
-                search_end_idx = len(lines)
-                for i in range(insert_index + 1, len(lines)):
-                    if '[mesh:' in lines[i]:
-                        search_end_idx = i
-                        break
-                for i in range(insert_index + 1, search_end_idx):
-                    if 'drawindexed' in lines[i]:
-                        draw_idx = i
-                        break
-                if draw_idx != -1:
-                    lines[draw_idx + 1:draw_idx + 1] = reset_lines
+                reset_lines.append("run = CommandList\\NTEMIFX\\Run" if GlobalConfig.logic_name == LogicName.NTEMI else "run = CommandList\\RabbitFX\\Run")
+                reset_insert_idx = self._find_mesh_block_reset_insert_index(lines, insert_index)
+                if reset_insert_idx != -1:
+                    lines[reset_insert_idx:reset_insert_idx] = reset_lines
         mesh_lines_info_phase2 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
         for mesh_index, mesh_name in reversed(mesh_lines_info_phase2):
             transparency_shader_name, transparency_value = self.extract_transparency_info_from_mesh_name(mesh_name)
@@ -1434,12 +1493,12 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     block_to_move = lines[start_move_idx:end_move_idx]
                     filtered_block_to_move = [
                         line for line in block_to_move
-                        if not any(keyword in line for keyword in ["Resource\\RabbitFX\\Glowmap = ref null", r"$\RabbitFX\brightness = 0", "Resource\\RabbitFX\\FXMap = ref null"])
+                        if not any(keyword in line for keyword in ["Resource\\RabbitFX\\Glowmap = ref null", r"$\RabbitFX\brightness = 0", "Resource\\RabbitFX\\FXMap = ref null", "Resource\\NTEMIFX\\Glowmap = ref null", r"$\NTEMIFX\brightness = 0", "Resource\\NTEMIFX\\FXMap = ref null"])
                     ]
                     final_block = []
                     for line in filtered_block_to_move:
-                        if "run = CommandList\\RabbitFX\\Run" in line:
-                            has_resource_before = any("Resource\\RabbitFX" in prev_line for prev_line in final_block)
+                        if "run = CommandList\\RabbitFX\\Run" in line or "run = CommandList\\NTEMIFX\\Run" in line:
+                            has_resource_before = any(("Resource\\RabbitFX" in prev_line) or ("Resource\\NTEMIFX" in prev_line) for prev_line in final_block)
                             if has_resource_before:
                                 final_block.append(line)
                         else:

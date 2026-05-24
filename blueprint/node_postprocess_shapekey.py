@@ -130,6 +130,49 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             seen_names.add(clean_name)
             yield clean_name
 
+        get_blueprint_model = getattr(BlueprintExportHelper, "get_current_blueprint_model", None)
+        blueprint_model = get_blueprint_model() if callable(get_blueprint_model) else None
+        processing_chains = getattr(blueprint_model, "processing_chains", []) if blueprint_model is not None else []
+        if processing_chains:
+            for chain in processing_chains:
+                if not getattr(chain, "is_valid", False) or not getattr(chain, "reached_output", False):
+                    continue
+                for candidate_name in (
+                    getattr(chain, "original_object_name", "") or "",
+                    getattr(chain, "object_name", "") or "",
+                    getattr(chain, "virtual_object_name", "") or "",
+                    getattr(chain, "export_object_name_override", "") or "",
+                ):
+                    try:
+                        resolved_name = ObjectPrefixHelper.resolve_source_object_name(candidate_name)
+                    except Exception:
+                        resolved_name = ""
+                    for item in add_name(resolved_name or candidate_name):
+                        yield item
+                get_export_object_name = getattr(chain, "get_export_object_name", None)
+                if callable(get_export_object_name):
+                    try:
+                        export_name = get_export_object_name() or ""
+                    except Exception:
+                        export_name = ""
+                    try:
+                        resolved_export_name = ObjectPrefixHelper.resolve_source_object_name(export_name)
+                    except Exception:
+                        resolved_export_name = ""
+                    for item in add_name(resolved_export_name or export_name):
+                        yield item
+                for rename_record in getattr(chain, "rename_history", []) or []:
+                    for candidate_name in (
+                        rename_record.get("old_name", "") or "",
+                        rename_record.get("new_name", "") or "",
+                    ):
+                        try:
+                            resolved_name = ObjectPrefixHelper.resolve_source_object_name(candidate_name)
+                        except Exception:
+                            resolved_name = ""
+                        for item in add_name(resolved_name or candidate_name):
+                            yield item
+
         for node in BlueprintExportHelper.collect_connected_start_nodes(self.id_data):
             if node.bl_idname == "SSMTNode_Object_Info":
                 for item in add_name(getattr(node, "object_name", "")):
@@ -171,15 +214,16 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 self._ensure_shapekey_variable_item(shape_key_name)
                 created_count += 1
             else:
+                owned_names = (
+                    getattr(existing, "assigned_variable_name", ""),
+                    getattr(existing, "custom_variable_name", ""),
+                )
                 if not existing.assigned_variable_name:
                     existing.assigned_variable_name = allocate_shape_key_variable_name(
                         shape_key_name,
                         preferred=existing.custom_variable_name,
+                        owned_names=owned_names,
                     )
-                else:
-                    mark_variable_name_used(existing.assigned_variable_name)
-                if existing.custom_variable_name:
-                    mark_variable_name_used(existing.custom_variable_name)
                 elif self._backfill_shape_key_variable_input(existing):
                     backfilled_count += 1
         return created_count, backfilled_count
@@ -187,17 +231,18 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     def get_shape_key_export_variable_name(self, shape_key_name: str) -> str:
         shape_key_name = str(shape_key_name or "").strip()
         item = self._ensure_shapekey_variable_item(shape_key_name)
+        owned_names = (
+            getattr(item, "assigned_variable_name", ""),
+            getattr(item, "custom_variable_name", ""),
+        )
         custom_name = normalize_variable_name(item.custom_variable_name)
         if custom_name:
-            mark_variable_name_used(custom_name)
             return f"${custom_name}"
 
         assigned_name = normalize_variable_name(item.assigned_variable_name)
         if not assigned_name:
-            assigned_name = allocate_shape_key_variable_name(shape_key_name)
+            assigned_name = allocate_shape_key_variable_name(shape_key_name, owned_names=owned_names)
             item.assigned_variable_name = assigned_name
-        else:
-            mark_variable_name_used(assigned_name)
         return f"${assigned_name}"
 
     def collect_blueprint_shape_key_names(self):

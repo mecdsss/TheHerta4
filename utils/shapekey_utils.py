@@ -471,15 +471,14 @@ class ShapeKeyUtils:
         '''
 
         if obj.data.shape_keys:
-            if configured_shapekey_names is None:
-                configured_shapekey_names = set()
-            else:
-                configured_shapekey_names = set(configured_shapekey_names)
+            reset_all_non_basis = configured_shapekey_names is None
+            configured_shapekey_names = set(configured_shapekey_names or [])
             
             for key_block in obj.data.shape_keys.key_blocks:
-                # 只处理在配置列表中的形态键
-                if key_block.name in configured_shapekey_names:
-                    # 如果不是当前正在处理的形态键，则归零
+                if key_block.name == 'Basis':
+                    continue
+
+                if reset_all_non_basis or key_block.name in configured_shapekey_names:
                     if key_block.name != current_shapekey_name:
                         key_block.value = 0.0
 

@@ -5,7 +5,7 @@ from bpy.types import Operator, Menu
 from bpy.props import StringProperty
 import mathutils
 
-from .node_base import SSMTNodeBase
+from .node_base import SSMTNodeBase, refresh_blueprint_node_colors
 
 
 def _make_json_serializable(value):
@@ -376,6 +376,8 @@ class SSMT_OT_LoadNodePreset(Operator):
                         node.update()
                     except:
                         pass
+
+            refresh_blueprint_node_colors(node_tree)
 
 
 class SSMT_OT_DeleteNodePreset(Operator):

@@ -571,6 +571,7 @@ class MeshCreateHelper:
         MeshCreateHelper.clear_material_nodes(node_tree)
         tex_image = node_tree.nodes.new('ShaderNodeTexImage')
         tex_image.image = bpy.data.images.load(texture_path)
+        tex_image.image.colorspace_settings.name = "sRGB"
         tex_image.image.alpha_mode = "NONE"
         tex_image.location = (-400, 0)
 
@@ -589,7 +590,8 @@ class MeshCreateHelper:
         MeshCreateHelper.clear_material_nodes(node_tree)
         tex_image = node_tree.nodes.new('ShaderNodeTexImage')
         tex_image.image = bpy.data.images.load(texture_path)
-        tex_image.image.alpha_mode = "NONE"
+        tex_image.image.colorspace_settings.name = "sRGB"
+        tex_image.image.alpha_mode = "CHANNEL_PACKED"
         tex_image.location = (-520, 0)
 
         transparent = node_tree.nodes.new('ShaderNodeBsdfTransparent')
@@ -768,14 +770,20 @@ class MeshCreateHelper:
 
         material = bpy.data.materials.new(name=material_name)
         material.use_nodes = True
-
-        if logic_name != LogicName.IdentityV:
-            _tex_node, diffuse = MeshCreateHelper.create_transparent_material_graph(
+        if logic_name == LogicName.IdentityV:
+            material.blend_method = "OPAQUE"
+            _tex_node, diffuse = MeshCreateHelper.create_diffuse_material_graph(
                 node_tree=material.node_tree,
                 texture_path=texture_path,
             )
         else:
-            _tex_node, diffuse = MeshCreateHelper.create_diffuse_material_graph(
+            material.blend_method = "BLEND"
+            if hasattr(material, "use_transparency_overlap"):
+                material.use_transparency_overlap = False
+            elif hasattr(material, "show_transparent_back"):
+                material.show_transparent_back = False
+
+            _tex_node, diffuse = MeshCreateHelper.create_transparent_material_graph(
                 node_tree=material.node_tree,
                 texture_path=texture_path,
             )

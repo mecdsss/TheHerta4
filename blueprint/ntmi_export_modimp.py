@@ -86,6 +86,7 @@ def _restore_material_texture_nodes(saved: list[dict]):
                 continue
 from ..ui.ntmi_modimp.export_tree_builder import (
     ExportTreeBuildResult,
+    collect_object_conditions,
     build_export_tree,
     cleanup_collections,
     condition_from_swap_work_keys,
@@ -96,6 +97,7 @@ from ..ui.ntmi_modimp.modimp_core import (
     get_export_collection_package,
     resolve_mod_importer_root,
 )
+from ..ui.ntmi_modimp.texture_slot_refresh import refresh_texture_slots_for_objects
 from .ntmi_multifile import execute_ntmi_multifile_postprocess
 from .ntmi_shapekey import execute_ntmi_shapekey_postprocess
 
@@ -183,52 +185,16 @@ def _collect_nested_trees(tree, visited=None):
     return nested
 
 
-def _object_conditions_from_blueprint_model(blueprint_model: BluePrintModel) -> dict[str, str]:
-    result = {}
-    for draw_call_model in blueprint_model.ordered_draw_obj_data_model_list:
-        condition = condition_from_swap_work_keys(draw_call_model.work_key_list)
-        if not condition:
-            continue
-        names = {
-            draw_call_model.obj_name,
-            draw_call_model.get_blender_obj_name(),
-            getattr(draw_call_model, "source_obj_name", "") or "",
-        }
-        for name in names:
-            if name:
-                result[name] = _merge_conditions(result.get(name, ""), condition)
-    for chain in getattr(blueprint_model, "processing_chains", []) or []:
-        if not getattr(chain, "is_valid", False) or not getattr(chain, "reached_output", False):
-            continue
-        condition = _condition_from_chain(chain)
-        if not condition:
-            continue
-        names = {
-            getattr(chain, "object_name", "") or "",
-            getattr(chain, "original_object_name", "") or "",
-            getattr(chain, "virtual_object_name", "") or "",
-            getattr(chain, "export_object_name_override", "") or "",
-        }
-        get_export_object_name = getattr(chain, "get_export_object_name", None)
-        if callable(get_export_object_name):
-            try:
-                names.add(get_export_object_name() or "")
-            except Exception:
-                pass
-        for name in names:
-            if name:
-                result[name] = _merge_conditions(result.get(name, ""), condition)
-    return result
+def _object_conditions_from_blueprint_model(source) -> dict[str, str]:
+    if isinstance(source, ExportTreeBuildResult):
+        return collect_object_conditions(source)
+    return collect_object_conditions(build_export_tree(source))
 
 
 def _wrap_condition(condition: str) -> str:
     condition = str(condition or "").strip()
     if not condition:
         return ""
-    if condition.startswith("(") and condition.endswith(")"):
-        return condition
-    if "&&" in condition or "||" in condition:
-        return f"({condition})"
     return condition
 
 
@@ -239,17 +205,17 @@ def _merge_conditions(existing: str, incoming: str) -> str:
         return incoming
     if not incoming or incoming == existing:
         return existing
-    return f"{_wrap_condition(existing)} && {_wrap_condition(incoming)}"
+    return f"{existing} && {incoming}"
 
 
 def _condition_from_chain(chain) -> str:
     conditions = []
     swap_condition = condition_from_swap_work_keys(getattr(chain, "shapekey_params", []) or [])
     if swap_condition:
-        conditions.append(_wrap_condition(swap_condition))
+        conditions.append(swap_condition)
     multifile_condition = str(getattr(chain, "ntmi_multifile_condition", "") or "").strip()
     if multifile_condition:
-        conditions.append(_wrap_condition(multifile_condition))
+        conditions.append(multifile_condition)
     return " && ".join(condition for condition in conditions if condition)
 
 
@@ -634,6 +600,14 @@ class ExportNTMIModImp:
             multifile_nodes,
             base_draw_only=True,
         )
+        refresh_texture_slots_for_objects(
+            [
+                obj
+                for draw_call_model in getattr(self.blueprint_model, "ordered_draw_obj_data_model_list", []) or []
+                for obj in [bpy.data.objects.get(draw_call_model.get_blender_obj_name())]
+                if obj is not None and obj.type == "MESH"
+            ]
+        )
         build_result = build_export_tree(self.blueprint_model)
         export_results: list[dict[str, object]] = []
         effective_generate_ini = self.generate_ini
@@ -682,7 +656,7 @@ class ExportNTMIModImp:
                 _restore_material_texture_nodes(saved_texture_nodes)
                 LOG.info("NTMI ModImp: restored material slots after export")
 
-            object_conditions = _object_conditions_from_blueprint_model(self.blueprint_model)
+            object_conditions = _object_conditions_from_blueprint_model(build_result)
             swap_nodes = _swap_node_payloads(self.blueprint_model)
 
             if effective_generate_ini:

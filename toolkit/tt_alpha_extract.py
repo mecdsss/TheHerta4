@@ -55,12 +55,13 @@ class TT_OT_extract_alpha_channel(bpy.types.Operator):
         image = bpy.data.images.load(alpha_map_image_path, check_existing=True)
         tex_node.image = image
         image.colorspace_settings.name = 'sRGB'
+        image.alpha_mode = 'CHANNEL_PACKED'
 
         transparent_bsdf = node_tree.nodes.new('ShaderNodeBsdfTransparent')
         transparent_bsdf.location = (-200, 100)
 
-        principled_bsdf = node_tree.nodes.new('ShaderNodeBsdfPrincipled')
-        principled_bsdf.location = (-200, -100)
+        diffuse_bsdf = node_tree.nodes.new('ShaderNodeBsdfDiffuse')
+        diffuse_bsdf.location = (-200, -100)
 
         mix_shader = node_tree.nodes.new('ShaderNodeMixShader')
         mix_shader.location = (0, 0)
@@ -68,10 +69,15 @@ class TT_OT_extract_alpha_channel(bpy.types.Operator):
         output_node = node_tree.nodes.new('ShaderNodeOutputMaterial')
         output_node.location = (200, 0)
 
-        node_tree.links.new(tex_node.outputs['Color'], principled_bsdf.inputs['Base Color'])
+        mat.blend_method = 'BLEND'
+        if hasattr(mat, "use_transparency_overlap"):
+            mat.use_transparency_overlap = False
+        elif hasattr(mat, "show_transparent_back"):
+            mat.show_transparent_back = False
+        node_tree.links.new(tex_node.outputs['Color'], diffuse_bsdf.inputs['Color'])
         node_tree.links.new(tex_node.outputs['Alpha'], mix_shader.inputs['Fac'])
         node_tree.links.new(transparent_bsdf.outputs['BSDF'], mix_shader.inputs[1])
-        node_tree.links.new(principled_bsdf.outputs['BSDF'], mix_shader.inputs[2])
+        node_tree.links.new(diffuse_bsdf.outputs['BSDF'], mix_shader.inputs[2])
         node_tree.links.new(mix_shader.outputs['Shader'], output_node.inputs['Surface'])
 
         return mat, created_new

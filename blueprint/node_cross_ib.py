@@ -233,8 +233,6 @@ class SSMTNode_CrossIB(SSMTNodeBase):
         self.inputs.new('SSMTSocketObject', "Input 1")
         self.outputs.new('SSMTSocketObject', "Output")
         self.width = 350
-        self.use_custom_color = True
-        self.color = (0.6, 0.3, 0.6)
 
         self._update_cross_ib_method()
 

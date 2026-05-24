@@ -335,6 +335,10 @@ class BMTP_ModelControlPanel(bpy.types.Panel):
         box.label(text="设置顶点色", icon='COLOR')
         box.prop(props, "vc_mode", expand=True)
         box.prop(props, "vc_color")
+        box.prop(props, "vc_attr_name")
+        row = box.row(align=True)
+        row.prop(props, "vc_attr_domain")
+        row.prop(props, "vc_attr_data_type")
         box.operator("toolkit.bmtp_set_vertex_color", icon='PLAY')
 
 
@@ -699,6 +703,10 @@ class TT_ChannelCompositePanel(bpy.types.Panel):
                 
                 rule_box.prop(rule, "output_name_prefix", text="输出前缀")
                 
+                rule_box.prop(rule, "input_source_mode", text="输入来源")
+                if rule.input_source_mode == "NAMED_OUTPUT":
+                    rule_box.prop(rule, "input_rule_name", text="引用规则")
+                
                 rule_box.separator(factor=0.3)
                 
                 for ch_idx in range(min(4, len(rule.output_channels))):
@@ -875,7 +883,12 @@ class TT_LightmapPanel(bpy.types.Panel):
         box.label(text="生成类型", icon='MATERIAL')
         row = box.row(align=True)
         row.prop(props, "lightmap_generate_lightmap")
+        row.prop(props, "lightmap_generate_highlightmap")
+        row = box.row(align=True)
+        row.prop(props, "lightmap_generate_rampmap")
         row.prop(props, "lightmap_generate_materialmap")
+        row = box.row(align=True)
+        row.prop(props, "lightmap_generate_stockingmap")
         
         box2 = layout.box()
         box2.label(text="应用模式", icon='SETTINGS')

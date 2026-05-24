@@ -2,7 +2,38 @@ import unittest
 
 import numpy as np
 
-from utils.vertex_color_utils import build_vertex_color_payload, srgb_to_linear
+from utils.vertex_color_utils import (
+    build_vertex_color_payload,
+    ensure_color_attribute,
+    srgb_to_linear,
+)
+
+
+class DummyColorAttribute:
+    def __init__(self, name, domain, data_type):
+        self.name = name
+        self.domain = domain
+        self.data_type = data_type
+
+
+class DummyColorAttributes:
+    def __init__(self, existing=None):
+        self._items = {attr.name: attr for attr in (existing or [])}
+        self.removed = []
+        self.created = []
+
+    def get(self, name):
+        return self._items.get(name)
+
+    def remove(self, attr):
+        self.removed.append(attr)
+        self._items.pop(attr.name, None)
+
+    def new(self, name, type, domain):
+        attr = DummyColorAttribute(name=name, domain=domain, data_type=type)
+        self._items[name] = attr
+        self.created.append(attr)
+        return attr
 
 
 class VertexColorUtilsTests(unittest.TestCase):
@@ -49,6 +80,28 @@ class VertexColorUtilsTests(unittest.TestCase):
                 color_rgba_srgb=(1.0, 1.0, 1.0, 1.0),
                 vc_mode="ALPHA_ONLY",
             )
+
+    def test_ensure_color_attribute_reuses_matching_attribute(self):
+        existing = DummyColorAttribute("COLOR", "CORNER", "BYTE_COLOR")
+        collection = DummyColorAttributes(existing=[existing])
+
+        attr = ensure_color_attribute(collection, "COLOR", "CORNER", "BYTE_COLOR")
+
+        self.assertIs(attr, existing)
+        self.assertEqual(collection.removed, [])
+        self.assertEqual(collection.created, [])
+
+    def test_ensure_color_attribute_recreates_mismatched_attribute(self):
+        existing = DummyColorAttribute("COLOR", "POINT", "FLOAT_COLOR")
+        collection = DummyColorAttributes(existing=[existing])
+
+        attr = ensure_color_attribute(collection, "COLOR", "CORNER", "BYTE_COLOR")
+
+        self.assertIsNot(attr, existing)
+        self.assertEqual(collection.removed, [existing])
+        self.assertEqual(len(collection.created), 1)
+        self.assertEqual(attr.domain, "CORNER")
+        self.assertEqual(attr.data_type, "BYTE_COLOR")
 
 
 if __name__ == "__main__":
