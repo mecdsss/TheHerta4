@@ -31,6 +31,30 @@ from .ntmi_modimp.ntemi_importer import (
 from .ui_prefix_quick_ops import PrefixQuickOpsHelper
 
 
+def _create_original_model_frame(tree, label="原始模型"):
+    frame = tree.nodes.new('NodeFrame')
+    frame.label = label
+    frame.use_custom_color = True
+    frame.color = (0.2, 0.35, 0.2)
+    return frame
+
+
+def _parent_nodes_to_frame(frame, nodes):
+    for node in nodes:
+        if node is None:
+            continue
+        node.parent = frame
+
+
+def _extract_gametype_name(import_folder_path: str) -> str:
+    normalized = str(import_folder_path or "").replace("\\", "/")
+    marker = "TYPE_"
+    index = normalized.rfind(marker)
+    if index == -1:
+        return ""
+    return normalized[index + len(marker):].strip("/").strip()
+
+
 def _build_workspace_import_targets(workspace_collection):
     partition_folder_paths = WorkSpaceHelper.get_workspace_partition_folderpath_list()
     target_base_paths = partition_folder_paths or [GlobalConfig.path_workspace_folder()]
@@ -128,9 +152,6 @@ def _detect_ntemi_workspace() -> bool:
                     continue
                 if str(payload.get("GamePreset", "") or "").strip().upper() == "NTEMI":
                     return True
-                break
-            break
-        break
     return False
 
 
@@ -139,13 +160,12 @@ def ImprotFromWorkSpaceFull(self, context):
     is_ntemi = _detect_ntemi_workspace()
 
     if is_ntemi:
-        _import_workspace_full_ntemi(self, context, workspace_collection)
-        return
+        return _import_workspace_full_ntemi(self, context, workspace_collection)
 
     import_targets = list(_build_workspace_import_targets(workspace_collection))
     if not import_targets:
         self.report({'ERROR'}, "当前工作空间未找到可导入的子模型目录。")
-        return
+        return False
 
     foldername_gametypename_dict = {}
     imported_objects = []
@@ -161,7 +181,10 @@ def ImprotFromWorkSpaceFull(self, context):
         print("Final Import Folder Path List: " + str(final_import_folder_path_list))
 
         for import_folder_path in final_import_folder_path_list:
-            gametype_name = import_folder_path.split("TYPE_")[1]
+            gametype_name = _extract_gametype_name(import_folder_path)
+            if not gametype_name:
+                self.report({'WARNING'}, f"跳过无法识别游戏类型的导入目录：{import_folder_path}")
+                continue
 
             try:
                 print("尝试导入路径: " + import_folder_path)
@@ -201,13 +224,13 @@ def ImprotFromWorkSpaceFull(self, context):
                 )
                 self.report({'INFO'}, "成功导入 " + target["import_key"] + " 的数据类型: " + gametype_name)
             except Exception as e:
-                print(f"Failed to import from {import_folder_path}: {e}")
+                print(f"导入目录失败：{import_folder_path}，错误：{e}")
                 continue
             break
 
     if not import_records:
         self.report({'ERROR'}, "当前工作空间没有成功导入任何模型，已跳过蓝图生成。")
-        return
+        return False
 
     save_import_json_path = os.path.join(GlobalConfig.path_workspace_folder(), "Import.json")
     JsonUtils.SaveToFile(json_dict=foldername_gametypename_dict, filepath=save_import_json_path)
@@ -224,8 +247,9 @@ def ImprotFromWorkSpaceFull(self, context):
         try:
             tree = bpy.data.node_groups.new(name=tree_name, type='SSMTBlueprintTreeType')
         except Exception as e:
-            print(f"Failed to create new node tree: {e}. Check if SSMTBlueprintTreeType is registered.")
-            return
+            print(f"创建蓝图节点树失败：{e}。请检查 SSMTBlueprintTreeType 是否已正确注册。")
+            self.report({'ERROR'}, "创建蓝图失败，请确认 SSMT 蓝图节点类型已正确注册。")
+            return False
         tree.use_fake_user = True
 
         global_properties = getattr(getattr(context, "scene", None), "global_properties", None)
@@ -233,11 +257,13 @@ def ImprotFromWorkSpaceFull(self, context):
             global_properties.selected_blueprint_name = tree.name
 
         drawib_tabname_dict = WorkSpaceHelper.get_drawib_tabname_dict()
+        original_model_frame = _create_original_model_frame(tree)
 
         tab_group_nodes = {}
         tab_node_lists = {}
         default_group_node = tree.nodes.new('SSMTNode_Object_Group')
         default_group_node.label = "Default Group"
+        default_group_node.parent = original_model_frame
         default_node_list = []
 
         y_gap = 200
@@ -254,6 +280,7 @@ def ImprotFromWorkSpaceFull(self, context):
             if tab_name and tab_name not in tab_group_nodes:
                 group_node = tree.nodes.new('SSMTNode_Object_Group')
                 group_node.label = tab_name
+                group_node.parent = original_model_frame
                 tab_group_nodes[tab_name] = group_node
                 tab_node_lists[tab_name] = []
 
@@ -268,6 +295,7 @@ def ImprotFromWorkSpaceFull(self, context):
             node.component = record["component"] or "1"
             node.alias_name = record["alias_name"]
             node.label = obj.name
+            node.parent = original_model_frame
 
             if target_group.inputs[-1].is_linked:
                 target_group.inputs.new('SSMTSocketObject', f"Input {len(target_group.inputs) + 1}")
@@ -323,6 +351,7 @@ def ImprotFromWorkSpaceFull(self, context):
                 merge_node = tree.nodes.new('SSMTNode_Object_Group')
                 merge_node.label = "Merge"
                 merge_node.location = (600, 0)
+                merge_node.parent = original_model_frame
 
                 for grp_node in all_group_nodes:
                     if merge_node.inputs[-1].is_linked:
@@ -334,13 +363,18 @@ def ImprotFromWorkSpaceFull(self, context):
         for grp_node in all_group_nodes:
             if hasattr(grp_node, "update"):
                 grp_node.update()
+        if hasattr(original_model_frame, "update"):
+            original_model_frame.update()
 
         print(f"Blueprint {tree_name} updated with imported objects, grouped by workspace tabs.")
+        return True
 
     except Exception as e:
         print(f"Error generating blueprint nodes: {e}")
         import traceback
         traceback.print_exc()
+        self.report({'ERROR'}, f"生成导入蓝图失败：{e}")
+        return False
 
 
 def _import_workspace_full_ntemi(self, context, workspace_collection):
@@ -349,7 +383,7 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
     draw_calls = _discover_draw_calls(workspace_root, drawib_aliasname_dict)
     if not draw_calls:
         self.report({'ERROR'}, "NTEMI工作空间未找到可导入的DrawCall数据。")
-        return
+        return False
 
     deduped_texture_dir = _resolve_deduped_texture_dir(workspace_root)
     frame_analysis_dir = _resolve_frame_analysis_dir(workspace_root)
@@ -424,14 +458,14 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
                 f"NTEMI 成功导入 {draw_call.submesh_folder_name}"
             )
         except Exception as e:
-            print(f"Failed to import NTEMI draw call {draw_call.submesh_folder_name}: {e}")
+            print(f"导入 NTEMI DrawCall 失败：{draw_call.submesh_folder_name}，错误：{e}")
             import traceback
             traceback.print_exc()
             continue
 
     if not import_records:
         self.report({'ERROR'}, "NTEMI工作空间没有成功导入任何模型，已跳过蓝图生成。")
-        return
+        return False
 
     save_import_json_path = os.path.join(workspace_root, "Import.json")
     JsonUtils.SaveToFile(json_dict=foldername_gametypename_dict, filepath=save_import_json_path)
@@ -465,8 +499,9 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
         try:
             tree = bpy.data.node_groups.new(name=tree_name, type='SSMTBlueprintTreeType')
         except Exception as e:
-            print(f"Failed to create new node tree: {e}. Check if SSMTBlueprintTreeType is registered.")
-            return
+            print(f"创建 NTEMI 蓝图节点树失败：{e}。请检查 SSMTBlueprintTreeType 是否已正确注册。")
+            self.report({'ERROR'}, "创建 NTEMI 蓝图失败，请确认 SSMT 蓝图节点类型已正确注册。")
+            return False
         tree.use_fake_user = True
 
         global_properties = getattr(getattr(context, "scene", None), "global_properties", None)
@@ -474,11 +509,13 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
             global_properties.selected_blueprint_name = tree.name
 
         drawib_tabname_dict = WorkSpaceHelper.get_drawib_tabname_dict()
+        original_model_frame = _create_original_model_frame(tree)
 
         tab_group_nodes = {}
         tab_node_lists = {}
         default_group_node = tree.nodes.new('SSMTNode_Object_Group')
         default_group_node.label = "Default Group"
+        default_group_node.parent = original_model_frame
         default_node_list = []
 
         y_gap = 200
@@ -495,6 +532,7 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
             if tab_name and tab_name not in tab_group_nodes:
                 group_node = tree.nodes.new('SSMTNode_Object_Group')
                 group_node.label = tab_name
+                group_node.parent = original_model_frame
                 tab_group_nodes[tab_name] = group_node
                 tab_node_lists[tab_name] = []
 
@@ -509,6 +547,7 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
             node.component = record["component"] or "1"
             node.alias_name = record["alias_name"]
             node.label = obj.name
+            node.parent = original_model_frame
 
             if target_group.inputs[-1].is_linked:
                 target_group.inputs.new('SSMTSocketObject', f"Input {len(target_group.inputs) + 1}")
@@ -564,6 +603,7 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
                 merge_node = tree.nodes.new('SSMTNode_Object_Group')
                 merge_node.label = "Merge"
                 merge_node.location = (600, 0)
+                merge_node.parent = original_model_frame
 
                 for grp_node in all_group_nodes:
                     if merge_node.inputs[-1].is_linked:
@@ -575,13 +615,18 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
         for grp_node in all_group_nodes:
             if hasattr(grp_node, "update"):
                 grp_node.update()
+        if hasattr(original_model_frame, "update"):
+            original_model_frame.update()
 
         print(f"NTEMI Blueprint {tree_name} created with NTMI ModImp output node.")
+        return True
 
     except Exception as e:
         print(f"Error generating NTEMI blueprint nodes: {e}")
         import traceback
         traceback.print_exc()
+        self.report({'ERROR'}, f"生成 NTEMI 导入蓝图失败：{e}")
+        return False
 
 
 class SSMT4ImportAllFromCurrentWorkSpaceBlueprint(bpy.types.Operator):
@@ -591,20 +636,23 @@ class SSMT4ImportAllFromCurrentWorkSpaceBlueprint(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        success = False
         if GlobalConfig.get_workspace_name() == "":
-            self.report({"ERROR"}, "Please select your WorkSpace in SSMT before import.")
+            self.report({"ERROR"}, "请先在 SSMT 中选择工作空间后再导入。")
         elif not os.path.exists(GlobalConfig.path_workspace_folder()):
             self.report(
                 {"ERROR"},
-                "WorkSpace Folder Didn't exists, Please create a WorkSpace in SSMT before import "
+                "工作空间目录不存在，请先在 SSMT 中创建工作空间后再导入："
                 + GlobalConfig.path_workspace_folder(),
             )
         else:
             TimerUtils.Start("ImportFromWorkSpaceBlueprint")
-            ImprotFromWorkSpaceFull(self, context)
+            success = bool(ImprotFromWorkSpaceFull(self, context))
             TimerUtils.End("ImportFromWorkSpaceBlueprint")
 
-        return {'FINISHED'}
+        if success:
+            return {'FINISHED'}
+        return {'CANCELLED'}
 
 
 class SSMT4ImportRaw(bpy.types.Operator, ImportHelper):
@@ -661,7 +709,10 @@ class SSMT4ImportRaw(bpy.types.Operator, ImportHelper):
         CollectionUtils.select_collection_objects(collection)
         PrefixQuickOpsHelper.merge_prefixes_from_objects(context, imported_objects)
 
-        return {'FINISHED'}
+        if imported_objects:
+            return {'FINISHED'}
+        self.report({'ERROR'}, "没有成功导入任何模型，请检查所选 JSON 或目录是否有效。")
+        return {'CANCELLED'}
 
 
 def register():

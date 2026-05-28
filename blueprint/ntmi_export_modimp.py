@@ -13,6 +13,8 @@ from .export_helper import BlueprintExportHelper
 from .model import BluePrintModel
 from .preprocess import PreProcessHelper
 from .variable_registry import ensure_object_swap_variable_name, get_node_variable_name
+from ..common.global_config import GlobalConfig
+from ..common.global_key_count_helper import GlobalKeyCountHelper
 from ..common.global_properties import GlobalProterties
 from ..common.object_prefix_helper import ObjectPrefixHelper
 from ..common.workspace_helper import WorkSpaceHelper
@@ -120,19 +122,34 @@ class NTMIModImpExportError(RuntimeError):
     pass
 
 
-def resolve_ntmi_modimp_output_dir(node) -> str:
-    use_custom_dir = bool(getattr(node, "use_custom_export_dir", False))
-    configured = str(getattr(node, "export_dir", "") or "").strip()
-    if use_custom_dir:
-        if not configured:
-            raise NTMIModImpExportError("Manual export directory is enabled, but no export directory is selected.")
-        return os.path.normpath(bpy.path.abspath(configured))
+def _resolve_default_ntmi_modimp_output_dir() -> str:
+    try:
+        GlobalConfig.read_from_main_json_ssmt4()
+        default_output_dir = str(GlobalConfig.path_generate_mod_folder() or "").strip()
+        if default_output_dir:
+            return os.path.normpath(default_output_dir)
+    except Exception as exc:
+        LOG.warning(f"NTMI ModImp: failed to resolve SSMT export directory, fall back to legacy path: {exc}")
 
     blend_path = str(getattr(bpy.data, "filepath", "") or "").strip()
     if blend_path:
         return os.path.normpath(str(Path(blend_path).resolve().parent / "NTMI_ModImp_Output"))
 
     return os.path.normpath(str(Path.home() / "TheHerta4_NTMI_ModImp_Output"))
+
+
+def resolve_ntmi_modimp_output_dir(node) -> str:
+    use_custom_dir = bool(getattr(node, "use_custom_export_dir", False))
+    configured = str(getattr(node, "export_dir", "") or "").strip()
+    if use_custom_dir:
+        if configured:
+            return os.path.normpath(bpy.path.abspath(configured))
+        LOG.warning(
+            "NTMI ModImp: manual export directory is enabled but empty; "
+            "fall back to the current SSMT export directory."
+        )
+
+    return _resolve_default_ntmi_modimp_output_dir()
 
 
 def _reset_output_dir(path: str):
@@ -570,9 +587,9 @@ def _validate_modimp_export_objects(export_objects: list[bpy.types.Object]):
         if remaining > 0:
             preview = f"{preview}, ... (+{remaining})"
         raise NTMIModImpExportError(
-            "NTMI ModImp export requires numeric vertex groups for skin weights. "
-            "The following export object(s) have no numeric vertex groups: "
-            f"{preview}. Run vertex-group mapping/process before export, or remove static/non-skinned meshes from this NTMI export path."
+            "NTMI ModImp 导出需要数字命名的顶点组来生成蒙皮权重。"
+            "以下导出物体未找到任何数字顶点组："
+            f"{preview}。请先执行顶点组映射/处理，或将静态/非蒙皮网格从该 NTMI 导出链路中移除。"
         )
 
 
@@ -623,9 +640,9 @@ class ExportNTMIModImp:
             if not dependency_status.available:
                 checked = "\n".join(dependency_status.checked_paths)
                 raise NTMIModImpExportError(
-                    "NTMI ModImp requires the Mod Importer dependency. "
-                    "Install/enable the Mod Importer add-on or set the dependency path on the output node.\n"
-                    f"Checked:\n{checked}"
+                    "NTMI ModImp 依赖 Mod Importer。"
+                    "请先安装/启用该依赖，或在输出节点上正确配置依赖路径。\n"
+                    f"已检查路径：\n{checked}"
                 )
             export_collection_package = get_export_collection_package(self.mod_importer_root)
             resolve_mod_importer_root(self.mod_importer_root)
@@ -700,11 +717,12 @@ class NTMIModImpExportSession:
         self.output_dir = resolve_ntmi_modimp_output_dir(node)
 
     def _collect_object_names(self) -> list[str]:
-        names = BlueprintExportHelper.collect_connected_object_names(self.tree)
+        names = BlueprintExportHelper.collect_connected_preprocess_object_names(self.tree)
         return PreProcessHelper.collect_target_object_names_strict(names)
 
     def run(self):
         previous_result_type = BlueprintExportHelper.runtime_result_output_node_type
+        previous_runtime_tree_name = BlueprintExportHelper.runtime_blueprint_tree_name
         previous_buffer_folder = BlueprintExportHelper.get_current_buffer_folder_name()
         previous_export_index = BlueprintExportHelper.current_export_index
         nested_trees = _collect_nested_trees(self.tree)
@@ -714,6 +732,7 @@ class NTMIModImpExportSession:
         BlueprintExportHelper.set_current_export_index(1)
         BlueprintExportHelper.set_current_buffer_folder_name("Buffer")
         BluePrintModel.clear_object_name_mapping()
+        GlobalKeyCountHelper.initialize()
 
         _reset_output_dir(self.output_dir)
 
@@ -723,7 +742,7 @@ class NTMIModImpExportSession:
             TimerUtils.end_stage("NTMI-ModImp-CollectObjects")
 
             if not object_names:
-                raise NTMIModImpExportError("No mesh objects are connected to the NTMI ModImp output node.")
+                raise NTMIModImpExportError("NTMI ModImp 输出节点未连接任何可导出的网格物体。")
 
             capture_direct_shapekeys = bool(
                 getattr(self.node, "run_postprocess_nodes", True)
@@ -770,6 +789,7 @@ class NTMIModImpExportSession:
                 PreProcessHelper.cleanup_copies()
             finally:
                 BlueprintExportHelper.runtime_result_output_node_type = previous_result_type
+                BlueprintExportHelper.runtime_blueprint_tree_name = previous_runtime_tree_name
                 BlueprintExportHelper.set_current_buffer_folder_name(previous_buffer_folder)
                 BlueprintExportHelper.set_current_export_index(previous_export_index)
 

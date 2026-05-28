@@ -55,6 +55,9 @@ _install_module(
 _install_module(
     f"{PKG}.ui.ntmi_modimp.prefix_property_cache",
     update_prefix_record_for_object=lambda *_args, **_kwargs: None,
+    replace_prefix_record_props=lambda *_args, **_kwargs: None,
+    get_prefix_record_props=lambda _name: {},
+    has_prefix_record=lambda _name: False,
 )
 
 
@@ -73,6 +76,9 @@ class TextureSlotRefreshTests(unittest.TestCase):
         refresh_module.build_texture_slots_from_workspace_unique = (
             refresh_module.__dict__["build_texture_slots_from_workspace_unique"]
         )
+        refresh_module.get_prefix_record_props = lambda _name: {}
+        refresh_module.has_prefix_record = lambda _name: False
+        refresh_module.replace_prefix_record_props = lambda *_args, **_kwargs: None
 
     def test_refresh_object_texture_slots_rewrites_runtime_contract(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -172,6 +178,21 @@ class TextureSlotRefreshTests(unittest.TestCase):
             self.assertEqual(slots["ps-t1"]["source_path"], "")
             self.assertEqual(slots["ps-t1"]["extension"], "dds")
             self.assertEqual(slots["ps-t1"]["mark_name"], "LightMap")
+
+    def test_refresh_object_texture_slots_uses_prefix_cache_workspace_unique_before_stale_object_prop(self):
+        obj = _FakeObject("LOD0.abc12345-12-0.Body")
+        obj["modimp_workspace_unique_str"] = "LOD0.stale-1-0"
+
+        calls = []
+        refresh_module.get_prefix_record_props = lambda _name: {
+            "modimp_workspace_unique_str": "LOD0.abc12345-12-0",
+        }
+        refresh_module.has_prefix_record = lambda _name: True
+        refresh_module.build_texture_slots_from_workspace_unique = lambda workspace_unique_str: calls.append(workspace_unique_str) or {}
+
+        refresh_module.refresh_object_texture_slots(obj)
+
+        self.assertEqual(calls, ["LOD0.abc12345-12-0"])
 
 
 if __name__ == "__main__":

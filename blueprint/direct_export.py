@@ -4,6 +4,7 @@ import shutil
 import bpy
 
 from ..common.global_config import GlobalConfig
+from ..common.global_key_count_helper import GlobalKeyCountHelper
 from ..common.global_properties import GlobalProterties
 from ..utils.log_utils import LOG
 from ..utils.timer_utils import TimerUtils
@@ -176,7 +177,7 @@ def _reset_buffer_folder(folder_name: str):
 
 
 def _build_object_name_list(tree, has_shapekey: bool, has_multifile: bool) -> list[str]:
-    return BlueprintExportHelper.collect_connected_object_names(tree)
+    return BlueprintExportHelper.collect_connected_preprocess_object_names(tree)
 
 
 class DirectExportSession:
@@ -541,12 +542,12 @@ class SSMT_OT_GenerateDirectModBlueprint(bpy.types.Operator):
         try:
             tree = self._resolve_target_tree(context)
             if not tree:
-                self.report({'ERROR'}, "No current blueprint tree found")
+                self.report({'ERROR'}, "未找到当前蓝图树，请先在蓝图编辑器中选中目标蓝图。")
                 return {'CANCELLED'}
 
             execute_direct_export(context=context, tree=tree)
 
-            self.report({'INFO'}, "Generate Mod Direct Success!")
+            self.report({'INFO'}, "直导出生成成功。")
             return {'FINISHED'}
         except Exception as exc:
             LOG.error(f"直出失败: {exc}")
@@ -560,10 +561,15 @@ class SSMT_OT_GenerateDirectModBlueprint(bpy.types.Operator):
 
 
 def execute_direct_export(context, tree):
+    previous_runtime_tree_name = BlueprintExportHelper.runtime_blueprint_tree_name
     BlueprintExportHelper.set_runtime_blueprint_tree(tree)
-    refresh_blueprint_sync_state(tree=tree, context=context, include_all_blueprints=True)
-    session = DirectExportSession(context=context, tree=tree)
-    session.run()
+    GlobalKeyCountHelper.initialize()
+    try:
+        refresh_blueprint_sync_state(tree=tree, context=context, include_all_blueprints=True)
+        session = DirectExportSession(context=context, tree=tree)
+        session.run()
+    finally:
+        BlueprintExportHelper.runtime_blueprint_tree_name = previous_runtime_tree_name
 
 
 classes = (

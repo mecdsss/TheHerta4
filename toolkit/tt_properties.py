@@ -172,6 +172,30 @@ class TT_TextureToolsProperties(bpy.types.PropertyGroup):
     atlas_padding: bpy.props.IntProperty(name="图集边距", description="图集中各贴图块之间的像素间距", default=8, min=0, max=128)
     atlas_color_size: bpy.props.IntProperty(name="纯色兜底尺寸", description="纯色材质在图集中使用的基础尺寸", default=32, min=4, max=1024)
     atlas_include_extra_textures: bpy.props.BoolProperty(name="包含附加贴图", description="同时尝试合并 Metallic/Roughness/Normal/Emission 贴图", default=True)
+    atlas_packer_type: bpy.props.EnumProperty(
+        name="打包策略",
+        description="控制图集块的打包方式",
+        items=[
+            ('RECTPACK', "紧凑打包", "使用紧凑矩形打包"),
+            ('GRID', "网格打包", "按统一网格顺序打包"),
+        ],
+        default='RECTPACK',
+    )
+    atlas_force_uniform_size: bpy.props.BoolProperty(
+        name="统一尺寸",
+        description="将所有贴图块扩展到相同尺寸后再打包",
+        default=False,
+    )
+    atlas_crop_transparent: bpy.props.BoolProperty(
+        name="裁剪透明边",
+        description="在打包前裁剪贴图四周的透明区域",
+        default=False,
+    )
+    atlas_pixel_art_scale: bpy.props.BoolProperty(
+        name="像素风缩放",
+        description="缩放图集时使用最近邻，保留像素风格",
+        default=False,
+    )
     atlas_image_format: bpy.props.EnumProperty(
         name="图集输出格式",
         description="图集贴图的输出格式",

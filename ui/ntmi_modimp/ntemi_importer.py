@@ -31,7 +31,7 @@ from .runtime_cache import (
     object_workspace_dir_from_type_dir,
     object_workspace_dir_from_unique,
 )
-from .prefix_property_cache import update_prefix_record_for_object
+from .prefix_property_cache import replace_prefix_record_props
 from .texture_slot_refresh import build_texture_slots_from_workspace_unique
 from .modimp_core import (
     ensure_mod_importer_package,
@@ -49,7 +49,7 @@ def _ensure_ntemi_game_data_converter(configured_root: str = ""):
     game_data_module = importlib.import_module(f"{package.__name__}.core.game_data")
     yihuan_converter = game_data_module._CONVERTERS.get("yihuan")
     if yihuan_converter is None:
-        raise RuntimeError("Yihuan converter not found in mod_importer-main")
+        raise RuntimeError("未在 mod_importer-main 中找到 Yihuan 游戏数据转换器。")
     return yihuan_converter
 
 
@@ -559,6 +559,29 @@ class NtemiDrawCallMeta:
     component: str
 
 
+def _parse_ntemi_submesh_folder_name(folder_name: str) -> Tuple[Optional[str], Optional[int], Optional[int], str]:
+    normalized = str(folder_name or "").strip()
+    parts = normalized.split("-")
+    if len(parts) < 3:
+        return None, None, None, f"目录名格式无效，至少需要 draw_ib-index_count-first_index：{normalized}"
+
+    draw_ib = str(parts[0]).strip()
+    if not draw_ib:
+        return None, None, None, f"目录名缺少 draw_ib：{normalized}"
+
+    try:
+        index_count = int(parts[1])
+    except (TypeError, ValueError):
+        return None, None, None, f"目录名中的 index_count 不是有效整数：{normalized}"
+
+    try:
+        first_index = int(parts[2])
+    except (TypeError, ValueError):
+        return None, None, None, f"目录名中的 first_index 不是有效整数：{normalized}"
+
+    return draw_ib, index_count, first_index, ""
+
+
 def _discover_draw_calls(workspace_root: str, drawib_aliasname_dict: dict = None) -> List[NtemiDrawCallMeta]:
     draw_calls: List[NtemiDrawCallMeta] = []
     lod0_dir = os.path.join(workspace_root, "LOD0")
@@ -571,26 +594,30 @@ def _discover_draw_calls(workspace_root: str, drawib_aliasname_dict: dict = None
         if not entry.is_dir():
             continue
         folder_name = entry.name
-        parts = folder_name.split("-")
-        if len(parts) < 3:
+        draw_ib, index_count, first_index, parse_error = _parse_ntemi_submesh_folder_name(folder_name)
+        if parse_error:
+            print(f"[NTEMI] 跳过子模型目录：{parse_error}")
             continue
-        draw_ib = parts[0]
-        index_count = int(parts[1])
-        first_index = int(parts[2])
 
         type_subdirs = sorted(Path(entry.path).glob("TYPE_*"))
         if not type_subdirs:
+            print(f"[NTEMI] 跳过 {folder_name}：未找到任何 TYPE_* 导入目录")
             continue
-        type_dir = str(type_subdirs[0])
 
-        json_file = os.path.join(type_dir, f"{folder_name}.json")
-        if not os.path.isfile(json_file):
+        type_dir = ""
+        for candidate_type_dir in type_subdirs:
+            candidate_json = os.path.join(str(candidate_type_dir), f"{folder_name}.json")
+            if os.path.isfile(candidate_json):
+                type_dir = str(candidate_type_dir)
+                break
+        if not type_dir:
+            print(f"[NTEMI] 跳过 {folder_name}：所有 TYPE_* 目录中都缺少 {folder_name}.json")
             continue
 
         alias_name = drawib_aliasname_dict.get(draw_ib, "")
         display_name = folder_name
         if alias_name:
-            display_name = f"{alias_name}-{parts[1]}-{parts[2]}"
+            display_name = f"{alias_name}-{index_count}-{first_index}"
 
         draw_calls.append(NtemiDrawCallMeta(
             lod_name="LOD0",
@@ -601,7 +628,7 @@ def _discover_draw_calls(workspace_root: str, drawib_aliasname_dict: dict = None
             index_count=index_count,
             display_name=display_name,
             alias_name=alias_name,
-            component=parts[1],
+            component=str(index_count),
         ))
     return draw_calls
 
@@ -750,6 +777,22 @@ def _set_object_props(obj: bpy.types.Object, props: dict[str, str]):
     for key, value in props.items():
         if value:
             obj[key] = value
+
+
+def _collect_modimp_props(obj) -> dict:
+    props = {}
+    for key in getattr(obj, "keys", lambda: [])():
+        key = str(key)
+        if not key.startswith("modimp_"):
+            continue
+        try:
+            value = obj.get(key)
+        except Exception:
+            continue
+        if value in (None, "", [], {}, ()):
+            continue
+        props[key] = value
+    return props
 
 
 def _localize_object_runtime_paths(obj: bpy.types.Object, object_workspace_dir: str):
@@ -912,7 +955,10 @@ class NTEMIImportHelper:
             object_workspace_dir_from_type_dir(draw_call_meta.folder_path),
         )
         _set_object_props(imported_obj, localized_path_props)
-        update_prefix_record_for_object(imported_obj, extra_owners=getattr(imported_obj, "users_collection", []) or ())
+        replace_prefix_record_props(
+            getattr(imported_obj, "name", ""),
+            _collect_modimp_props(imported_obj),
+        )
 
         return imported_obj
 
@@ -1000,6 +1046,9 @@ def _perform_bone_merge_postprocess(
                     str(obj.get("modimp_workspace_unique_str", "") or ""),
                 )
                 _localize_object_runtime_paths(obj, object_workspace_dir)
-            update_prefix_record_for_object(obj, extra_owners=getattr(obj, "users_collection", []) or [])
+            replace_prefix_record_props(
+                getattr(obj, "name", ""),
+                _collect_modimp_props(obj),
+            )
 
     print(f"[NTEMI BoneMerge] completed successfully")

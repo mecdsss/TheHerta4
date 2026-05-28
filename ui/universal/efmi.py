@@ -445,6 +445,10 @@ class ExportEFMI:
             ini_builder=ini_builder,
             drawib_drawibmodel_dict=drawib_drawibmodel_dict,
         )
+        M_IniHelper.generate_shared_slot_style_texture_ini(
+            ini_builder=ini_builder,
+            drawib_drawibmodel_dict=drawib_drawibmodel_dict,
+        )
 
         self._integrate_object_swap_ini_hook(ini_builder)
 
@@ -491,7 +495,7 @@ class ExportEFMI:
                 texture_markup_info_list = drawib_model.get_submesh_texture_markup_info_list(submesh_model)
                 if GlobalProterties.use_rabbitfx_slot():
                     for texture_markup_info in texture_markup_info_list:
-                        if getattr(texture_markup_info, "mark_type", "") != "Slot":
+                        if not M_IniHelper.is_slot_binding_mark_type(getattr(texture_markup_info, "mark_type", "")):
                             continue
                         if texture_markup_info.mark_name == "DiffuseMap":
                             texture_override_ib_section.append("Resource\\RabbitFx\\Diffuse = ref " + texture_markup_info.get_resource_name())
@@ -503,7 +507,7 @@ class ExportEFMI:
                     texture_override_ib_section.append("run = CommandList\\RabbitFx\\SetTextures")
                     
                     for texture_markup_info in texture_markup_info_list:
-                        if getattr(texture_markup_info, "mark_type", "") != "Slot":
+                        if not M_IniHelper.is_slot_binding_mark_type(getattr(texture_markup_info, "mark_type", "")):
                             continue
                         if texture_markup_info.mark_name in ["DiffuseMap", "LightMap", "NormalMap"]:
                             pass
@@ -518,7 +522,7 @@ class ExportEFMI:
                             texture_override_ib_section.append(slot + " = " + texture_markup_info.get_resource_name())
                 else:
                     for texture_markup_info in texture_markup_info_list:
-                        if getattr(texture_markup_info, "mark_type", "") != "Slot":
+                        if not M_IniHelper.is_slot_binding_mark_type(getattr(texture_markup_info, "mark_type", "")):
                             continue
                         texture_override_ib_section.append(texture_markup_info.mark_slot + " = " + texture_markup_info.get_resource_name())
 

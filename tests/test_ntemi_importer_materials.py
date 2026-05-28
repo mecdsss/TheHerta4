@@ -144,7 +144,7 @@ _install_module(
 )
 _install_module(
     f"{PKG}.ui.ntmi_modimp.prefix_property_cache",
-    update_prefix_record_for_object=lambda *_args, **_kwargs: None,
+    replace_prefix_record_props=lambda *_args, **_kwargs: None,
 )
 _install_module(
     f"{PKG}.ui.ntmi_modimp.texture_slot_refresh",
@@ -207,6 +207,27 @@ class NTEMIImporterMaterialTests(unittest.TestCase):
             tex_node = next(node for node in material.node_tree.nodes if node.bl_idname == "ShaderNodeTexImage")
             self.assertEqual(tex_node.image.colorspace_settings.name, "sRGB")
             self.assertEqual(tex_node.image.alpha_mode, "CHANNEL_PACKED")
+
+    def test_collect_modimp_props_only_returns_non_empty_modimp_custom_props(self):
+        obj = types.SimpleNamespace(
+            keys=lambda: ["modimp_profile_id", "modimp_vb0_buf_path", "not_modimp", "modimp_empty"],
+            get=lambda key: {
+                "modimp_profile_id": "yihuan",
+                "modimp_vb0_buf_path": "X:/Workspace/LOD0/abc-1-0/Position.buf",
+                "not_modimp": "ignore",
+                "modimp_empty": "",
+            }.get(key),
+        )
+
+        props = ntemi_importer._collect_modimp_props(obj)
+
+        self.assertEqual(
+            props,
+            {
+                "modimp_profile_id": "yihuan",
+                "modimp_vb0_buf_path": "X:/Workspace/LOD0/abc-1-0/Position.buf",
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -4,25 +4,26 @@ import os
 from collections import OrderedDict, defaultdict
 
 import bpy
-from mathutils import Vector
 
 from .tt_texture_atlas_vendor import RectPack2D
 
 try:
-    from PIL import Image, ImageChops, ImageFile, UnidentifiedImageError
+    from PIL import Image, ImageFile, UnidentifiedImageError
 
     Image.MAX_IMAGE_PIXELS = None
     ImageFile.LOAD_TRUNCATED_IMAGES = True
     try:
-        RESAMPLING = Image.Resampling.LANCZOS
+        RESAMPLING_LANCZOS = Image.Resampling.LANCZOS
+        RESAMPLING_NEAREST = Image.Resampling.NEAREST
     except AttributeError:
-        RESAMPLING = Image.LANCZOS
+        RESAMPLING_LANCZOS = Image.LANCZOS
+        RESAMPLING_NEAREST = Image.NEAREST
 except ImportError:
     Image = None
-    ImageChops = None
     ImageFile = None
     UnidentifiedImageError = OSError
-    RESAMPLING = None
+    RESAMPLING_LANCZOS = None
+    RESAMPLING_NEAREST = None
 
 
 ATLAS_TEXTURE_PREFIX = "texture_atlas_"
@@ -31,9 +32,10 @@ EXTRA_TEXTURE_INPUTS = {
     "metallic": "Metallic",
     "roughness": "Roughness",
     "normal_map": "Normal",
+    "specular": "Specular IOR Level",
     "emission": "Emission Color",
 }
-NON_COLOR_TEXTURES = {"metallic", "roughness", "normal_map"}
+NON_COLOR_TEXTURES = {"metallic", "roughness", "normal_map", "specular"}
 
 
 class AtlasError(RuntimeError):
@@ -42,6 +44,12 @@ class AtlasError(RuntimeError):
 
 def is_pillow_available():
     return Image is not None
+
+
+def get_resampling_filter(props):
+    if getattr(props, "atlas_pixel_art_scale", False):
+        return RESAMPLING_NEAREST
+    return RESAMPLING_LANCZOS
 
 
 def align_uv(face_uv):
@@ -77,23 +85,47 @@ def get_image_source(image):
 
 def open_pillow_image(image):
     source, _ = get_image_source(image)
-    if isinstance(source, bytes):
-        loader = io.BytesIO(source)
-    else:
-        loader = source
+    loader = io.BytesIO(source) if isinstance(source, bytes) else source
     try:
         return Image.open(loader).convert("RGBA")
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise AtlasError(f"Pillow 无法读取贴图 '{image.name}'：{exc}") from exc
 
 
+def crop_image_transparent_border(image):
+    if image is None:
+        return None, None
+    alpha = image.getchannel("A")
+    bbox = alpha.getbbox()
+    if not bbox:
+        return image.copy(), None
+    return image.crop(bbox), bbox
+
+
 def find_output_node(node_tree):
     if not node_tree:
         return None
-    for node in node_tree.nodes:
-        if node.bl_idname == "ShaderNodeOutputMaterial":
+    nodes = list(getattr(node_tree, "nodes", []) or [])
+    connected_outputs = []
+    active_outputs = []
+    fallback_outputs = []
+    for node in nodes:
+        if node.bl_idname != "ShaderNodeOutputMaterial":
+            continue
+        fallback_outputs.append(node)
+        if getattr(node, "is_active_output", False):
+            active_outputs.append(node)
+        if any(link.is_valid for socket in getattr(node, "inputs", []) for link in socket.links):
+            connected_outputs.append(node)
+
+    for node in active_outputs:
+        if node in connected_outputs:
             return node
-    return None
+    if connected_outputs:
+        return connected_outputs[0]
+    if active_outputs:
+        return active_outputs[0]
+    return fallback_outputs[0] if fallback_outputs else None
 
 
 def trace_connected_nodes(node, visited=None):
@@ -114,8 +146,7 @@ def find_principled_node(material):
     output = find_output_node(material.node_tree)
     if not output:
         return None
-    connected = trace_connected_nodes(output)
-    for node in connected:
+    for node in trace_connected_nodes(output):
         if node.bl_idname == "ShaderNodeBsdfPrincipled":
             return node
     return None
@@ -158,8 +189,7 @@ def get_material_albedo_image(material):
 
     output = find_output_node(material.node_tree)
     if output:
-        connected = trace_connected_nodes(output)
-        for node in connected:
+        for node in trace_connected_nodes(output):
             if node.bl_idname == "ShaderNodeTexImage" and getattr(node, "image", None):
                 return node.image
     return None
@@ -281,8 +311,8 @@ def get_scale_factors(atlas_size, raw_size):
 def tile_image(image, uv_size, output_size):
     tiled = Image.new("RGBA", output_size)
     tile_width, tile_height = image.size
-    count_x = math.ceil(uv_size[0])
-    count_y = math.ceil(uv_size[1])
+    count_x = max(1, math.ceil(uv_size[0]))
+    count_y = max(1, math.ceil(uv_size[1]))
     output_height = output_size[1]
     for row in range(count_y):
         y = output_height - tile_height - row * tile_height
@@ -291,9 +321,26 @@ def tile_image(image, uv_size, output_size):
     return tiled
 
 
+def _normalize_source_image(image, props):
+    crop_box = None
+    if image and getattr(props, "atlas_crop_transparent", False):
+        image, crop_box = crop_image_transparent_border(image)
+    return image, crop_box
+
+
+def _calculate_item_size(base_image_size, uv_size, padding):
+    return (
+        int(base_image_size[0] * max(1, math.ceil(uv_size[0])) + padding),
+        int(base_image_size[1] * max(1, math.ceil(uv_size[1])) + padding),
+    )
+
+
 def build_material_records(context, props):
     structure = OrderedDict()
     warnings = []
+    uniform_width = 1
+    uniform_height = 1
+
     for item in props.atlas_materials:
         material = item.material
         if not material or not item.enabled or item.skip_reason:
@@ -313,7 +360,6 @@ def build_material_records(context, props):
 
         if not uv_loops:
             warnings.append(f"{material.name}: skipped because no UVs were found on current source objects")
-            warnings[-1] = f"{material.name}: 已跳过，当前来源物体上没有找到可用 UV"
             continue
 
         albedo_image = get_material_albedo_image(material)
@@ -323,38 +369,72 @@ def build_material_records(context, props):
             warnings.append(f"{material.name}: {exc}")
             continue
 
+        albedo_pil, crop_box = _normalize_source_image(albedo_pil, props)
         uv_size = get_max_uv_coordinates(uv_loops)
-        if albedo_pil:
-            base_image_size = albedo_pil.size
-        else:
-            base_image_size = (props.atlas_color_size, props.atlas_color_size)
-        size = (
-            int(base_image_size[0] * math.ceil(uv_size[0]) + props.atlas_padding),
-            int(base_image_size[1] * math.ceil(uv_size[1]) + props.atlas_padding),
-        )
+        base_image_size = albedo_pil.size if albedo_pil else (props.atlas_color_size, props.atlas_color_size)
+
+        uniform_width = max(uniform_width, int(base_image_size[0]))
+        uniform_height = max(uniform_height, int(base_image_size[1]))
 
         extra_images = {}
         if props.atlas_include_extra_textures:
             for texture_type, image in get_material_extra_images(material).items():
                 try:
-                    extra_images[texture_type] = open_pillow_image(image)
+                    extra_image = open_pillow_image(image)
+                    if crop_box:
+                        extra_image = extra_image.crop(crop_box)
+                    extra_images[texture_type] = extra_image
                 except AtlasError as exc:
-                    warnings.append(f"{material.name}: 已跳过 {texture_type} 贴图（{exc}）")
+                    warnings.append(f"{material.name}: skipped {texture_type} texture ({exc})")
 
         structure[material] = {
             "material": material,
             "objects": source_objects,
             "uv_loops": uv_loops,
             "gfx": {
-                "size": size,
+                "size": _calculate_item_size(base_image_size, uv_size, props.atlas_padding),
                 "uv_size": uv_size,
                 "fit": None,
                 "albedo": albedo_pil,
                 "color": get_material_color(material),
                 "extras": extra_images,
+                "base_image_size": base_image_size,
             },
         }
+
+    if getattr(props, "atlas_force_uniform_size", False):
+        for item in structure.values():
+            item["gfx"]["base_image_size"] = (uniform_width, uniform_height)
+            item["gfx"]["size"] = _calculate_item_size(
+                (uniform_width, uniform_height),
+                item["gfx"]["uv_size"],
+                props.atlas_padding,
+            )
+
     return structure, warnings
+
+
+def _apply_grid_pack(structure):
+    if not structure:
+        return
+    max_width = max(item["gfx"]["size"][0] for item in structure.values())
+    max_height = max(item["gfx"]["size"][1] for item in structure.values())
+    columns = max(1, int(math.ceil(math.sqrt(len(structure)))))
+    for index, item in enumerate(structure.values()):
+        column = index % columns
+        row = index // columns
+        item["gfx"]["fit"] = {
+            "x": column * max_width,
+            "y": row * max_height,
+        }
+
+
+def pack_structure(structure, props):
+    packer_type = getattr(props, "atlas_packer_type", "RECTPACK")
+    if packer_type == "GRID":
+        _apply_grid_pack(structure)
+    else:
+        RectPack2D().pack(structure)
 
 
 def get_raw_atlas_size(structure):
@@ -369,6 +449,7 @@ def get_raw_atlas_size(structure):
 
 def generate_atlas_images(structure, atlas_size, props):
     half_padding = int(props.atlas_padding / 2)
+    resize_filter = get_resampling_filter(props)
     atlases = {"albedo": Image.new("RGBA", atlas_size, (0, 0, 0, 0))}
     if props.atlas_include_extra_textures:
         for texture_type in EXTRA_TEXTURE_INPUTS:
@@ -386,7 +467,7 @@ def generate_atlas_images(structure, atlas_size, props):
         if gfx["albedo"]:
             albedo = gfx["albedo"].copy()
             if albedo.size != inner_size:
-                albedo = albedo.resize(inner_size, RESAMPLING)
+                albedo = albedo.resize(inner_size, resize_filter)
             if max(gfx["uv_size"]) > 1:
                 albedo = tile_image(albedo, gfx["uv_size"], inner_size)
         else:
@@ -402,18 +483,19 @@ def generate_atlas_images(structure, atlas_size, props):
                 continue
             current = texture_image.copy()
             if current.size != inner_size:
-                current = current.resize(inner_size, RESAMPLING)
+                current = current.resize(inner_size, resize_filter)
             if max(gfx["uv_size"]) > 1:
                 current = tile_image(current, gfx["uv_size"], inner_size)
             atlases[texture_type].paste(current, position)
+
     return atlases
 
 
 def align_uvs(structure, atlas_size, raw_size, props):
     raw_width, raw_height = raw_size
     scaled_width, scaled_height = get_scale_factors(atlas_size, raw_size)
-    margin = props.atlas_padding + 2
-    border_margin = int(props.atlas_padding / 2) + 1
+    margin = props.atlas_padding + (0 if getattr(props, "atlas_pixel_art_scale", False) else 2)
+    border_margin = int(props.atlas_padding / 2) + (0 if getattr(props, "atlas_pixel_art_scale", False) else 1)
 
     for item in structure.values():
         gfx = item["gfx"]
@@ -425,8 +507,8 @@ def align_uvs(structure, atlas_size, raw_size, props):
         y_offset = gfx["fit"]["y"] - border_margin
 
         for uv in item["uv_loops"]:
-            reset_x = uv.x / uv_width * width_margin
-            reset_y = uv.y / uv_height * height_margin - gfx_height
+            reset_x = uv.x / max(uv_width, 1e-6) * width_margin
+            reset_y = uv.y / max(uv_height, 1e-6) * height_margin - gfx_height
             uv.x = ((reset_x + x_offset) / raw_width) * scaled_width
             uv.y = ((reset_y - y_offset) / raw_height) * scaled_height + 1
 
@@ -440,7 +522,7 @@ def save_atlases(output_dir, atlas_name, atlases):
         "TIFF": "tif",
         "BMP": "bmp",
     }
-    image_format = getattr(atlases.get("_meta", {}), "get", lambda _k, _d=None: None)("image_format", "PNG")
+    image_format = atlases.get("_meta", {}).get("image_format", "PNG")
     extension = extension_map.get(image_format, "png")
     for texture_type, atlas in atlases.items():
         if texture_type == "_meta":
@@ -480,24 +562,47 @@ def create_atlas_material(saved_paths, atlas_name):
     node_tree = material.node_tree
     node_tree.nodes.clear()
 
-    transparent_node = node_tree.nodes.new(type="ShaderNodeBsdfTransparent")
-    transparent_node.location = (-250, 120)
-
-    diffuse_node = node_tree.nodes.new(type="ShaderNodeBsdfDiffuse")
-    diffuse_node.location = (-250, -80)
-
-    mix_shader = node_tree.nodes.new(type="ShaderNodeMixShader")
-    mix_shader.location = (0, 0)
-
     output_node = node_tree.nodes.new(type="ShaderNodeOutputMaterial")
-    output_node.location = (240, 0)
+    output_node.location = (500, 0)
+    principled_node = node_tree.nodes.new(type="ShaderNodeBsdfPrincipled")
+    principled_node.location = (180, 0)
+    node_tree.links.new(principled_node.outputs["BSDF"], output_node.inputs["Surface"])
 
-    albedo_node = create_texture_node(node_tree, saved_paths["albedo"], "Atlas Albedo", (-600, 300))
-    node_tree.links.new(albedo_node.outputs["Color"], diffuse_node.inputs["Color"])
-    node_tree.links.new(albedo_node.outputs["Alpha"], mix_shader.inputs["Fac"])
-    node_tree.links.new(transparent_node.outputs["BSDF"], mix_shader.inputs[1])
-    node_tree.links.new(diffuse_node.outputs["BSDF"], mix_shader.inputs[2])
-    node_tree.links.new(mix_shader.outputs["Shader"], output_node.inputs["Surface"])
+    albedo_node = create_texture_node(node_tree, saved_paths["albedo"], "Atlas Albedo", (-600, 200))
+    node_tree.links.new(albedo_node.outputs["Color"], principled_node.inputs["Base Color"])
+    if "Alpha" in principled_node.inputs:
+        node_tree.links.new(albedo_node.outputs["Alpha"], principled_node.inputs["Alpha"])
+
+    if "normal_map" in saved_paths and "Normal" in principled_node.inputs:
+        normal_tex = create_texture_node(node_tree, saved_paths["normal_map"], "Atlas Normal", (-600, -80), non_color=True)
+        normal_map = node_tree.nodes.new(type="ShaderNodeNormalMap")
+        normal_map.location = (-250, -80)
+        node_tree.links.new(normal_tex.outputs["Color"], normal_map.inputs["Color"])
+        node_tree.links.new(normal_map.outputs["Normal"], principled_node.inputs["Normal"])
+
+    scalar_inputs = {
+        "metallic": "Metallic",
+        "roughness": "Roughness",
+        "specular": "Specular IOR Level",
+        "emission": "Emission Color",
+    }
+    y_positions = {
+        "metallic": -220,
+        "roughness": -360,
+        "specular": -500,
+        "emission": -640,
+    }
+    for texture_type, input_name in scalar_inputs.items():
+        if texture_type not in saved_paths or input_name not in principled_node.inputs:
+            continue
+        texture_node = create_texture_node(
+            node_tree,
+            saved_paths[texture_type],
+            f"Atlas {texture_type.title()}",
+            (-600, y_positions[texture_type]),
+            non_color=texture_type in NON_COLOR_TEXTURES,
+        )
+        node_tree.links.new(texture_node.outputs["Color"], principled_node.inputs[input_name])
 
     return material
 
@@ -527,7 +632,7 @@ def generate_texture_atlas(context, props):
     if len(structure) < 2:
         raise AtlasError("至少需要两个可读取的材质才能生成图集")
 
-    RectPack2D().pack(structure)
+    pack_structure(structure, props)
     raw_size = get_raw_atlas_size(structure)
     atlas_size = calculate_adjusted_size(
         props.atlas_size_mode,
@@ -541,8 +646,9 @@ def generate_texture_atlas(context, props):
     atlases["_meta"] = {"image_format": props.atlas_image_format}
     align_uvs(structure, atlas_size, raw_size, props)
     output_dir = bpy.path.abspath(props.output_dir)
-    saved_paths = save_atlases(output_dir, props.atlas_output_name.strip() or "TextureAtlas", atlases)
-    atlas_material = create_atlas_material(saved_paths, props.atlas_output_name.strip() or "TextureAtlas")
+    atlas_name = props.atlas_output_name.strip() or "TextureAtlas"
+    saved_paths = save_atlases(output_dir, atlas_name, atlases)
+    atlas_material = create_atlas_material(saved_paths, atlas_name)
     assign_atlas_material(structure, atlas_material)
 
     return {

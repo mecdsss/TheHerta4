@@ -531,10 +531,8 @@ class SSMTNode_MultiFile_Export(SSMTNodeBase):
         if (from_index < 0 or from_index >= len(self.object_list) or
             to_index < 0 or to_index >= len(self.object_list)):
             return
-        
-        item = self.object_list[from_index]
-        self.object_list.remove(from_index)
-        self.object_list.move(len(self.object_list), to_index)
+
+        self.object_list.move(from_index, to_index)
     
     def parse_collection(self, collection_name):
         if not collection_name:

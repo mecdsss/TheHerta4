@@ -1072,6 +1072,7 @@ class SSMT_MT_NodeMenu_VertexGroup(bpy.types.Menu):
         _add_node_entry(layout, "顶点组匹配", 'GROUP', "SSMTNode_VertexGroupMatch")
         _add_node_entry(layout, "顶点组处理", 'MESH_DATA', "SSMTNode_VertexGroupProcess")
         _add_node_entry(layout, "映射表输入", 'TEXT', "SSMTNode_VertexGroupMappingInput")
+        _add_node_entry(layout, "VG Test Split", 'MOD_EXPLODE', "SSMTNode_VertexGroupTestSplit")
 
 
 class SSMT_MT_NodeMenu_Blueprint(bpy.types.Menu):
@@ -1083,7 +1084,6 @@ class SSMT_MT_NodeMenu_Blueprint(bpy.types.Menu):
         _add_node_entry(layout, "Mod面板", 'MENU_PANEL', "SSMTNode_ModPanel")
         _add_node_entry(layout, "跨IB节点", 'ARROW_LEFTRIGHT', "SSMTNode_CrossIB")
         _add_node_entry(layout, "多文件导出", 'FILE', "SSMTNode_MultiFile_Export")
-        _add_node_entry(layout, "Bone Palette 导出", 'ARMATURE_DATA', "SSMTNode_BonePalette_Export")
 
 
 class SSMT_MT_NodeMenu_PostProcess(bpy.types.Menu):

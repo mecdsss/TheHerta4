@@ -45,6 +45,14 @@ class M_IniHelper:
         return count
 
     @classmethod
+    def is_slot_binding_mark_type(cls, mark_type: str) -> bool:
+        return mark_type in {"Slot", "SharedSlot"}
+
+    @classmethod
+    def is_shared_slot_mark_type(cls, mark_type: str) -> bool:
+        return mark_type == "SharedSlot"
+
+    @classmethod
     def _get_extract_gametype_folder_path(cls, draw_ib_model: DrawIBModel) -> str:
         primary_submesh_metadata = getattr(draw_ib_model, "primary_submesh_metadata", None)
         if primary_submesh_metadata is not None:
@@ -397,6 +405,96 @@ class M_IniHelper:
 
         # if len(repeat_hash_list) != 0:
         #     texture_ini_builder.save_to_file(MainConfig.path_generate_mod_folder() + MainConfig.workspacename + "_Texture.ini")
+
+    @classmethod
+    def generate_shared_slot_style_texture_ini(cls, ini_builder:M_IniBuilder, drawib_drawibmodel_dict:dict[str,DrawIBModel]):
+        """
+        SharedSlot:
+        - 文件去重和命名按 Hash 风格
+        - INI 绑定按 Slot 风格，仅生成 Resource 段
+        """
+        if GlobalProterties.forbid_auto_texture_ini():
+            return
+
+        appended_resource_names:set[str] = set()
+        hash_filename_cache:dict[str, str] = {}
+
+        for draw_ib, draw_ib_model in drawib_drawibmodel_dict.items():
+            shared_slot_resource_section = M_IniSection(M_SectionType.ResourceTexture)
+            has_shared_slot = False
+
+            for submesh_model in getattr(draw_ib_model, "submesh_model_list", []):
+                texture_markup_info_list = draw_ib_model.get_submesh_texture_markup_info_list(submesh_model)
+                if not texture_markup_info_list:
+                    continue
+
+                part_name = draw_ib_model.get_submesh_part_name(submesh_model)
+                submesh_folder_name = getattr(submesh_model, "workspace_unique_str", "") or getattr(submesh_model, "unique_str", "")
+                if not submesh_folder_name:
+                    continue
+
+                hash_deduped_texture_info_dict = WorkSpaceHelper.get_hash_deduped_texture_info_dict(
+                    submesh_folder_name=submesh_folder_name
+                )
+
+                for texture_markup_info in texture_markup_info_list:
+                    if getattr(texture_markup_info, "mark_type", "") != "SharedSlot":
+                        continue
+
+                    hash_style_texture_filename = hash_filename_cache.get(texture_markup_info.mark_hash)
+                    if hash_style_texture_filename is None:
+                        original_texture_file_path = cls._get_slot_texture_source_path(
+                            draw_ib_model=draw_ib_model,
+                            part_name=part_name,
+                            texture_markup_info=texture_markup_info,
+                        )
+                        if not original_texture_file_path or not os.path.exists(original_texture_file_path):
+                            continue
+
+                        hash_style_texture_filename = draw_ib + "_" + draw_ib_model.draw_ib_alias + "_"
+
+                        deduped_texture_info = hash_deduped_texture_info_dict.get(texture_markup_info.mark_hash, None)
+                        if deduped_texture_info is None:
+                            deduped_texture_info = cls._get_hash_deduped_texture_info(
+                                draw_ib_model=draw_ib_model,
+                                mark_hash=texture_markup_info.mark_hash,
+                            )
+
+                        if deduped_texture_info is None:
+                            hash_style_texture_filename = texture_markup_info.mark_filename
+                        else:
+                            component_count_list_str = deduped_texture_info.componet_count_list_str
+                            hash_style_texture_filename = hash_style_texture_filename + "_" + component_count_list_str + "_"
+                            hash_style_texture_filename = (
+                                hash_style_texture_filename
+                                + deduped_texture_info.original_hash
+                                + "_"
+                                + deduped_texture_info.render_hash
+                                + "_"
+                                + deduped_texture_info.format
+                                + "_"
+                                + texture_markup_info.mark_name
+                            )
+                            hash_style_texture_filename = hash_style_texture_filename + "." + texture_markup_info.mark_filename.split(".")[1]
+
+                        target_texture_file_path = GlobalConfig.path_generatemod_texture_folder(draw_ib=draw_ib) + hash_style_texture_filename
+                        if not os.path.exists(target_texture_file_path):
+                            shutil.copy2(original_texture_file_path, target_texture_file_path)
+
+                        hash_filename_cache[texture_markup_info.mark_hash] = hash_style_texture_filename
+
+                    has_shared_slot = True
+                    resource_name = texture_markup_info.get_resource_name()
+                    if resource_name in appended_resource_names:
+                        continue
+
+                    appended_resource_names.add(resource_name)
+                    shared_slot_resource_section.append("[" + resource_name + "]")
+                    shared_slot_resource_section.append("filename = Textures/" + hash_style_texture_filename)
+                    shared_slot_resource_section.new_line()
+
+            if has_shared_slot:
+                ini_builder.append_section(shared_slot_resource_section)
 
     @classmethod
     def move_slot_style_textures(cls,draw_ib_model:DrawIBModel):

@@ -229,12 +229,28 @@ class SSMTNode_CrossIB(SSMTNodeBase):
         get=lambda self: self._get_current_logic_name()
     )
 
+    unsupported_reason: StringProperty(
+        name="unsupported_reason",
+        description="Cross IB 节点在当前游戏类型下不可用的原因",
+        default="",
+        options={'HIDDEN'}
+    )
+
     def init(self, context):
         self.inputs.new('SSMTSocketObject', "Input 1")
         self.outputs.new('SSMTSocketObject', "Output")
         self.width = 350
 
-        self._update_cross_ib_method()
+        try:
+            self._update_cross_ib_method()
+            if CrossIBMethodEnum.get_available_methods(self._get_current_logic_name()):
+                self.unsupported_reason = ""
+        except Exception:
+            logic_name = self._get_current_logic_name()
+            self.unsupported_reason = (
+                f"Cross IB 仅支持 EFMI（终末地）和 ZZMI（绝区零），"
+                f"当前模式“{logic_name}”下不会参与导出。"
+            )
 
     def _get_current_logic_name(self):
         from ..common.global_config import GlobalConfig
@@ -246,7 +262,15 @@ class SSMTNode_CrossIB(SSMTNodeBase):
 
         available_methods = CrossIBMethodEnum.get_available_methods(logic_name)
 
+        if not available_methods:
+            self.unsupported_reason = (
+                f"Cross IB 仅支持 EFMI（终末地）和 ZZMI（绝区零），"
+                f"当前模式“{logic_name or '未知'}”下不会参与导出。"
+            )
+            return
+
         if available_methods:
+            self.unsupported_reason = ""
             if self.cross_ib_method not in available_methods:
                 self.cross_ib_method = available_methods[0]
         else:

@@ -160,7 +160,7 @@ class ExportIdentityV(DrawIBExportBase):
                 texture_markup_info_list = drawib_model.get_submesh_texture_markup_info_list(submesh_model)
                 if texture_markup_info_list:
                     for texture_markup_info in texture_markup_info_list:
-                        if texture_markup_info.mark_type == "Slot":
+                        if M_IniHelper.is_slot_binding_mark_type(texture_markup_info.mark_type):
                             texture_override_ib_section.append(texture_markup_info.mark_slot + " = " + texture_markup_info.get_resource_name())
 
             if not d3d11_game_type.GPU_PreSkinning:
@@ -174,6 +174,11 @@ class ExportIdentityV(DrawIBExportBase):
                 obj_name_draw_offset_dict=drawib_model.obj_name_draw_offset,
             ):
                 texture_override_ib_section.append(drawindexed_str)
+
+            if not d3d11_game_type.GPU_PreSkinning and len(self.blueprint_model.keyname_mkey_dict.values()) != 0:
+                texture_override_ib_section.append("$active" + str(GlobalKeyCountHelper.generated_mod_number) + " = 1")
+                if GlobalProterties.generate_branch_mod_gui():
+                    texture_override_ib_section.append("$ActiveCharacter = 1")
 
             texture_override_ib_section.append("ib = " + backup_resource_name)
             texture_override_ib_section.new_line()
@@ -229,6 +234,7 @@ class ExportIdentityV(DrawIBExportBase):
         ini_builder = M_IniBuilder()
         drawib_drawibmodel_dict = {drawib_model.draw_ib: drawib_model for drawib_model in self.drawib_model_list}
         M_IniHelper.generate_hash_style_texture_ini(ini_builder=ini_builder, drawib_drawibmodel_dict=drawib_drawibmodel_dict)
+        M_IniHelper.generate_shared_slot_style_texture_ini(ini_builder=ini_builder, drawib_drawibmodel_dict=drawib_drawibmodel_dict)
 
         self._integrate_object_swap_ini_hook(ini_builder)
 

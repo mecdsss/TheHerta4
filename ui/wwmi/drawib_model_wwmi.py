@@ -47,6 +47,7 @@ class BlendRemapEntry(TypedDict):
 @dataclass
 class ComponentModel:
     component_name: str
+    component_index: int
     final_ordered_draw_obj_model_list: list[DrawCallModel] = field(default_factory=list)
 
 
@@ -81,6 +82,33 @@ class DrawIBModelWWMI:
     blend_remap_reverse_buffer: numpy.ndarray | None = field(init=False, default=None, repr=False)
     blend_remap_vertex_vg_buffer: numpy.ndarray | None = field(init=False, default=None, repr=False)
 
+    @staticmethod
+    def _get_workspace_submesh_order(draw_ib: str) -> dict[str, int]:
+        ordered_unique_str_list: list[str] = []
+        candidate_base_paths = [
+            GlobalConfig.path_workspace_folder(),
+            *WorkSpaceHelper.get_workspace_partition_folderpath_list(),
+        ]
+        for base_path in candidate_base_paths:
+            if not os.path.isdir(base_path):
+                continue
+            for submesh_folder_path in WorkSpaceHelper._get_submesh_folderpath_list_from(base_path):
+                submesh_folder_name = os.path.basename(submesh_folder_path)
+                _lod_name, bare_unique_str = WorkSpaceHelper.parse_lod_unique_str(submesh_folder_name)
+                if not bare_unique_str.startswith(draw_ib + "-"):
+                    continue
+                if submesh_folder_name not in ordered_unique_str_list:
+                    ordered_unique_str_list.append(submesh_folder_name)
+            for lod_name, submesh_folderpath_list in WorkSpaceHelper.get_lod_submesh_folderpath_dict(base_path).items():
+                for submesh_folder_path in submesh_folderpath_list:
+                    bare_unique_str = os.path.basename(submesh_folder_path)
+                    if not bare_unique_str.startswith(draw_ib + "-"):
+                        continue
+                    unique_str = WorkSpaceHelper._compose_lod_name(lod_name, bare_unique_str)
+                    if unique_str not in ordered_unique_str_list:
+                        ordered_unique_str_list.append(unique_str)
+        return {unique_str: index for index, unique_str in enumerate(ordered_unique_str_list)}
+
     def __post_init__(self):
         drawib_aliasname_dict: dict[str, str] = WorkSpaceHelper.get_drawib_aliasname_dict()
         self.draw_ib_alias = drawib_aliasname_dict.get(self.draw_ib, self.draw_ib)
@@ -103,9 +131,10 @@ class DrawIBModelWWMI:
         unique_str_metadata_dict: dict[str, SubmeshMetadata] = {
             primary_workspace_unique_str: self.primary_submesh_metadata
         }
+        workspace_submesh_order = self._get_workspace_submesh_order(self.draw_ib)
         ordered_workspace_unique_str_list: list[str] = []
-        component_name_drawcall_model_dict: dict[str, list[DrawCallModel]] = {}
-        component_index_by_unique_str: dict[str, int] = {}
+        drawcall_model_list_by_unique_str: dict[str, list[DrawCallModel]] = {}
+        component_sort_key_by_unique_str: dict[str, tuple[int, int, int]] = {}
 
         for drawcall_model in self.ordered_drawcall_model_list:
             workspace_unique_str = drawcall_model.get_workspace_unique_str()
@@ -116,16 +145,42 @@ class DrawIBModelWWMI:
                 drawcall_metadata = SubmeshMetadataResolver.resolve(workspace_unique_str)
                 unique_str_metadata_dict[workspace_unique_str] = drawcall_metadata
 
-            component_index = component_index_by_unique_str.setdefault(workspace_unique_str, len(component_index_by_unique_str) + 1)
+            try:
+                match_first_index = int(drawcall_model.match_first_index)
+            except (TypeError, ValueError):
+                match_first_index = 0
+            component_sort_key_by_unique_str.setdefault(
+                workspace_unique_str,
+                (
+                    workspace_submesh_order.get(workspace_unique_str, 1 << 30),
+                    match_first_index,
+                    len(component_sort_key_by_unique_str),
+                ),
+            )
+            component_drawcall_model_list = drawcall_model_list_by_unique_str.get(workspace_unique_str, [])
+            component_drawcall_model_list.append(drawcall_model)
+            drawcall_model_list_by_unique_str[workspace_unique_str] = component_drawcall_model_list
+
+        sorted_workspace_unique_str_list = sorted(
+            ordered_workspace_unique_str_list,
+            key=lambda unique_str: component_sort_key_by_unique_str.get(unique_str, (1 << 30, 1 << 30)),
+        )
+        component_index_by_unique_str = {
+            unique_str: index + 1
+            for index, unique_str in enumerate(sorted_workspace_unique_str_list)
+        }
+
+        for workspace_unique_str in sorted_workspace_unique_str_list:
+            component_index = component_index_by_unique_str[workspace_unique_str]
+            drawcall_metadata = unique_str_metadata_dict.get(workspace_unique_str)
+            if drawcall_metadata is None:
+                continue
             part_name = drawcall_metadata.part_name or str(component_index)
             component_name = "Component " + str(component_index if not str(part_name).isdigit() else part_name)
-            component_drawcall_model_list = component_name_drawcall_model_dict.get(component_name, [])
-            component_drawcall_model_list.append(drawcall_model)
-            component_name_drawcall_model_dict[component_name] = component_drawcall_model_list
-
-        for component_name, component_drawcall_model_list in component_name_drawcall_model_dict.items():
+            component_drawcall_model_list = drawcall_model_list_by_unique_str.get(workspace_unique_str, [])
             component_model = ComponentModel(
                 component_name=component_name,
+                component_index=component_index - 1,
                 final_ordered_draw_obj_model_list=component_drawcall_model_list,
             )
             self.component_model_list.append(component_model)
@@ -133,7 +188,7 @@ class DrawIBModelWWMI:
 
         ordered_metadata = [
             unique_str_metadata_dict[workspace_unique_str]
-            for workspace_unique_str in ordered_workspace_unique_str_list
+            for workspace_unique_str in sorted_workspace_unique_str_list
             if workspace_unique_str in unique_str_metadata_dict
         ]
         self.extracted_object = ExtractedObjectHelper.build_from_submesh_metadata_list(ordered_metadata)
@@ -162,7 +217,14 @@ class DrawIBModelWWMI:
         self.submesh_model_list = []
         self.match_first_index_partname_dict = {}
         seen_submesh_keys:set[tuple[str, int]] = set()
-        for drawcall_model in self.ordered_drawcall_model_list:
+        sorted_drawcall_model_list = sorted(
+            self.ordered_drawcall_model_list,
+            key=lambda drawcall_model: (
+                workspace_submesh_order.get(drawcall_model.get_workspace_unique_str(), 1 << 30),
+                int(drawcall_model.match_first_index) if str(drawcall_model.match_first_index).isdigit() else 0,
+            ),
+        )
+        for drawcall_model in sorted_drawcall_model_list:
             workspace_unique_str = drawcall_model.get_workspace_unique_str()
             drawcall_metadata = unique_str_metadata_dict.get(workspace_unique_str)
             if drawcall_metadata is None:
@@ -323,8 +385,7 @@ class DrawIBModelWWMI:
         processed_obj_name_list: list[str] = []
 
         for component_model in self.component_model_list:
-            component_count = str(component_model.component_name)[10:]
-            component_id = int(component_count) - 1
+            component_id = int(component_model.component_index)
 
             for drawcall_model in component_model.final_ordered_draw_obj_model_list:
                 export_obj_name = drawcall_model.obj_name
@@ -363,8 +424,6 @@ class DrawIBModelWWMI:
         index_offset = 0
 
         for component_id, component in enumerate(components):
-            component.objects.sort(key=lambda temp_object: temp_object.name)
-
             for temp_object in component.objects:
                 temp_obj = temp_object.object
 

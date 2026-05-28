@@ -575,6 +575,148 @@ class BlueprintExportHelper:
         return object_names
 
     @staticmethod
+    def _find_object_by_pointer(object_id: str):
+        pointer_value = str(object_id or "").strip()
+        if not pointer_value:
+            return None
+
+        for obj in bpy.data.objects:
+            if obj is None:
+                continue
+            try:
+                if str(obj.as_pointer()) == pointer_value:
+                    return obj
+            except (AttributeError, ReferenceError):
+                continue
+
+        return None
+
+    @staticmethod
+    def _resolve_preprocess_object_name(candidate_name: str, object_id: str = "", original_object_name: str = "") -> str:
+        for candidate_id in (object_id,):
+            obj = BlueprintExportHelper._find_object_by_pointer(candidate_id)
+            if obj is not None:
+                return obj.name
+
+        for raw_name in (candidate_name, original_object_name):
+            clean_name = str(raw_name or "").strip()
+            if not clean_name:
+                continue
+
+            obj = bpy.data.objects.get(clean_name)
+            if obj is not None:
+                return obj.name
+
+            try:
+                resolved_name = ObjectPrefixHelper.resolve_source_object_name(clean_name)
+            except Exception:
+                resolved_name = ""
+            if resolved_name:
+                obj = bpy.data.objects.get(resolved_name)
+                if obj is not None:
+                    return obj.name
+
+        return str(candidate_name or "").strip()
+
+    @staticmethod
+    def iter_preprocess_lookup_names(
+        candidate_name: str,
+        object_id: str = "",
+        original_object_name: str = "",
+        virtual_object_name: str = "",
+    ) -> list[str]:
+        candidate_names: list[str] = []
+        seen_names: set[str] = set()
+
+        def append_name(raw_name: str):
+            clean_name = str(raw_name or "").strip()
+            if not clean_name or clean_name in seen_names:
+                return
+            seen_names.add(clean_name)
+            candidate_names.append(clean_name)
+
+        append_name(
+            BlueprintExportHelper._resolve_preprocess_object_name(
+                candidate_name,
+                object_id=object_id,
+                original_object_name=original_object_name,
+            )
+        )
+        append_name(virtual_object_name)
+        append_name(candidate_name)
+        append_name(original_object_name)
+
+        for raw_name in (candidate_name, original_object_name, virtual_object_name):
+            clean_name = str(raw_name or "").strip()
+            if not clean_name:
+                continue
+            try:
+                resolved_name = ObjectPrefixHelper.resolve_source_object_name(clean_name)
+            except Exception:
+                resolved_name = ""
+            append_name(resolved_name)
+
+        return candidate_names
+
+    @staticmethod
+    def find_preprocess_copy_name(
+        original_to_copy_map: dict,
+        candidate_name: str,
+        object_id: str = "",
+        original_object_name: str = "",
+        virtual_object_name: str = "",
+    ) -> tuple[str, str]:
+        for lookup_name in BlueprintExportHelper.iter_preprocess_lookup_names(
+            candidate_name,
+            object_id=object_id,
+            original_object_name=original_object_name,
+            virtual_object_name=virtual_object_name,
+        ):
+            copy_name = str(original_to_copy_map.get(lookup_name, "") or "").strip()
+            if copy_name:
+                return lookup_name, copy_name
+
+        return "", ""
+
+    @staticmethod
+    def collect_connected_preprocess_object_names(tree) -> list[str]:
+        if not tree:
+            return []
+
+        object_names = []
+        seen_names = set()
+
+        def append_name(candidate_name: str):
+            clean_name = str(candidate_name or "").strip()
+            if not clean_name or clean_name in seen_names:
+                return
+            seen_names.add(clean_name)
+            object_names.append(clean_name)
+
+        for node in BlueprintExportHelper.collect_connected_start_nodes(tree):
+            if node.bl_idname == 'SSMTNode_Object_Info':
+                append_name(
+                    BlueprintExportHelper._resolve_preprocess_object_name(
+                        getattr(node, 'object_name', ''),
+                        object_id=getattr(node, 'object_id', ''),
+                        original_object_name=getattr(node, 'original_object_name', ''),
+                    )
+                )
+                continue
+
+            if node.bl_idname == 'SSMTNode_MultiFile_Export':
+                for item in getattr(node, 'object_list', []):
+                    append_name(
+                        BlueprintExportHelper._resolve_preprocess_object_name(
+                            getattr(item, 'object_name', ''),
+                            object_id=getattr(item, 'object_id', ''),
+                            original_object_name=getattr(item, 'original_object_name', ''),
+                        )
+                    )
+
+        return object_names
+
+    @staticmethod
     def get_active_mod_panel_nodes(context=None, tree=None):
         current_tree = tree or BlueprintExportHelper.get_current_blueprint_tree(context=context)
         if not current_tree:
@@ -1402,12 +1544,20 @@ class BlueprintExportHelper:
             if not name:
                 return name
             patterns = [
+                r'_vgtest_unassigned_copy$',
+                r'_vgtest_copy$',
                 r'_copy$',
                 r'_chain\d+$',
                 r'_dup\d+$',
+                r'_chain\d+_vgtest_unassigned_copy$',
+                r'_chain\d+_vgtest_copy$',
                 r'_chain\d+_copy$',
+                r'_dup\d+_vgtest_unassigned_copy$',
+                r'_dup\d+_vgtest_copy$',
                 r'_dup\d+_copy$',
                 r'_chain\d+_dup\d+$',
+                r'_chain\d+_dup\d+_vgtest_unassigned_copy$',
+                r'_chain\d+_dup\d+_vgtest_copy$',
                 r'_chain\d+_dup\d+_copy$',
             ]
             result = name
@@ -1773,12 +1923,20 @@ def _patched_generate_shapekey_classification_report(blueprint_model=None):
         if not name:
             return name
         patterns = [
+            r'_vgtest_unassigned_copy$',
+            r'_vgtest_copy$',
             r'_copy$',
             r'_chain\d+$',
             r'_dup\d+$',
+            r'_chain\d+_vgtest_unassigned_copy$',
+            r'_chain\d+_vgtest_copy$',
             r'_chain\d+_copy$',
+            r'_dup\d+_vgtest_unassigned_copy$',
+            r'_dup\d+_vgtest_copy$',
             r'_dup\d+_copy$',
             r'_chain\d+_dup\d+$',
+            r'_chain\d+_dup\d+_vgtest_unassigned_copy$',
+            r'_chain\d+_dup\d+_vgtest_copy$',
             r'_chain\d+_dup\d+_copy$',
         ]
         result = name

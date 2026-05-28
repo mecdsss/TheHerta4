@@ -705,14 +705,17 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         if obj is None:
             return ""
         try:
-            from ..ui.ntmi_modimp.prefix_property_cache import get_prefix_record_props
+            from ..ui.ntmi_modimp.prefix_property_cache import get_prefix_record_props, has_prefix_record
         except Exception:
             return ""
 
         try:
             cached_props = get_prefix_record_props(getattr(obj, "name", ""))
+            has_cached_record = has_prefix_record(getattr(obj, "name", ""))
         except Exception:
             return ""
+        if not has_cached_record:
+            return None
         if not isinstance(cached_props, dict):
             return ""
 
@@ -728,7 +731,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
         result = OrderedDict()
         raw = self._collect_ntmi_cached_texture_slots_raw(obj)
-        if not raw:
+        if raw is None:
             raw = str(obj.get("modimp_texture_slots", "") or "").strip()
         if not raw:
             return result

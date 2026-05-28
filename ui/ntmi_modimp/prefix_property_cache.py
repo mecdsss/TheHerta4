@@ -104,7 +104,7 @@ def update_prefix_record_for_object(obj, extra_owners: Iterable[object] = ()):
         return
 
     merged_props = {}
-    for owner in (obj, *tuple(extra_owners)):
+    for owner in (*tuple(extra_owners), obj):
         for key, value in _collect_object_props(owner).items():
             merged_props[key] = value
 
@@ -118,6 +118,45 @@ def update_prefix_record_for_object(obj, extra_owners: Iterable[object] = ()):
         "bare_prefix": identity[1],
         "object_name": str(getattr(obj, "name", "") or ""),
         "props": merged_props,
+    }
+
+    replaced = False
+    for index, entry in enumerate(entries):
+        candidate_identity = (
+            str(entry.get("lod_name", "") or "").strip().lower(),
+            str(entry.get("bare_prefix", "") or "").strip().lower(),
+        )
+        if prefix_identity_matches(identity, candidate_identity):
+            entries[index] = updated_entry
+            replaced = True
+            break
+    if not replaced:
+        entries.append(updated_entry)
+
+    payload["entries"] = entries
+    _write_payload(payload)
+
+
+def replace_prefix_record_props(obj_name: str, props: dict):
+    identity = _object_prefix_identity(obj_name)
+    if identity is None:
+        return
+
+    normalized_props = {}
+    for key, value in (props or {}).items():
+        if not str(key).startswith("modimp_"):
+            continue
+        if value in (None, "", [], {}, ()):
+            continue
+        normalized_props[str(key)] = value
+
+    payload = _read_payload()
+    entries = [entry for entry in payload.get("entries", []) if isinstance(entry, dict)]
+    updated_entry = {
+        "lod_name": identity[0],
+        "bare_prefix": identity[1],
+        "object_name": str(obj_name or ""),
+        "props": normalized_props,
     }
 
     replaced = False
@@ -166,3 +205,21 @@ def get_prefix_record_props(obj_name: str) -> dict:
     )
     props = matches[0].get("props", {})
     return dict(props) if isinstance(props, dict) else {}
+
+
+def has_prefix_record(obj_name: str) -> bool:
+    identity = _object_prefix_identity(obj_name)
+    if identity is None:
+        return False
+
+    payload = _read_payload()
+    for entry in payload.get("entries", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        candidate_identity = (
+            str(entry.get("lod_name", "") or "").strip().lower(),
+            str(entry.get("bare_prefix", "") or "").strip().lower(),
+        )
+        if prefix_identity_matches(identity, candidate_identity):
+            return True
+    return False

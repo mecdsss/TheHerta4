@@ -52,11 +52,25 @@ class ObjectPrefixHelperTests(unittest.TestCase):
             "LOD0.ae1ab184-29187-0_dup2",
             "LOD0.ae1ab184-29187-0_chain1_dup2_copy",
             "LOD0.ae1ab184-29187-0_chain1_copy_temp",
+            "LOD0.ae1ab184-29187-0_vgtest_copy",
+            "LOD0.ae1ab184-29187-0_chain1_vgtest_copy",
         ):
             with self.subTest(object_name=object_name):
                 prefix_info = ObjectPrefixHelper.extract_prefix_info(object_name)
 
                 self.assertEqual(prefix_info, ("LOD0.ae1ab184-29187-0", "."))
+
+    def test_build_virtual_object_name_does_not_duplicate_prefix_for_runtime_copy(self):
+        node = types.SimpleNamespace(
+            object_name="LOD0.fbb18630-24567-0_copy",
+            object_prefix="LOD0.fbb18630-24567-0",
+            prefix_separator=".",
+        )
+
+        self.assertEqual(
+            ObjectPrefixHelper.build_virtual_object_name_for_node(node),
+            "LOD0.fbb18630-24567-0_copy",
+        )
 
 
 if __name__ == "__main__":

@@ -97,6 +97,23 @@ class PrefixPropertyCacheTests(unittest.TestCase):
         self.assertEqual(props["modimp_vb0_buf_path"], "X:/Workspace/LOD0/abc12345-12-0/Position.buf")
         self.assertEqual(props["modimp_collector_collect_key"], "collect-1")
 
+    def test_replace_prefix_record_props_rebuilds_entry_instead_of_merging_old_fields(self):
+        obj = _FakeObject("LOD0.abc12345-12-0.Body")
+        obj["modimp_vb0_buf_path"] = "X:/Workspace/LOD0/abc12345-12-0/OldPosition.buf"
+        obj["modimp_collector_collect_key"] = "collect-old"
+
+        cache_module.update_prefix_record_for_object(obj)
+        cache_module.replace_prefix_record_props(
+            "LOD0.abc12345-12-0.Body",
+            {
+                "modimp_vb0_buf_path": "X:/Workspace/LOD0/abc12345-12-0/NewPosition.buf",
+            },
+        )
+
+        props = cache_module.get_prefix_record_props("LOD0.abc12345-12-0.Other")
+        self.assertEqual(props["modimp_vb0_buf_path"], "X:/Workspace/LOD0/abc12345-12-0/NewPosition.buf")
+        self.assertNotIn("modimp_collector_collect_key", props)
+
 
 if __name__ == "__main__":
     unittest.main()

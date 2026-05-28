@@ -34,6 +34,14 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         except (OSError, IOError):
             return None
 
+    @staticmethod
+    def _is_resource_section(section_name: str) -> bool:
+        normalized = str(section_name or "").strip()
+        if not (normalized.startswith("[") and normalized.endswith("]")):
+            return False
+        normalized = normalized[1:-1]
+        return normalized.startswith("Resource")
+
     def execute_postprocess(self, mod_export_path):
         print(f"[ResourceMerge] 开始执行，Mod导出路径: {mod_export_path}")
         print(f"[ResourceMerge] 路径是否存在: {os.path.exists(mod_export_path)}")
@@ -74,7 +82,7 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
             elif current_section:
                 sections[current_section].append(line)
 
-        resource_sections = {k: v for k, v in sections.items() if k.startswith('[Resource-')}
+        resource_sections = {k: v for k, v in sections.items() if self._is_resource_section(k)}
         print(f"[ResourceMerge] ini中共有 {len(sections)} 个section，其中 {len(resource_sections)} 个Resource section")
 
         file_hash_to_first_ref = {}

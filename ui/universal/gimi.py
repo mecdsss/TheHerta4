@@ -80,7 +80,7 @@ class ExportGIMI(ExportUnity):
                 slot_replace_exists = False
                 if texture_markup_info_list:
                     for texture_markup_info in texture_markup_info_list:
-                        if texture_markup_info.mark_type == "Slot":
+                        if M_IniHelper.is_slot_binding_mark_type(texture_markup_info.mark_type):
                             slot_replace_exists = True
                             texture_override_ib_section.append(texture_markup_info.mark_slot + " = " + texture_markup_info.get_resource_name())
 
@@ -108,6 +108,8 @@ class ExportGIMI(ExportUnity):
         drawib_drawibmodel_dict = {drawib_model.draw_ib: drawib_model for drawib_model in self.drawib_model_list}
 
         M_IniHelper.generate_hash_style_texture_ini(ini_builder=ini_builder, drawib_drawibmodel_dict=drawib_drawibmodel_dict)
+        M_IniHelper.generate_shared_slot_style_texture_ini(ini_builder=ini_builder, drawib_drawibmodel_dict=drawib_drawibmodel_dict)
+        self._integrate_object_swap_ini_hook(ini_builder)
         for drawib_model in self.drawib_model_list:
             self.add_unity_vs_texture_override_vlr_section(ini_builder=ini_builder, drawib_model=drawib_model)
             self.add_unity_vs_texture_override_vb_sections(ini_builder=ini_builder, drawib_model=drawib_model)

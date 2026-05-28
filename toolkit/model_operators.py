@@ -1,5 +1,7 @@
 import bpy
 import bmesh
+import math
+from mathutils import Vector
 
 from bpy.props import BoolProperty, CollectionProperty
 
@@ -8,6 +10,117 @@ from ..utils.collection_utils import CollectionUtils
 from ..utils.vertexgroup_utils import VertexGroupUtils
 from ..utils.shapekey_utils import ShapeKeyUtils
 from ..utils.algorithm_utils import AlgorithmUtils
+
+
+def _get_single_selected_mesh():
+    if len(bpy.context.selected_objects) == 0:
+        return None
+    obj = bpy.context.selected_objects[0]
+    if obj.type != 'MESH':
+        return None
+    return obj
+
+
+def _get_collection_mesh_objects(collection):
+    return [obj for obj in collection.objects if obj.type == 'MESH']
+
+
+def _get_object_vertex_group_name_set(obj):
+    VertexGroupUtils.remove_unused_vertex_groups(obj)
+    return {vg.name for vg in obj.vertex_groups}
+
+
+def _get_object_world_center(obj):
+    if not obj.data or len(obj.data.vertices) == 0:
+        return obj.matrix_world.translation.copy()
+    total = obj.matrix_world @ obj.data.vertices[0].co
+    for vertex in obj.data.vertices[1:]:
+        total += obj.matrix_world @ vertex.co
+    return total / len(obj.data.vertices)
+
+
+def _get_object_world_bounds(obj):
+    if not obj.bound_box:
+        origin = obj.matrix_world.translation.copy()
+        return origin, origin
+    corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    min_corner = corners[0].copy()
+    max_corner = corners[0].copy()
+    for corner in corners[1:]:
+        min_corner.x = min(min_corner.x, corner.x)
+        min_corner.y = min(min_corner.y, corner.y)
+        min_corner.z = min(min_corner.z, corner.z)
+        max_corner.x = max(max_corner.x, corner.x)
+        max_corner.y = max(max_corner.y, corner.y)
+        max_corner.z = max(max_corner.z, corner.z)
+    return min_corner, max_corner
+
+
+def _bounds_gap(bounds_a, bounds_b):
+    min_a, max_a = bounds_a
+    min_b, max_b = bounds_b
+
+    def axis_gap(a_min, a_max, b_min, b_max):
+        if a_max < b_min:
+            return b_min - a_max
+        if b_max < a_min:
+            return a_min - b_max
+        return 0.0
+
+    gap_x = axis_gap(min_a.x, max_a.x, min_b.x, max_b.x)
+    gap_y = axis_gap(min_a.y, max_a.y, min_b.y, max_b.y)
+    gap_z = axis_gap(min_a.z, max_a.z, min_b.z, max_b.z)
+    return math.sqrt(gap_x * gap_x + gap_y * gap_y + gap_z * gap_z)
+
+
+def _cluster_loose_parts_by_vg_similarity_and_distance(objects):
+    if not objects:
+        return []
+
+    object_infos = []
+    max_extent = 0.0
+    for obj in objects:
+        vg_set = _get_object_vertex_group_name_set(obj)
+        center = _get_object_world_center(obj)
+        bounds = _get_object_world_bounds(obj)
+        min_corner, max_corner = bounds
+        extent = (max_corner - min_corner).length
+        max_extent = max(max_extent, extent)
+        object_infos.append((obj, vg_set, center, bounds))
+
+    adjacency_threshold = max(0.001, max_extent * 0.05)
+
+    parent = list(range(len(object_infos)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left, right):
+        root_left = find(left)
+        root_right = find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    for left in range(len(object_infos)):
+        _obj_left, vg_left, _center_left, bounds_left = object_infos[left]
+        for right in range(left + 1, len(object_infos)):
+            _obj_right, vg_right, _center_right, bounds_right = object_infos[right]
+            if not vg_left or not vg_right:
+                continue
+            intersection = len(vg_left & vg_right)
+            union_size = len(vg_left | vg_right)
+            similarity = intersection / union_size if union_size else 0.0
+            gap_distance = _bounds_gap(bounds_left, bounds_right)
+            if similarity >= 0.5 and gap_distance <= adjacency_threshold:
+                union(left, right)
+
+    grouped = {}
+    for index, (obj, _, _, _) in enumerate(object_infos):
+        grouped.setdefault(find(index), []).append(obj)
+    return list(grouped.values())
 
 
 class ModelSplitByLoosePart(bpy.types.Operator):
@@ -79,6 +192,58 @@ class ModelSplitByVertexGroup(bpy.types.Operator):
         self.report({'INFO'}, "根据顶点组分割模型成功!")
         return {'FINISHED'}
     
+
+class ModelSplitEachVertexGroup(bpy.types.Operator):
+    bl_idname = "toolkit.split_each_vertex_group"
+    bl_label = "按每个顶点组分割"
+    bl_description = "为每个顶点组单独分离一个网格对象"
+
+    def execute(self, context):
+        obj = _get_single_selected_mesh()
+        if obj is None:
+            self.report({'ERROR'}, "请选择一个网格对象")
+            return {'CANCELLED'}
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        VertexGroupUtils.split_mesh_by_vertex_group(obj)
+        for split_obj in bpy.context.selected_objects:
+            if split_obj.type == 'MESH':
+                VertexGroupUtils.remove_unused_vertex_groups(split_obj)
+
+        self.report({'INFO'}, self.bl_label + " 成功")
+        return {'FINISHED'}
+
+
+class ModelSplitLoosePartClusterByVertexGroup(bpy.types.Operator):
+    bl_idname = "toolkit.split_loose_part_cluster_by_vertex_group"
+    bl_label = "松散块按VG聚类"
+    bl_description = "先按松散块分离，再按顶点组相似度和空间邻近关系聚类合并"
+
+    def execute(self, context):
+        obj = _get_single_selected_mesh()
+        if obj is None:
+            self.report({'ERROR'}, "请选择一个网格对象")
+            return {'CANCELLED'}
+
+        collection_name = f"{obj.name}_LoosePartClusters"
+        ObjUtils.split_obj_by_loose_parts_to_collection(obj=obj, collection_name=collection_name)
+        collection = CollectionUtils.get_collection_by_name(collection_name=collection_name)
+        if collection is None:
+            self.report({'ERROR'}, "未能创建拆分结果集合")
+            return {'CANCELLED'}
+
+        grouped_objects = _cluster_loose_parts_by_vg_similarity_and_distance(_get_collection_mesh_objects(collection))
+        for object_group in grouped_objects:
+            if len(object_group) <= 1:
+                continue
+            ObjUtils.merge_objects(obj_list=object_group, target_collection=collection)
+
+        for merged_obj in _get_collection_mesh_objects(collection):
+            VertexGroupUtils.remove_unused_vertex_groups(merged_obj)
+
+        self.report({'INFO'}, self.bl_label + " 成功")
+        return {'FINISHED'}
+
 
 class ModelDeleteLoosePoint(bpy.types.Operator):
     bl_idname = "toolkit.delete_loose_point"
@@ -316,6 +481,8 @@ class RenameAmatureFromGame(bpy.types.Operator):
 model_operators_list = [
     ModelSplitByLoosePart,
     ModelSplitByVertexGroup,
+    ModelSplitEachVertexGroup,
+    ModelSplitLoosePartClusterByVertexGroup,
     ModelDeleteLoosePoint,
     ModelClearCustomSplitNormals,
     ModelRenameVertexGroupNameWithTheirSuffix,

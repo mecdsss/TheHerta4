@@ -9,7 +9,7 @@ import bpy
 from ...common.submesh_metadata import SubmeshMetadataResolver
 from ...common.texture_metadata_helper import TextureMetadataResolver
 from ...common.workspace_helper import WorkSpaceHelper
-from .prefix_property_cache import update_prefix_record_for_object
+from .prefix_property_cache import get_prefix_record_props, has_prefix_record, replace_prefix_record_props, update_prefix_record_for_object
 
 
 def _resolve_type_dir(workspace_unique_str: str) -> str:
@@ -118,14 +118,33 @@ def build_texture_slots_from_workspace_unique(workspace_unique_str: str) -> dict
 
 
 def refresh_object_texture_slots(obj, extra_owners: Iterable[object] = ()) -> dict:
-    workspace_unique_str = str(obj.get("modimp_workspace_unique_str", "") or "").strip()
+    cached_props = {}
+    has_cached_record = False
+    try:
+        cached_props = get_prefix_record_props(getattr(obj, "name", ""))
+        has_cached_record = has_prefix_record(getattr(obj, "name", ""))
+    except Exception:
+        cached_props = {}
+        has_cached_record = False
+
+    workspace_unique_str = ""
+    if has_cached_record:
+        workspace_unique_str = str(cached_props.get("modimp_workspace_unique_str", "") or "").strip()
+    if not workspace_unique_str and not has_cached_record:
+        workspace_unique_str = str(obj.get("modimp_workspace_unique_str", "") or "").strip()
+
     if not workspace_unique_str:
         for owner in (obj, *tuple(extra_owners or ())):
             try:
                 owner.pop("modimp_texture_slots", None)
             except Exception:
                 continue
-        update_prefix_record_for_object(obj, extra_owners=extra_owners)
+        if has_cached_record:
+            merged = dict(cached_props) if isinstance(cached_props, dict) else {}
+            merged.pop("modimp_texture_slots", None)
+            replace_prefix_record_props(getattr(obj, "name", ""), merged)
+        else:
+            update_prefix_record_for_object(obj, extra_owners=extra_owners)
         return {}
 
     slots = build_texture_slots_from_workspace_unique(workspace_unique_str)
@@ -135,7 +154,13 @@ def refresh_object_texture_slots(obj, extra_owners: Iterable[object] = ()) -> di
                 owner.pop("modimp_texture_slots", None)
             except Exception:
                 continue
-        update_prefix_record_for_object(obj, extra_owners=extra_owners)
+        if has_cached_record:
+            merged = dict(cached_props) if isinstance(cached_props, dict) else {}
+            merged["modimp_workspace_unique_str"] = workspace_unique_str
+            merged.pop("modimp_texture_slots", None)
+            replace_prefix_record_props(getattr(obj, "name", ""), merged)
+        else:
+            update_prefix_record_for_object(obj, extra_owners=extra_owners)
         return {}
 
     serialized = json.dumps(slots, ensure_ascii=False)
@@ -146,7 +171,13 @@ def refresh_object_texture_slots(obj, extra_owners: Iterable[object] = ()) -> di
         except Exception:
             continue
 
-    update_prefix_record_for_object(obj, extra_owners=extra_owners)
+    if has_cached_record:
+        merged = dict(cached_props) if isinstance(cached_props, dict) else {}
+        merged["modimp_workspace_unique_str"] = workspace_unique_str
+        merged["modimp_texture_slots"] = serialized
+        replace_prefix_record_props(getattr(obj, "name", ""), merged)
+    else:
+        update_prefix_record_for_object(obj, extra_owners=extra_owners)
     return slots
 
 

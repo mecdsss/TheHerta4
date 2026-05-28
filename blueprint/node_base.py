@@ -105,7 +105,7 @@ class SSMTNodeBase(Node):
             return _NODE_COLOR_GROUP
         if bl_idname == 'SSMTNode_ObjectSwap':
             return _NODE_COLOR_SWITCH
-        if bl_idname in {'SSMTNode_VertexGroupMappingInput', 'SSMTNode_VertexGroupMatch', 'SSMTNode_VertexGroupProcess'}:
+        if bl_idname in {'SSMTNode_VertexGroupMappingInput', 'SSMTNode_VertexGroupMatch', 'SSMTNode_VertexGroupProcess', 'SSMTNode_VertexGroupTestSplit'}:
             return _NODE_COLOR_VERTEX_GROUP
         if bl_idname in {'SSMTNode_ShapeKey', 'SSMTNode_ShapeKey_Output', 'SSMTNode_PostProcess_ShapeKey'}:
             return _NODE_COLOR_SHAPEKEY
@@ -464,6 +464,79 @@ class THEHERTA3_OT_RenamePersistentBlueprint(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class THEHERTA3_OT_CopyFrameProperties(bpy.types.Operator):
+    bl_idname = "theherta3.copy_frame_properties"
+    bl_label = "复制Frame属性到其他选中Frame"
+    bl_description = "将活动 Frame 的标签、颜色和缩放属性复制到其他选中的 Frame"
+
+    def execute(self, context):
+        source = getattr(context, "active_node", None)
+        if source is None or getattr(source, "bl_idname", "") != "NodeFrame":
+            self.report({'WARNING'}, "当前活动节点不是 Frame")
+            return {'CANCELLED'}
+
+        copied = 0
+        for node in getattr(context, "selected_nodes", []) or []:
+            if node == source or getattr(node, "bl_idname", "") != "NodeFrame":
+                continue
+            node.label = source.label
+            if hasattr(node, "label_size") and hasattr(source, "label_size"):
+                node.label_size = source.label_size
+            node.use_custom_color = source.use_custom_color
+            if hasattr(node, "color") and hasattr(source, "color"):
+                node.color = source.color[:]
+            if hasattr(node, "shrink") and hasattr(source, "shrink"):
+                node.shrink = source.shrink
+            if hasattr(node, "width") and hasattr(source, "width"):
+                node.width = source.width
+            if hasattr(node, "height") and hasattr(source, "height"):
+                node.height = source.height
+            copied += 1
+
+        self.report({'INFO'}, f"已复制 Frame 属性到 {copied} 个节点")
+        return {'FINISHED'}
+
+
+class SSMT_PT_FrameProperties(bpy.types.Panel):
+    bl_label = "Frame 属性"
+    bl_idname = "SSMT_PT_FrameProperties"
+    bl_space_type = 'NODE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = '节点'
+
+    @classmethod
+    def poll(cls, context):
+        space_data = getattr(context, "space_data", None)
+        node_tree = getattr(space_data, "node_tree", None)
+        if node_tree is None or getattr(node_tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
+            return False
+        return any(getattr(node, "bl_idname", "") == "NodeFrame" for node in (getattr(context, "selected_nodes", []) or []))
+
+    def draw(self, context):
+        layout = self.layout
+        selected_frames = [node for node in (getattr(context, "selected_nodes", []) or []) if getattr(node, "bl_idname", "") == "NodeFrame"]
+        if not selected_frames:
+            layout.label(text="未选中 Frame", icon='INFO')
+            return
+
+        frame = selected_frames[0]
+        layout.label(text=f"已选中 {len(selected_frames)} 个 Frame", icon='FILE_PARENT')
+        layout.prop(frame, "label", text="标签")
+        if hasattr(frame, "label_size"):
+            layout.prop(frame, "label_size", text="字体大小")
+        layout.prop(frame, "use_custom_color", text="自定义颜色")
+        if getattr(frame, "use_custom_color", False):
+            layout.prop(frame, "color", text="颜色")
+        if hasattr(frame, "shrink"):
+            layout.prop(frame, "shrink", text="自动贴合")
+        if hasattr(frame, "width"):
+            layout.prop(frame, "width", text="宽度")
+        if hasattr(frame, "height"):
+            layout.prop(frame, "height", text="高度")
+        if len(selected_frames) > 1:
+            layout.operator("theherta3.copy_frame_properties", icon='DUPLICATE')
+
+
 def register():
     bpy.utils.register_class(SSMTBlueprintTree)
     bpy.utils.register_class(SSMTSocketObject)
@@ -471,9 +544,13 @@ def register():
     bpy.utils.register_class(THEHERTA3_OT_OpenPersistentBlueprint)
     bpy.utils.register_class(THEHERTA3_OT_DeletePersistentBlueprint)
     bpy.utils.register_class(THEHERTA3_OT_RenamePersistentBlueprint)
+    bpy.utils.register_class(THEHERTA3_OT_CopyFrameProperties)
+    bpy.utils.register_class(SSMT_PT_FrameProperties)
 
 
 def unregister():
+    bpy.utils.unregister_class(SSMT_PT_FrameProperties)
+    bpy.utils.unregister_class(THEHERTA3_OT_CopyFrameProperties)
     bpy.utils.unregister_class(THEHERTA3_OT_RenamePersistentBlueprint)
     bpy.utils.unregister_class(THEHERTA3_OT_DeletePersistentBlueprint)
     bpy.utils.unregister_class(SSMTSocketPostProcess)

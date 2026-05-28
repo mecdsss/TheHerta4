@@ -37,7 +37,12 @@ _install_module(
         parse_prefix_parts=lambda _prefix: {},
     ),
 )
-_install_module(f"{PKG}.ui.ntmi_modimp.prefix_property_cache", get_prefix_record_props=lambda _name: {})
+_prefix_cache_state = {"props": {}}
+_install_module(
+    f"{PKG}.ui.ntmi_modimp.prefix_property_cache",
+    get_prefix_record_props=lambda _name: dict(_prefix_cache_state["props"]),
+    has_prefix_record=lambda _name: bool(_prefix_cache_state["props"]),
+)
 
 
 module_path = Path(__file__).resolve().parents[1] / "ui" / "ntmi_modimp" / "export_tree_builder.py"
@@ -55,7 +60,16 @@ class _FakeWorkKey:
         self.condition_operator = condition_operator
 
 
+class _FakeObject(dict):
+    def __init__(self, name, **props):
+        super().__init__(**props)
+        self.name = name
+
+
 class NTMIObjectConditionTests(unittest.TestCase):
+    def setUp(self):
+        _prefix_cache_state["props"] = {}
+
     def test_condition_from_work_keys_dedupes_identical_swap_conditions(self):
         work_keys = [
             _FakeWorkKey("$swapkey9", 0),
@@ -122,6 +136,27 @@ class NTMIObjectConditionTests(unittest.TestCase):
             collected["main_copy"],
             "(($swapkey9 == 0 || $swapkey9 == 1) && $state == 2) || $swapkey3 == 1",
         )
+
+    def test_ensure_prefix_custom_props_overwrites_stale_modimp_fields_from_cache(self):
+        _prefix_cache_state["props"] = {
+            "modimp_profile_id": "yihuan",
+            "modimp_match_vs_position_hash": "freshpos",
+        }
+
+        obj = _FakeObject(
+            "LOD0.abc12345-12-0.Body",
+            modimp_profile_id="stale-profile",
+            modimp_match_vs_position_hash="stalepos",
+            modimp_texture_slots='{"stale": true}',
+            unrelated_prop="keep-me",
+        )
+        changed = export_tree_builder._ensure_prefix_custom_props(obj)
+
+        self.assertTrue(changed)
+        self.assertEqual(obj["modimp_profile_id"], "yihuan")
+        self.assertEqual(obj["modimp_match_vs_position_hash"], "freshpos")
+        self.assertNotIn("modimp_texture_slots", obj)
+        self.assertEqual(obj["unrelated_prop"], "keep-me")
 
 
 if __name__ == "__main__":

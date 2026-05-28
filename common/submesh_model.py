@@ -362,6 +362,10 @@ class SubMeshModel:
             normalized_name = self._normalize_source_name(name)
             if normalized_name:
                 normalized_names.add(normalized_name)
+            if name.endswith("_vgtest_unassigned_copy"):
+                normalized_names.add(name[:-23])
+            if name.endswith("_vgtest_copy"):
+                normalized_names.add(name[:-12])
             if name.endswith("_copy"):
                 normalized_names.add(name[:-5])
 
@@ -373,6 +377,14 @@ class SubMeshModel:
 
         result = name
         for pattern in (
+            r"_chain\d+_dup\d+_vgtest_unassigned_copy$",
+            r"_chain\d+_vgtest_unassigned_copy$",
+            r"_dup\d+_vgtest_unassigned_copy$",
+            r"_vgtest_unassigned_copy$",
+            r"_chain\d+_dup\d+_vgtest_copy$",
+            r"_chain\d+_vgtest_copy$",
+            r"_dup\d+_vgtest_copy$",
+            r"_vgtest_copy$",
             r"_chain\d+_dup\d+_copy$",
             r"_chain\d+_copy$",
             r"_dup\d+_copy$",

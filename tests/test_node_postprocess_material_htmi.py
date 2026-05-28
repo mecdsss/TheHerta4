@@ -60,6 +60,7 @@ _install_module(
 _install_module(
     f"{PKG}.ui.ntmi_modimp.prefix_property_cache",
     get_prefix_record_props=lambda _name: dict(_prefix_cache_state["props"]),
+    has_prefix_record=lambda _name: bool(_prefix_cache_state["props"]),
 )
 _install_module(
     f"{PKG}.common.global_config",
@@ -940,6 +941,65 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             override_lines = sections["[TextureOverride_Test]"]
             self.assertIn("ps-t0 = Resource_DiffuseMap_Body", override_lines)
             self.assertIn("ps-t1 = Resource_LightMap_Body", override_lines)
+
+    def test_htmi_does_not_fallback_to_object_texture_slots_when_prefix_cache_exists_but_is_empty(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stale_diffuse_path = os.path.join(temp_dir, "stale-diffuse.png")
+            with open(stale_diffuse_path, "wb") as file_obj:
+                file_obj.write(b"stale")
+
+            obj_name = "LOD0.fd054d1d-30030-0.Body"
+            obj = _FakeObject(
+                obj_name,
+                {
+                    "ps-t0": {
+                        "mark_name": "DiffuseMap",
+                        "mark_type": "Slot",
+                        "mark_slot": "ps-t0",
+                        "mark_filename": "stale-DiffuseMap.dds",
+                        "source_path": stale_diffuse_path,
+                    },
+                },
+                [("DiffuseMap_Body", stale_diffuse_path)],
+            )
+            _prefix_cache_state["props"] = {
+                "modimp_profile_id": "yihuan",
+                "modimp_workspace_unique_str": "LOD0.fd054d1d-30030-0",
+            }
+            _fake_bpy.data.objects[obj.name] = obj
+
+            sections = OrderedDict(
+                [
+                    (
+                        "[TextureOverride_Test]",
+                        [
+                            f"[mesh:{obj.name}]",
+                            "hash = fd054d1d",
+                            "ps-t0 = Resource-old-DiffuseMap",
+                            "drawindexed = 3, 0, 0",
+                        ],
+                    ),
+                    ("_config_path", temp_dir),
+                ]
+            )
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+
+            node.process_texture_override_section(
+                "[TextureOverride_Test]",
+                sections,
+                material_group_to_swapkey={},
+                swap_key_prefix="$swapkey",
+                next_swap_key_num=150,
+                used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            override_lines = sections["[TextureOverride_Test]"]
+            self.assertNotIn("ps-t0 = Resource_DiffuseMap_Body", override_lines)
 
 
 if __name__ == "__main__":

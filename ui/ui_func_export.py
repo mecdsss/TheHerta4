@@ -7,6 +7,7 @@ from ..utils.command_utils import CommandUtils
 from ..utils.log_utils import LOG
 
 from ..common.global_config import GlobalConfig
+from ..common.global_key_count_helper import GlobalKeyCountHelper
 
 from ..blueprint.model import BluePrintModel
 from ..blueprint.direct_export import execute_direct_export, has_direct_export_mode
@@ -110,6 +111,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         TimerUtils.end_stage("蓝图验证")
 
         BluePrintModel.clear_object_name_mapping()
+        GlobalKeyCountHelper.initialize()
 
         LOG.info("=" * 60)
         LOG.info("🚀 开始生成Mod")
@@ -339,7 +341,9 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         if log_name:
             print(f"📄 导出日志已保存至文本编辑器: {log_name}")
 
-        return {'FINISHED'}
+        if export_success:
+            return {'FINISHED'}
+        return {'CANCELLED'}
 
     def _build_export_round_plan(self, has_shapekey_export: bool, max_shapekey_slot: int,
                                  has_multi_file_export: bool, max_multi_file_count: int) -> list:
@@ -463,6 +467,7 @@ class SSMTQuickExportSelected(bpy.types.Operator):
         try:
             LOG.start_collecting()
             TimerUtils.start_session("快速局部导出")
+            GlobalKeyCountHelper.initialize()
 
             LOG.info("=" * 60)
             LOG.info("🚀 开始快速局部导出")

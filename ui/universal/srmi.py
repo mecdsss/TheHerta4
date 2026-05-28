@@ -83,6 +83,10 @@ class ExportSRMI:
             ini_builder=ini_builder,
             drawib_drawibmodel_dict=drawib_drawibmodel_dict,
         )
+        M_IniHelper.generate_shared_slot_style_texture_ini(
+            ini_builder=ini_builder,
+            drawib_drawibmodel_dict=drawib_drawibmodel_dict,
+        )
         print("ExportSRMI: 已完成 Hash 风格贴图配置生成")
 
         # 【钩子】集成物体切换节点的配置生成
@@ -185,7 +189,7 @@ class ExportSRMI:
                 if not GlobalProterties.forbid_auto_texture_ini():
                     texture_markup_info_list = drawib_model.get_submesh_texture_markup_info_list(submesh_model)
                     for texture_markup_info in texture_markup_info_list:
-                        if getattr(texture_markup_info, "mark_type", "") != "Slot":
+                        if not M_IniHelper.is_slot_binding_mark_type(getattr(texture_markup_info, "mark_type", "")):
                             continue
                         texture_override_ib_section.append(texture_markup_info.mark_slot + " = " + texture_markup_info.get_resource_name())
 

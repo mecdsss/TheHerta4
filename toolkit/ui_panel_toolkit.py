@@ -94,6 +94,26 @@ class VGToolsPanel(bpy.types.Panel):
         sub_box.operator("toolkit.fill_vg_number_gaps", icon='LINENUMBERS_ON')
 
 
+class VGTestPanel(bpy.types.Panel):
+    bl_label = "VG Test"
+    bl_idname = "VIEW3D_PT_Herta_VGTest_Panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'TheHerta4'
+    bl_parent_id = 'VIEW3D_PT_Herta_Toolkit_Panel'
+    bl_order = 1
+
+    def draw(self, context):
+        layout = self.layout
+
+        box = layout.box()
+        box.label(text="VG Test", icon='MOD_EXPLODE')
+        col = box.column(align=True)
+        col.operator("toolkit.vgtest_unify_numeric", icon='LINENUMBERS_ON')
+        col.operator("toolkit.vgtest_restore_local_numeric", icon='LOOP_BACK')
+        col.operator("toolkit.vgtest_split_preview", icon='MOD_EXPLODE')
+
+
 class BMTP_MainPanel(bpy.types.Panel):
     bl_label = "骨骼与模型处理工具"
     bl_idname = "VIEW3D_PT_Herta_BMTP_Main_Panel"
@@ -370,6 +390,8 @@ class BMTP_MeshEditPanel(bpy.types.Panel):
         box.operator("toolkit.split_by_loose_part")
         box.operator("toolkit.split_mesh_by_common_vertex_group")
         box.operator("toolkit.split_by_vertex_group")
+        box.operator("toolkit.split_each_vertex_group")
+        box.operator("toolkit.split_loose_part_cluster_by_vertex_group")
 
 
 class BMTP_UVToolsPanel(bpy.types.Panel):
@@ -990,6 +1012,10 @@ class TT_TextureAtlasPanel(bpy.types.Panel):
         config_box.prop(props, "atlas_padding")
         config_box.prop(props, "atlas_color_size")
         config_box.prop(props, "atlas_include_extra_textures")
+        config_box.prop(props, "atlas_packer_type")
+        config_box.prop(props, "atlas_force_uniform_size")
+        config_box.prop(props, "atlas_crop_transparent")
+        config_box.prop(props, "atlas_pixel_art_scale")
         config_box.prop(props, "atlas_image_format")
         config_box.prop(props, "atlas_size_mode")
         if props.atlas_size_mode == 'CUSTOM':

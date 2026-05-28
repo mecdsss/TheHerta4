@@ -10,7 +10,7 @@ import bpy
 from ...blueprint.model import BluePrintModel
 from ...common.draw_call_model import DrawCallModel
 from ...common.object_prefix_helper import ObjectPrefixHelper
-from .prefix_property_cache import get_prefix_record_props
+from .prefix_property_cache import get_prefix_record_props, has_prefix_record
 
 
 PROP_KIND = "modimp_kind"
@@ -43,7 +43,11 @@ def _resolve_profile_id(blueprint_model: BluePrintModel) -> str:
     for draw_call_model in getattr(blueprint_model, "ordered_draw_obj_data_model_list", []) or []:
         obj = bpy.data.objects.get(draw_call_model.get_blender_obj_name())
         if obj is not None:
-            profile_id = str(obj.get("modimp_profile_id", "") or "").strip()
+            cached_props = get_prefix_record_props(obj.name)
+            cached_record_exists = has_prefix_record(obj.name)
+            profile_id = str(cached_props.get("modimp_profile_id", "") or "").strip() if isinstance(cached_props, dict) else ""
+            if not profile_id and not cached_record_exists:
+                profile_id = str(obj.get("modimp_profile_id", "") or "").strip()
             if profile_id:
                 return profile_id
     return PROFILE_ID
@@ -151,18 +155,28 @@ def _copy_props(source, target, keys: Iterable[str]):
             target[key] = value
 
 
-def _ensure_prefix_custom_props(obj: bpy.types.Object) -> int:
-    copied = 0
+def _ensure_prefix_custom_props(obj: bpy.types.Object) -> bool:
+    has_cached_record = has_prefix_record(obj.name)
     cached_props = get_prefix_record_props(obj.name)
-    for key, value in cached_props.items():
-        if key in obj:
+    if not has_cached_record:
+        return False
+    if not isinstance(cached_props, dict):
+        cached_props = {}
+
+    for key in list(obj.keys()):
+        if not str(key).startswith("modimp_") or key in cached_props:
             continue
         try:
-            obj[key] = value
-            copied += 1
+            del obj[key]
         except Exception:
             continue
-    return copied
+
+    for key, value in cached_props.items():
+        try:
+            obj[key] = value
+        except Exception:
+            continue
+    return True
 
 
 def _unique_collection_name(base_name: str) -> str:
@@ -525,8 +539,15 @@ def _copy_runtime_contract(
     draw_ib: str,
     index_count: int,
     first_index: int,
+    allow_fallback: bool = True,
 ):
+    _copy_props(obj, region_collection, RUNTIME_REGION_PROPS)
+    if _region_contract_status(region_collection)[0] or not allow_fallback:
+        return
+
     for source_owner in _source_owner_candidates(obj):
+        if source_owner is obj:
+            continue
         _copy_props(source_owner, region_collection, RUNTIME_REGION_PROPS)
         if _region_contract_status(region_collection)[0]:
             break
@@ -543,7 +564,20 @@ def _copy_collector_props(
     source_collection: bpy.types.Collection,
     *,
     draw_ib: str = "",
+    authoritative_object_names: set[str] | None = None,
 ):
+    authoritative_object_names = authoritative_object_names or set()
+    authoritative_objects = [
+        obj for obj in objects
+        if str(getattr(obj, "name", "") or "") in authoritative_object_names
+    ]
+    if authoritative_objects:
+        for obj in authoritative_objects:
+            _copy_props(obj, source_collection, COLLECTOR_PROPS)
+            if _collector_contract_status(source_collection)[0]:
+                break
+        return
+
     owners = []
     for obj in objects:
         owners.extend(_source_owner_candidates(obj))
@@ -609,6 +643,7 @@ def build_export_tree(blueprint_model: BluePrintModel, tree_prefix: str = "TheHe
     warnings = []
     created_names = []
     grouped: dict[str, dict[tuple[int, int], list[tuple[DrawCallModel, bpy.types.Object, object]]]] = {}
+    authoritative_prefix_cache_names: set[str] = set()
     resolved_profile_id = _resolve_profile_id(blueprint_model)
 
     for draw_call_model in blueprint_model.ordered_draw_obj_data_model_list:
@@ -625,7 +660,8 @@ def build_export_tree(blueprint_model: BluePrintModel, tree_prefix: str = "TheHe
             warnings.append(f"Skip non-mesh object: {obj.name}")
             continue
 
-        _ensure_prefix_custom_props(obj)
+        if _ensure_prefix_custom_props(obj):
+            authoritative_prefix_cache_names.add(obj.name)
 
         draw_ib, index_count, first_index = key
         chain = _find_chain_for_draw(blueprint_model, draw_call_model)
@@ -645,7 +681,12 @@ def build_export_tree(blueprint_model: BluePrintModel, tree_prefix: str = "TheHe
         root_collections.append(root_collection)
 
         all_source_objects = [item[1] for region_items in region_map.values() for item in region_items]
-        _copy_collector_props(all_source_objects, root_collection, draw_ib=draw_ib)
+        _copy_collector_props(
+            all_source_objects,
+            root_collection,
+            draw_ib=draw_ib,
+            authoritative_object_names=authoritative_prefix_cache_names,
+        )
         has_collector_contract, missing_collector_fields = _collector_contract_status(root_collection)
 
         source_record = SourceBuildRecord(
@@ -676,6 +717,7 @@ def build_export_tree(blueprint_model: BluePrintModel, tree_prefix: str = "TheHe
                     draw_ib=draw_ib,
                     index_count=index_count,
                     first_index=first_index,
+                    allow_fallback=obj.name not in authoritative_prefix_cache_names,
                 )
                 condition = _condition_from_work_keys(draw_call_model.work_key_list)
                 if not condition and chain is not None:

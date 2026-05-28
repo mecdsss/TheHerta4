@@ -45,6 +45,8 @@ class PreProcessHelper:
         return (
             object_name.endswith('_temp')
             or object_name.endswith('_copy')
+            or object_name.endswith('_vgtest_unassigned_copy')
+            or object_name.endswith('_vgtest_copy')
             or object_name.startswith('TEMP_SUBMESH_MERGED_')
             or re.search(r'_chain\d+$', object_name) is not None
             or re.search(r'_dup\d+$', object_name) is not None
@@ -59,6 +61,8 @@ class PreProcessHelper:
         seen = set()
         strip_patterns = (
             re.compile(r'_temp$'),
+            re.compile(r'_vgtest_unassigned_copy$'),
+            re.compile(r'_vgtest_copy$'),
             re.compile(r'_copy$'),
             re.compile(r'_chain\d+$'),
             re.compile(r'_dup\d+$'),
@@ -1419,8 +1423,14 @@ class PreProcessHelper:
                     original_name = ObjectPrefixHelper.build_virtual_object_name_for_node(node)
                     if original_name.endswith('_copy'):
                         continue
-                    if original_name in cls.original_to_copy_map:
-                        copy_name = cls.original_to_copy_map[original_name]
+                    matched_name, copy_name = BlueprintExportHelper.find_preprocess_copy_name(
+                        cls.original_to_copy_map,
+                        getattr(node, 'object_name', ''),
+                        object_id=getattr(node, 'object_id', ''),
+                        original_object_name=getattr(node, 'original_object_name', ''),
+                        virtual_object_name=original_name,
+                    )
+                    if copy_name:
                         cls.modified_nodes.append({
                             "tree_name": current_tree.name,
                             "node_name": node.name,
@@ -1432,11 +1442,12 @@ class PreProcessHelper:
                         })
                         node.object_name = copy_name
                         node.object_id = cls._resolve_object_id(copy_name, getattr(node, 'object_id', ''))
+                        node.original_object_name = matched_name or getattr(node, 'original_object_name', '')
                         updated_count += 1
                         
-                        if original_name not in multi_ref_objects:
-                            multi_ref_objects[original_name] = []
-                        multi_ref_objects[original_name].append(f"Object_Info:{node.name}")
+                        if matched_name not in multi_ref_objects:
+                            multi_ref_objects[matched_name] = []
+                        multi_ref_objects[matched_name].append(f"Object_Info:{node.name}")
                 
                 elif node.bl_idname == 'SSMTNode_MultiFile_Export' and not node.mute:
                     object_list = getattr(node, 'object_list', [])
@@ -1446,8 +1457,14 @@ class PreProcessHelper:
                             continue
                         if original_name.endswith('_copy'):
                             continue
-                        if original_name in cls.original_to_copy_map:
-                            copy_name = cls.original_to_copy_map[original_name]
+                        matched_name, copy_name = BlueprintExportHelper.find_preprocess_copy_name(
+                            cls.original_to_copy_map,
+                            original_name,
+                            object_id=getattr(item, 'object_id', ''),
+                            original_object_name=getattr(item, 'original_object_name', ''),
+                            virtual_object_name="",
+                        )
+                        if copy_name:
                             cls.modified_nodes.append({
                                 "tree_name": current_tree.name,
                                 "node_name": node.name,
@@ -1459,11 +1476,12 @@ class PreProcessHelper:
                             })
                             item.object_name = copy_name
                             item.object_id = cls._resolve_object_id(copy_name, getattr(item, 'object_id', ''))
+                            item.original_object_name = matched_name or getattr(item, 'original_object_name', '')
                             multi_file_updated_count += 1
                             
-                            if original_name not in multi_ref_objects:
-                                multi_ref_objects[original_name] = []
-                            multi_ref_objects[original_name].append(f"MultiFile_Export:{node.name}")
+                            if matched_name not in multi_ref_objects:
+                                multi_ref_objects[matched_name] = []
+                            multi_ref_objects[matched_name].append(f"MultiFile_Export:{node.name}")
 
                 elif node.bl_idname == 'SSMTNode_VertexGroupMatch' and not node.mute:
                     source_object = getattr(node, 'source_object', '')
@@ -1629,11 +1647,17 @@ class PreProcessHelper:
                 continue
             if obj_name.endswith('_copy_temp') or obj_name.startswith('TEMP_SUBMESH_MERGED_'):
                 copies_to_remove.append(obj)
+            elif obj_name.endswith('_vgtest_unassigned_copy'):
+                copies_to_remove.append(obj)
+            elif obj_name.endswith('_vgtest_copy'):
+                copies_to_remove.append(obj)
             elif obj_name.endswith('_copy'):
                 copies_to_remove.append(obj)
             elif '_chain' in obj_name:
                 if (
                     re.search(r'_chain\d+$', obj_name)
+                    or re.search(r'_chain\d+_vgtest_unassigned_copy$', obj_name)
+                    or re.search(r'_chain\d+_vgtest_copy$', obj_name)
                     or re.search(r'_chain\d+_copy$', obj_name)
                     or re.search(r'_chain\d+_copy_temp$', obj_name)
                 ):
@@ -1641,6 +1665,8 @@ class PreProcessHelper:
             elif '_dup' in obj_name:
                 if (
                     re.search(r'_dup\d+$', obj_name)
+                    or re.search(r'_dup\d+_vgtest_unassigned_copy$', obj_name)
+                    or re.search(r'_dup\d+_vgtest_copy$', obj_name)
                     or re.search(r'_dup\d+_copy$', obj_name)
                     or re.search(r'_dup\d+_copy_temp$', obj_name)
                 ):
@@ -1721,12 +1747,24 @@ class PreProcessHelper:
         if not cls.has_copies():
             return True
 
+        if object_name.endswith('_vgtest_copy'):
+            return True
+        if object_name.endswith('_vgtest_unassigned_copy'):
+            return True
         if object_name.endswith('_copy'):
             return True
 
+        if re.search(r'_chain\d+_vgtest_copy$', object_name):
+            return True
+        if re.search(r'_chain\d+_vgtest_unassigned_copy$', object_name):
+            return True
         if re.search(r'_chain\d+_copy$', object_name) or re.search(r'_chain\d+$', object_name):
             return True
 
+        if re.search(r'_dup\d+_vgtest_copy$', object_name):
+            return True
+        if re.search(r'_dup\d+_vgtest_unassigned_copy$', object_name):
+            return True
         if re.search(r'_dup\d+_copy$', object_name) or re.search(r'_dup\d+$', object_name):
             return True
 

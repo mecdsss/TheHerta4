@@ -67,6 +67,13 @@ class ObjBufferHelper:
             obj.data.uv_layers.active = original_active_uv
 
     @staticmethod
+    def _allow_wide_blendindices_for_remap() -> bool:
+        return (
+            GlobalConfig.logic_name in (LogicName.WWMI, LogicName.NTEMI)
+            and GlobalProterties.import_merged_vgmap()
+        )
+
+    @staticmethod
     def get_obj_data_model_list_by_draw_ib(ordered_draw_obj_data_model_list:list[DrawCallModel], draw_ib:str):
         '''
         只返回指定draw_ib的obj列表
@@ -392,6 +399,8 @@ class ObjBufferHelper:
         elif d3d11_element.Format == 'R8G8B8A8_UINT':
             max_index = int(numpy.max(blendindices, initial=0))
             if max_index > 255:
+                if ObjBufferHelper._allow_wide_blendindices_for_remap():
+                    return blendindices.astype(numpy.uint16)
                 raise Fatal(
                     "BLENDINDICES contains values larger than 255 (max="
                     + str(max_index)
@@ -400,9 +409,11 @@ class ObjBufferHelper:
             blendindices = blendindices.astype(numpy.uint8)
             return blendindices
             # print(original_elementname_data_dict[d3d11_element_name].dtype)
-        elif d3d11_element.Format == "R8_UINT" and d3d11_element.ByteWidth == 8:
+        elif d3d11_element.Format == "R8_UINT":
             max_index = int(numpy.max(blendindices, initial=0))
             if max_index > 255:
+                if ObjBufferHelper._allow_wide_blendindices_for_remap():
+                    return blendindices.astype(numpy.uint16)
                 raise Fatal(
                     "BLENDINDICES contains values larger than 255 (max="
                     + str(max_index)
@@ -413,7 +424,7 @@ class ObjBufferHelper:
             return blendindices
             # print(original_elementname_data_dict[d3d11_element_name].dtype)
             # print("WWMI R8_UINT特殊处理")
-        elif d3d11_element.Format == "R16_UINT" and d3d11_element.ByteWidth == 16:
+        elif d3d11_element.Format == "R16_UINT":
             blendindices = blendindices.astype(numpy.uint16)
             return blendindices
             # print("WWMI R16_UINT特殊处理")
@@ -577,10 +588,24 @@ class ObjBufferHelper:
                 data = original_elementname_data_dict.get(d3d11_element_name, None)
 
             if data is None:
-                # Missing data is a fatal condition — better to raise so caller
+                # Missing data is a fatal condition – better to raise so caller
                 # can diagnose than to silently write zeros for an expected
                 # element (which would corrupt downstream buffers).
                 SSMTErrorUtils.raise_fatal(f"Missing element data for '{d3d11_element_name}' when packing vertex ndarray")
+
+            target_dtype = element_vertex_ndarray.dtype[d3d11_element_name].base
+            if (
+                d3d11_element_name == "BLENDINDICES"
+                and target_dtype == numpy.uint8
+                and isinstance(data, numpy.ndarray)
+                and data.size != 0
+            ):
+                max_index = int(numpy.max(data, initial=0))
+                if max_index > 255:
+                    SSMTErrorUtils.raise_fatal(
+                        "BLENDINDICES remap did not reduce values to uint8 range before packing "
+                        f"(max={max_index})."
+                    )
             element_vertex_ndarray[d3d11_element_name] = data
         
         return element_vertex_ndarray

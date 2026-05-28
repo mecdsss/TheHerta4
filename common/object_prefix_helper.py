@@ -14,6 +14,14 @@ _BLENDER_SUFFIX_PATTERN = re.compile(r"\.\d{3,}$")
 _BLENDER_SUFFIX_INNER_PATTERN = re.compile(r"\.\d{3,}")
 _LOD_PREFIX_PATTERN = re.compile(r"^(LOD\d+)\.(.+)$", re.IGNORECASE)
 _RUNTIME_SUFFIX_PATTERNS = (
+    re.compile(r"_chain\d+_dup\d+_vgtest_unassigned_copy$"),
+    re.compile(r"_chain\d+_vgtest_unassigned_copy$"),
+    re.compile(r"_dup\d+_vgtest_unassigned_copy$"),
+    re.compile(r"_vgtest_unassigned_copy$"),
+    re.compile(r"_chain\d+_dup\d+_vgtest_copy$"),
+    re.compile(r"_chain\d+_vgtest_copy$"),
+    re.compile(r"_dup\d+_vgtest_copy$"),
+    re.compile(r"_vgtest_copy$"),
     re.compile(r"_chain\d+_dup\d+_copy_temp$"),
     re.compile(r"_chain\d+_dup\d+_copy$"),
     re.compile(r"_chain\d+_dup\d+$"),
@@ -332,6 +340,10 @@ class ObjectPrefixHelper:
     @classmethod
     def build_virtual_object_name_for_node(cls, node, strict: bool = False) -> str:
         object_name = getattr(node, "object_name", "")
+        if object_name:
+            parsed_prefix_info = cls.extract_prefix_info(object_name)
+            if parsed_prefix_info:
+                return object_name
         prefix_info = cls.get_node_prefix_info_with_source(node)
         if not prefix_info and strict:
             prefix, separator = cls.require_node_prefix_info(node)

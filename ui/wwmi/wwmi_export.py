@@ -25,6 +25,17 @@ def _iter_blend_remap_components(draw_ib_model: DrawIBModelWWMI):
         yield component_tmp_obj_name, use_remap, component_count
 
 
+def _get_component_model(draw_ib_model: DrawIBModelWWMI, component_index: int):
+    for component_model in getattr(draw_ib_model, "component_model_list", []):
+        if int(getattr(component_model, "component_index", -1)) == int(component_index):
+            return component_model
+    raise ValueError(
+        "WWMI component model mapping missing: "
+        f"component_index={component_index}, "
+        f"known_component_indices={[getattr(model, 'component_index', None) for model in getattr(draw_ib_model, 'component_model_list', [])]}"
+    )
+
+
 def _get_component_vg_count(draw_ib_model: DrawIBModelWWMI, component_tmp_obj_name: str, component_count: int) -> int:
     vg_count = getattr(draw_ib_model, "component_real_vg_count_dict", {}).get(component_count)
     if vg_count is None:
@@ -339,12 +350,10 @@ class ExportWWMI:
 
     def add_texture_override_component(self, ini_builder: M_IniBuilder, draw_ib_model: DrawIBModelWWMI):
         texture_override_component = M_IniSection(M_SectionType.TextureOverrideIB)
-        component_count = 0
-
-        for component_tmp_obj_name, component_blend_remap_used in draw_ib_model.blend_remap_used.items():
-            component_name = "Component " + str(component_count + 1)
-            component_count_str = str(component_count)
-            component_object = draw_ib_model.extracted_object.components[component_count]
+        for fallback_index, (component_tmp_obj_name, component_blend_remap_used) in enumerate(draw_ib_model.blend_remap_used.items()):
+            component_index = _get_component_index(draw_ib_model, component_tmp_obj_name, fallback_index)
+            component_count_str = str(component_index)
+            component_object = draw_ib_model.extracted_object.components[component_index]
 
             texture_override_component.append("[TextureOverrideComponent" + component_count_str + "]")
             texture_override_component.append("hash = " + draw_ib_model.extracted_object.vb0_hash)
@@ -371,14 +380,14 @@ class ExportWWMI:
                 texture_override_component.append("  if ResourceMergedSkeleton !== null")
                 texture_override_component.append("    handling = skip")
 
-                component_model = draw_ib_model.component_name_component_model_dict[component_name]
+                component_model = _get_component_model(draw_ib_model, component_index)
                 drawindexed_str_list = M_IniHelper.get_drawindexed_str_list(component_model.final_ordered_draw_obj_model_list)
 
                 if len(drawindexed_str_list) != 0:
                     if component_blend_remap_used:
-                        texture_override_component.append("    ResourceBlendBufferOverride = ref ResourceRemappedBlendBufferComponent" + str(component_count))
-                        texture_override_component.append("    ResourceMergedSkeletonOverride = ref ResourceRemappedSkeletonComponent" + str(component_count))
-                        texture_override_component.append("    ResourceExtraMergedSkeletonOverride = ref ResourceExtraRemappedSkeletonComponent" + str(component_count))
+                        texture_override_component.append("    ResourceBlendBufferOverride = ref ResourceRemappedBlendBufferComponent" + component_count_str)
+                        texture_override_component.append("    ResourceMergedSkeletonOverride = ref ResourceRemappedSkeletonComponent" + component_count_str)
+                        texture_override_component.append("    ResourceExtraMergedSkeletonOverride = ref ResourceExtraRemappedSkeletonComponent" + component_count_str)
 
                     texture_override_component.append("    run = CommandListTriggerResourceOverrides")
                     texture_override_component.append("    run = CommandListOverrideSharedResources")
@@ -388,7 +397,7 @@ class ExportWWMI:
                     texture_override_component.append("    run = CommandListCleanupSharedResources")
                 texture_override_component.append("  endif")
             else:
-                component_model = draw_ib_model.component_name_component_model_dict[component_name]
+                component_model = _get_component_model(draw_ib_model, component_index)
                 drawindexed_str_list = M_IniHelper.get_drawindexed_str_list(component_model.final_ordered_draw_obj_model_list)
                 if len(drawindexed_str_list) != 0:
                     texture_override_component.append("  handling = skip")
@@ -401,7 +410,6 @@ class ExportWWMI:
 
             texture_override_component.append("endif")
             texture_override_component.new_line()
-            component_count = component_count + 1
 
         ini_builder.append_section(texture_override_component)
 
@@ -622,6 +630,7 @@ class ExportWWMI:
             M_IniHelper.add_branch_key_sections(ini_builder=config_ini_builder, key_name_mkey_dict=self.blueprint_model.keyname_mkey_dict)
             M_IniHelperGUI.add_branch_mod_gui_section(ini_builder=config_ini_builder, key_name_mkey_dict=self.blueprint_model.keyname_mkey_dict)
             M_IniHelper.generate_hash_style_texture_ini(ini_builder=config_ini_builder, drawib_drawibmodel_dict=self.drawib_drawibmodel_dict)
+            M_IniHelper.generate_shared_slot_style_texture_ini(ini_builder=config_ini_builder, drawib_drawibmodel_dict=self.drawib_drawibmodel_dict)
             config_ini_builder.save_to_file_not_reorder(os.path.join(GlobalConfig.path_generate_mod_folder(), GlobalConfig.get_workspace_name() + "_" + draw_ib + ".ini"))
             config_ini_builder.clear()
 

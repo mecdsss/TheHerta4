@@ -177,8 +177,10 @@ class ExportRoundExecutor:
     @staticmethod
     def collect_object_names_from_tree(tree) -> list:
         # 并行轮次和主线程轮次必须看到完全一致的连通物体集合。
-        object_names = BlueprintExportHelper.collect_connected_object_names(tree)
+        object_names = BlueprintExportHelper.collect_connected_preprocess_object_names(tree)
         LOG.info(f"Collected preprocess objects from {tree.name}: {len(object_names)}")
+        for obj_name in object_names:
+            LOG.info(f"   Preprocess object: {obj_name}")
         return object_names
 
     @staticmethod
