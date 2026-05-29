@@ -1072,7 +1072,6 @@ class SSMT_MT_NodeMenu_VertexGroup(bpy.types.Menu):
         _add_node_entry(layout, "顶点组匹配", 'GROUP', "SSMTNode_VertexGroupMatch")
         _add_node_entry(layout, "顶点组处理", 'MESH_DATA', "SSMTNode_VertexGroupProcess")
         _add_node_entry(layout, "映射表输入", 'TEXT', "SSMTNode_VertexGroupMappingInput")
-        _add_node_entry(layout, "VG Test Split", 'MOD_EXPLODE', "SSMTNode_VertexGroupTestSplit")
 
 
 class SSMT_MT_NodeMenu_Blueprint(bpy.types.Menu):

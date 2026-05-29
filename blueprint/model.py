@@ -23,7 +23,6 @@ _NODE_TYPE_DATA_TYPE = 'SSMTNode_DataType'
 _NODE_TYPE_VERTEX_GROUP_PROCESS = 'SSMTNode_VertexGroupProcess'
 _NODE_TYPE_VERTEX_GROUP_MATCH = 'SSMTNode_VertexGroupMatch'
 _NODE_TYPE_VERTEX_GROUP_MAPPING_INPUT = 'SSMTNode_VertexGroupMappingInput'
-_NODE_TYPE_VERTEX_GROUP_TEST_SPLIT = 'SSMTNode_VertexGroupTestSplit'
 _NODE_TYPE_BLUEPRINT_NEST = 'SSMTNode_Blueprint_Nest'
 _NODE_TYPE_CROSS_IB = 'SSMTNode_CrossIB'
 _NODE_TYPE_MULTI_FILE_EXPORT = 'SSMTNode_MultiFile_Export'
@@ -41,7 +40,6 @@ _KNOWN_NODE_TYPES = {
     _NODE_TYPE_VERTEX_GROUP_PROCESS,
     _NODE_TYPE_VERTEX_GROUP_MATCH,
     _NODE_TYPE_VERTEX_GROUP_MAPPING_INPUT,
-    _NODE_TYPE_VERTEX_GROUP_TEST_SPLIT,
     _NODE_TYPE_BLUEPRINT_NEST,
     _NODE_TYPE_CROSS_IB,
     _NODE_TYPE_MULTI_FILE_EXPORT,
@@ -87,7 +85,6 @@ class ProcessingChain:
 
     vertex_group_process_nodes: List[bpy.types.Node] = field(default_factory=list)
     vertex_group_mapping_nodes: List[bpy.types.Node] = field(default_factory=list)
-    vertex_group_test_split_nodes: List[bpy.types.Node] = field(default_factory=list)
     export_object_name_override: str = ""
 
     reached_output: bool = False
@@ -172,10 +169,6 @@ class ProcessingChain:
             if target_hash:
                 params.append(f"hash={target_hash}")
             return f"VertexGroupMappingInput[{','.join(params)}]" if params else "VertexGroupMappingInput[]"
-
-        elif node_type == 'VertexGroupTestSplit':
-            return "VertexGroupTestSplit[suffix=_vgtest]"
-
         elif node_type == 'Blueprint_Nest':
             params = []
             blueprint_name = getattr(node, 'blueprint_name', '')
@@ -313,7 +306,6 @@ class ProcessingChain:
         new_chain.multi_file_option_count = self.multi_file_option_count
         new_chain.vertex_group_process_nodes = list(self.vertex_group_process_nodes)
         new_chain.vertex_group_mapping_nodes = list(self.vertex_group_mapping_nodes)
-        new_chain.vertex_group_test_split_nodes = list(self.vertex_group_test_split_nodes)
         new_chain.export_object_name_override = self.export_object_name_override
         new_chain.reached_output = self.reached_output
         new_chain.is_valid = self.is_valid
@@ -408,7 +400,6 @@ class BluePrintModel:
         self.postprocess_nodes: List[bpy.types.Node] = []
         self.nested_blueprint_trees: List[bpy.types.NodeTree] = []
         self.vertex_group_process_nodes: List[bpy.types.Node] = []
-        self.vertex_group_test_split_nodes: List[bpy.types.Node] = []
         self.multi_file_export_nodes: List[bpy.types.Node] = []
         self.cross_ib_nodes: List[bpy.types.Node] = []
 
@@ -462,7 +453,6 @@ class BluePrintModel:
     def _collect_nested_postprocess_nodes(self):
         if not self.nested_blueprint_trees:
             return
-
         existing_pp_keys = {_get_node_unique_key(n) for n in self.postprocess_nodes}
         nested_pp_count = 0
 
@@ -601,20 +591,16 @@ class BluePrintModel:
         if not blueprint_name or blueprint_name == 'NONE':
             LOG.debug(f"   🔗 Blueprint_Nest 节点 '{nest_node.name}' 未指定蓝图，跳过")
             return
-
         if blueprint_name in visited:
             LOG.warning(f"   ⚠️ 检测到嵌套蓝图循环引用: {blueprint_name}，跳过")
             return
-
         nested_tree = bpy.data.node_groups.get(blueprint_name)
         if not nested_tree:
             LOG.warning(f"   ⚠️ Blueprint_Nest 节点 '{nest_node.name}' 引用的蓝图 '{blueprint_name}' 不存在")
             return
-
         if nested_tree.bl_idname != 'SSMTBlueprintTreeType':
             LOG.warning(f"   ⚠️ Blueprint_Nest 节点 '{nest_node.name}' 引用的 '{blueprint_name}' 不是 SSMT 蓝图树 (类型: {nested_tree.bl_idname})")
             return
-
         visited_copy = visited | {blueprint_name}
         self.nested_blueprint_trees.append(nested_tree)
         LOG.info(f"   🔗 解析嵌套蓝图: '{blueprint_name}' (节点数: {len(nested_tree.nodes)})")
@@ -667,13 +653,10 @@ class BluePrintModel:
                 if mapped_name != original_obj_name:
                     chain.object_name = mapped_name
                     LOG.debug(f"   🔄 使用映射名称: '{original_obj_name}' → '{mapped_name}'")
-            return
-
         rename_chains = [c for c in valid_chains if c.rename_history]
         if not rename_chains:
             BluePrintModel._has_executed_rename = True
             return
-
         from .node_rename import SSMTNode_Object_Rename
 
         for chain in rename_chains:
@@ -739,13 +722,11 @@ class BluePrintModel:
 
         if not valid_chains:
             LOG.warning("   ⚠️ 没有有效的处理链")
-            return
-
         for chain in valid_chains:
             draw_call_model = chain.to_draw_call_model()
             self.ordered_draw_obj_data_model_list.append(draw_call_model)
             LOG.info(
-                f"[VGTEST-DRAWCALL] runtime='{chain.object_name}' export='{draw_call_model.obj_name}' "
+                f"[VG-DRAWCALL] runtime='{chain.object_name}' export='{draw_call_model.obj_name}' "
                 f"source='{draw_call_model.source_obj_name}'"
             )
 
@@ -786,7 +767,6 @@ class BluePrintModel:
 
     def _execute_chain_nodes_sequentially(self):
         from .node_rename import SSMTNode_Object_Rename
-        from .vg_test_runtime import VGTestRuntime
 
         valid_chains = [c for c in self.processing_chains if c.is_valid and c.reached_output]
 
@@ -795,10 +775,6 @@ class BluePrintModel:
             for c in valid_chains
         )
         has_vg_chains = any(c.vertex_group_process_nodes for c in valid_chains)
-        has_vgtest_split_chains = any(c.vertex_group_test_split_nodes for c in valid_chains)
-
-        if not has_rename_chains and not has_vg_chains and not has_vgtest_split_chains:
-            return
 
         if BluePrintModel._has_executed_rename:
             for chain in valid_chains:
@@ -809,29 +785,20 @@ class BluePrintModel:
                     LOG.debug(f"   Use mapped object name: '{original_obj_name}' -> '{mapped_name}'")
             if has_vg_chains:
                 self._integrate_vertex_group_nodes()
-            if has_vgtest_split_chains:
-                self._merge_processing_chains()
             return
-
-        if has_rename_chains and not has_vg_chains and not has_vgtest_split_chains:
+        if has_rename_chains and not has_vg_chains:
             self._execute_object_rename_nodes()
             return
-
-        if not has_rename_chains and not has_vgtest_split_chains:
+        if not has_rename_chains:
             if has_vg_chains:
                 self._integrate_vertex_group_nodes()
             return
-
-        LOG.info("[VGTEST-SPLIT] Sequential chain execution started")
-
         for chain in valid_chains:
             if has_rename_chains:
                 chain.rename_history = []
 
         rename_count = 0
         vg_count = 0
-        vgtest_split_count = 0
-        vgtest_split_output_count = 0
         deferred_chain_count = 0
         next_processing_chains = []
 
@@ -852,7 +819,7 @@ class BluePrintModel:
             if not obj and chain.original_object_name:
                 obj = bpy.data.objects.get(chain.original_object_name)
             if not obj:
-                LOG.warning(f"[VGTEST-SPLIT] Skip chain because object is missing: '{obj_name}'")
+                LOG.warning(f"[VG-CHAIN] Skip chain because object is missing: '{obj_name}'")
                 continue
 
             chain_defer_rename = any(
@@ -889,7 +856,7 @@ class BluePrintModel:
                             stats = node.process_object(state_obj)
                             vg_count += 1
                             LOG.info(
-                                f"[VGTEST-CHAIN] VertexGroupProcess node '{node.name}' on '{current_name}' "
+                                f"[VG-CHAIN] VertexGroupProcess node '{node.name}' on '{current_name}' "
                                 f"(renamed={stats.get('renamed', 0)}, merged={stats.get('merged', 0)}, "
                                 f"cleaned={stats.get('cleaned', 0)}, filled={stats.get('filled', 0)})"
                             )
@@ -917,58 +884,8 @@ class BluePrintModel:
                                 state_chain.export_object_name_override = current_name
                             _append_runtime_rename_history(state_chain, node, history)
                             rename_count += 1
-                            LOG.info(f"[VGTEST-CHAIN] Rename '{old_name}' -> '{current_name}'")
+                            LOG.info(f"[VG-CHAIN] Rename '{old_name}' -> '{current_name}'")
                         next_states.append(state)
-                        continue
-
-                    if node.bl_idname == _NODE_TYPE_VERTEX_GROUP_TEST_SPLIT:
-                        from .node_vertex_group_test_split import SSMTNode_VertexGroupTestSplit
-
-                        validation_errors = SSMTNode_VertexGroupTestSplit.validate_chain_position(state_chain)
-                        if validation_errors:
-                            raise RuntimeError(" ".join(validation_errors))
-
-                        LOG.info(
-                            f"[VGTEST-SPLIT] Chain object '{current_name}' entering node '{node.name}' "
-                            f"(original='{state_chain.original_object_name or current_name}')"
-                        )
-                        split_results = VGTestRuntime.expand_chain_object_for_export(
-                            source_object_name=current_name,
-                            original_object_name=state_chain.original_object_name or current_name,
-                        )
-                        vgtest_split_count += 1
-                        vgtest_split_output_count += len(split_results)
-
-                        for split_result in split_results:
-                            branch_chain = copy.deepcopy(state_chain)
-                            branch_chain.object_name = split_result["object_name"]
-                            branch_chain.original_object_name = split_result["original_object_name"]
-                            branch_chain.export_object_name_override = split_result["export_name"]
-                            branch_chain.virtual_object_name = split_result["export_name"]
-
-                            branch_obj = bpy.data.objects.get(split_result["object_name"])
-                            if branch_obj is None:
-                                branch_obj = bpy.data.objects.get(split_result["export_name"])
-                            if branch_obj is None:
-                                LOG.warning(
-                                    f"[VGTEST-SPLIT] Split output object missing: '{split_result['object_name']}'"
-                                )
-                                continue
-
-                            next_states.append(
-                                {
-                                    "chain": branch_chain,
-                                    "obj": branch_obj,
-                                    "current_name": branch_obj.name,
-                                    "original_obj_name": split_result["object_name"],
-                                    "chain_had_rename": state["chain_had_rename"],
-                                    "deferred_rename_nodes": list(state["deferred_rename_nodes"]),
-                                }
-                            )
-                            LOG.info(
-                                f"[VGTEST-SPLIT]   -> prefix='{split_result.get('prefix', '')}' "
-                                f"runtime='{split_result['object_name']}' export='{split_result['export_name']}'"
-                            )
                         continue
 
                     next_states.append(state)
@@ -997,7 +914,7 @@ class BluePrintModel:
                         state_chain.export_object_name_override = current_name
                     _append_runtime_rename_history(state_chain, deferred_node, history)
                     rename_count += 1
-                    LOG.info(f"[VGTEST-CHAIN] Deferred rename '{old_name}' -> '{current_name}'")
+                    LOG.info(f"[VG-CHAIN] Deferred rename '{old_name}' -> '{current_name}'")
 
                 if state["chain_had_rename"] and state_obj.name != state["original_obj_name"]:
                     BluePrintModel._object_name_mapping[state["original_obj_name"]] = state_obj.name
@@ -1011,14 +928,10 @@ class BluePrintModel:
         SSMTNode_Object_Rename.log_rename_summary(rename_chains)
 
         LOG.info(
-            f"[VGTEST-SPLIT] Sequential chain execution complete: rename={rename_count}, "
-            f"vg_process={vg_count}, split_calls={vgtest_split_count}, "
-            f"split_outputs={vgtest_split_output_count}, deferred_rename_chains={deferred_chain_count}, "
+            f"[VG-CHAIN] Sequential chain execution complete: rename={rename_count}, "
+            f"vg_process={vg_count}, deferred_rename_chains={deferred_chain_count}, "
             f"final_chains={len(self.processing_chains)}"
         )
-
-    def _integrate_vertex_group_test_split_nodes(self):
-        return
 
     @staticmethod
     def _append_cross_ib_mapping_from_name_pair(
@@ -1031,13 +944,11 @@ class BluePrintModel:
 
         if not old_name or not new_name or old_name == new_name:
             return
-
         old_prefix_info = ObjectPrefixHelper.extract_prefix_info(old_name)
         new_prefix_info = ObjectPrefixHelper.extract_prefix_info(new_name)
 
         if not old_prefix_info or not new_prefix_info:
             return
-
         old_prefix = old_prefix_info[0]
         new_prefix = new_prefix_info[0]
 
@@ -1212,7 +1123,6 @@ class BluePrintModel:
         if not has_cross_ib_rename:
             LOG.info("🔗 未检测到同时包含跨IB节点和重命名节点的链路")
             return
-
     def _process_cross_ib_nodes(self):
         LOG.info(f"🔗 开始处理跨IB节点，共 {len(self.cross_ib_nodes)} 个节点")
 
@@ -1220,7 +1130,6 @@ class BluePrintModel:
             self.has_cross_ib = False
             LOG.info("🔗 没有找到跨IB节点，跳过处理")
             return
-
         from .node_cross_ib import CrossIBMatchMode
 
         self.cross_ib_info_dict.clear()
@@ -1391,7 +1300,6 @@ class BluePrintModel:
     def execute_postprocess_nodes(self, mod_export_path: str):
         if not self.postprocess_nodes:
             return
-
         for pp_node in self.postprocess_nodes:
             node_class = type(pp_node)
             clear_cache = getattr(node_class, 'clear_cache', None)
@@ -1431,7 +1339,6 @@ class BluePrintModel:
         if not valid_chains:
             LOG.warning("   ⚠️ 没有有效的处理链")
             return
-
         longest_chain = max(valid_chains, key=lambda c: len(c.node_path))
         LOG.info(f"   📏 最长处理链参考: '{longest_chain.object_name}' (节点数: {len(longest_chain.node_path)})")
 
@@ -1639,7 +1546,6 @@ class BluePrintModel:
     def parse_single_node(self, unknown_node:bpy.types.Node, chain_key_list:list[M_Key]):
         if unknown_node.mute:
             return
-
         if unknown_node.bl_idname == _NODE_TYPE_OBJECT_GROUP:
             self.parse_current_node(unknown_node, chain_key_list)
 
@@ -1677,10 +1583,6 @@ class BluePrintModel:
             self.parse_current_node(unknown_node, chain_key_list)
 
         elif unknown_node.bl_idname == _NODE_TYPE_VERTEX_GROUP_MAPPING_INPUT:
-            self.parse_current_node(unknown_node, chain_key_list)
-
-        elif unknown_node.bl_idname == _NODE_TYPE_VERTEX_GROUP_TEST_SPLIT:
-            self.vertex_group_test_split_nodes.append(unknown_node)
             self.parse_current_node(unknown_node, chain_key_list)
 
         elif unknown_node.bl_idname == _NODE_TYPE_BLUEPRINT_NEST:

@@ -126,7 +126,7 @@ class ExportRoundExecutor:
 
     @staticmethod
     def export_with_ini(blueprint_model):
-        if GlobalConfig.logic_name == LogicName.EFMI:
+        if GlobalConfig.logic_name in (LogicName.EFMI, LogicName.HTMI):
             ExportEFMI(blueprint_model=blueprint_model).export()
         elif GlobalConfig.logic_name == LogicName.GIMI:
             ExportGIMI(blueprint_model=blueprint_model).export()
@@ -138,7 +138,7 @@ class ExportRoundExecutor:
             ExportSRMI(blueprint_model=blueprint_model).export()
         elif GlobalConfig.logic_name == LogicName.ZZMI:
             ExportZZMI(blueprint_model=blueprint_model).export()
-        elif GlobalConfig.logic_name in (LogicName.WWMI, LogicName.NTEMI):
+        elif GlobalConfig.logic_name == LogicName.WWMI:
             ExportWWMI(blueprint_model=blueprint_model).export()
         elif GlobalConfig.logic_name == LogicName.SnowBreak:
             ExportSnowBreak(blueprint_model=blueprint_model).export()
@@ -151,7 +151,7 @@ class ExportRoundExecutor:
 
     @staticmethod
     def export_buffers_only(blueprint_model):
-        if GlobalConfig.logic_name == LogicName.EFMI:
+        if GlobalConfig.logic_name in (LogicName.EFMI, LogicName.HTMI):
             ExportEFMI(blueprint_model=blueprint_model).export_buffers_only()
         elif GlobalConfig.logic_name == LogicName.GIMI:
             ExportGIMI(blueprint_model=blueprint_model).export_buffers_only()
@@ -163,7 +163,7 @@ class ExportRoundExecutor:
             ExportSRMI(blueprint_model=blueprint_model).export_buffers_only()
         elif GlobalConfig.logic_name == LogicName.ZZMI:
             ExportZZMI(blueprint_model=blueprint_model).export_buffers_only()
-        elif GlobalConfig.logic_name in (LogicName.WWMI, LogicName.NTEMI):
+        elif GlobalConfig.logic_name == LogicName.WWMI:
             ExportWWMI(blueprint_model=blueprint_model).export_buffers_only()
         elif GlobalConfig.logic_name == LogicName.SnowBreak:
             ExportSnowBreak(blueprint_model=blueprint_model).export_buffers_only()

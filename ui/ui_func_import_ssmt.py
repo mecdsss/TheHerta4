@@ -22,6 +22,7 @@ from .ntmi_modimp.ntemi_importer import (
     NTEMIImportHelper,
     NtemiDrawCallMeta,
     _discover_draw_calls,
+    _load_frame_analysis_dir_map,
     _resolve_deduped_texture_dir,
     _resolve_frame_analysis_dir,
     _load_component_name_map,
@@ -262,7 +263,7 @@ def ImprotFromWorkSpaceFull(self, context):
         tab_group_nodes = {}
         tab_node_lists = {}
         default_group_node = tree.nodes.new('SSMTNode_Object_Group')
-        default_group_node.label = "Default Group"
+        default_group_node.label = "默认分组"
         default_group_node.parent = original_model_frame
         default_node_list = []
 
@@ -342,14 +343,14 @@ def ImprotFromWorkSpaceFull(self, context):
 
         output_node = tree.nodes.new('SSMTNode_Result_Output')
         output_node.location = (800, 0)
-        output_node.label = "Generate Mod"
+        output_node.label = "生成 Mod"
 
         if len(output_node.inputs) > 0 and len(all_group_nodes) > 0:
             if len(all_group_nodes) == 1:
                 tree.links.new(all_group_nodes[0].outputs[0], output_node.inputs[0])
             else:
                 merge_node = tree.nodes.new('SSMTNode_Object_Group')
-                merge_node.label = "Merge"
+                merge_node.label = "合并"
                 merge_node.location = (600, 0)
                 merge_node.parent = original_model_frame
 
@@ -366,11 +367,11 @@ def ImprotFromWorkSpaceFull(self, context):
         if hasattr(original_model_frame, "update"):
             original_model_frame.update()
 
-        print(f"Blueprint {tree_name} updated with imported objects, grouped by workspace tabs.")
+        print(f"蓝图 {tree_name} 已按工作空间标签完成导入对象分组更新。")
         return True
 
     except Exception as e:
-        print(f"Error generating blueprint nodes: {e}")
+        print(f"生成蓝图节点时发生错误：{e}")
         import traceback
         traceback.print_exc()
         self.report({'ERROR'}, f"生成导入蓝图失败：{e}")
@@ -385,34 +386,49 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
         self.report({'ERROR'}, "NTEMI工作空间未找到可导入的DrawCall数据。")
         return False
 
-    deduped_texture_dir = _resolve_deduped_texture_dir(workspace_root)
-    frame_analysis_dir = _resolve_frame_analysis_dir(workspace_root)
-    component_map = _load_component_name_map(os.path.join(workspace_root, "LOD0"))
-
-    lod0_collection = CollectionUtils.create_new_collection(
-        collection_name="LOD0",
-        color_tag=CollectionColor.Blue,
-    )
-    workspace_collection.children.link(lod0_collection)
+    default_frame_analysis_dir = _resolve_frame_analysis_dir(workspace_root)
+    frame_analysis_dir_map = _load_frame_analysis_dir_map(workspace_root)
+    lod_collection_map = {}
+    deduped_texture_dir_map = {}
+    component_map_by_lod = {}
 
     foldername_gametypename_dict = {}
     imported_objects = []
     import_records = []
 
     for draw_call in draw_calls:
+        lod_name = str(draw_call.lod_name or "LOD0").strip() or "LOD0"
+        lod_collection = lod_collection_map.get(lod_name)
+        if lod_collection is None:
+            lod_collection = CollectionUtils.create_new_collection(
+                collection_name=lod_name,
+                color_tag=CollectionColor.Blue,
+            )
+            workspace_collection.children.link(lod_collection)
+            lod_collection_map[lod_name] = lod_collection
+
+        if lod_name not in deduped_texture_dir_map:
+            deduped_texture_dir_map[lod_name] = _resolve_deduped_texture_dir(workspace_root, lod_name)
+        if lod_name not in component_map_by_lod:
+            component_map_by_lod[lod_name] = _load_component_name_map(os.path.join(workspace_root, lod_name))
+
+        frame_analysis_dir = frame_analysis_dir_map.get(
+            str(draw_call.draw_ib or "").strip().lower(),
+            default_frame_analysis_dir,
+        )
         json_file_path = os.path.join(
             draw_call.folder_path, f"{draw_call.submesh_folder_name}.json"
         )
 
-        workspace_unique_str = f"LOD0.{draw_call.submesh_folder_name}"
+        workspace_unique_str = f"{lod_name}.{draw_call.submesh_folder_name}"
 
         try:
             imported_obj = NTEMIImportHelper.create_mesh_with_modimp_props(
                 json_file_path=json_file_path,
                 draw_call_meta=draw_call,
-                import_collection=lod0_collection,
-                deduped_texture_dir=deduped_texture_dir,
-                component_map=component_map,
+                import_collection=lod_collection,
+                deduped_texture_dir=deduped_texture_dir_map.get(lod_name, ""),
+                component_map=component_map_by_lod.get(lod_name, {}),
                 workspace_unique_str=workspace_unique_str,
                 frame_analysis_dir=frame_analysis_dir,
             )
@@ -448,17 +464,19 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
                     "alias_name": draw_call.alias_name,
                     "draw_ib": draw_call.draw_ib,
                     "component": draw_call.component,
-                    "import_collection": lod0_collection,
+                    "lod_name": lod_name,
+                    "frame_analysis_dir": frame_analysis_dir,
+                    "import_collection": lod_collection,
                     "imported_obj": imported_obj,
                     "gametype_name": gametype_name,
                 }
             )
             self.report(
                 {'INFO'},
-                f"NTEMI 成功导入 {draw_call.submesh_folder_name}"
+                f"NTEMI 成功导入 {workspace_unique_str}"
             )
         except Exception as e:
-            print(f"导入 NTEMI DrawCall 失败：{draw_call.submesh_folder_name}，错误：{e}")
+            print(f"导入 NTEMI DrawCall 失败：{workspace_unique_str}，错误：{e}")
             import traceback
             traceback.print_exc()
             continue
@@ -476,21 +494,30 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
     CollectionUtils.select_collection_objects(workspace_collection)
     PrefixQuickOpsHelper.merge_prefixes_from_objects(context, imported_objects)
 
-    if frame_analysis_dir:
-        imported_by_draw_ib: dict[str, list] = {}
-        for record in import_records:
-            imported_obj = record.get("imported_obj")
-            draw_ib = str(record.get("draw_ib", "") or "").strip()
-            if imported_obj is None or not draw_ib:
-                continue
-            imported_by_draw_ib.setdefault(draw_ib, []).append(imported_obj)
+    imported_by_source: dict[tuple[str, str], list] = {}
+    for record in import_records:
+        imported_obj = record.get("imported_obj")
+        draw_ib = str(record.get("draw_ib", "") or "").strip()
+        frame_analysis_dir = str(record.get("frame_analysis_dir", "") or "").strip()
+        if imported_obj is None or not draw_ib or not frame_analysis_dir:
+            continue
+        imported_by_source.setdefault((frame_analysis_dir, draw_ib), []).append(imported_obj)
 
-        for draw_ib, draw_ib_objects in imported_by_draw_ib.items():
+    for (frame_analysis_dir, draw_ib), draw_ib_objects in imported_by_source.items():
+        try:
             _perform_bone_merge_postprocess(
                 objects=draw_ib_objects,
                 frame_analysis_dir=frame_analysis_dir,
                 draw_ib=draw_ib,
                 workspace_root=workspace_root,
+            )
+        except Exception as e:
+            print(f"NTEMI骨骼合并后处理失败：DrawIB={draw_ib}，FrameAnalysis={frame_analysis_dir}，错误：{e}")
+            import traceback
+            traceback.print_exc()
+            self.report(
+                {'WARNING'},
+                f"已跳过 DrawIB {draw_ib} 的骨骼合并后处理：{os.path.basename(frame_analysis_dir)}"
             )
 
     try:
@@ -514,7 +541,7 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
         tab_group_nodes = {}
         tab_node_lists = {}
         default_group_node = tree.nodes.new('SSMTNode_Object_Group')
-        default_group_node.label = "Default Group"
+        default_group_node.label = "默认分组"
         default_group_node.parent = original_model_frame
         default_node_list = []
 
@@ -594,14 +621,14 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
 
         output_node = tree.nodes.new('SSMTNode_Result_Output_NTMIModImp')
         output_node.location = (800, 0)
-        output_node.label = "NTMI ModImp Output"
+        output_node.label = "NTMI ModImp 输出"
 
         if len(output_node.inputs) > 0 and len(all_group_nodes) > 0:
             if len(all_group_nodes) == 1:
                 tree.links.new(all_group_nodes[0].outputs[0], output_node.inputs[0])
             else:
                 merge_node = tree.nodes.new('SSMTNode_Object_Group')
-                merge_node.label = "Merge"
+                merge_node.label = "合并"
                 merge_node.location = (600, 0)
                 merge_node.parent = original_model_frame
 
@@ -618,11 +645,11 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
         if hasattr(original_model_frame, "update"):
             original_model_frame.update()
 
-        print(f"NTEMI Blueprint {tree_name} created with NTMI ModImp output node.")
+        print(f"已创建 NTEMI 蓝图 {tree_name}，并挂载 NTMI ModImp 输出节点。")
         return True
 
     except Exception as e:
-        print(f"Error generating NTEMI blueprint nodes: {e}")
+        print(f"生成 NTEMI 蓝图节点时发生错误：{e}")
         import traceback
         traceback.print_exc()
         self.report({'ERROR'}, f"生成 NTEMI 导入蓝图失败：{e}")

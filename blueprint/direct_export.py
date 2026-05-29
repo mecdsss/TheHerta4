@@ -143,7 +143,7 @@ def sync_multifile_direct_mode(node, context=None):
 
 
 def _build_exporter(blueprint_model):
-    if GlobalConfig.logic_name == "EFMI":
+    if GlobalConfig.logic_name in (LogicName.EFMI, LogicName.HTMI):
         return ExportEFMI(blueprint_model=blueprint_model)
     if GlobalConfig.logic_name == "GIMI":
         return ExportGIMI(blueprint_model=blueprint_model)
@@ -155,7 +155,7 @@ def _build_exporter(blueprint_model):
         return ExportSRMI(blueprint_model=blueprint_model)
     if GlobalConfig.logic_name == "ZZMI":
         return ExportZZMI(blueprint_model=blueprint_model)
-    if GlobalConfig.logic_name in ("WWMI", "NTEMI"):
+    if GlobalConfig.logic_name == "WWMI":
         return ExportWWMI(blueprint_model=blueprint_model)
     if GlobalConfig.logic_name == "SnowBreak":
         return ExportSnowBreak(blueprint_model=blueprint_model)

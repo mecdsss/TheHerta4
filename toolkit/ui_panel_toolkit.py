@@ -94,26 +94,6 @@ class VGToolsPanel(bpy.types.Panel):
         sub_box.operator("toolkit.fill_vg_number_gaps", icon='LINENUMBERS_ON')
 
 
-class VGTestPanel(bpy.types.Panel):
-    bl_label = "VG Test"
-    bl_idname = "VIEW3D_PT_Herta_VGTest_Panel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'TheHerta4'
-    bl_parent_id = 'VIEW3D_PT_Herta_Toolkit_Panel'
-    bl_order = 1
-
-    def draw(self, context):
-        layout = self.layout
-
-        box = layout.box()
-        box.label(text="VG Test", icon='MOD_EXPLODE')
-        col = box.column(align=True)
-        col.operator("toolkit.vgtest_unify_numeric", icon='LINENUMBERS_ON')
-        col.operator("toolkit.vgtest_restore_local_numeric", icon='LOOP_BACK')
-        col.operator("toolkit.vgtest_split_preview", icon='MOD_EXPLODE')
-
-
 class BMTP_MainPanel(bpy.types.Panel):
     bl_label = "骨骼与模型处理工具"
     bl_idname = "VIEW3D_PT_Herta_BMTP_Main_Panel"

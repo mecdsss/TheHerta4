@@ -71,6 +71,9 @@ def _read_vb0_positions(path: str) -> list:
 
 def _read_half2x4_records(path: str) -> list:
     io_module = _get_ref_module()
+    reader = getattr(io_module, "read_texcoord_records", None)
+    if callable(reader):
+        return reader(path)
     return io_module.read_half2x4_records(path)
 
 
@@ -116,12 +119,54 @@ def _resolve_frame_analysis_dir(workspace_root: str) -> str:
     return ""
 
 
-def _resolve_deduped_texture_dir(workspace_root: str) -> str:
-    lod0_dir = os.path.join(workspace_root, "LOD0")
-    deduped_dir = os.path.join(lod0_dir, "DedupedTextures")
+def _load_frame_analysis_dir_map(workspace_root: str) -> Dict[str, str]:
+    frame_analysis_dir_map: Dict[str, str] = {}
+    config_directory = os.path.join(workspace_root, "Config", "Tabs")
+    if not os.path.isdir(config_directory):
+        return frame_analysis_dir_map
+
+    for tab_file in sorted(Path(config_directory).glob("ws-tab-*.json")):
+        try:
+            payload = json.loads(tab_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        frame_analysis_dir = str(payload.get("frameAnalysisFolderPath", "") or "").strip()
+        if not frame_analysis_dir or not os.path.isdir(frame_analysis_dir):
+            continue
+
+        for row in payload.get("modelRows", []):
+            if not isinstance(row, dict):
+                continue
+            draw_ib = str(row.get("drawIB", "") or "").strip().lower()
+            if draw_ib:
+                frame_analysis_dir_map[draw_ib] = frame_analysis_dir
+
+    return frame_analysis_dir_map
+
+
+def _resolve_deduped_texture_dir(workspace_root: str, lod_name: str = "LOD0") -> str:
+    lod_dir = os.path.join(workspace_root, str(lod_name or "LOD0"))
+    deduped_dir = os.path.join(lod_dir, "DedupedTextures")
     if os.path.isdir(deduped_dir):
         return deduped_dir
     return ""
+
+
+def _iter_ntemi_lod_dirs(workspace_root: str) -> List[Tuple[str, str]]:
+    lod_dirs: List[Tuple[str, str]] = []
+    if not os.path.isdir(workspace_root):
+        return lod_dirs
+
+    for entry in os.scandir(workspace_root):
+        if not entry.is_dir():
+            continue
+        if not re.fullmatch(r"LOD\d+", entry.name, re.IGNORECASE):
+            continue
+        lod_dirs.append((entry.name, entry.path))
+
+    lod_dirs.sort(key=lambda item: int(str(item[0])[3:]))
+    return lod_dirs
 
 
 def _read_index_binary(ib_path: str) -> list:
@@ -582,57 +627,6 @@ def _parse_ntemi_submesh_folder_name(folder_name: str) -> Tuple[Optional[str], O
     return draw_ib, index_count, first_index, ""
 
 
-def _discover_draw_calls(workspace_root: str, drawib_aliasname_dict: dict = None) -> List[NtemiDrawCallMeta]:
-    draw_calls: List[NtemiDrawCallMeta] = []
-    lod0_dir = os.path.join(workspace_root, "LOD0")
-    if not os.path.isdir(lod0_dir):
-        return draw_calls
-    if drawib_aliasname_dict is None:
-        drawib_aliasname_dict = {}
-
-    for entry in sorted(os.scandir(lod0_dir), key=lambda e: e.name):
-        if not entry.is_dir():
-            continue
-        folder_name = entry.name
-        draw_ib, index_count, first_index, parse_error = _parse_ntemi_submesh_folder_name(folder_name)
-        if parse_error:
-            print(f"[NTEMI] 跳过子模型目录：{parse_error}")
-            continue
-
-        type_subdirs = sorted(Path(entry.path).glob("TYPE_*"))
-        if not type_subdirs:
-            print(f"[NTEMI] 跳过 {folder_name}：未找到任何 TYPE_* 导入目录")
-            continue
-
-        type_dir = ""
-        for candidate_type_dir in type_subdirs:
-            candidate_json = os.path.join(str(candidate_type_dir), f"{folder_name}.json")
-            if os.path.isfile(candidate_json):
-                type_dir = str(candidate_type_dir)
-                break
-        if not type_dir:
-            print(f"[NTEMI] 跳过 {folder_name}：所有 TYPE_* 目录中都缺少 {folder_name}.json")
-            continue
-
-        alias_name = drawib_aliasname_dict.get(draw_ib, "")
-        display_name = folder_name
-        if alias_name:
-            display_name = f"{alias_name}-{index_count}-{first_index}"
-
-        draw_calls.append(NtemiDrawCallMeta(
-            lod_name="LOD0",
-            submesh_folder_name=folder_name,
-            folder_path=type_dir,
-            draw_ib=draw_ib,
-            first_index=first_index,
-            index_count=index_count,
-            display_name=display_name,
-            alias_name=alias_name,
-            component=str(index_count),
-        ))
-    return draw_calls
-
-
 # ── modimp properties ──────────────────────────────────────────────────
 
 def _apply_ntemi_modimp_properties(
@@ -977,21 +971,21 @@ def _perform_bone_merge_postprocess(
     discovery_module = importlib.import_module(f"{package.__name__}.core.discovery")
     operators_module = importlib.import_module(f"{package.__name__}.operators")
 
-    print(f"[NTEMI BoneMerge] discovering model for IB={draw_ib} from {frame_analysis_dir}")
+    print(f"[NTEMI 骨骼合并] 正在从 {frame_analysis_dir} 识别 IB={draw_ib} 的模型")
     detected_model = discovery_module.discover_yihuan_model(
         frame_dump_dir=frame_analysis_dir,
         ib_hash=draw_ib,
     )
-    print(f"[NTEMI BoneMerge] discovered model with {len(detected_model.slices)} slices")
+    print(f"[NTEMI 骨骼合并] 已识别模型，切片数量：{len(detected_model.slices)}")
 
     summary = discovery_module.analyze_yihuan_frame_stages(
         frame_dump_dir=frame_analysis_dir,
         ib_hash=draw_ib,
     )
-    print(f"[NTEMI BoneMerge] analyzed frame stages, dispatches={summary.get('dispatch_count', 0)}")
+    print(f"[NTEMI 骨骼合并] 帧阶段分析完成，Dispatch 数量：{summary.get('dispatch_count', 0)}")
 
     collector_contract = operators_module._build_collector_runtime_contract(summary, detected_model)
-    print(f"[NTEMI BoneMerge] built collector contract with {len(collector_contract)} fields")
+    print(f"[NTEMI 骨骼合并] 已生成收集器契约，字段数量：{len(collector_contract)}")
 
     if collector_contract:
         seen_collections = set()
@@ -1010,16 +1004,16 @@ def _perform_bone_merge_postprocess(
 
     bone_merge_map = operators_module._build_bone_merge_map(summary, detected_model)
     entries = bone_merge_map.get("entries", [])
-    print(f"[NTEMI BoneMerge] built bone merge map with {len(entries)} entries")
+    print(f"[NTEMI 骨骼合并] 已生成骨骼合并映射，条目数量：{len(entries)}")
 
     if not entries:
-        print("[NTEMI BoneMerge] bone merge map has no entries, skipping bone merge.")
+        print("[NTEMI 骨骼合并] 骨骼合并映射为空，跳过骨骼合并。")
     else:
         renamed_count = operators_module._apply_bone_merge_map_to_objects(
             objects,
             bone_merge_map,
         )
-        print(f"[NTEMI BoneMerge] renamed {renamed_count} vertex groups across {len(objects)} objects")
+        print(f"[NTEMI 骨骼合并] 已在 {len(objects)} 个对象上重命名 {renamed_count} 个顶点组")
 
     for detected_slice in detected_model.slices:
         for obj in objects:
@@ -1051,4 +1045,56 @@ def _perform_bone_merge_postprocess(
                 _collect_modimp_props(obj),
             )
 
-    print(f"[NTEMI BoneMerge] completed successfully")
+    print("[NTEMI 骨骼合并] 处理完成")
+
+
+def _discover_draw_calls(workspace_root: str, drawib_aliasname_dict: dict = None) -> List[NtemiDrawCallMeta]:
+    draw_calls: List[NtemiDrawCallMeta] = []
+    lod_dirs = _iter_ntemi_lod_dirs(workspace_root)
+    if not lod_dirs:
+        return draw_calls
+    if drawib_aliasname_dict is None:
+        drawib_aliasname_dict = {}
+
+    for lod_name, lod_dir in lod_dirs:
+        for entry in sorted(os.scandir(lod_dir), key=lambda e: e.name):
+            if not entry.is_dir():
+                continue
+            folder_name = entry.name
+            draw_ib, index_count, first_index, parse_error = _parse_ntemi_submesh_folder_name(folder_name)
+            if parse_error:
+                print(f"[NTEMI] 跳过子模型目录：{parse_error}")
+                continue
+
+            type_subdirs = sorted(Path(entry.path).glob("TYPE_*"))
+            if not type_subdirs:
+                print(f"[NTEMI] 跳过 {lod_name}.{folder_name}：未找到任何 TYPE_* 导入目录")
+                continue
+
+            type_dir = ""
+            for candidate_type_dir in type_subdirs:
+                candidate_json = os.path.join(str(candidate_type_dir), f"{folder_name}.json")
+                if os.path.isfile(candidate_json):
+                    type_dir = str(candidate_type_dir)
+                    break
+            if not type_dir:
+                print(f"[NTEMI] 跳过 {lod_name}.{folder_name}：所有 TYPE_* 目录中都缺少 {folder_name}.json")
+                continue
+
+            alias_name = drawib_aliasname_dict.get(draw_ib, "")
+            display_name = folder_name
+            if alias_name:
+                display_name = f"{alias_name}-{index_count}-{first_index}"
+
+            draw_calls.append(NtemiDrawCallMeta(
+                lod_name=lod_name,
+                submesh_folder_name=folder_name,
+                folder_path=type_dir,
+                draw_ib=draw_ib,
+                first_index=first_index,
+                index_count=index_count,
+                display_name=display_name,
+                alias_name=alias_name,
+                component=str(index_count),
+            ))
+    return draw_calls

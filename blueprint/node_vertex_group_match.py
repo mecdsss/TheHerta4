@@ -26,6 +26,13 @@ class VertexGroupMatcherOptimized:
     def __init__(self, candidates_count: int = 3, chunk_size: int = 256):
         self.candidates_count = candidates_count
         self.chunk_size = chunk_size
+
+    @staticmethod
+    def _calculate_match_center(points: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        total_weight = float(np.sum(weights))
+        if total_weight <= 1e-8:
+            return np.mean(points, axis=0).astype(np.float32, copy=False)
+        return np.average(points, axis=0, weights=weights).astype(np.float32, copy=False)
     
     def get_vertex_positions(self, obj, use_shape_key: bool = False, context=None) -> np.ndarray:
         """获取物体所有顶点的世界坐标"""
@@ -43,7 +50,7 @@ class VertexGroupMatcherOptimized:
             ], dtype=np.float32)
         return positions
     
-    def get_vg_point_clouds(self, obj, positions: np.ndarray) -> Dict[str, np.ndarray]:
+    def get_vg_point_clouds(self, obj, positions: np.ndarray) -> Dict[str, Dict[str, np.ndarray]]:
         """获取每个顶点组影响的所有顶点点云"""
         vg_points = {}
         vg_weights = {}
@@ -66,10 +73,14 @@ class VertexGroupMatcherOptimized:
         result = {}
         for name, points in vg_points.items():
             if points:
+                points_array = np.array(points, dtype=np.float32)
+                weights_array = np.array(vg_weights[name], dtype=np.float32)
+                match_center = self._calculate_match_center(points_array, weights_array)
                 result[name] = {
-                    'points': np.array(points, dtype=np.float32),
-                    'weights': np.array(vg_weights[name], dtype=np.float32),
-                    'centroid': np.mean(points, axis=0)
+                    'points': points_array,
+                    'weights': weights_array,
+                    'centroid': match_center,
+                    'weighted_centroid': match_center,
                 }
         return result
     
@@ -99,7 +110,7 @@ class VertexGroupMatcherOptimized:
         kd = kdtree.KDTree(size)
         
         for i, name in enumerate(names):
-            centroid = vg_data[name]['centroid']
+            centroid = vg_data[name].get('weighted_centroid', vg_data[name]['centroid'])
             kd.insert(centroid, i)
         
         kd.balance()
@@ -121,7 +132,7 @@ class VertexGroupMatcherOptimized:
         mapping = {}
         
         for src_name, src_data in source_vg.items():
-            src_centroid = Vector(src_data['centroid'])
+            src_centroid = Vector(src_data.get('weighted_centroid', src_data['centroid']))
             src_points = src_data['points']
             
             found = kd_tree.find_range(src_centroid, threshold * 10)
@@ -1996,7 +2007,7 @@ class SSMT_OT_VertexGroupMatchQuickWeight(bpy.types.Operator):
 
         if active_obj.type == 'CURVE' and active_obj.name.startswith("Match_"):
             return self._handle_curve_selection(context, active_obj)
-        
+
         if active_obj.name.startswith("Source_") or active_obj.name.startswith("Target_"):
             return self._handle_debug_object_selection(context, active_obj)
         
@@ -2203,6 +2214,7 @@ class SSMT_OT_VertexGroupMatchQuickWeight(bpy.types.Operator):
         else:
             self.report({'INFO'}, f"已进入权重绘制模式: {mesh_obj.name} - {found_vg.name}")
         return {'FINISHED'}
+
 
 
 def register_keymaps():

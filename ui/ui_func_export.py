@@ -94,6 +94,15 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
                         return True
         return False
 
+    @staticmethod
+    def _find_ntmi_modimp_output_node(tree):
+        if not tree:
+            return None
+        for node in getattr(tree, "nodes", []) or []:
+            if getattr(node, "bl_idname", "") == "SSMTNode_Result_Output_NTMIModImp":
+                return node
+        return None
+
     def execute(self, context):
         LOG.start_collecting()
         GlobalConfig.read_from_main_json_ssmt4()
@@ -104,6 +113,20 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         tree = self._resolve_target_tree(context)
         if not tree:
             self.report({'ERROR'}, "未找到当前蓝图，请在蓝图编辑器中点击 Generate Mod")
+            return {'CANCELLED'}
+
+        if GlobalConfig.logic_name == LogicName.NTEMI:
+            ntmi_output_node = self._find_ntmi_modimp_output_node(tree)
+            if ntmi_output_node is not None:
+                self.report(
+                    {'ERROR'},
+                    "NTEMI 已停用普通导出链路，请改用蓝图中的“NTMI ModImp Output”节点按钮进行导出。"
+                )
+            else:
+                self.report(
+                    {'ERROR'},
+                    "NTEMI 已停用普通导出链路。请先从工作空间重新生成或添加“NTMI ModImp Output”节点后再导出。"
+                )
             return {'CANCELLED'}
 
         BlueprintExportHelper.set_runtime_blueprint_tree(tree)
@@ -450,6 +473,10 @@ class SSMTQuickExportSelected(bpy.types.Operator):
     bl_description = "无视蓝图，直接导出当前选中的网格物体"
     bl_options = {'REGISTER', 'UNDO'}
 
+    _NTEMI_QUICK_EXPORT_DISABLED_MESSAGE = (
+        "NTEMI 已停用快速局部导出，请改用“NTMI ModImp Output”独立导出器。"
+    )
+
     def execute(self, context):
         selected_meshes, skipped_count = self._collect_selected_meshes(context)
         if not selected_meshes:
@@ -457,6 +484,9 @@ class SSMTQuickExportSelected(bpy.types.Operator):
             return {'CANCELLED'}
 
         GlobalConfig.read_from_main_json_ssmt4()
+        if GlobalConfig.logic_name == LogicName.NTEMI:
+            self.report({'ERROR'}, self._NTEMI_QUICK_EXPORT_DISABLED_MESSAGE)
+            return {'CANCELLED'}
 
         temp_tree = None
         previous_runtime_tree_name = BlueprintExportHelper.runtime_blueprint_tree_name

@@ -3,7 +3,6 @@ from .model_operators import model_operators_list
 from .ui_panel_toolkit import (
     ToolkitPanel, 
     VGToolsPanel,
-    VGTestPanel,
     BMTP_MainPanel,
     BMTP_BoneControlPanel,
     BMTP_WeightControlPanel,
@@ -28,7 +27,6 @@ from .ui_panel_toolkit import (
 from .vg_properties import vg_properties_list
 from .vg_backup import vg_backup_operators
 from .vg_create import vg_create_operators
-from .vg_test_ops import vg_test_operators
 from .vg_weight_adjust import vg_weight_adjust_operators
 
 from .bmtp_properties import bmtp_properties_list
@@ -80,7 +78,6 @@ from .ui_panel_animation import (
 __all__ = [
     'ToolkitPanel',
     'VGToolsPanel',
-    'VGTestPanel',
     'BMTP_MainPanel',
     'BMTP_BoneControlPanel',
     'BMTP_WeightControlPanel',
@@ -105,7 +102,6 @@ __all__ = [
     'vg_properties_list',
     'vg_backup_operators',
     'vg_create_operators',
-    'vg_test_operators',
     'vg_weight_adjust_operators',
     'bmtp_properties_list',
     'bmtp_bone_tools_list',
@@ -176,13 +172,6 @@ def register():
         except Exception as e:
             print(f"[TheHerta4]   注册失败: {op_class.__name__} - {e}")
     
-    for op_class in vg_test_operators:
-        try:
-            bpy.utils.register_class(op_class)
-            print(f"[TheHerta4]   registered {op_class.__name__}")
-        except Exception as e:
-            print(f"[TheHerta4]   failed to register: {op_class.__name__} - {e}")
-
     for op_class in vg_weight_adjust_operators:
         try:
             bpy.utils.register_class(op_class)
@@ -406,7 +395,6 @@ def register():
     
     bpy.utils.register_class(ToolkitPanel)
     bpy.utils.register_class(VGToolsPanel)
-    bpy.utils.register_class(VGTestPanel)
     bpy.utils.register_class(BMTP_MainPanel)
     bpy.utils.register_class(BMTP_BoneControlPanel)
     bpy.utils.register_class(BMTP_WeightControlPanel)
@@ -475,7 +463,6 @@ def unregister():
     bpy.utils.unregister_class(BMTP_WeightControlPanel)
     bpy.utils.unregister_class(BMTP_BoneControlPanel)
     bpy.utils.unregister_class(BMTP_MainPanel)
-    bpy.utils.unregister_class(VGTestPanel)
     bpy.utils.unregister_class(VGToolsPanel)
     bpy.utils.unregister_class(ToolkitPanel)
     
@@ -484,7 +471,7 @@ def unregister():
             bpy.utils.unregister_class(op_class)
         except Exception:
             pass
-    
+
     for op_class in reversed(at_animation_export_list):
         try:
             bpy.utils.unregister_class(op_class)
@@ -672,12 +659,6 @@ def unregister():
         except Exception:
             pass
     
-    for op_class in reversed(vg_test_operators):
-        try:
-            bpy.utils.unregister_class(op_class)
-        except Exception:
-            pass
-
     for op_class in reversed(vg_create_operators):
         try:
             bpy.utils.unregister_class(op_class)

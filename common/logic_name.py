@@ -19,6 +19,7 @@ class LogicName:
     ZZMI = "ZZMI"
     WWMI = "WWMI"
     EFMI = "EFMI"
+    HTMI = "HTMI"
 
     # 小众游戏，使用人数极少，有用户反馈时进行维护即可
     # 注意，如果一个游戏有原生Mod方式，就不应该使用3Dmigoto来进行Mod制作

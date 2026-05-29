@@ -14,6 +14,8 @@ if "bpy" not in sys.modules:
 
 if "mathutils" not in sys.modules:
     sys.modules["mathutils"] = types.SimpleNamespace(Matrix=object)
+elif not hasattr(sys.modules["mathutils"], "Matrix"):
+    setattr(sys.modules["mathutils"], "Matrix", object)
 
 if "TheHerta4.utils.timer_utils" not in sys.modules:
     sys.modules["TheHerta4.utils.timer_utils"] = types.SimpleNamespace(
