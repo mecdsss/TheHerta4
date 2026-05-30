@@ -6,6 +6,7 @@ from ..common.global_config import GlobalConfig
 from ..common.global_properties import GlobalProterties
 from ..common.m_key import M_Key
 from ..common.object_prefix_helper import ObjectPrefixHelper
+from ..utils.shapekey_utils import ShapeKeyUtils
 
 
 def _get_node_unique_key(node) -> str:
@@ -50,16 +51,11 @@ class BlueprintExportHelper:
     def get_exportable_shape_key_infos(obj, slot_limit: int | None = None) -> list[tuple[int, str, object]]:
         if obj is None or not getattr(obj, "data", None):
             return []
-        shape_keys = getattr(getattr(obj.data, "shape_keys", None), "key_blocks", None)
-        if not shape_keys:
-            return []
 
         ignore_muted = BlueprintExportHelper.should_ignore_muted_shape_keys()
         slot_infos = []
         slot_index = 0
-        for key_index, key_block in enumerate(shape_keys):
-            if key_index == 0:
-                continue
+        for key_block in ShapeKeyUtils.iter_exportable_shape_keys(obj) or ():
             if ignore_muted and getattr(key_block, "mute", False):
                 continue
             slot_index += 1

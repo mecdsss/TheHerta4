@@ -1,0 +1,176 @@
+import importlib.util
+import sys
+import types
+import unittest
+from pathlib import Path
+
+
+def _install_module(name, **attrs):
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    sys.modules[name] = module
+    return module
+
+
+PKG = "_export_utils_state_consistency_test_pkg"
+for package_name in (PKG, f"{PKG}.utils", f"{PKG}.common", f"{PKG}.blueprint"):
+    package = _install_module(package_name)
+    package.__path__ = []
+
+
+class _FakeShapeKey:
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+        self.mute = False
+        self.data = []
+
+
+class _FakeMesh:
+    def __init__(self):
+        self.polygons = []
+        self.uv_layers = {}
+
+
+class _FakeObject:
+    def __init__(self):
+        self.name = "Mesh"
+        self.type = "MESH"
+        self.data = types.SimpleNamespace(
+            shape_keys=types.SimpleNamespace(
+                key_blocks=[
+                    _FakeShapeKey("Basis", 0.0),
+                    _FakeShapeKey("Smile", 1.0),
+                    _FakeShapeKey("Blink", 0.25),
+                ]
+            )
+        )
+        self._mesh = _FakeMesh()
+
+    def evaluated_get(self, _depsgraph):
+        return types.SimpleNamespace(to_mesh=lambda: self._mesh)
+
+
+_install_module(
+    "bpy",
+    context=types.SimpleNamespace(
+        evaluated_depsgraph_get=lambda: object(),
+        view_layer=types.SimpleNamespace(update=lambda: None),
+    ),
+    data=types.SimpleNamespace(objects={}),
+    types=types.SimpleNamespace(Object=object, Mesh=object),
+)
+_install_module(f"{PKG}.common.global_config", GlobalConfig=types.SimpleNamespace(logic_name="GIMI"))
+_install_module(f"{PKG}.common.logic_name", LogicName=types.SimpleNamespace(GF2="GF2", YYSLS="YYSLS", SnowBreak="SnowBreak"))
+_install_module(f"{PKG}.common.global_properties", GlobalProterties=types.SimpleNamespace())
+_install_module(f"{PKG}.common.d3d11_gametype", D3D11GameType=object)
+_install_module(f"{PKG}.common.obj_buffer_helper", ObjBufferHelper=types.SimpleNamespace(
+    parse_elementname_data_dict=lambda mesh, d3d11_game_type: {"POSITION": mesh},
+))
+_install_module(f"{PKG}.utils.timer_utils", TimerUtils=types.SimpleNamespace())
+_install_module(f"{PKG}.utils.obj_utils", ObjUtils=types.SimpleNamespace(
+    get_obj_by_name=lambda name: None,
+    get_mesh_evaluate_from_obj=lambda obj: obj._mesh,
+    mesh_triangulate=lambda mesh: None,
+))
+
+
+class _FakeShapeKeyUtils:
+    @staticmethod
+    def iter_exportable_shape_keys(obj):
+        key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None) or []
+        for index, key_block in enumerate(key_blocks):
+            if index == 0:
+                continue
+            if str(getattr(key_block, "name", "") or "").strip().lower() == "basis":
+                continue
+            yield key_block
+
+    @classmethod
+    def count_exportable_shape_keys(cls, obj):
+        return sum(1 for _key_block in cls.iter_exportable_shape_keys(obj))
+
+    @classmethod
+    def has_exportable_shape_keys(cls, obj):
+        return cls.count_exportable_shape_keys(obj) > 0
+
+    @staticmethod
+    def preserve_shape_key_state(obj):
+        class _Ctx:
+            def __enter__(self_inner):
+                self_inner.state = [(kb, kb.value) for kb in obj.data.shape_keys.key_blocks]
+                return self_inner.state
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                for key_block, value in self_inner.state:
+                    key_block.value = value
+                return False
+
+        return _Ctx()
+
+    @staticmethod
+    def reset_shapekey_values(obj):
+        for key_block in obj.data.shape_keys.key_blocks:
+            if key_block.name != "Basis":
+                key_block.value = 0.0
+
+    @staticmethod
+    def _update_view_layer():
+        return None
+
+    @staticmethod
+    def extract_shapekey_data(merged_obj, index_vertex_id_dict):
+        return [1], [2], [3]
+
+
+_install_module(f"{PKG}.utils.shapekey_utils", ShapeKeyUtils=_FakeShapeKeyUtils)
+_install_module(f"{PKG}.blueprint.export_helper", BlueprintExportHelper=types.SimpleNamespace(
+    should_preserve_current_shapekey_mix_for_export=lambda: False,
+))
+
+
+module_path = Path(__file__).resolve().parents[1] / "utils" / "export_utils.py"
+spec = importlib.util.spec_from_file_location(f"{PKG}.utils.export_utils", module_path)
+export_utils = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = export_utils
+spec.loader.exec_module(export_utils)
+
+
+class ExportUtilsStateConsistencyTests(unittest.TestCase):
+    def test_build_obj_element_context_restores_source_shape_key_values(self):
+        obj = _FakeObject()
+
+        context = export_utils.ExportUtils.build_obj_element_context(
+            d3d11_game_type=types.SimpleNamespace(get_total_structured_dtype=lambda: object()),
+            obj=obj,
+        )
+
+        self.assertIs(context.obj, obj)
+        self.assertEqual(obj.data.shape_keys.key_blocks[1].value, 1.0)
+        self.assertEqual(obj.data.shape_keys.key_blocks[2].value, 0.25)
+
+    def test_build_wwmi_shapekey_payload_ignores_basis_only_shape_keys(self):
+        obj = _FakeObject()
+        obj.data.shape_keys.key_blocks = [_FakeShapeKey("Basis", 0.0)]
+
+        result = export_utils.ExportUtils.build_wwmi_shapekey_payload(
+            obj=obj,
+            index_vertex_id_dict={},
+        )
+
+        self.assertEqual(result, ([], [], [], False))
+
+    def test_build_wwmi_shapekey_payload_exports_when_non_basis_shape_key_exists(self):
+        obj = _FakeObject()
+
+        result = export_utils.ExportUtils.build_wwmi_shapekey_payload(
+            obj=obj,
+            index_vertex_id_dict={},
+        )
+
+        self.assertEqual(result, ([1], [2], [3], True))
+
+
+if __name__ == "__main__":
+    unittest.main()

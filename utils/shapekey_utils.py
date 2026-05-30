@@ -4,6 +4,7 @@ import bpy
 import time
 import numpy
 import re
+from contextlib import contextmanager
 from mathutils import Matrix
 
 from .timer_utils import TimerUtils
@@ -19,6 +20,283 @@ class ShapeKeyUtils:
         ("pointer", "from", "指针", "shape key", "shape keys", "形态键"),
         ("delete", "deleted", "删除", "移除"),
     )
+
+    @staticmethod
+    def is_basis_shape_key_name(name) -> bool:
+        return str(name or "").strip().lower() == "basis"
+
+    @classmethod
+    def iter_exportable_shape_keys(cls, obj):
+        key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
+        if not key_blocks:
+            return
+
+        for index, key_block in enumerate(key_blocks):
+            if index == 0:
+                continue
+            if cls.is_basis_shape_key_name(getattr(key_block, "name", "")):
+                continue
+            yield key_block
+
+    @classmethod
+    def count_exportable_shape_keys(cls, obj) -> int:
+        return sum(1 for _key_block in cls.iter_exportable_shape_keys(obj) or ())
+
+    @classmethod
+    def has_exportable_shape_keys(cls, obj) -> bool:
+        return cls.count_exportable_shape_keys(obj) > 0
+
+    @staticmethod
+    def get_basis_shape_key_block(obj):
+        key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
+        if not key_blocks:
+            return None
+        try:
+            return key_blocks[0]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_set_active_object(obj):
+        bpy.context.view_layer.objects.active = obj
+
+    @staticmethod
+    def _update_view_layer():
+        view_layer = getattr(bpy.context, "view_layer", None)
+        update_method = getattr(view_layer, "update", None)
+        if callable(update_method):
+            update_method()
+
+    @staticmethod
+    def _ensure_object_mode_for_active_object(obj):
+        active_object = bpy.context.view_layer.objects.active
+        if active_object is None:
+            return
+
+        current_mode = getattr(active_object, "mode", None)
+        if current_mode == 'EDIT':
+            try:
+                active_object.update_from_editmode()
+            except Exception:
+                pass
+
+        if current_mode and current_mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+    @staticmethod
+    def _safe_deselect_all_objects():
+        for selected_obj in list(bpy.context.selected_objects):
+            try:
+                selected_obj.select_set(False)
+            except Exception:
+                pass
+        bpy.context.view_layer.objects.active = None
+
+    @classmethod
+    @contextmanager
+    def _shape_key_operator_context(cls, obj):
+        original_active = bpy.context.view_layer.objects.active
+        original_selected = [
+            selected_obj
+            for selected_obj in bpy.context.selected_objects
+            if selected_obj is not None
+        ]
+        original_mode = getattr(original_active, "mode", None) if original_active is not None else None
+
+        try:
+            if original_active is not None:
+                cls._ensure_object_mode_for_active_object(original_active)
+            cls._safe_deselect_all_objects()
+            cls._safe_set_active_object(obj)
+            obj.select_set(True)
+            cls._ensure_object_mode_for_active_object(obj)
+
+            yield
+        finally:
+            try:
+                cls._safe_deselect_all_objects()
+            except Exception:
+                pass
+
+            for selected_obj in original_selected:
+                try:
+                    if selected_obj.name in bpy.data.objects:
+                        selected_obj.select_set(True)
+                except Exception:
+                    pass
+
+            if original_active is not None:
+                try:
+                    if original_active.name in bpy.data.objects:
+                        cls._safe_set_active_object(original_active)
+                        if original_mode and getattr(original_active, "mode", None) != original_mode:
+                            bpy.ops.object.mode_set(mode=original_mode)
+                except Exception:
+                    pass
+
+    @classmethod
+    @contextmanager
+    def operator_context(cls, obj):
+        with cls._shape_key_operator_context(obj):
+            yield obj
+
+    @classmethod
+    def remove_shape_keys(cls, obj, all=True, apply_mix=None, active_shape_key_index=None):
+        kwargs = {"all": all}
+        if apply_mix is not None:
+            kwargs["apply_mix"] = apply_mix
+
+        with cls._shape_key_operator_context(obj):
+            if active_shape_key_index is not None:
+                obj.active_shape_key_index = active_shape_key_index
+            bpy.ops.object.shape_key_remove(**kwargs)
+
+    @classmethod
+    @contextmanager
+    def temporarily_disable_visible_modifiers(cls, obj):
+        modifiers = list(getattr(obj, "modifiers", []) or [])
+        original_states = [
+            (modifier, bool(getattr(modifier, "show_viewport", False)))
+            for modifier in modifiers
+        ]
+
+        try:
+            for modifier, show_viewport in original_states:
+                if show_viewport:
+                    modifier.show_viewport = False
+            if original_states:
+                cls._update_view_layer()
+            yield
+        finally:
+            for modifier, show_viewport in original_states:
+                try:
+                    modifier.show_viewport = show_viewport
+                except Exception:
+                    pass
+            if original_states:
+                cls._update_view_layer()
+
+    @classmethod
+    def sync_basis_shape_key_to_mesh(cls, obj) -> bool:
+        basis_key = cls.get_basis_shape_key_block(obj)
+        vertices = getattr(getattr(obj, "data", None), "vertices", None)
+        basis_points = getattr(basis_key, "data", None) if basis_key is not None else None
+        if basis_points is None or vertices is None:
+            return False
+
+        try:
+            coords = numpy.empty((len(vertices), 3), dtype=numpy.float32)
+            vertices.foreach_get("co", coords.ravel())
+            if len(basis_points) != len(vertices):
+                return False
+            basis_points.foreach_set("co", coords.ravel())
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def bake_current_shape_key_mix_to_mesh(cls, obj, stage_label: str = "") -> bool:
+        if not obj or getattr(obj, "type", None) != 'MESH' or not getattr(obj, "data", None):
+            return False
+
+        coords = None
+        with cls.temporarily_disable_visible_modifiers(obj):
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            evaluated_obj = obj.evaluated_get(depsgraph)
+            evaluated_mesh = evaluated_obj.to_mesh()
+            try:
+                coords = numpy.empty((len(evaluated_mesh.vertices), 3), dtype=numpy.float32)
+                evaluated_mesh.vertices.foreach_get("co", coords.ravel())
+            finally:
+                evaluated_obj.to_mesh_clear()
+
+        if coords is None:
+            return False
+
+        obj.data.vertices.foreach_set("co", coords.ravel())
+        cls.sync_basis_shape_key_to_mesh(obj)
+        obj.data.update()
+        return True
+
+    @classmethod
+    def remove_non_basis_shape_keys(cls, obj, stage_label: str = "") -> int:
+        key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
+        if not key_blocks:
+            return 0
+
+        clear_method = getattr(obj, "shape_key_clear", None)
+        if callable(clear_method):
+            clear_method()
+            remaining_key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
+            if not remaining_key_blocks or len(remaining_key_blocks) <= 1:
+                return max(len(key_blocks) - 1, 0)
+
+        if callable(getattr(obj, "shape_key_remove", None)):
+            removed_count = 0
+            for shape_key in reversed(list(key_blocks)[1:]):
+                obj.shape_key_remove(shape_key)
+                removed_count += 1
+            return removed_count
+
+        removed_count = 0
+        remaining_key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
+        try:
+            while remaining_key_blocks and len(remaining_key_blocks) > 1:
+                cls.remove_shape_keys(obj, all=False, active_shape_key_index=len(remaining_key_blocks) - 1)
+                removed_count += 1
+                remaining_key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
+        except Exception as exc:
+            stage_prefix = f"{stage_label}: " if stage_label else ""
+            raise RuntimeError(
+                f"{stage_prefix}当前对象不支持 shape_key_remove，无法移除非 Basis 形态键。"
+            ) from exc
+        return removed_count
+
+    @classmethod
+    def capture_shape_key_state(cls, obj) -> list[dict]:
+        key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
+        if not key_blocks:
+            return []
+
+        state = []
+        for key_block in key_blocks:
+            state.append(
+                {
+                    "name": getattr(key_block, "name", ""),
+                    "value": float(getattr(key_block, "value", 0.0)),
+                    "mute": bool(getattr(key_block, "mute", False)),
+                }
+            )
+        return state
+
+    @classmethod
+    def restore_shape_key_state(cls, obj, shape_key_state: list[dict]):
+        key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
+        if not key_blocks:
+            return
+
+        state_by_name = {
+            entry.get("name", ""): entry
+            for entry in shape_key_state
+            if entry.get("name", "")
+        }
+        for key_block in key_blocks:
+            state_entry = state_by_name.get(getattr(key_block, "name", ""))
+            if getattr(key_block, "name", "") != 'Basis':
+                key_block.value = float(state_entry.get("value", 0.0)) if state_entry else 0.0
+            if state_entry is not None and hasattr(key_block, 'mute'):
+                key_block.mute = bool(state_entry.get("mute", False))
+
+    @classmethod
+    @contextmanager
+    def preserve_shape_key_state(cls, obj):
+        shape_key_state = cls.capture_shape_key_state(obj)
+        try:
+            yield shape_key_state
+        finally:
+            if shape_key_state:
+                cls.restore_shape_key_state(obj, shape_key_state)
+                cls._update_view_layer()
 
     @staticmethod
     def _get_shape_key_coordinate_snapshot(obj):
@@ -87,24 +365,28 @@ class ShapeKeyUtils:
         )
         original_active = bpy.context.view_layer.objects.active
         original_selection = list(bpy.context.selected_objects)
+        original_mode = getattr(original_active, "mode", None) if original_active is not None else None
 
         try:
-            bpy.ops.object.select_all(action='DESELECT')
-            bpy.context.view_layer.objects.active = obj
-            obj.select_set(True)
-            bpy.ops.object.transform_apply(
-                location=location,
-                rotation=rotation,
-                scale=scale,
-            )
+            with cls.operator_context(obj):
+                bpy.ops.object.transform_apply(
+                    location=location,
+                    rotation=rotation,
+                    scale=scale,
+                )
             cls._restore_transformed_shape_key_coordinates(obj, snapshot, matrix)
         finally:
-            bpy.ops.object.select_all(action='DESELECT')
+            cls._safe_deselect_all_objects()
             for selected_obj in original_selection:
                 if selected_obj.name in bpy.data.objects:
                     selected_obj.select_set(True)
             if original_active and original_active.name in bpy.data.objects:
-                bpy.context.view_layer.objects.active = original_active
+                cls._safe_set_active_object(original_active)
+                if original_mode and getattr(original_active, "mode", None) != original_mode:
+                    try:
+                        bpy.ops.object.mode_set(mode=original_mode)
+                    except Exception:
+                        pass
 
     @classmethod
     def apply_modifiers_for_object_with_shape_keys_optimized(cls, context, selected_modifiers, disable_armatures=False):
@@ -240,7 +522,7 @@ class ShapeKeyUtils:
 
         # Handle base shape in "originalObject"
         print("applyModifierForObjectWithShapeKeys: Applying base shape key")
-        bpy.ops.object.shape_key_remove(all=True)
+        cls.remove_shape_keys(originalObject, all=True)
         for modifierName in selectedModifiers:
             bpy.ops.object.modifier_apply(modifier=modifierName)
         vertCount = len(originalObject.data.vertices)
@@ -260,15 +542,15 @@ class ShapeKeyUtils:
             # Copy temp object.
             bpy.ops.object.duplicate_move(OBJECT_OT_duplicate={"linked":False, "mode":'TRANSLATION'}, TRANSFORM_OT_translate={"value":(0, 0, 0), "orient_type":'GLOBAL', "orient_matrix":((1, 0, 0), (0, 1, 0), (0, 0, 1)), "orient_matrix_type":'GLOBAL', "constraint_axis":(False, False, False), "mirror":True, "use_proportional_edit":False, "proportional_edit_falloff":'SMOOTH', "proportional_size":1, "use_proportional_connected":False, "use_proportional_projected":False, "snap":False, "snap_target":'CLOSEST', "snap_point":(0, 0, 0), "snap_align":False, "snap_normal":(0, 0, 0), "gpencil_strokes":False, "cursor_transform":False, "texture_space":False, "remove_on_cancel":False, "release_confirm":False, "use_accurate":False})
             tmpObject = context.view_layer.objects.active
-            bpy.ops.object.shape_key_remove(all=True)
+            cls.remove_shape_keys(tmpObject, all=True)
             copyObject.select_set(True)
             copyObject.active_shape_key_index = i
             
             # Get right shape-key.
             bpy.ops.object.shape_key_transfer()
             context.object.active_shape_key_index = 0
-            bpy.ops.object.shape_key_remove()
-            bpy.ops.object.shape_key_remove(all=True)
+            cls.remove_shape_keys(tmpObject, all=False)
+            cls.remove_shape_keys(tmpObject, all=True)
             
             # Time to apply modifiers.
             for modifierName in selectedModifiers:
@@ -533,11 +815,6 @@ class ShapeKeyUtils:
                     print(f"[ShapeKeyUtils] 检查形态键时发生异常: {obj.name}.{key_block.name} - {e} (跳过，由 Blender 自动处理)")
             
             if keys_to_remove:
-                original_active = bpy.context.view_layer.objects.active
-                bpy.context.view_layer.objects.active = obj
-                bpy.ops.object.select_all(action='DESELECT')
-                obj.select_set(True)
-                
                 for key_name in reversed(keys_to_remove):
                     try:
                         key_index = -1
@@ -547,15 +824,15 @@ class ShapeKeyUtils:
                                 break
                         
                         if key_index >= 0:
-                            obj.active_shape_key_index = key_index
-                            bpy.ops.object.shape_key_remove(all=False)
+                            cls.remove_shape_keys(
+                                obj,
+                                all=False,
+                                active_shape_key_index=key_index,
+                            )
                             cleaned_count += 1
                             print(f"[ShapeKeyUtils] 已删除损坏的形态键: {obj.name}.{key_name}")
                     except Exception as e:
                         print(f"[ShapeKeyUtils] 删除形态键失败: {obj.name}.{key_name} - {e}")
-                
-                if original_active:
-                    bpy.context.view_layer.objects.active = original_active
         
         if cleaned_count > 0:
             print(f"[ShapeKeyUtils] 共清理 {cleaned_count} 个损坏的形态键")

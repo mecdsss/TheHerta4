@@ -76,6 +76,12 @@ _install_module(
     f"{PKG}.utils.log_utils",
     LOG=types.SimpleNamespace(info=lambda *_args, **_kwargs: None, warning=lambda *_args, **_kwargs: None),
 )
+_install_module(
+    f"{PKG}.utils.shapekey_utils",
+    ShapeKeyUtils=types.SimpleNamespace(
+        is_basis_shape_key_name=lambda name: str(name or "").strip().lower() == "basis",
+    ),
+)
 
 _helper_state = {"collect_connected_start_nodes": lambda _tree: [], "blueprint_model": None}
 _install_module(
@@ -124,6 +130,74 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
 
         self.assertEqual(result, ["Blink", "Smile"])
 
+    def test_ensure_shape_key_variable_map_rebuilds_items_from_current_scan(self):
+        class _FakeItem:
+            def __init__(self, shape_key_name="", assigned_variable_name="", custom_variable_name=""):
+                self.shape_key_name = shape_key_name
+                self.assigned_variable_name = assigned_variable_name
+                self.custom_variable_name = custom_variable_name
+
+        class _FakeCollection(list):
+            def add(self):
+                item = _FakeItem()
+                self.append(item)
+                return item
+
+            def remove(self, index):
+                del self[index]
+
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        node.shapekey_variable_items = _FakeCollection([
+            _FakeItem("A", "Freq_A", "Freq_A"),
+            _FakeItem("B", "Freq_B", "Manual_B"),
+            _FakeItem("C", "Freq_C", "Freq_C"),
+            _FakeItem("D", "Freq_D", "Freq_D"),
+            _FakeItem("E", "Freq_E", "Freq_E"),
+        ])
+
+        created_count, backfilled_count = node.ensure_shape_key_variable_map(["A", "B", "C"])
+
+        self.assertEqual(created_count, 0)
+        self.assertEqual(backfilled_count, 0)
+        self.assertEqual(
+            [item.shape_key_name for item in node.shapekey_variable_items],
+            ["A", "B", "C"],
+        )
+        self.assertEqual(node.shapekey_variable_items[1].custom_variable_name, "Manual_B")
+
+    def test_ensure_shape_key_variable_map_adds_new_items_after_pruning_stale_ones(self):
+        class _FakeItem:
+            def __init__(self, shape_key_name="", assigned_variable_name="", custom_variable_name=""):
+                self.shape_key_name = shape_key_name
+                self.assigned_variable_name = assigned_variable_name
+                self.custom_variable_name = custom_variable_name
+
+        class _FakeCollection(list):
+            def add(self):
+                item = _FakeItem()
+                self.append(item)
+                return item
+
+            def remove(self, index):
+                del self[index]
+
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        node.shapekey_variable_items = _FakeCollection([
+            _FakeItem("A", "Freq_A", "Freq_A"),
+            _FakeItem("B", "Freq_B", "Freq_B"),
+            _FakeItem("C", "Freq_C", "Freq_C"),
+            _FakeItem("D", "Freq_D", "Freq_D"),
+            _FakeItem("E", "Freq_E", "Freq_E"),
+        ])
+
+        node.ensure_shape_key_variable_map(["A", "B", "C"])
+        created_count, _backfilled_count = node.ensure_shape_key_variable_map(["A", "B", "F"])
+
+        self.assertEqual(created_count, 1)
+        self.assertEqual(
+            [item.shape_key_name for item in node.shapekey_variable_items],
+            ["A", "B", "F"],
+        )
 
 if __name__ == "__main__":
     unittest.main()

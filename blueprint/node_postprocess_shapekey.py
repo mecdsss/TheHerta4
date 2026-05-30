@@ -202,17 +202,25 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return False
 
     def ensure_shape_key_variable_map(self, shape_key_names):
+        normalized_names = sorted({str(name or "").strip() for name in shape_key_names if str(name or "").strip()})
+        existing_by_name = {
+            item.shape_key_name: item
+            for item in self.shapekey_variable_items
+            if str(getattr(item, "shape_key_name", "") or "").strip()
+        }
         created_count = 0
         backfilled_count = 0
-        for shape_key_name in sorted({str(name or "").strip() for name in shape_key_names if str(name or "").strip()}):
-            existing = None
-            for item in self.shapekey_variable_items:
-                if item.shape_key_name == shape_key_name:
-                    existing = item
-                    break
+
+        rebuilt_items = []
+        for shape_key_name in normalized_names:
+            existing = existing_by_name.get(shape_key_name)
             if existing is None:
-                self._ensure_shapekey_variable_item(shape_key_name)
+                item = self.shapekey_variable_items.add()
+                item.shape_key_name = shape_key_name
+                item.assigned_variable_name = allocate_shape_key_variable_name(shape_key_name)
+                item.custom_variable_name = normalize_variable_name(item.assigned_variable_name)
                 created_count += 1
+                rebuilt_items.append(item)
             else:
                 owned_names = (
                     getattr(existing, "assigned_variable_name", ""),
@@ -226,6 +234,33 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     )
                 elif self._backfill_shape_key_variable_input(existing):
                     backfilled_count += 1
+                rebuilt_items.append(existing)
+
+        if len(rebuilt_items) == len(self.shapekey_variable_items):
+            for index, item in enumerate(rebuilt_items):
+                if self.shapekey_variable_items[index] is not item:
+                    break
+            else:
+                return created_count, backfilled_count
+
+        serialized_items = [
+            {
+                "shape_key_name": getattr(item, "shape_key_name", ""),
+                "assigned_variable_name": getattr(item, "assigned_variable_name", ""),
+                "custom_variable_name": getattr(item, "custom_variable_name", ""),
+            }
+            for item in rebuilt_items
+        ]
+
+        while len(self.shapekey_variable_items) > 0:
+            self.shapekey_variable_items.remove(len(self.shapekey_variable_items) - 1)
+
+        for serialized in serialized_items:
+            item = self.shapekey_variable_items.add()
+            item.shape_key_name = serialized["shape_key_name"]
+            item.assigned_variable_name = serialized["assigned_variable_name"]
+            item.custom_variable_name = serialized["custom_variable_name"]
+
         return created_count, backfilled_count
 
     def get_shape_key_export_variable_name(self, shape_key_name: str) -> str:

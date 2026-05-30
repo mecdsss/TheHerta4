@@ -610,7 +610,7 @@ class PreProcessHelper:
         cls._apply_constraints(copy_names)
 
         LOG.info("正在应用修改器...")
-        cls._apply_modifiers(copy_names)
+        cls._apply_modifiers(copy_names, fail_on_error=capture_shape_keys)
 
         LOG.info("正在三角化网格...")
         cls._triangulate_objects(copy_names)
@@ -722,43 +722,13 @@ class PreProcessHelper:
     def _capture_shape_key_state(cls, obj) -> List[dict]:
         if not obj or obj.type != 'MESH' or not obj.data:
             return []
-
-        shape_keys = getattr(obj.data, 'shape_keys', None)
-        key_blocks = getattr(shape_keys, 'key_blocks', None)
-        if not key_blocks:
-            return []
-
-        return [
-            {
-                "name": key_block.name,
-                "value": float(getattr(key_block, 'value', 0.0)),
-                "mute": bool(getattr(key_block, 'mute', False)),
-            }
-            for key_block in key_blocks
-        ]
+        return ShapeKeyUtils.capture_shape_key_state(obj)
 
     @classmethod
     def _apply_shape_key_state(cls, obj, shape_key_state: List[dict]):
         if not obj or obj.type != 'MESH' or not obj.data:
             return
-
-        shape_keys = getattr(obj.data, 'shape_keys', None)
-        key_blocks = getattr(shape_keys, 'key_blocks', None)
-        if not key_blocks:
-            return
-
-        state_by_name = {
-            entry.get("name", ""): entry
-            for entry in shape_key_state
-            if entry.get("name", "")
-        }
-
-        for key_block in key_blocks:
-            state_entry = state_by_name.get(key_block.name)
-            if key_block.name != 'Basis':
-                key_block.value = float(state_entry.get("value", 0.0)) if state_entry else 0.0
-            if state_entry is not None and hasattr(key_block, 'mute'):
-                key_block.mute = bool(state_entry.get("mute", False))
+        ShapeKeyUtils.restore_shape_key_state(obj, shape_key_state)
 
     @classmethod
     def _clear_shape_key_values(cls, obj):
@@ -808,14 +778,7 @@ class PreProcessHelper:
             obj.data.vertices.foreach_set('co', basis_coords.ravel())
             obj.data.update()
 
-        clear_method = getattr(obj, 'shape_key_clear', None)
-        if callable(clear_method):
-            clear_method()
-            remaining_key_blocks = getattr(getattr(getattr(obj, 'data', None), 'shape_keys', None), 'key_blocks', None)
-            if not remaining_key_blocks:
-                return
-
-        bpy.ops.object.shape_key_remove(all=True, apply_mix=False)
+        ShapeKeyUtils.remove_non_basis_shape_keys(obj, "Preprocess clear neutral shape keys")
 
     @classmethod
     def _direct_shapekey_record_aliases(cls, copy_name: str) -> List[str]:
@@ -1100,21 +1063,14 @@ class PreProcessHelper:
             if not obj.constraints:
                 continue
             
-            original_active = bpy.context.view_layer.objects.active
-            bpy.context.view_layer.objects.active = obj
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            
             constraint_names = [c.name for c in obj.constraints]
-            for constraint_name in constraint_names:
-                try:
-                    bpy.ops.object.constraint_apply(constraint=constraint_name)
-                    applied_count += 1
-                except Exception as e:
-                    LOG.warning(f"   应用约束失败 {obj_name}.{constraint_name}: {e}")
-            
-            if original_active:
-                bpy.context.view_layer.objects.active = original_active
+            with ShapeKeyUtils.operator_context(obj):
+                for constraint_name in constraint_names:
+                    try:
+                        bpy.ops.object.constraint_apply(constraint=constraint_name)
+                        applied_count += 1
+                    except Exception as e:
+                        LOG.warning(f"   应用约束失败 {obj_name}.{constraint_name}: {e}")
         
         LOG.info(f"   ✅ 应用约束: {applied_count} 个")
 
@@ -1155,43 +1111,36 @@ class PreProcessHelper:
             
             LOG.info(f"   {obj_name}: {modifier_count} 个修改器, {shape_key_count_before} 个形态键")
             
-            original_active = bpy.context.view_layer.objects.active
-            did_select_object = False
-            if modifier_names:
-                bpy.context.view_layer.objects.active = obj
-                bpy.ops.object.select_all(action='DESELECT')
-                obj.select_set(True)
-                did_select_object = True
-            
-            if has_shape_keys:
-                if modifier_names:
-                    # Use the conservative path for shape-key meshes. The
-                    # optimized path only validates vertex-count stability and
-                    # has been producing semantically wrong geometry for several
-                    # modifier types in real exports.
-                    success, error = ShapeKeyUtils.apply_modifiers_for_object_with_shape_keys(
-                        bpy.context, modifier_names, disable_armatures=False
-                    )
-                    if success:
-                        applied_count += len(modifier_names)
-                        shapekey_count += 1
-                        shape_key_count_after = len(obj.data.shape_keys.key_blocks) if obj.data.shape_keys else 0
-                        LOG.info(f"   ✅ {obj_name}: 修改器应用成功，形态键 {shape_key_count_before} -> {shape_key_count_after}")
-                    else:
-                        failure_message = f"{obj_name}: shape-key modifier apply failed - {error}"
-                        LOG.warning(f"   ❌ {failure_message}")
-                        failure_messages.append(failure_message)
-                        failed_count += 1
-            else:
-                for modifier_name in modifier_names:
-                    try:
-                        bpy.ops.object.modifier_apply(modifier=modifier_name)
-                        applied_count += 1
-                    except Exception as e:
-                        failure_message = f"{obj_name}.{modifier_name}: modifier apply failed - {e}"
-                        LOG.warning(f"   ❌ {failure_message}")
-                        failure_messages.append(failure_message)
-                        failed_count += 1
+            with ShapeKeyUtils.operator_context(obj):
+                if has_shape_keys:
+                    if modifier_names:
+                        # Use the conservative path for shape-key meshes. The
+                        # optimized path only validates vertex-count stability and
+                        # has been producing semantically wrong geometry for several
+                        # modifier types in real exports.
+                        success, error = ShapeKeyUtils.apply_modifiers_for_object_with_shape_keys(
+                            bpy.context, modifier_names, disable_armatures=False
+                        )
+                        if success:
+                            applied_count += len(modifier_names)
+                            shapekey_count += 1
+                            shape_key_count_after = len(obj.data.shape_keys.key_blocks) if obj.data.shape_keys else 0
+                            LOG.info(f"   ✅ {obj_name}: 修改器应用成功，形态键 {shape_key_count_before} -> {shape_key_count_after}")
+                        else:
+                            failure_message = f"{obj_name}: shape-key modifier apply failed - {error}"
+                            LOG.warning(f"   ❌ {failure_message}")
+                            failure_messages.append(failure_message)
+                            failed_count += 1
+                else:
+                    for modifier_name in modifier_names:
+                        try:
+                            bpy.ops.object.modifier_apply(modifier=modifier_name)
+                            applied_count += 1
+                        except Exception as e:
+                            failure_message = f"{obj_name}.{modifier_name}: modifier apply failed - {e}"
+                            LOG.warning(f"   ❌ {failure_message}")
+                            failure_messages.append(failure_message)
+                            failed_count += 1
             
             for mod_name in reversed(disabled_modifier_names):
                 try:
@@ -1205,9 +1154,6 @@ class PreProcessHelper:
             if disabled_modifier_names:
                 LOG.info(f"   🗑️ {obj_name}: 已删除 {len(disabled_modifier_names)} 个禁用修改器")
             
-            if did_select_object and original_active:
-                bpy.context.view_layer.objects.active = original_active
-        
         if removed_disabled_count > 0:
             LOG.info(f"   ✅ 应用修改器: {applied_count} 个, 删除禁用修改器: {removed_disabled_count} 个")
         elif shapekey_count > 0:
@@ -1242,27 +1188,16 @@ class PreProcessHelper:
                 skipped_count += 1
                 continue
             
-            original_active = bpy.context.view_layer.objects.active
-            bpy.context.view_layer.objects.active = obj
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            
             try:
-                bpy.ops.object.mode_set(mode='EDIT')
-                bpy.ops.mesh.select_all(action='SELECT')
-                bpy.ops.mesh.quads_convert_to_tris(quad_method='BEAUTY', ngon_method='BEAUTY')
-                bpy.ops.object.mode_set(mode='OBJECT')
-                triangulated_count += 1
+                with ShapeKeyUtils.operator_context(obj):
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    bpy.ops.mesh.select_all(action='SELECT')
+                    bpy.ops.mesh.quads_convert_to_tris(quad_method='BEAUTY', ngon_method='BEAUTY')
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    triangulated_count += 1
             except Exception as e:
                 LOG.warning(f"   三角化失败 {obj_name}: {e}")
                 failed_count += 1
-                try:
-                    bpy.ops.object.mode_set(mode='OBJECT')
-                except Exception:
-                    pass
-            
-            if original_active:
-                bpy.context.view_layer.objects.active = original_active
         
         if skipped_count > 0:
             LOG.info(f"   ✅ 三角化: {triangulated_count} 个物体, 跳过已全三角物体 {skipped_count} 个")
@@ -1285,20 +1220,12 @@ class PreProcessHelper:
                 skipped_count += 1
                 continue
             
-            original_active = bpy.context.view_layer.objects.active
-            bpy.context.view_layer.objects.active = obj
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            
             try:
                 ShapeKeyUtils.transform_apply_preserve_shape_keys(obj, location=True, rotation=True, scale=True)
                 applied_count += 1
             except Exception as e:
                 LOG.warning(f"   应用变换失败 {obj_name}: {e}")
                 failed_count += 1
-            
-            if original_active:
-                bpy.context.view_layer.objects.active = original_active
         
         if skipped_count > 0:
             LOG.info(f"   ✅ 应用变换: {applied_count} 个物体, 跳过单位变换物体 {skipped_count} 个")
@@ -1333,26 +1260,22 @@ class PreProcessHelper:
 
             LOG.info(f"   {obj_name}: 有 {shapekey_count} 个形态键，准备应用...")
 
-            original_active = bpy.context.view_layer.objects.active
-            bpy.context.view_layer.objects.active = obj
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-
             try:
                 if cls._shape_key_values_are_neutral(obj.data.shape_keys.key_blocks):
                     cls._remove_shape_keys_without_apply_mix(obj)
                     fast_clear_count += 1
                 else:
-                    bpy.ops.object.shape_key_remove(all=True, apply_mix=True)
+                    if not ShapeKeyUtils.bake_current_shape_key_mix_to_mesh(obj, f"Preprocess apply shape keys: {obj_name}"):
+                        raise RuntimeError(f"对象 '{obj_name}' 无法从评估网格烘焙当前形态键混合结果")
+                    ShapeKeyUtils.remove_non_basis_shape_keys(obj, f"Preprocess apply shape keys: {obj_name}")
                     baked_mix_count += 1
                 applied_count += 1
                 LOG.info(f"   ✅ {obj_name}: 形态键应用成功")
             except Exception as e:
-                LOG.warning(f"   应用形态键失败 {obj_name}: {e}")
                 failed_count += 1
-
-            if original_active:
-                bpy.context.view_layer.objects.active = original_active
+                message = str(e)
+                LOG.warning(f"   应用形态键失败 {obj_name}: {message}")
+                raise RuntimeError(f"前处理中的形态键应用失败: {obj_name} - {message}") from e
 
         LOG.info(
             f"   ✅ 应用形态键: {applied_count} 个物体, {no_shapekey_count} 个无形态键, "

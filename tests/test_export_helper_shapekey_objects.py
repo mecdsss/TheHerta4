@@ -14,7 +14,7 @@ def _install_module(name, **attrs):
 
 
 PKG = "_export_helper_shapekey_objects_test_pkg"
-for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common"):
+for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common", f"{PKG}.utils"):
     package = _install_module(package_name)
     package.__path__ = []
 
@@ -109,6 +109,19 @@ _install_module(f"{PKG}.common.m_key", M_Key=type("M_Key", (), {}))
 _install_module(
     f"{PKG}.common.object_prefix_helper",
     ObjectPrefixHelper=types.SimpleNamespace(resolve_source_object_name=lambda name: name),
+)
+_install_module(
+    f"{PKG}.utils.shapekey_utils",
+    ShapeKeyUtils=types.SimpleNamespace(
+        is_basis_shape_key_name=lambda name: str(name or "").strip().lower() == "basis",
+        iter_exportable_shape_keys=lambda obj: (
+            key_block
+            for index, key_block in enumerate(
+                getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", []) or []
+            )
+            if index != 0 and str(getattr(key_block, "name", "") or "").strip().lower() != "basis"
+        ),
+    ),
 )
 
 
@@ -241,6 +254,23 @@ class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
         report_text = _fake_bpy.data.texts["Shape_Key_Classification"]._value
         self.assertIn("物体: LOD0.hash-0.Body_chain1_copy", report_text)
         self.assertIn("物体: LOD0.hash-0.Body_chain2_copy", report_text)
+
+    def test_get_exportable_shape_key_infos_excludes_basis_name(self):
+        obj = types.SimpleNamespace(
+            name="Body",
+            data=types.SimpleNamespace(
+                shape_keys=types.SimpleNamespace(
+                    key_blocks=[
+                        types.SimpleNamespace(name="Basis", mute=False),
+                        types.SimpleNamespace(name="Smile", mute=False),
+                    ]
+                )
+            )
+        )
+
+        result = export_helper.BlueprintExportHelper.get_exportable_shape_key_infos(obj)
+
+        self.assertEqual([(slot_index, shape_key_name) for slot_index, shape_key_name, _ in result], [(1, "Smile")])
 
 
 if __name__ == "__main__":

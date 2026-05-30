@@ -14,7 +14,7 @@ def _install_module(name, **attrs):
 
 
 PKG = "_blueprint_enum_selection_test_pkg"
-for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common"):
+for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common", f"{PKG}.utils"):
     package = _install_module(package_name)
     package.__path__ = []
 
@@ -50,6 +50,12 @@ _install_module(f"{PKG}.common.global_config", GlobalConfig=types.SimpleNamespac
 _install_module(f"{PKG}.common.global_properties", GlobalProterties=types.SimpleNamespace())
 _install_module(f"{PKG}.common.m_key", M_Key=types.SimpleNamespace())
 _install_module(f"{PKG}.common.object_prefix_helper", ObjectPrefixHelper=types.SimpleNamespace())
+_install_module(
+    f"{PKG}.utils.shapekey_utils",
+    ShapeKeyUtils=types.SimpleNamespace(
+        iter_exportable_shape_keys=lambda obj: (),
+    ),
+)
 
 
 module_path = Path(__file__).resolve().parents[1] / "blueprint" / "export_helper.py"

@@ -1,5 +1,6 @@
 import bpy
 import numpy
+from contextlib import contextmanager
 
 from dataclasses import dataclass, field
 from typing import Optional
@@ -67,6 +68,18 @@ class WWMIBufferBuildResult:
 
 class ExportUtils:
     @staticmethod
+    @contextmanager
+    def _temporarily_reset_shapekey_values_for_export(obj: bpy.types.Object):
+        if BlueprintExportHelper.should_preserve_current_shapekey_mix_for_export():
+            yield
+            return
+
+        with ShapeKeyUtils.preserve_shape_key_state(obj):
+            ShapeKeyUtils.reset_shapekey_values(obj)
+            ShapeKeyUtils._update_view_layer()
+            yield
+
+    @staticmethod
     def build_obj_element_context(
         d3d11_game_type: D3D11GameType,
         obj: Optional[bpy.types.Object] = None,
@@ -74,23 +87,20 @@ class ExportUtils:
         final_elementname_data_dict: Optional[dict] = None,
     ) -> ObjElementContext:
         resolved_obj = obj or ObjUtils.get_obj_by_name(name=obj_name)
+        with ExportUtils._temporarily_reset_shapekey_values_for_export(resolved_obj):
+            mesh = ObjUtils.get_mesh_evaluate_from_obj(obj=resolved_obj)
+            if len(mesh.polygons) > 0:
+                uv_map_name = "TEXCOORD.xy" if "TEXCOORD.xy" in mesh.uv_layers else None
+                try:
+                    mesh.calc_tangents(uvmap=uv_map_name)
+                except RuntimeError:
+                    ObjUtils.mesh_triangulate(mesh)
+                    mesh.calc_tangents(uvmap=uv_map_name)
 
-        if not BlueprintExportHelper.should_preserve_current_shapekey_mix_for_export():
-            ShapeKeyUtils.reset_shapekey_values(resolved_obj)
-
-        mesh = ObjUtils.get_mesh_evaluate_from_obj(obj=resolved_obj)
-        if len(mesh.polygons) > 0:
-            uv_map_name = "TEXCOORD.xy" if "TEXCOORD.xy" in mesh.uv_layers else None
-            try:
-                mesh.calc_tangents(uvmap=uv_map_name)
-            except RuntimeError:
-                ObjUtils.mesh_triangulate(mesh)
-                mesh.calc_tangents(uvmap=uv_map_name)
-
-        original_elementname_data_dict = ObjBufferHelper.parse_elementname_data_dict(
-            mesh=mesh,
-            d3d11_game_type=d3d11_game_type,
-        )
+            original_elementname_data_dict = ObjBufferHelper.parse_elementname_data_dict(
+                mesh=mesh,
+                d3d11_game_type=d3d11_game_type,
+            )
 
         return ObjElementContext(
             obj=resolved_obj,
@@ -232,10 +242,7 @@ class ExportUtils:
             sample_key_block.value = 1.0
             bpy.context.view_layer.update()
 
-            bpy.ops.object.select_all(action='DESELECT')
-            bpy.context.view_layer.objects.active = sample_obj
-            sample_obj.select_set(True)
-            bpy.ops.object.shape_key_remove(all=True, apply_mix=True)
+            ShapeKeyUtils.remove_shape_keys(sample_obj, all=True, apply_mix=True)
             bpy.context.view_layer.update()
 
             return sample_obj, sample_obj.data
@@ -439,46 +446,49 @@ class ExportUtils:
 
         TimerUtils.Start(f"Processing {len(shape_keys)} ShapeKeys for {obj.name}")
         try:
-            if index_loop_id_dict is not None:
-                target_count = len(index_loop_id_dict)
-                indices_map = numpy.zeros(target_count, dtype=int)
-                indices_map[:] = list(index_loop_id_dict.values())
-            else:
-                target_count = len(obj.data.vertices)
-                indices_map = numpy.arange(target_count, dtype=int)
+            with ShapeKeyUtils.preserve_shape_key_state(obj):
+                ShapeKeyUtils.reset_shapekey_values(obj)
+                ShapeKeyUtils._update_view_layer()
 
-            base_shape_vertex_ndarray = numpy.zeros(target_count, dtype=dtype)
+                if index_loop_id_dict is not None:
+                    target_count = len(index_loop_id_dict)
+                    indices_map = numpy.zeros(target_count, dtype=int)
+                    indices_map[:] = list(index_loop_id_dict.values())
+                else:
+                    target_count = len(obj.data.vertices)
+                    indices_map = numpy.arange(target_count, dtype=int)
 
-            for shapekey in shape_keys:
-                shapekey_name = shapekey.name
-                sample_obj = None
-                try:
-                    sample_obj, mesh_eval = ExportUtils._create_baked_shape_key_sample_mesh(
-                        obj=obj,
-                        shapekey_name=shapekey_name,
-                    )
-                    if mesh_eval is None:
-                        continue
+                base_shape_vertex_ndarray = numpy.zeros(target_count, dtype=dtype)
 
-                    if len(mesh_eval.polygons) > 0:
-                        uv_map_name = "TEXCOORD.xy" if "TEXCOORD.xy" in mesh_eval.uv_layers else None
-                        try:
-                            mesh_eval.calc_tangents(uvmap=uv_map_name)
-                        except RuntimeError:
-                            ObjUtils.mesh_triangulate(mesh_eval)
-                            mesh_eval.calc_tangents(uvmap=uv_map_name)
+                for shapekey in shape_keys:
+                    shapekey_name = shapekey.name
+                    sample_obj = None
+                    try:
+                        sample_obj, mesh_eval = ExportUtils._create_baked_shape_key_sample_mesh(
+                            obj=obj,
+                            shapekey_name=shapekey_name,
+                        )
+                        if mesh_eval is None:
+                            continue
 
-                    shape_key_buffer_dict[shapekey_name] = ExportUtils.build_shape_key_buffer_result(
-                        name=shapekey_name,
-                        base_element_vertex_ndarray=base_shape_vertex_ndarray,
-                        mesh=mesh_eval,
-                        indices_map=indices_map,
-                        d3d11_game_type=d3d11_game_type,
-                    )
-                finally:
-                    ExportUtils._cleanup_shape_key_sample_object(sample_obj)
+                        if len(mesh_eval.polygons) > 0:
+                            uv_map_name = "TEXCOORD.xy" if "TEXCOORD.xy" in mesh_eval.uv_layers else None
+                            try:
+                                mesh_eval.calc_tangents(uvmap=uv_map_name)
+                            except RuntimeError:
+                                ObjUtils.mesh_triangulate(mesh_eval)
+                                mesh_eval.calc_tangents(uvmap=uv_map_name)
+
+                        shape_key_buffer_dict[shapekey_name] = ExportUtils.build_shape_key_buffer_result(
+                            name=shapekey_name,
+                            base_element_vertex_ndarray=base_shape_vertex_ndarray,
+                            mesh=mesh_eval,
+                            indices_map=indices_map,
+                            d3d11_game_type=d3d11_game_type,
+                        )
+                    finally:
+                        ExportUtils._cleanup_shape_key_sample_object(sample_obj)
         finally:
-            ShapeKeyUtils.reset_shapekey_values(obj)
             TimerUtils.End(f"Processing {len(shape_keys)} ShapeKeys for {obj.name}")
 
         return shape_key_buffer_dict
@@ -581,7 +591,7 @@ class ExportUtils:
 
     @staticmethod
     def build_wwmi_shapekey_payload(obj: bpy.types.Object, index_vertex_id_dict: dict):
-        if obj.data.shape_keys is None or len(getattr(obj.data.shape_keys, "key_blocks", [])) == 0:
+        if not ShapeKeyUtils.has_exportable_shape_keys(obj):
             return [], [], [], False
 
         shapekey_offsets, shapekey_vertex_ids, shapekey_vertex_offsets = ShapeKeyUtils.extract_shapekey_data(

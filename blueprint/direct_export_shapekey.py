@@ -8,6 +8,7 @@ from time import perf_counter
 import bpy
 
 from ..utils.log_utils import LOG
+from ..utils.shapekey_utils import ShapeKeyUtils
 from .direct_export_runtime_utils import normalize_runtime_name as _normalize_runtime_name
 from .direct_export_shapekey_output_mixin import DirectShapeKeyOutputMixin
 from .direct_export_shapekey_runtime_mixin import DirectShapeKeyRuntimeMixin
@@ -102,8 +103,7 @@ class DirectShapeKeyGenerator(
                 if source_obj is None:
                     continue
 
-                shape_keys = getattr(getattr(source_obj.data, "shape_keys", None), "key_blocks", None)
-                if shape_keys and len(shape_keys) > 1:
+                if ShapeKeyUtils.has_exportable_shape_keys(source_obj):
                     return variant_name
 
         return fallback_name

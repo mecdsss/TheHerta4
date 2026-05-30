@@ -689,10 +689,7 @@ class DirectShapeKeySamplingMixin:
             sample_key_block.value = 1.0
             bpy.context.view_layer.update()
 
-            bpy.ops.object.select_all(action='DESELECT')
-            bpy.context.view_layer.objects.active = sample_obj
-            sample_obj.select_set(True)
-            bpy.ops.object.shape_key_remove(all=True, apply_mix=True)
+            ShapeKeyUtils.remove_shape_keys(sample_obj, all=True, apply_mix=True)
             bpy.context.view_layer.update()
 
             position_bytes = self._build_position_bytes_for_sample_object(sample_obj, sample_context)

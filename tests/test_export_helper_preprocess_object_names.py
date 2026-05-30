@@ -14,7 +14,7 @@ def _install_module(name, **attrs):
 
 
 PKG = "_export_helper_preprocess_object_names_test_pkg"
-for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common"):
+for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common", f"{PKG}.utils"):
     package = _install_module(package_name)
     package.__path__ = []
 
@@ -111,6 +111,12 @@ _install_module(f"{PKG}.common.m_key", M_Key=type("M_Key", (), {}))
 _install_module(
     f"{PKG}.common.object_prefix_helper",
     ObjectPrefixHelper=_FakeObjectPrefixHelper,
+)
+_install_module(
+    f"{PKG}.utils.shapekey_utils",
+    ShapeKeyUtils=types.SimpleNamespace(
+        iter_exportable_shape_keys=lambda obj: (),
+    ),
 )
 
 
