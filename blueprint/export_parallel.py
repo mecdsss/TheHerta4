@@ -43,6 +43,8 @@ class ParallelExportError(RuntimeError):
 
 
 class ExportRoundExecutor:
+    """导出轮次执行器，管理单次导出的完整生命周期（前处理→蓝图解析→导出→清理）"""
+
     @classmethod
     def execute_round(cls, tree, round_plan: dict, allow_parallel_preprocess: bool = True) -> dict:
         BluePrintModel.clear_object_name_mapping()

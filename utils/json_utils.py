@@ -12,6 +12,7 @@ class JsonUtils:
             
     @classmethod
     def LoadFromFile(cls, filepath: str) -> dict:
+        """从 JSON 文件加载字典，失败时返回空字典"""
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 # 读取文件内容并解析为字典

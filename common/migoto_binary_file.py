@@ -11,12 +11,10 @@ from .fmt_file import FMTFile
 
 
 class MigotoBinaryFile:
-
-    '''
-    3Dmigoto模型文件
+    '''3Dmigoto 模型文件类，封装 .ib、.vb、.fmt 文件的读取和解析
 
     暂时还没有更好的设计，暂时先沿用旧的ib vb fmt设计
-    
+
     prefix是前缀，比如Body.ib Body.vb Body.fmt 那么此时Body就是prefix
     location_folder_path是存放这些文件的文件夹路径，比如当前工作空间中提取的对应数据类型文件夹
 

@@ -61,6 +61,7 @@ _NODE_COLOR_SHAPEKEY = (0.94, 0.57, 0.15)
 _NODE_COLOR_BLUEPRINT = (0.55, 0.39, 0.76)
 _NODE_COLOR_SPECIALIZED = (0.67, 0.39, 0.66)
 _NODE_COLOR_HIGHLIGHT = (0.92, 0.74, 0.18)
+_NODE_COLOR_ANIM_DRIVER = (0.20, 0.70, 0.60)
 
 
 class SSMTNodeBase(Node):
@@ -90,7 +91,11 @@ class SSMTNodeBase(Node):
 
     @classmethod
     def poll(cls, ntree):
-        return ntree.bl_idname == 'SSMTBlueprintTreeType'
+        if ntree.bl_idname != 'SSMTBlueprintTreeType':
+            return False
+        if ntree.get("is_animation_driver"):
+            return False
+        return True
 
     @classmethod
     def get_default_node_color(cls, node_or_bl_idname):
@@ -115,6 +120,8 @@ class SSMTNodeBase(Node):
             return _NODE_COLOR_OUTPUT
         if bl_idname.startswith('SSMTNode_PostProcess_'):
             return _NODE_COLOR_POSTPROCESS
+        if bl_idname.startswith('SSMTNode_AnimDriver_'):
+            return _NODE_COLOR_ANIM_DRIVER
         if bl_idname.startswith('SSMTNode_'):
             return _NODE_COLOR_SPECIALIZED
         return None

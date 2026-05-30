@@ -6,7 +6,10 @@ from utils.shapekey_rebase_utils import rebase_shape_key_coordinates
 
 
 class ShapeKeyRebaseUtilsTests(unittest.TestCase):
+    """测试形态键坐标重定基功能"""
+
     def test_rebase_moves_other_keys_onto_new_basis_using_original_offsets(self):
+        """测试重定基将其他形态键移动到新 Basis 上，使用原始偏移量"""
         coordinates = {
             "Basis": np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
             "MoveY": np.array([[0.0, 1.0, 0.0]], dtype=np.float32),
@@ -25,6 +28,7 @@ class ShapeKeyRebaseUtilsTests(unittest.TestCase):
         self.assertNotIn("MoveX", rebased)
 
     def test_rebase_can_keep_source_shape_key_as_zero_offset_copy(self):
+        """测试重定基可以保留源形态键作为零偏移副本"""
         coordinates = {
             "Basis": np.array([[5.0, 0.0, 0.0], [1.0, 2.0, 3.0]], dtype=np.float32),
             "Smile": np.array([[5.0, 1.0, 0.0], [2.0, 4.0, 6.0]], dtype=np.float32),

@@ -74,6 +74,7 @@ class BMTP_OT_LinkListClear(bpy.types.Operator):
 
 
 class BMTP_OT_ExecuteLink(bpy.types.Operator):
+    """将源列表中的所有项目以关联方式添加到目标集合"""
     bl_idname = "toolkit.bmtp_execute_collection_link"
     bl_label = "执行关联"
     bl_description = "将源列表中的所有项目以'关联'方式添加到目标集合中"

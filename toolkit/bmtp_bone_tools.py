@@ -49,6 +49,7 @@ class BMTP_OT_ShowUsedBones(bpy.types.Operator):
 
 
 class BMTP_OT_ShowAllBones(bpy.types.Operator):
+    """显示骨架中的所有骨骼"""
     bl_idname = "toolkit.bmtp_show_all_bones"
     bl_label = "显示所有骨骼"
     bl_description = "显示骨架中的所有骨骼"
@@ -174,6 +175,7 @@ class BMTP_OT_RemapBones(bpy.types.Operator):
 
 
 class BMTP_OT_RestoreBoneNames(bpy.types.Operator):
+    """使用映射表将索引化骨骼名称恢复为原始名称"""
     bl_idname = "toolkit.bmtp_restore_bone_names"
     bl_label = "从映射表恢复"
     bl_description = "使用选定的映射表，将索引化的骨骼名称恢复为原始名称"

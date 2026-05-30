@@ -229,6 +229,7 @@ def texture_auto_reload_timer_callback():
 
 @persistent
 def load_post_handler(_scene):
+    """加载后处理：初始化贴图签名缓存"""
     _prime_image_signature_cache()
 
 

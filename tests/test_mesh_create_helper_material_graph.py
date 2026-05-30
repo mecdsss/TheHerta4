@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -200,10 +201,14 @@ spec.loader.exec_module(mesh_create_helper)
 
 
 class MeshCreateHelperMaterialGraphTests(unittest.TestCase):
+    """测试网格创建助手的材质图构建：不同逻辑名称下的节点结构差异"""
+
     def setUp(self):
+        """每个测试前清空材质集合"""
         _fake_bpy.data.materials.clear()
 
     def test_multiple_logic_names_do_not_create_principled_bsdf(self):
+        """测试多种逻辑名称下都不会创建 Principled BSDF 节点"""
         logic_names = ("GIMI", "ZZMI", "IdentityV", "NTEMI", "SnowBreak")
 
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -31,6 +31,7 @@ _ORIGINAL_NODE_SELECTED_COLOR = None
 
 
 def _refresh_blueprint_node_colors_safe():
+    """安全刷新所有蓝图节点的颜色（带异常保护）"""
     try:
         from .blueprint.node_base import refresh_all_blueprint_node_colors_and_redraw
         refresh_all_blueprint_node_colors_and_redraw()
@@ -39,6 +40,7 @@ def _refresh_blueprint_node_colors_safe():
 
 
 def _schedule_blueprint_node_color_refresh():
+    """通过Blender定时器安排蓝图节点颜色刷新"""
     def _timer_callback():
         _refresh_blueprint_node_colors_safe()
         return None
@@ -50,6 +52,7 @@ def _schedule_blueprint_node_color_refresh():
 
 
 def _set_node_selected_theme_color(color):
+    """设置Blender节点编辑器中节点的选中状态主题色（橙色主题）"""
     global _ORIGINAL_NODE_SELECTED_COLOR
 
     try:
@@ -73,7 +76,7 @@ bl_info = {
     "name": "TheHerta4",
     "description": "Blender Plugin of SSMT4",
     "blender": (4, 5, 0),
-    "version": (4, 4, 4),
+    "version": (4, 4, 5),
     "location": "View3D",
     "category": "Generic"
 }
@@ -85,6 +88,7 @@ class HERTT_OT_SwitchToMainPanel(bpy.types.Operator):
     bl_label = "切换回主面板"
 
     def execute(self, context):
+        """执行：将面板切换到主面板模式"""
         context.scene.herta_show_toolkit = False
         return {'FINISHED'}
 
@@ -95,12 +99,13 @@ class HERTT_OT_SwitchToToolkit(bpy.types.Operator):
     bl_label = "切换到工具集面板"
     
     def execute(self, context):
+        """执行：将面板切换到工具集模式"""
         context.scene.herta_show_toolkit = True
         return {'FINISHED'}
 
 
 class UpdaterPanel(bpy.types.Panel):
-    """Update Panel"""
+    """更新检查面板 - 在3D视口侧边栏显示版本更新信息"""
     bl_label = "检查版本更新"
     bl_idname = "HERTA_PT_UpdaterPanel"
     bl_space_type = 'VIEW_3D'
@@ -111,32 +116,24 @@ class UpdaterPanel(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
+        """轮询条件：仅在主面板模式下显示（非工具集模式）"""
         if not hasattr(context.scene, 'herta_show_toolkit'):
             return True
         return not context.scene.herta_show_toolkit
 
     def draw(self, context):
+        """绘制更新面板UI"""
         layout = self.layout
-        
-        # Call to check for update in background.
-        # Note: built-in checks ensure it runs at most once, and will run in
-        # the background thread, not blocking or hanging blender.
-        # Internally also checks to see if auto-check enabled and if the time
-        # interval has passed.
-        # addon_updater_ops.check_for_update_background()
         col = layout.column()
         col.scale_y = 0.7
-        # Could also use your own custom drawing based on shared variables.
         if addon_updater_ops.updater.update_ready:
             layout.label(text="存在可用更新！", icon="INFO")
 
-        # Call built-in function with draw code/checks.
-        # addon_updater_ops.update_notice_box_ui(self, context)
         addon_updater_ops.update_settings_ui(self, context)
 
 
 class HertaUpdatePreference(bpy.types.AddonPreferences):
-    # Addon updater preferences.
+    """插件更新器偏好设置"""
     bl_label = "TheHerta 更新器"
     bl_idname = __package__
 
@@ -173,11 +170,13 @@ class HertaUpdatePreference(bpy.types.AddonPreferences):
         min=0,
         max=59) # type: ignore
     def draw(self, context):
+        """绘制偏好设置面板UI"""
         layout = self.layout
         layout.prop(self, "自动检查更新")
         addon_updater_ops.update_settings_ui(self, context)
 
 def register():
+    """插件注册入口 - 注册所有属性、面板、操作符和蓝图系统"""
     global_properties.register()
     GlobalConfig.read_from_main_json_ssmt4()
     _set_node_selected_theme_color((0.78, 0.41, 0.10))
@@ -216,6 +215,7 @@ def register():
 
 
 def unregister():
+    """插件注销入口 - 注销所有注册的属性、面板、操作符和蓝图系统"""
     global _ORIGINAL_NODE_SELECTED_COLOR
 
     if _ORIGINAL_NODE_SELECTED_COLOR is not None:

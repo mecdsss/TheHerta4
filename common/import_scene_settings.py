@@ -2,6 +2,7 @@ import bpy
 
 
 def apply_import_render_environment(scene=None):
+    """应用导入渲染环境设置，包括透明背景、sRGB 色彩空间和白色世界环境"""
     target_scene = scene or getattr(bpy.context, "scene", None)
     if target_scene is None:
         return

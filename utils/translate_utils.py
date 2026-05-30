@@ -1,10 +1,7 @@
 import bpy
 
 class TR:
-    '''
-    中文为主要语言，这个类的作用是将中文翻译成其他语言。
-    因为开发人员只有我自己，所以只添加英文翻译。
-    '''
+    """多语言翻译工具类，将中文 UI 文本翻译为其他语言"""
     
     # 翻译字典 - key为中文，value为英文翻译（只保留3个作为演示）
     _translations = {
@@ -19,7 +16,7 @@ class TR:
 
     @classmethod
     def _get_blender_language(cls) -> str:
-        """获取Blender当前使用的语言设置"""
+        """获取 Blender 当前使用的语言设置"""
         try:
             # 获取Blender的用户偏好设置中的语言
             return bpy.context.preferences.view.language

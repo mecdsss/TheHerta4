@@ -85,6 +85,14 @@ _MODULE_REGISTRY = [
     # 直出模块保持为可选注册，避免旧环境缺少新节点时阻塞整个蓝图系统加载。
     {"name": "direct_export", "required": False},
     {"name": "node_postprocess_multifile", "required": False},
+    {"name": "anim_driver_base", "required": False},
+    {"name": "anim_driver_collector", "required": False},
+    {"name": "anim_driver_runtime", "required": False},
+    {"name": "anim_driver_forward_play", "required": False},
+    {"name": "anim_driver_pingpong", "required": False},
+    {"name": "anim_driver_trigger", "required": False},
+    {"name": "anim_driver_toggle", "required": False},
+    {"name": "node_postprocess_anim_driver", "required": False},
 ]
 
 _MODULE_AVAILABLE = {}

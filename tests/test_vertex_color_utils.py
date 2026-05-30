@@ -37,7 +37,10 @@ class DummyColorAttributes:
 
 
 class VertexColorUtilsTests(unittest.TestCase):
+    """测试顶点颜色工具：颜色载荷构建和颜色属性管理"""
+
     def test_full_color_builds_linear_float_payload(self):
+        """测试 FULL_COLOR 模式构建线性浮点颜色载荷"""
         payload = build_vertex_color_payload(
             num_loops=2,
             color_rgba_srgb=(0.5, 1.0, 0.0, 1.0),
@@ -55,6 +58,7 @@ class VertexColorUtilsTests(unittest.TestCase):
         self.assertAlmostEqual(float(payload[0]), float(srgb_to_linear(0.5)), places=6)
 
     def test_alpha_only_preserves_rgb_channels(self):
+        """测试 ALPHA_ONLY 模式保留 RGB 通道仅修改 Alpha"""
         existing_colors = np.array(
             [0.1, 0.2, 0.3, 0.9, 0.4, 0.5, 0.6, 0.8],
             dtype=np.float32,
@@ -74,6 +78,7 @@ class VertexColorUtilsTests(unittest.TestCase):
         np.testing.assert_allclose(payload, expected_payload, rtol=1e-6, atol=1e-6)
 
     def test_alpha_only_requires_existing_color_buffer(self):
+        """测试 ALPHA_ONLY 模式需要现有的颜色缓冲区"""
         with self.assertRaises(ValueError):
             build_vertex_color_payload(
                 num_loops=1,
@@ -82,6 +87,7 @@ class VertexColorUtilsTests(unittest.TestCase):
             )
 
     def test_ensure_color_attribute_reuses_matching_attribute(self):
+        """测试 ensure_color_attribute 复用匹配的颜色属性"""
         existing = DummyColorAttribute("COLOR", "CORNER", "BYTE_COLOR")
         collection = DummyColorAttributes(existing=[existing])
 
@@ -92,6 +98,7 @@ class VertexColorUtilsTests(unittest.TestCase):
         self.assertEqual(collection.created, [])
 
     def test_ensure_color_attribute_recreates_mismatched_attribute(self):
+        """测试 ensure_color_attribute 重建不匹配的颜色属性"""
         existing = DummyColorAttribute("COLOR", "POINT", "FLOAT_COLOR")
         collection = DummyColorAttributes(existing=[existing])
 

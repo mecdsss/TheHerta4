@@ -12,14 +12,17 @@ TARGET_HASH_EXACT = "LOD0.ae1ab184-71202-29187.00"
 
 
 def _numeric_groups(obj):
+    """获取对象中所有数字命名的顶点组"""
     return [vg.name for vg in getattr(obj, "vertex_groups", []) if str(vg.name).isdigit()]
 
 
 def _all_groups(obj, limit=80):
+    """获取对象中前N个顶点组名称"""
     return [vg.name for vg in list(getattr(obj, "vertex_groups", []))[:limit]]
 
 
 def _find_tree():
+    """在场景中查找名为"娜娜丽"的 SSMTBlueprintTreeType 蓝图树"""
     for node_group in bpy.data.node_groups:
         if getattr(node_group, "bl_idname", "") == "SSMTBlueprintTreeType" and node_group.name == "娜娜丽":
             return node_group
@@ -27,6 +30,7 @@ def _find_tree():
 
 
 def _collect_nested_trees(tree):
+    """递归收集蓝图树中所有嵌套的子蓝图树"""
     nested = []
     visited = set()
 
@@ -51,6 +55,7 @@ def _collect_nested_trees(tree):
 
 
 def _prepare_pipeline(tree):
+    """准备并执行预处理管线，返回构建的 BluePrintModel"""
     addon_root = os.path.dirname(os.path.dirname(__file__))
     if addon_root not in sys.path:
         sys.path.insert(0, addon_root)
@@ -98,6 +103,7 @@ def _prepare_pipeline(tree):
 
 
 def _find_vg_process_node(blueprint_model):
+    """在 BluePrintModel 的处理链中查找匹配目标副本的顶点组处理节点"""
     for chain in getattr(blueprint_model, "processing_chains", []) or []:
         if str(getattr(chain, "object_name", "") or "") != TARGET_COPY:
             continue
@@ -108,6 +114,7 @@ def _find_vg_process_node(blueprint_model):
 
 
 def _clone_object(obj, suffix):
+    """克隆对象及其网格数据，链接到场景集合"""
     clone = obj.copy()
     clone.data = obj.data.copy()
     clone.name = f"{obj.name}{suffix}"
@@ -116,6 +123,7 @@ def _clone_object(obj, suffix):
 
 
 def _cleanup_object(obj):
+    """删除对象及其未使用的网格数据"""
     if obj is None:
         return
     mesh = getattr(obj, "data", None)
@@ -125,6 +133,7 @@ def _cleanup_object(obj):
 
 
 def _apply_process(node, obj, mapping_nodes):
+    """对对象应用顶点组处理管线的所有步骤（重命名、合并、清理、排序等）"""
     merged_mapping = node.get_merged_mapping_for_object(obj.name, mapping_nodes)
     stats = {
         "mapping_size": len(merged_mapping),
@@ -141,6 +150,7 @@ def _apply_process(node, obj, mapping_nodes):
 
 
 def main():
+    """精确匹配案例分析主函数：比较有/无精确匹配节点的顶点组处理结果"""
     tree = _find_tree()
     if tree is None:
         sys.stdout.write(json.dumps({"error": "tree_not_found"}, ensure_ascii=False, indent=2))

@@ -8,6 +8,7 @@ import numpy as np
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -97,7 +98,10 @@ class _FakeObject:
 
 
 class VertexGroupMatchWeightedCenterTests(unittest.TestCase):
+    """测试顶点组匹配的加权质心计算：权重大的顶点对质心影响更大"""
+
     def test_point_cloud_center_biases_toward_stronger_weight(self):
+        """测试点云质心偏向权重更大的顶点"""
         matcher = module.VertexGroupMatcherOptimized()
         obj = _FakeObject()
         positions = np.array(

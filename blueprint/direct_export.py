@@ -181,6 +181,8 @@ def _build_object_name_list(tree, has_shapekey: bool, has_multifile: bool) -> li
 
 
 class DirectExportSession:
+    """直出导出会话管理器，管理从前处理到后处理的完整直出流程"""
+
     def __init__(self, context, tree):
         self.context = context
         self.tree = tree

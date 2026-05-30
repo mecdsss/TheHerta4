@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -41,7 +42,10 @@ spec.loader.exec_module(resource_merge_module)
 
 
 class ResourceMergeTests(unittest.TestCase):
+    """测试资源合并后处理：合并内容相同的资源段并清理冗余文件"""
+
     def test_resource_sections_without_hyphen_are_merged(self):
+        """测试无连字符的资源段被合并（相同内容的纹理文件只保留一个）"""
         node = resource_merge_module.SSMTNode_PostProcess_ResourceMerge()
 
         with tempfile.TemporaryDirectory() as temp_dir:

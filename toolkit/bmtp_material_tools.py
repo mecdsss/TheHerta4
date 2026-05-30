@@ -2,6 +2,7 @@ import bpy
 
 
 class BMTP_OT_ClearMaterials(bpy.types.Operator):
+    """清除选中物体的所有材质并清理孤立数据"""
     bl_idname = "toolkit.bmtp_clear_materials"
     bl_label = "清理选中物体材质"
     bl_options = {'REGISTER', 'UNDO'}

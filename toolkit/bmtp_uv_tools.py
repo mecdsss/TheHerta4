@@ -36,6 +36,7 @@ class BMTP_OT_KeepActiveUV(bpy.types.Operator):
 
 
 class BMTP_OT_DeleteUVsByPattern(bpy.types.Operator):
+    """按正则表达式模式批量删除UV贴图"""
     bl_idname = "toolkit.bmtp_delete_uvs_by_pattern"
     bl_label = "按模式删除UV"
     bl_options = {'REGISTER', 'UNDO'}
@@ -70,6 +71,7 @@ class BMTP_OT_DeleteUVsByPattern(bpy.types.Operator):
 
 
 class BMTP_OT_RenameUVsByPattern(bpy.types.Operator):
+    """按正则表达式模式批量重命名UV贴图"""
     bl_idname = "toolkit.bmtp_rename_uvs_by_pattern"
     bl_label = "按模式重命名UV"
     bl_options = {'REGISTER', 'UNDO'}

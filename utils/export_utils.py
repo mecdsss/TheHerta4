@@ -19,6 +19,8 @@ from ..common.obj_buffer_helper import ObjBufferHelper
 
 @dataclass
 class ObjElementContext:
+    """导出元素上下文数据类"""
+
     obj: bpy.types.Object
     mesh: bpy.types.Mesh
     d3d11_game_type: D3D11GameType
@@ -67,6 +69,8 @@ class WWMIBufferBuildResult:
 
 
 class ExportUtils:
+    """导出工具类，负责模型数据打包、索引缓冲区和 ShapeKey 缓冲区构建"""
+
     @staticmethod
     @contextmanager
     def _temporarily_reset_shapekey_values_for_export(obj: bpy.types.Object):

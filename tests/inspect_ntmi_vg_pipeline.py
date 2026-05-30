@@ -19,14 +19,17 @@ TARGET_BASE_NAMES = [
 
 
 def _numeric_groups(obj):
+    """获取对象中所有数字命名的顶点组"""
     return [vg.name for vg in getattr(obj, "vertex_groups", []) if str(vg.name).isdigit()]
 
 
 def _all_groups(obj, limit=40):
+    """获取对象中前N个顶点组名称"""
     return [vg.name for vg in list(getattr(obj, "vertex_groups", []))[:limit]]
 
 
 def _find_tree():
+    """在场景中查找第一个 SSMTBlueprintTreeType 蓝图树"""
     for node_group in bpy.data.node_groups:
         if getattr(node_group, "bl_idname", "") == "SSMTBlueprintTreeType":
             return node_group
@@ -34,6 +37,7 @@ def _find_tree():
 
 
 def _find_target_nodes(tree):
+    """在蓝图树中查找匹配目标名称的 Object_Info 节点"""
     matched = []
     for node in getattr(tree, "nodes", []):
         if getattr(node, "bl_idname", "") != "SSMTNode_Object_Info":
@@ -45,6 +49,7 @@ def _find_target_nodes(tree):
 
 
 def _collect_mapping_sources(vg_node):
+    """收集顶点组处理节点关联的所有映射源节点的信息"""
     payload = []
     get_connected_mapping_nodes = getattr(vg_node, "get_connected_mapping_nodes", None)
     if not callable(get_connected_mapping_nodes):
@@ -76,6 +81,7 @@ def _collect_mapping_sources(vg_node):
 
 
 def _collect_before_state():
+    """收集目标对象预处理前的顶点组状态"""
     report = []
     for base_name in TARGET_BASE_NAMES:
         obj = bpy.data.objects.get(base_name)
@@ -91,6 +97,7 @@ def _collect_before_state():
 
 
 def _build_blueprint_model(tree):
+    """从蓝图树构建 BluePrintModel 实例"""
     addon_root = os.path.dirname(os.path.dirname(__file__))
     if addon_root not in sys.path:
         sys.path.insert(0, addon_root)
@@ -108,6 +115,7 @@ def _build_blueprint_model(tree):
 
 
 def _collect_nested_trees(tree):
+    """递归收集蓝图树中所有嵌套的子蓝图树"""
     nested = []
     visited = set()
 
@@ -132,6 +140,7 @@ def _collect_nested_trees(tree):
 
 
 def _collect_chain_state(blueprint_model):
+    """收集 BluePrintModel 中与目标对象相关的处理链状态"""
     rows = []
     for chain in getattr(blueprint_model, "processing_chains", []) or []:
         original_object_name = str(getattr(chain, "original_object_name", "") or "")
@@ -161,6 +170,7 @@ def _collect_chain_state(blueprint_model):
 
 
 def _collect_vg_nodes(blueprint_model):
+    """收集 BluePrintModel 中与目标对象相关的顶点组处理节点及其映射源"""
     rows = []
     seen = set()
     for chain in getattr(blueprint_model, "processing_chains", []) or []:
@@ -185,6 +195,7 @@ def _collect_vg_nodes(blueprint_model):
 
 
 def _collect_copy_state():
+    """收集预处理后副本对象的顶点组状态"""
     report = []
     for base_name in TARGET_BASE_NAMES:
         copy_name = f"{base_name}_copy"
@@ -201,6 +212,7 @@ def _collect_copy_state():
 
 
 def _run_preprocess_pipeline(tree):
+    """运行完整的预处理管线并返回对象名称与副本映射"""
     addon_root = os.path.dirname(os.path.dirname(__file__))
     if addon_root not in sys.path:
         sys.path.insert(0, addon_root)
@@ -249,6 +261,7 @@ def _run_preprocess_pipeline(tree):
 
 
 def main():
+    """VG管线探索主函数：收集预处理前后顶点组状态并输出 JSON"""
     tree = _find_tree()
     payload = {
         "blend": bpy.data.filepath,

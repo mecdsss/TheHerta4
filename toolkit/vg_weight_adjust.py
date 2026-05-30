@@ -13,6 +13,7 @@ class VGAdjustListUI(bpy.types.UIList):
 
 
 class RefreshVGList(bpy.types.Operator):
+    """刷新活动物体的顶点组列表到可用列表"""
     bl_idname = "toolkit.refresh_vg_list"
     bl_label = "刷新顶点组"
     bl_options = {'REGISTER'}
@@ -43,6 +44,7 @@ class RefreshVGList(bpy.types.Operator):
 
 
 class SelectAllVG(bpy.types.Operator):
+    """全选可用顶点组列表中的项"""
     bl_idname = "toolkit.select_all_vg"
     bl_label = "全选"
     bl_options = {'REGISTER'}
@@ -153,6 +155,7 @@ class RemoveVGFromAdjustList(bpy.types.Operator):
 
 
 class ClearVGAdjustList(bpy.types.Operator):
+    """清空已选顶点组调整列表"""
     bl_idname = "toolkit.clear_vg_adjust_list"
     bl_label = "清空列表"
     bl_options = {'REGISTER', 'UNDO'}
@@ -218,6 +221,7 @@ class AdjustVGWeights(bpy.types.Operator):
 
 
 class NormalizeVGWeights(bpy.types.Operator):
+    """规格化顶点组权重，使选中或全部顶点组的权重和为1"""
     bl_idname = "toolkit.normalize_vg_weights"
     bl_label = "规格化顶点组权重"
     bl_options = {'REGISTER', 'UNDO'}

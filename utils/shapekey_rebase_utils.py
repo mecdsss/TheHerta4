@@ -7,7 +7,7 @@ def rebase_shape_key_coordinates(
     new_basis_name,
     remove_new_basis_key=True,
 ):
-    """Rebase all shape key coordinates onto a new basis shape."""
+    """将全部形态键坐标重新基于新的 Basis 形态键计算偏移"""
     if basis_name == new_basis_name:
         raise ValueError("new basis shape key must be different from the current basis")
     if basis_name not in coordinates_by_name:

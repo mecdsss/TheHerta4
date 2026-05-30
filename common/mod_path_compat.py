@@ -108,6 +108,7 @@ def collect_base_position_resource_map(sections, prefix_extractor) -> dict:
 
 
 def ensure_resource_alias_section(sections, resource_name: str, alias_suffix: str, source_candidates=None) -> str:
+    """确保资源别名 section 存在，不存在则从源 section 复制"""
     alias_section_name = f"[{resource_name}{alias_suffix}]"
     if alias_section_name in sections:
         return alias_section_name
@@ -142,6 +143,7 @@ def resource_name_to_section(resource_name: str) -> str:
 
 
 def section_to_resource_name(section_name: str) -> str:
+    """将 INI section 名称转换为资源名称（移除方括号）"""
     clean_name = str(section_name or "").strip()
     if clean_name.startswith("[") and clean_name.endswith("]"):
         return clean_name[1:-1]
@@ -158,6 +160,7 @@ def derive_shapekey_base_resource_name(base_resource_name: str) -> str:
 
 
 def derive_shapekey_slot_resource_name(base_resource_name: str, slot_num: int, suffix: str = "") -> str:
+    """派生形态键插槽资源名称"""
     clean_name = section_to_resource_name(base_resource_name)
     if clean_name.endswith("_Position"):
         return f"{clean_name}1{int(slot_num):03d}{suffix}"

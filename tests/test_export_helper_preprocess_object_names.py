@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -63,6 +64,7 @@ class _FakeNodeCollection(list):
 
 
 def _make_tree(name, *nodes):
+    """创建测试用的 Fake 蓝图树"""
     tree = types.SimpleNamespace(
         name=name,
         bl_idname="SSMTBlueprintTreeType",
@@ -128,12 +130,16 @@ spec.loader.exec_module(export_helper)
 
 
 class ExportHelperPreprocessObjectNameTests(unittest.TestCase):
+    """测试 ExportHelper 预处理对象名称收集功能"""
+
     def setUp(self):
+        """每个测试前清空 Fake 数据"""
         _fake_bpy.data.objects.clear()
         _fake_bpy.data.node_groups[:] = []
         export_helper.BlueprintExportHelper.runtime_result_output_node_type = ""
 
     def test_collect_connected_preprocess_object_names_prefers_object_id_resolution(self):
+        """测试 collect_connected_preprocess_object_names 优先通过 object_id 解析真实对象名"""
         _fake_bpy.data.objects["Body"] = _FakeObject("Body", 1001)
 
         object_info = _FakeNode(
@@ -156,6 +162,7 @@ class ExportHelperPreprocessObjectNameTests(unittest.TestCase):
         self.assertEqual(result, ["Body"])
 
     def test_collect_connected_preprocess_object_names_resolves_multifile_items_to_real_names(self):
+        """测试 collect_connected_preprocess_object_names 能解析多文件导出项的真实对象名"""
         _fake_bpy.data.objects["Hair"] = _FakeObject("Hair", 2002)
 
         multifile_item = types.SimpleNamespace(
@@ -180,6 +187,7 @@ class ExportHelperPreprocessObjectNameTests(unittest.TestCase):
         self.assertEqual(result, ["Hair"])
 
     def test_find_preprocess_copy_name_matches_virtual_and_real_names(self):
+        """测试 find_preprocess_copy_name 能匹配虚拟名称和真实名称"""
         _fake_bpy.data.objects["Body"] = _FakeObject("Body", 3003)
 
         copy_map = {

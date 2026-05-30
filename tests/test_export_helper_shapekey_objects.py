@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -74,6 +75,7 @@ class _FakeNodeCollection(list):
 
 
 def _make_tree(name, *nodes):
+    """创建测试用的 Fake 蓝图树"""
     tree = types.SimpleNamespace(
         name=name,
         bl_idname="SSMTBlueprintTreeType",
@@ -133,7 +135,10 @@ spec.loader.exec_module(export_helper)
 
 
 class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
+    """测试 ExportHelper 的形态键对象收集和分类功能"""
+
     def setUp(self):
+        """每个测试前清空 Fake 数据"""
         _fake_bpy.data.objects.clear()
         _fake_bpy.data.node_groups[:] = []
         _fake_bpy.data.texts.clear()
@@ -142,6 +147,7 @@ class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
         export_helper.BlueprintExportHelper.runtime_result_output_node_type = ""
 
     def test_collect_shapekey_objects_resolves_virtual_name_back_to_real_source_object(self):
+        """测试 collect_shapekey_objects 将虚拟名称解析回真实源对象名"""
         _fake_bpy.data.objects["Body"] = types.SimpleNamespace(name="Body")
         export_helper.ObjectPrefixHelper.resolve_source_object_name = lambda name: "Body" if name == "Hash.Body" else name
         export_helper.BlueprintExportHelper.collect_connected_object_names = staticmethod(lambda _tree: ["Hash.Body"])
@@ -151,6 +157,7 @@ class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
         self.assertEqual(result, ["Body"])
 
     def test_ntmi_result_output_enables_shapekey_postprocess_scan(self):
+        """测试 NTMI 结果输出节点启用形态键后处理扫描"""
         shapekey_node = _FakeNode("ShapeKeyPP", "SSMTNode_PostProcess_ShapeKey")
         output_node = _FakeNode(
             "NTMI Output",
@@ -166,6 +173,7 @@ class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
         self.assertEqual([node.name for node in nodes], ["ShapeKeyPP"])
 
     def test_ntmi_result_output_prefix_fallback_works_without_runtime_override(self):
+        """测试 NTMI 输出节点前缀回退在无运行时覆盖时正常工作"""
         shapekey_node = _FakeNode("ShapeKeyPP", "SSMTNode_PostProcess_ShapeKey")
         output_node = _FakeNode(
             "NTMI Output",
@@ -178,6 +186,7 @@ class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
         self.assertTrue(export_helper.BlueprintExportHelper.has_shapekey_postprocess_node(tree))
 
     def test_ntmi_result_output_is_used_when_collecting_connected_shapekey_objects(self):
+        """测试收集连接的形态键对象时使用 NTMI 输出节点"""
         body_obj = types.SimpleNamespace(name="Body")
         _fake_bpy.data.objects["Body"] = body_obj
         export_helper.ObjectPrefixHelper.resolve_source_object_name = lambda name: name
@@ -197,6 +206,7 @@ class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
         self.assertEqual(result, ["Body"])
 
     def test_collect_shapekey_objects_deduplicates_resolved_source_names(self):
+        """测试 collect_shapekey_objects 对解析后的源名称去重"""
         _fake_bpy.data.objects["Body"] = types.SimpleNamespace(name="Body")
         export_helper.ObjectPrefixHelper.resolve_source_object_name = lambda name: "Body"
         export_helper.BlueprintExportHelper.collect_connected_object_names = staticmethod(
@@ -208,6 +218,7 @@ class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
         self.assertEqual(result, ["Body"])
 
     def test_generate_shapekey_classification_report_keeps_nested_blueprint_and_split_chain_outputs(self):
+        """测试生成形态键分类报告包含嵌套蓝图和分割链的输出"""
         _fake_bpy.data.objects["Body"] = types.SimpleNamespace(
             name="Body",
             data=types.SimpleNamespace(
@@ -256,6 +267,7 @@ class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
         self.assertIn("物体: LOD0.hash-0.Body_chain2_copy", report_text)
 
     def test_get_exportable_shape_key_infos_excludes_basis_name(self):
+        """测试 get_exportable_shape_key_infos 排除 Basis 形态键"""
         obj = types.SimpleNamespace(
             name="Body",
             data=types.SimpleNamespace(

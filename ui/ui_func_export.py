@@ -20,6 +20,7 @@ from ..common.logic_name import LogicName
 
 
 def _raise_for_unknown_logic_name() -> None:
+    """当游戏预设未加载或不受支持时抛出异常"""
     raise ValueError(
         "当前游戏预设未加载或不受支持，未执行任何主导出逻辑。"
         f" 当前 logic_name='{GlobalConfig.logic_name}'，请先确认全局设置中的游戏预设已正确加载。"
@@ -27,6 +28,7 @@ def _raise_for_unknown_logic_name() -> None:
 
 
 class SSMTGenerateModBlueprint(bpy.types.Operator):
+    """根据蓝图架构生成 Mod 文件的主导出 Blender 算子"""
     bl_idname = "ssmt.generate_mod_blueprint"
     bl_label = TR.translate("生成Mod")
     bl_description = "根据当前工作空间对应的蓝图架构生成对应的Mod文件"
@@ -41,6 +43,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
     ) # type: ignore
 
     def _resolve_target_tree(self, context):
+        """解析目标蓝图节点树"""
         requested_tree_name = str(getattr(self, "blueprint_name", "") or "").strip()
         if requested_tree_name:
             tree = BlueprintExportHelper.get_selected_blueprint_tree(
@@ -57,6 +60,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         return tree
 
     def invoke(self, context, event):
+        """弹窗确认导出目录是否为空（含后处理节点时）"""
         tree = self._resolve_target_tree(context)
         if not tree:
             return self.execute(context)
@@ -73,6 +77,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         return self.execute(context)
 
     def draw(self, context):
+        """绘制确认对话框"""
         layout = self.layout
         layout.label(text="⚠️ 导出目录不为空！", icon='ERROR')
         layout.separator()
@@ -82,6 +87,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         layout.label(text="是否继续导出？")
 
     def _has_postprocess_nodes(self, tree) -> bool:
+        """检查蓝图中是否包含后处理节点"""
         for node in tree.nodes:
             if node.bl_idname.startswith(self._POSTPROCESS_NODE_PREFIX) and not node.mute:
                 return True
@@ -468,6 +474,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
             )
 
 class SSMTQuickExportSelected(bpy.types.Operator):
+    """快速局部导出选中的网格物体，无需复杂蓝图"""
     bl_idname = "ssmt.quick_export_selected"
     bl_label = TR.translate("快速局部导出")
     bl_description = "无视蓝图，直接导出当前选中的网格物体"

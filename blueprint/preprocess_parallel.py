@@ -19,10 +19,12 @@ from .preprocess_cache import PreProcessCache
 
 
 class ParallelPreprocessError(RuntimeError):
+    """并行前处理异常"""
     pass
 
 
 class ParallelPreprocessCoordinator:
+    """并行前处理协调器，通过多个 Blender 子进程并行处理物体前处理"""
     SESSION_VERSION = 2
 
     @classmethod

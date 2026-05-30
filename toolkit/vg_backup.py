@@ -5,6 +5,7 @@ from collections import defaultdict
 
 
 class VGBackupListUI(bpy.types.UIList):
+    """顶点组备份列表的UI渲染"""
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row()
@@ -18,6 +19,7 @@ class VGBackupListUI(bpy.types.UIList):
 
 
 class BackupVGWeights(bpy.types.Operator):
+    """备份当前活动物体的顶点组权重数据"""
     bl_idname = "toolkit.backup_vg_weights"
     bl_label = "备份顶点组权重"
     bl_options = {'REGISTER', 'UNDO'}
@@ -104,6 +106,7 @@ class RestoreVGWeights(bpy.types.Operator):
 
 
 class RemoveVGBackup(bpy.types.Operator):
+    """删除选中的顶点组权重备份"""
     bl_idname = "toolkit.remove_vg_backup"
     bl_label = "删除顶点组权重备份"
     bl_options = {'REGISTER', 'UNDO'}
@@ -185,6 +188,7 @@ class BatchBackupVGWeights(bpy.types.Operator):
 
 
 class BatchRestoreVGWeights(bpy.types.Operator):
+    """为所有选中的网格物体批量恢复顶点组权重"""
     bl_idname = "toolkit.batch_restore_vg_weights"
     bl_label = "批量恢复选中物体权重"
     bl_options = {'REGISTER', 'UNDO'}

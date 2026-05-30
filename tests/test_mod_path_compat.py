@@ -9,7 +9,10 @@ from common.mod_path_compat import (
 
 
 class ModPathCompatTests(unittest.TestCase):
+    """测试 Mod 路径兼容性工具：资源映射、别名和缓冲区候选搜索"""
+
     def test_collect_base_position_resource_map_keeps_existing_resource_names(self):
+        """测试 collect_base_position_resource_map 正确分组已有资源名"""
         sections = OrderedDict(
             [
                 ("[Resource_LOD0_c8197c5b_53472_0_Position]", ["type = Buffer"]),
@@ -33,6 +36,7 @@ class ModPathCompatTests(unittest.TestCase):
         )
 
     def test_ensure_resource_alias_section_clones_real_section(self):
+        """测试 ensure_resource_alias_section 克隆真实资源段创建别名"""
         sections = OrderedDict(
             [
                 ("[Resource_LOD0_c8197c5b_53472_0_Position]", [
@@ -56,6 +60,7 @@ class ModPathCompatTests(unittest.TestCase):
         )
 
     def test_iter_position_buffer_candidates_accepts_lod_prefixed_stem(self):
+        """测试 iter_position_buffer_candidates 接受 LOD 前缀的文件名作为候选"""
         import os
         import tempfile
 

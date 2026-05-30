@@ -4,6 +4,7 @@ from collections import defaultdict
 
 
 class CreateVGsAndUV(bpy.types.Operator):
+    """创建全权重顶点组、空顶点组和UV层"""
     bl_idname = "toolkit.create_vgs_and_uv"
     bl_label = "执行创建"
     bl_options = {'REGISTER', 'UNDO'}
@@ -111,6 +112,7 @@ class BatchDeleteVG(bpy.types.Operator):
 
 
 class BatchRenameVG(bpy.types.Operator):
+    """批量重命名顶点组（旧名称→新名称）"""
     bl_idname = "toolkit.batch_rename_vg"
     bl_label = "执行批量重命名"
     bl_options = {'REGISTER', 'UNDO'}
@@ -219,6 +221,7 @@ class FillVGNumberGaps(bpy.types.Operator):
 
 
 class MergeVGByPrefix(bpy.types.Operator):
+    """按数字前缀合并顶点组，可选同步合并骨骼"""
     bl_idname = "toolkit.merge_vg_by_prefix"
     bl_label = "按数字前缀合并顶点组"
     bl_options = {'REGISTER', 'UNDO'}
@@ -339,6 +342,7 @@ class MergeVGByPrefix(bpy.types.Operator):
 
 
 class RemoveNonNumericVG(bpy.types.Operator):
+    """删除所有非纯数字命名的顶点组"""
     bl_idname = "toolkit.remove_non_numeric_vg"
     bl_label = "仅保留数字顶点组"
     bl_options = {'REGISTER', 'UNDO'}

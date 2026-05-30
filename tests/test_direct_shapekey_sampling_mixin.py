@@ -8,6 +8,7 @@ import numpy as np
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -108,6 +109,8 @@ class _Node:
 
 
 class _SamplingHarness(sampling_module.DirectShapeKeySamplingMixin):
+    """测试桩：实现 DirectShapeKeySamplingMixin 的抽象方法"""
+
     def __init__(self, object_context):
         self.node = _Node()
         self.object_context = object_context
@@ -127,7 +130,10 @@ class _SamplingHarness(sampling_module.DirectShapeKeySamplingMixin):
 
 
 class DirectShapeKeySamplingMixinTests(unittest.TestCase):
+    """测试直接导出形态键采样 Mixin 的位置覆盖计算逻辑"""
+
     def test_preprocess_record_path_rebuilds_target_from_base_plus_converted_basis_delta(self):
+        """测试基于预处理记录重建目标位置：基础位置 + 转换后的偏移量"""
         base_positions = np.asarray(
             [
                 [100.0, 200.0, 300.0],

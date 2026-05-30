@@ -47,15 +47,18 @@ _KNOWN_NODE_TYPES = {
 
 
 def _get_node_unique_key(node: bpy.types.Node) -> str:
+    """获取节点在全局的唯一标识键"""
     tree_name = node.id_data.name if hasattr(node, 'id_data') and node.id_data else ""
     return f"{tree_name}::{node.name}"
 
 
 def _is_postprocess_node(bl_idname: str) -> bool:
+    """判断是否为后处理节点类型"""
     return bl_idname.startswith('SSMTNode_PostProcess_')
 
 
 def _is_known_node_type(bl_idname: str) -> bool:
+    """判断是否为已知的蓝图节点类型"""
     return bl_idname in _KNOWN_NODE_TYPES or _is_postprocess_node(bl_idname)
 
 

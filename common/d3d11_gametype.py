@@ -51,6 +51,8 @@ class D3D11GameType:
         self._load_from_json_dict(game_type_json)
 
     def _load_from_json_dict(self, game_type_json: dict):
+        """从 JSON 字典加载游戏类型配置，解析所有 D3D11 元素"""
+
         self.OrderedFullElementList = []
         self.OrderedCategoryNameList = []
         self.D3D11ElementList = []
@@ -98,6 +100,7 @@ class D3D11GameType:
         file_path: str = "",
         override_d3d11_element_list: list[dict] | None = None,
     ):
+        """从 SubmeshJson 字典创建 D3D11GameType 实例，支持覆盖 D3D11 元素列表"""
         game_type_json = {
             "GPU-PreSkinning": submesh_json_dict.get("GPU-PreSkinning", False),
             "WorkGameType": submesh_json_dict.get("WorkGameType", ""),
@@ -127,7 +130,8 @@ class D3D11GameType:
         return new_dict
 
     def get_blendindices_count_wwmi(self) -> int:
-        """
+        """获取 WWMI 游戏的混合索引数量（给 WWMI 准备，其它逻辑不兼容）
+
         Nico:注意这个方法是给WWMI准备的,其它逻辑不兼容此方法,也不需要用到此方法
         Return the number of blend indices (VG channels) used by the game type.
 

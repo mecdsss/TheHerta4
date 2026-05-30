@@ -42,15 +42,7 @@ class TBNCodec:
 
     @staticmethod
     def oct_encode_vector(normals: numpy.ndarray) -> numpy.ndarray:
-        """
-        八面体编码: 将 3D 法线 (x,y,z) 编码为 2D 向量 (x,y)
-        
-        Args:
-            normals: shape (N, 3) 的 float32 法线向量
-            
-        Returns:
-            shape (N, 2) 的 float32 编码向量
-        """
+        """八面体编码：将 3D 法线编码为 2D 向量"""
         # Keep behavior aligned with EFMI-Tools reference implementation.
         norm = numpy.linalg.norm(normals, axis=1, keepdims=True)
         norm = numpy.where(norm < 1e-8, 1.0, norm)
@@ -103,15 +95,8 @@ class TBNCodec:
 
     @staticmethod
     def encode_10_10_10_2(data: numpy.ndarray) -> numpy.ndarray:
-        """
-        打包 3 个浮点数和 2 个布尔值为 10-10-10-2 编码的 uint32
-        
-        Args:
-            data: shape (N, 5) 的 float32 数组: [x, y, z, packed_flag, sign_flag]
-            
-        Returns:
-            shape (N,) 的 uint32 数组
-        """
+        """打包 3 个浮点数和 2 个布尔值为 10-10-10-2 编码的 uint32"""
+
         assert data.ndim == 2, 'Array for 10-10-10-2 encoding must be 2D'
         assert data.shape[1] == 5, 'Array for 10-10-10-2 encoding must be with shape (N, 5)'
         assert numpy.issubdtype(data.dtype, numpy.floating), 'Array must have floating dtype'
@@ -285,16 +270,7 @@ class TBNCodec:
         flip_texcoord_v: bool = True,
         flip_bitangent_sign: bool = True,
     ) -> numpy.ndarray:
-        """
-        完整复用 EFMI-Tools 思路：将 TBN 打包为 R10G10B10A2_UINT（存入 R32_UINT）。
-
-        说明:
-            - XY: 八面体编码法线
-            - Z: 切线角度编码
-            - bit30: packed flag
-            - bit31: bitangent sign
-            - 可选执行 flip_texcoord_v / flip_bitangent_sign，与 EFMI-Tools 默认行为保持一致
-        """
+        """将 TBN 打包为 R10G10B10A2_UINT 格式（兼容 EFMI-Tools）"""
         n = numpy.asarray(normals, dtype=numpy.float32)
         t = numpy.array(tangents, dtype=numpy.float32, copy=True)
         b = numpy.array(bitangent_signs, dtype=numpy.float32, copy=True).reshape(-1)
@@ -315,16 +291,8 @@ class TBNCodec:
     
     @staticmethod
     def decode_octahedral_r32_uint(data: numpy.ndarray) -> numpy.ndarray:
-        """
-        解码终末地风格的八面体 R32_UINT 格式为法线
-        (简化版,仅解码法线)
-        
-        Args:
-            data: shape (N,) 的 uint32 编码数据
-            
-        Returns:
-            shape (N, 3) 的法线向量
-        """
+        """解码八面体 R32_UINT 格式为法线向量"""
+
         raw = data.astype(numpy.uint32)
         
         mask_10bit = 0x3FF

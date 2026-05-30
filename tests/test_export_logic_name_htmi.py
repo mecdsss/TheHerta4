@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -14,6 +15,7 @@ def _install_module(name, **attrs):
 
 
 def _load_module(module_name: str, file_path: Path):
+    """从文件路径加载模块"""
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
@@ -22,6 +24,7 @@ def _load_module(module_name: str, file_path: Path):
 
 
 class _BaseExportStub:
+    """导出器测试桩基类"""
     export_calls = 0
     buffer_calls = 0
 
@@ -81,7 +84,10 @@ class _ExportZZMI(_BaseExportStub):
 
 
 class ExportLogicNameHTMITests(unittest.TestCase):
+    """测试 HTMI 逻辑名称下的导出路由：HTMI 应路由到 EFMI 导出器"""
+
     def setUp(self):
+        """每个测试前重置所有导出器桩的调用计数"""
         for cls in (
             _ExportEFMI,
             _ExportGIMI,
@@ -97,6 +103,7 @@ class ExportLogicNameHTMITests(unittest.TestCase):
             cls.reset()
 
     def test_parallel_export_routes_htmi_to_efmi_exporter(self):
+        """测试并行导出模式下 HTMI 被路由到 EFMI 导出器"""
         pkg = "_export_parallel_htmi_test_pkg"
         for package_name in (pkg, f"{pkg}.blueprint", f"{pkg}.common", f"{pkg}.ui", f"{pkg}.ui.universal", f"{pkg}.ui.wwmi", f"{pkg}.utils"):
             package = _install_module(package_name)
@@ -190,6 +197,7 @@ class ExportLogicNameHTMITests(unittest.TestCase):
         self.assertEqual(_ExportUnity.export_calls, 0)
 
     def test_direct_export_routes_htmi_to_efmi_exporter(self):
+        """测试直接导出模式下 HTMI 被路由到 EFMI 导出器"""
         pkg = "_direct_export_htmi_test_pkg"
         for package_name in (pkg, f"{pkg}.blueprint", f"{pkg}.common", f"{pkg}.ui", f"{pkg}.ui.universal", f"{pkg}.ui.wwmi", f"{pkg}.utils"):
             package = _install_module(package_name)

@@ -43,7 +43,10 @@ spec.loader.exec_module(import_scene_settings)
 
 
 class ImportSceneSettingsTests(unittest.TestCase):
+    """测试导入场景设置：渲染环境的默认值配置"""
+
     def test_apply_import_render_environment_sets_expected_scene_defaults(self):
+        """测试 apply_import_render_environment 正确设置场景默认值"""
         _fake_scene.render.film_transparent = False
         _fake_scene.display_settings.display_device = "None"
         _fake_scene.view_settings.view_transform = "Filmic"

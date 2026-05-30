@@ -2,6 +2,7 @@ import bpy
 
 
 class VGBackupItem(bpy.types.PropertyGroup):
+    """顶点组备份数据项"""
     name: bpy.props.StringProperty(name="备份名称", default="New Backup")
     timestamp: bpy.props.FloatProperty(name="时间戳", default=0.0)
     data: bpy.props.StringProperty(name="权重数据", subtype='BYTE_STRING')
@@ -13,6 +14,7 @@ class VGAdjustItem(bpy.types.PropertyGroup):
 
 
 class VGProperties(bpy.types.PropertyGroup):
+    """顶点组工具的全局属性设置"""
     vg_create_full_name: bpy.props.StringProperty(name="全权重组名", default="FullWeight")
     vg_create_empty_name: bpy.props.StringProperty(name="空权重组名", default="EmptyWeight")
     vg_create_delete_existing: bpy.props.BoolProperty(name="删除现有组", default=False)

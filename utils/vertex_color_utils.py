@@ -47,7 +47,8 @@ def build_vertex_color_payload(num_loops, color_rgba_srgb, vc_mode, existing_col
 
 
 def ensure_color_attribute(color_attributes, attr_name, attr_domain, attr_data_type):
-    """Get or recreate a Blender color attribute with the requested shape."""
+    """确保 Blender 颜色属性存在并符合要求的类型和域"""
+
     color_attr = color_attributes.get(attr_name)
     if color_attr is not None:
         if color_attr.domain != attr_domain or color_attr.data_type != attr_data_type:

@@ -23,6 +23,7 @@ class ShapeKeyUtils:
 
     @staticmethod
     def is_basis_shape_key_name(name) -> bool:
+        """判断名称是否为 Basis 形态键"""
         return str(name or "").strip().lower() == "basis"
 
     @classmethod
@@ -58,6 +59,7 @@ class ShapeKeyUtils:
 
     @staticmethod
     def _safe_set_active_object(obj):
+        """安全设置活动对象"""
         bpy.context.view_layer.objects.active = obj
 
     @staticmethod
@@ -69,6 +71,8 @@ class ShapeKeyUtils:
 
     @staticmethod
     def _ensure_object_mode_for_active_object(obj):
+        """确保活动对象处于 OBJECT 模式"""
+        
         active_object = bpy.context.view_layer.objects.active
         if active_object is None:
             return
@@ -154,6 +158,7 @@ class ShapeKeyUtils:
     @classmethod
     @contextmanager
     def temporarily_disable_visible_modifiers(cls, obj):
+        """临时禁用所有可见修改器"""
         modifiers = list(getattr(obj, "modifiers", []) or [])
         original_states = [
             (modifier, bool(getattr(modifier, "show_viewport", False)))
@@ -356,6 +361,8 @@ class ShapeKeyUtils:
 
     @classmethod
     def transform_apply_preserve_shape_keys(cls, obj, location=True, rotation=True, scale=True):
+        """应用变换时保留形态键坐标"""
+        
         snapshot = cls._get_shape_key_coordinate_snapshot(obj)
         matrix = cls._build_applied_transform_matrix(
             obj,
@@ -407,6 +414,8 @@ class ShapeKeyUtils:
 
     @classmethod
     def apply_modifiers_for_object_with_shape_keys(cls,context, selectedModifiers, disable_armatures):
+        """对含形态键的对象逐个应用修改器（经典算法，来自 Przemysław Bągard）"""
+        
         # The MIT License (MIT)
         #
         # Copyright (c) 2015 Przemysław Bągard
@@ -746,11 +755,8 @@ class ShapeKeyUtils:
     
     @staticmethod
     def reset_shapekey_values(obj, configured_shapekey_names=None, current_shapekey_name=None):
-        '''
-        把在配置列表中的非当前形态键归零，未配置的形态键保留原值
-        configured_shapekey_names: 在蓝图节点中配置的所有形态键名称列表
-        current_shapekey_name: 当前正在处理的形态键名称
-        '''
+        """重置形态键值：将配置列表中非当前的形态键归零"""
+
 
         if obj.data.shape_keys:
             reset_all_non_basis = configured_shapekey_names is None
@@ -766,14 +772,8 @@ class ShapeKeyUtils:
 
     @classmethod
     def cleanup_invalid_shapekeys(cls, obj_names=None):
-        '''
-        清理损坏的形态键（relative_key 指针无效的形态键）
-        obj_names: 要检查的物体名称列表，如果为 None 则检查所有物体
-        返回: 清理的形态键数量
-        
-        注意：Blender 会自动检测并删除 invalid 'from' pointer 的形态键，
-        此函数主要用于预防性检查，确保形态键数据结构正常。
-        '''
+        """清理损坏的形态键（relative_key 指针无效的形态键）"""
+
         cleaned_count = 0
         
         if obj_names is None:
@@ -875,6 +875,8 @@ class ShapeKeyUtils:
 
     @classmethod
     def save_mainfile_with_shape_key_recovery(cls):
+        """保存当前 Blender 文件，遇到形态键自动修复后重试"""
+        
         try:
             bpy.ops.wm.save_mainfile()
             return

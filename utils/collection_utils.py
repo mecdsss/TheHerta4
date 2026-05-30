@@ -59,12 +59,7 @@ class CollectionUtils:
 
     @classmethod
     def create_new_collection(cls,collection_name:str,color_tag:CollectionColor=CollectionColor.White,link_to_parent_collection_name:str = ""):
-        '''
-        创建一个新的集合，并且可以选择是否链接到父集合
-        :param collection_name: 集合名称
-        :param color_tag: 集合颜色标签  不填则默认为白色
-        :param link_to_parent_collection_name: 如果不为空，则将新创建的集合链接到指定的父集合
-        '''
+        """创建新集合并可选链接到父集合"""
         new_collection = bpy.data.collections.new(collection_name)
         new_collection.color_tag = color_tag
         

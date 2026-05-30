@@ -75,6 +75,7 @@ class BMTP_OT_DynamicBridge(bpy.types.Operator):
 
 
 class BMTP_OT_SetVertexColor(bpy.types.Operator):
+    """为选中网格物体设置顶点色颜色属性"""
     bl_idname = "toolkit.bmtp_set_vertex_color"
     bl_label = "应用顶点色"
     bl_options = {'REGISTER', 'UNDO'}
@@ -131,6 +132,7 @@ class BMTP_OT_SetVertexColor(bpy.types.Operator):
 
 
 class BMTP_OT_DeleteEmptyMeshes(bpy.types.Operator):
+    """删除选中物体中没有面的空网格"""
     bl_idname = "toolkit.bmtp_delete_empty_meshes"
     bl_label = "删除选中物体的空网格"
     bl_options = {'REGISTER', 'UNDO'}
@@ -174,6 +176,7 @@ class BMTP_OT_SyncDataNames(bpy.types.Operator):
 
 
 class BMTP_OT_CleanUselessShapeKeys(bpy.types.Operator):
+    """清理选中物体中没有效果的形态键（所有顶点与基础键相同）"""
     bl_idname = "toolkit.bmtp_clean_useless_shape_keys"
     bl_label = "清理选中物体的无效形态键"
     bl_description = "清理选中物体中没有效果的形态键（所有顶点位置与基础形态键相同的形态键）"

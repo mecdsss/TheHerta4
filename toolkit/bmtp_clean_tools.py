@@ -177,6 +177,7 @@ class BMTP_OT_ClearSharpEdges(bpy.types.Operator):
 
 
 class BMTP_OT_ClearSeams(bpy.types.Operator):
+    """清理选中物体的UV接缝标记"""
     bl_idname = "toolkit.bmtp_clear_seams"
     bl_label = "清理UV接缝标记"
     bl_description = "清理选中物体的UV接缝标记"

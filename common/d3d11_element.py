@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class D3D11Element:
+    """D3D11 顶点元素数据类，描述一个顶点语义元素（如 POSITION、NORMAL、TEXCOORD 等）的格式和布局"""
     SemanticName:str
     SemanticIndex:int
     Format:str
@@ -28,6 +29,7 @@ class D3D11Element:
         self.ElementName = self.get_indexed_semantic_name()
 
     def get_indexed_semantic_name(self)->str:
+        """获取带索引的语义名称，如 TEXCOORD1、COLOR0 等"""
         if self.SemanticIndex == 0:
             return self.SemanticName
         else:

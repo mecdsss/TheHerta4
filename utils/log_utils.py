@@ -29,6 +29,7 @@ class LOG:
 
     @classmethod
     def start_collecting(cls):
+        """开始收集日志输出"""
         _reconfigure_stdio_utf8()
         cls._log_capture = io.StringIO()
         cls._original_stdout = sys.stdout
@@ -50,6 +51,7 @@ class LOG:
 
     @classmethod
     def clear_log(cls):
+        """清空已收集的日志内容"""
         if cls._log_capture:
             cls._log_capture = io.StringIO()
 
@@ -86,15 +88,18 @@ class LOG:
 
     @classmethod
     def warning(cls,input:str):
+        """输出警告日志（黄色文本）"""
         print("\033[33m" + "Warning: " + cls._normalize_log_text(input) + "\033[0m")
         cls.newline()
 
     @classmethod
     def debug(cls, input: str):
+        """输出调试日志（青色文本）"""
         print("\033[36m" + "Debug: " + cls._normalize_log_text(input) + "\033[0m")
 
     @classmethod
     def newline(cls):
+        """输出分隔线（绿色）"""
         print("\033[32m" + "-" * 110 + "\033[0m")
 
     @classmethod
@@ -125,6 +130,7 @@ class LOG:
 
 
 class _TeeOutput:
+    """将输出同时写入多个流的 Tee 类"""
     def __init__(self, *outputs):
         self.outputs = outputs
 

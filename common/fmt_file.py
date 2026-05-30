@@ -90,6 +90,7 @@ class FMTFile:
                 f"gametypename='{self.gametypename}', prefix='{self.prefix}', elements={self.elements})")
     
     def get_dtype(self):
+        """根据 elements 列表生成 numpy 结构化 dtype"""
         fields = []
         names = []
         formats = []

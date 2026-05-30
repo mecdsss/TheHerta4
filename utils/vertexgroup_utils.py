@@ -204,6 +204,8 @@ class VertexGroupUtils:
 
     @classmethod
     def fill_vertex_group_gaps(cls):
+        """填充顶点组编号缺口，并排序"""
+        
         # Author: SilentNightSound#7430
         # Fills in missing vertex groups for a model so there are no gaps, and sorts to make sure everything is in order
         # Works on the currently selected object
@@ -292,10 +294,8 @@ class VertexGroupUtils:
 
     @classmethod
     def split_mesh_by_vertex_group(cls,obj):
-        '''
-        Code copied and modified from @Kail_Nethunter, very useful in some special meets.
-        https://blenderartists.org/t/split-a-mesh-by-vertex-groups/438990/11
-        '''
+        """按顶点组拆分网格"""
+
         origin_name = obj.name
         keys = obj.vertex_groups.keys()
         real_keys = []
@@ -346,10 +346,8 @@ class VertexGroupUtils:
 
     @classmethod
     def get_weighted_center(cls, obj, vgroup):
-        '''
-        Credit to @Comilarex
-        https://gamebanana.com/tools/19057
-        '''
+        """计算顶点组的加权中心位置"""
+
         total_weight_area = 0.0
         weighted_position_sum = Vector((0.0, 0.0, 0.0))
 
@@ -562,14 +560,8 @@ class VertexGroupUtils:
 
     @classmethod
     def get_blendweights_blendindices_v4_fast(cls, mesh, normalize_weights: bool = False, blend_size=4):
-        '''
-        Collects flat triplets (vertex_idx, group_id, weight) once, then uses numpy to
-        compute per-vertex top-K (K = aligned_max_groups) and maps to per-loop arrays.
-        Returns same shape: (blendweights_dict, blendindices_dict) with SemanticIndex 0.
+        """获取 blendweights 和 blendindices（v4 快速版，使用 numpy 向量化加速）"""
 
-        目前只有鸣潮在使用，尚未在其它游戏中进行测试
-        TODO 需要测试其它游戏是否兼容。
-        '''
         import numpy as np
 
         mesh_loops = mesh.loops

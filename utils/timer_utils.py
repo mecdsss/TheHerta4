@@ -7,6 +7,7 @@ from .log_utils import LOG
 
 @dataclass
 class StageTimer:
+    """阶段性计时器"""
     stage_name: str
     start_time: datetime = None
     end_time: datetime = None
@@ -26,6 +27,8 @@ class ExportTimerSession:
 
 
 class TimerUtils:
+    """计时工具类，支持阶段计时与会话统计"""
+
     run_start = None
     run_end = None
     methodname_runstart_dict = {}

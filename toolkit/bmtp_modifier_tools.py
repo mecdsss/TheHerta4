@@ -58,6 +58,7 @@ class BMTP_OT_ArmatureToShapekey(bpy.types.Operator):
 
 
 class BMTP_OT_ApplyArmatureModifier(bpy.types.Operator):
+    """将所有选中网格物体上的骨架修改器直接应用"""
     bl_idname = "toolkit.bmtp_apply_armature_modifier"
     bl_label = "应用骨架修改器 (批量)"
     bl_description = "将所有选中网格物体上的骨架修改器直接应用"
@@ -131,6 +132,7 @@ class BMTP_OT_ApplyArmatureModifier(bpy.types.Operator):
 
 
 class BMTP_OT_ApplyAllShapeKeys(bpy.types.Operator):
+    """将所有选中网格物体的全部形态键应用到基础网格"""
     bl_idname = "toolkit.bmtp_apply_all_shape_keys"
     bl_label = "应用全部形态键 (批量)"
     bl_description = "将所有选中网格物体上的全部形态键应用到基础网格"
@@ -182,6 +184,7 @@ class BMTP_OT_ApplyAllShapeKeys(bpy.types.Operator):
 
 
 class BMTP_OT_LatticeToShapekey(bpy.types.Operator):
+    """将所有选中网格物体上的晶格修改器转换为形态键"""
     bl_idname = "toolkit.bmtp_lattice_to_shapekey"
     bl_label = "晶格修改器 -> 形态键 (批量)"
     bl_description = "将所有选中网格物体上的晶格修改器转换为形态键"

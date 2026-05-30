@@ -15,6 +15,7 @@ from ..common.object_prefix_helper import ObjectPrefixHelper
 
 
 class PreProcessHelper:
+    """前处理辅助类，管理物体副本创建、修改器应用、三角化、变换应用、形态键处理和缓存"""
     PRESERVE_SHAPEKEY_CACHE_PREFIX = "preserve_shapekeys_v4__"
     DIRECT_SHAPEKEY_CACHE_PREFIX = "direct_shapekeys_v2__"
     DIRECT_SHAPEKEY_RECORDS_SUFFIX = "direct_shapekey_records.pkl"

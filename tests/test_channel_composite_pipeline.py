@@ -10,6 +10,7 @@ from unittest import mock
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -38,7 +39,10 @@ spec.loader.exec_module(tt_normal_map)
 
 
 class ChannelCompositePipelineTests(unittest.TestCase):
+    """测试通道合成管线：规则间的输出可被后续规则引用"""
+
     def test_previous_output_can_feed_next_rule(self):
+        """测试前一条规则的输出可以正确作为下一条规则的输入源"""
         operator = tt_normal_map.TT_OT_execute_channel_composite()
         processor = tt_normal_map.ChannelProcessor()
 
@@ -82,6 +86,7 @@ class ChannelCompositePipelineTests(unittest.TestCase):
         self.assertAlmostEqual(float(resolved_pixels[0, 0, 0]), float(pixels_a[0, 0, 0]), places=6)
 
     def test_execute_keeps_only_final_composite_result(self):
+        """测试执行后仅保留最终合成结果，中间规则输出文件被清理"""
         operator = tt_normal_map.TT_OT_execute_channel_composite()
 
         base_pixels = np.zeros((2, 2, 4), dtype=np.float32)
@@ -176,6 +181,7 @@ class ChannelCompositePipelineTests(unittest.TestCase):
             self.assertEqual(remaining_files[0].read_text(encoding="utf-8"), "StepB")
 
     def test_execute_keeps_all_generated_outputs_when_materials_are_created(self):
+        """测试创建材质模式时保留所有规则的输出文件"""
         operator = tt_normal_map.TT_OT_execute_channel_composite()
 
         base_pixels = np.zeros((2, 2, 4), dtype=np.float32)

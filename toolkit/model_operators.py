@@ -22,6 +22,7 @@ def _get_single_selected_mesh():
 
 
 def _get_collection_mesh_objects(collection):
+    """获取集合中所有网格物体"""
     return [obj for obj in collection.objects if obj.type == 'MESH']
 
 
@@ -74,6 +75,7 @@ def _bounds_gap(bounds_a, bounds_b):
 
 
 def _cluster_loose_parts_by_vg_similarity_and_distance(objects):
+    """根据顶点组相似度和空间距离对松散块进行聚类"""
     if not objects:
         return []
 

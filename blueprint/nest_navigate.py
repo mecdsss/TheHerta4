@@ -3,8 +3,11 @@ from bpy.types import Operator
 from bpy.props import StringProperty
 
 
+_ANIM_DRIVER_NODE_TYPE = 'SSMTNode_PostProcess_AnimDriver'
+
+
 class SSMT_OT_BlueprintNestNavigate(Operator):
-    '''Navigate through nested blueprints - Tab键导航嵌套蓝图'''
+    '''Navigate through nested blueprints - Tab键导航嵌套蓝图/动画驱动蓝图'''
     bl_idname = "ssmt.blueprint_nest_navigate"
     bl_label = "蓝图嵌套导航"
     bl_options = {'REGISTER', 'INTERNAL'}
@@ -18,7 +21,7 @@ class SSMT_OT_BlueprintNestNavigate(Operator):
 
         if len(selected_nodes) == 1:
             selected_node = selected_nodes[0]
-            if selected_node.bl_idname == 'SSMTNode_Blueprint_Nest':
+            if selected_node.bl_idname in ('SSMTNode_Blueprint_Nest', _ANIM_DRIVER_NODE_TYPE):
                 self.enter_nested_blueprint(context, selected_node)
                 return {'FINISHED'}
 
@@ -86,7 +89,7 @@ class SSMT_OT_BlueprintNestNavigate(Operator):
                 continue
 
             for node in node_group.nodes:
-                if node.bl_idname == 'SSMTNode_Blueprint_Nest':
+                if node.bl_idname in ('SSMTNode_Blueprint_Nest', _ANIM_DRIVER_NODE_TYPE):
                     if getattr(node, 'blueprint_name', '') == blueprint_name:
                         parent_blueprints.append((node_group, node))
 

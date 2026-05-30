@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -138,7 +139,10 @@ spec.loader.exec_module(export_utils)
 
 
 class ExportUtilsStateConsistencyTests(unittest.TestCase):
+    """测试导出工具中形态键值的状态一致性和构建函数"""
+
     def test_build_obj_element_context_restores_source_shape_key_values(self):
+        """测试 build_obj_element_context 在上下文退出后恢复原始形态键值"""
         obj = _FakeObject()
 
         context = export_utils.ExportUtils.build_obj_element_context(
@@ -151,6 +155,7 @@ class ExportUtilsStateConsistencyTests(unittest.TestCase):
         self.assertEqual(obj.data.shape_keys.key_blocks[2].value, 0.25)
 
     def test_build_wwmi_shapekey_payload_ignores_basis_only_shape_keys(self):
+        """测试仅含 Basis 形态键时 build_wwmi_shapekey_payload 返回空结果"""
         obj = _FakeObject()
         obj.data.shape_keys.key_blocks = [_FakeShapeKey("Basis", 0.0)]
 
@@ -162,6 +167,7 @@ class ExportUtilsStateConsistencyTests(unittest.TestCase):
         self.assertEqual(result, ([], [], [], False))
 
     def test_build_wwmi_shapekey_payload_exports_when_non_basis_shape_key_exists(self):
+        """测试存在非 Basis 形态键时 build_wwmi_shapekey_payload 正常导出"""
         obj = _FakeObject()
 
         result = export_utils.ExportUtils.build_wwmi_shapekey_payload(

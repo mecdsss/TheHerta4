@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -58,7 +59,10 @@ class _FakeMatchNode:
 
 
 class ExactMatchPriorityTests(unittest.TestCase):
+    """测试精确匹配顶点组处理的优先级逻辑"""
+
     def test_target_hash_with_dot_suffix_is_not_collapsed_into_parent_hash(self):
+        """测试带点后缀的目标哈希不会被折叠为父级哈希"""
         process_node = node_vertex_group_process.SSMTNode_VertexGroupProcess()
 
         self.assertTrue(
@@ -81,6 +85,7 @@ class ExactMatchPriorityTests(unittest.TestCase):
         )
 
     def test_exact_match_stops_further_merging(self):
+        """测试精确匹配节点阻止后续映射的合并"""
         process_node = node_vertex_group_process.SSMTNode_VertexGroupProcess()
         exact_node = _FakeMatchNode(
             "Exact",
@@ -114,6 +119,7 @@ class ExactMatchPriorityTests(unittest.TestCase):
         self.assertEqual(merged, {"DEF-A": "1", "DEF-B": "2"})
 
     def test_threadsafe_exact_match_stops_further_merging(self):
+        """测试线程安全的精确匹配也阻止后续映射合并"""
         process_node = node_vertex_group_process.SSMTNode_VertexGroupProcess()
         prepared_data = {
             "nodes": [
@@ -144,6 +150,7 @@ class ExactMatchPriorityTests(unittest.TestCase):
         self.assertEqual(merged, {"DEF-A": "1"})
 
     def test_exact_hash_match_can_isolate_more_specific_hash(self):
+        """测试精确哈希匹配能隔离更具体的哈希"""
         process_node = node_vertex_group_process.SSMTNode_VertexGroupProcess()
         specific_node = _FakeMatchNode(
             "Specific",

@@ -33,6 +33,7 @@ from .ui_prefix_quick_ops import PrefixQuickOpsHelper
 
 
 def _create_original_model_frame(tree, label="原始模型"):
+    """创建一个用于容纳原始模型节点的框架"""
     frame = tree.nodes.new('NodeFrame')
     frame.label = label
     frame.use_custom_color = True
@@ -41,6 +42,7 @@ def _create_original_model_frame(tree, label="原始模型"):
 
 
 def _parent_nodes_to_frame(frame, nodes):
+    """将一组节点设置为指定框架的子节点"""
     for node in nodes:
         if node is None:
             continue
@@ -48,6 +50,7 @@ def _parent_nodes_to_frame(frame, nodes):
 
 
 def _extract_gametype_name(import_folder_path: str) -> str:
+    """从导入路径中提取游戏类型名称（如 TYPE_XXX 中的 XXX）"""
     normalized = str(import_folder_path or "").replace("\\", "/")
     marker = "TYPE_"
     index = normalized.rfind(marker)
@@ -57,6 +60,7 @@ def _extract_gametype_name(import_folder_path: str) -> str:
 
 
 def _build_workspace_import_targets(workspace_collection):
+    """构建工作空间中所有可导入子模型的迭代器，每个条目包含路径、显示名等信息"""
     partition_folder_paths = WorkSpaceHelper.get_workspace_partition_folderpath_list()
     target_base_paths = partition_folder_paths or [GlobalConfig.path_workspace_folder()]
 
@@ -131,6 +135,7 @@ def _build_workspace_import_targets(workspace_collection):
 
 
 def _detect_ntemi_workspace() -> bool:
+    """检测当前工作空间是否为 NTEMI（异环·安魂曲）工作空间"""
     if GlobalConfig.logic_name == LogicName.NTEMI:
         return True
     workspace_root = GlobalConfig.path_workspace_folder()
@@ -157,6 +162,7 @@ def _detect_ntemi_workspace() -> bool:
 
 
 def ImprotFromWorkSpaceFull(self, context):
+    """从工作空间完整导入所有子模型并构建蓝图节点树"""
     workspace_collection = WorkSpaceHelper.create_and_get_workspace_collection()
     is_ntemi = _detect_ntemi_workspace()
 
@@ -379,6 +385,7 @@ def ImprotFromWorkSpaceFull(self, context):
 
 
 def _import_workspace_full_ntemi(self, context, workspace_collection):
+    """NTEMI 工作空间的完整导入流程，含骨骼合并后处理"""
     workspace_root = GlobalConfig.path_workspace_folder()
     drawib_aliasname_dict = WorkSpaceHelper.get_drawib_aliasname_dict()
     draw_calls = _discover_draw_calls(workspace_root, drawib_aliasname_dict)
@@ -657,6 +664,7 @@ def _import_workspace_full_ntemi(self, context, workspace_collection):
 
 
 class SSMT4ImportAllFromCurrentWorkSpaceBlueprint(bpy.types.Operator):
+    """一键导入当前 SSMT 工作空间下所有内容的 Blender 算子"""
     bl_idname = "ssmt4.import_all_from_workspace"
     bl_label = TR.translate("一键导入SSMT工作空间内容")
     bl_description = "一键导入当前工作空间文件夹下所有的内容"
@@ -683,6 +691,7 @@ class SSMT4ImportAllFromCurrentWorkSpaceBlueprint(bpy.types.Operator):
 
 
 class SSMT4ImportRaw(bpy.types.Operator, ImportHelper):
+    """导入 SSMT 格式模型文件的 Blender 算子，支持批量选择 JSON 文件"""
     bl_idname = "ssmt4.import_raw"
     bl_label = TR.translate("导入SSMT格式模型")
     bl_description = "导入SSMT格式的模型文件，只需选择.json文件即可"
@@ -699,6 +708,7 @@ class SSMT4ImportRaw(bpy.types.Operator, ImportHelper):
     )  # type: ignore
 
     def execute(self, context):
+        """执行导入操作，遍历选中的 JSON 文件并创建网格对象"""
         dirname = os.path.dirname(self.filepath)
 
         collection_name = os.path.basename(dirname)

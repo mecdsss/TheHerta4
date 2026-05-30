@@ -14,6 +14,7 @@ from ..common.object_prefix_helper import ObjectPrefixHelper
 
 
 class PreProcessCache:
+    """前处理缓存系统，基于物体哈希的缓存保存/加载，使用 .blend 库文件存储"""
     CACHE_DIR_NAME = ".ssmt_preprocess_cache"
     CACHE_INDEX_FILENAME = "cache_index.json"
     CACHE_BUNDLE_DIR_NAME = "bundles"

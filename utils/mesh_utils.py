@@ -5,9 +5,11 @@ from ..common.global_config import GlobalConfig
 from ..common.logic_name import LogicName
 
 class MeshUtils:
+    """网格法线导入工具类"""
 
     @classmethod
     def set_import_normals(cls,mesh,normals):
+        """设置导入的法线数据（兼容 Blender 4.0 以下版本）"""
         # Blender4.2 移除了mesh.create_normal_splits()
         if bpy.app.version <= (4, 0, 0):
             # mesh.use_auto_smooth = True
@@ -39,6 +41,7 @@ class MeshUtils:
     # 这玩意太坑了，花了很久才搞明白，Blender不同版本的法线处理差异
     @classmethod
     def set_import_normals_v2(cls, mesh, normals):
+        """设置导入的法线数据 v2 版，支持 Blender 4.1+ 的丝滑插值路径"""
         import bpy
         import numpy as np
 

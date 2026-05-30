@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -41,11 +42,15 @@ spec.loader.exec_module(dds_conversion)
 
 
 class DDSConversionTests(unittest.TestCase):
+    """测试 DDS 转换工具的纹理类型检测和格式解析"""
+
     def test_color_texture_uses_srgb_input_flag(self):
+        """测试漫反射贴图使用 --srgb-in 标志，法线贴图不使用"""
         self.assertIn("--srgb-in", dds_conversion._texconv_colorspace_flags("DiffuseMap"))
         self.assertIn("--ignore-srgb", dds_conversion._texconv_colorspace_flags("NormalMap"))
 
     def test_custom_rule_keeps_real_texture_type_for_srgb_decision(self):
+        """测试自定义规则下纹理类型仍正确用于 sRGB 判断"""
         props = types.SimpleNamespace(
             dds_use_custom_rules=True,
             dds_rules=[

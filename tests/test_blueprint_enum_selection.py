@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -66,7 +67,10 @@ spec.loader.exec_module(export_helper)
 
 
 class BlueprintEnumSelectionTests(unittest.TestCase):
+    """测试蓝图枚举选择功能：稳定编号和有效性校验"""
+
     def setUp(self):
+        """每个测试前重置全局属性和蓝图树列表"""
         _fake_global_properties.clear()
         _fake_bpy.data.node_groups[:] = [
             types.SimpleNamespace(name="Alpha", bl_idname="SSMTBlueprintTreeType"),
@@ -74,6 +78,7 @@ class BlueprintEnumSelectionTests(unittest.TestCase):
         ]
 
     def test_enum_items_use_stable_numbers(self):
+        """测试两次调用 get_blueprint_enum_items 返回一致的列表"""
         first_items = export_helper.BlueprintExportHelper.get_blueprint_enum_items()
         second_items = export_helper.BlueprintExportHelper.get_blueprint_enum_items()
 
@@ -81,6 +86,7 @@ class BlueprintEnumSelectionTests(unittest.TestCase):
         self.assertTrue(all(len(item) == 5 for item in first_items))
 
     def test_ensure_valid_selection_repairs_saved_numeric_value(self):
+        """测试 ensure_valid_selected_blueprint_name 将数字值修复为对应名称"""
         beta_number = next(
             item[4]
             for item in export_helper.BlueprintExportHelper.get_blueprint_enum_items()
@@ -94,6 +100,7 @@ class BlueprintEnumSelectionTests(unittest.TestCase):
         self.assertEqual(_fake_global_properties["selected_blueprint_name"], "Beta")
 
     def test_ensure_valid_selection_replaces_deleted_blueprint(self):
+        """测试当已保存的蓝图名称不存在时，自动回退到第一个可用蓝图"""
         _fake_global_properties["selected_blueprint_name"] = "Missing"
 
         selected = export_helper.BlueprintExportHelper.ensure_valid_selected_blueprint_name()

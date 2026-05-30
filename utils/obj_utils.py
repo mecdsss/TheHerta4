@@ -43,6 +43,7 @@ def get_user_context(context):
 
 
 def set_user_context(context, user_context):
+    """恢复用户上下文"""
     deselect_all_objects()
     for object in user_context.selected_objects:
         try:
@@ -58,6 +59,7 @@ def set_user_context(context, user_context):
         
 
 def get_active_object(context):
+    """获取活动对象"""
     return context.view_layer.objects.active
 
 
@@ -66,6 +68,7 @@ def get_selected_objects(context):
 
 
 def link_object_to_scene(context, obj):
+    """将对象链接到场景"""
     context.scene.collection.objects.link(obj)
 
 
@@ -84,6 +87,7 @@ def link_object_to_collection(obj, col):
 
 
 def unlink_object_from_collection(obj, col):
+    """从集合中取消链接对象"""
     obj = ObjUtils.assert_object(obj)
     col = assert_collection(col)
     col.objects.unlink(obj) 
@@ -93,6 +97,7 @@ def unlink_object_from_collection(obj, col):
     
 
 def select_object(obj):
+    """选中对象（如果不在场景中则链接到场景）"""
     obj = ObjUtils.assert_object(obj)
     if obj.name not in bpy.context.view_layer.objects:
         if not obj.users_collection:
@@ -113,6 +118,7 @@ def deselect_object(obj):
 
 
 def deselect_all_objects():
+    """取消选择所有对象"""
     for obj in bpy.context.selected_objects:
         deselect_object(obj)
     bpy.context.view_layer.objects.active = None
@@ -128,6 +134,7 @@ def set_active_object(context, obj):
 
 
 def object_is_hidden(obj):
+    """判断对象是否被隐藏"""
     if obj.hide_get():
         return True
     if hasattr(obj, 'hide_viewport') and obj.hide_viewport:
@@ -141,6 +148,7 @@ def hide_object(obj):
 
 
 def unhide_object(obj):
+    """取消隐藏对象"""
     obj = ObjUtils.assert_object(obj)
     obj.hide_set(False)
     if hasattr(obj, 'hide_viewport'):
@@ -163,6 +171,7 @@ def remove_object(obj):
 
 
 def get_modifiers(obj):
+    """获取对象的修改器列表"""
     obj = ObjUtils.assert_object(obj)
     return obj.modifiers
 
@@ -182,6 +191,7 @@ def copy_object(context, obj, name=None, collection=None):
 
 
 def assert_vertex_group(obj, vertex_group):
+    """断言顶点组存在并返回"""
     obj = ObjUtils.assert_object(obj)
     if isinstance(vertex_group, bpy.types.VertexGroup):
         vertex_group = vertex_group.name
@@ -198,6 +208,7 @@ def remove_vertex_groups(obj, vertex_groups):
 
 
 def normalize_all_weights(context, obj):
+    """归一化对象所有顶点组的权重"""
     with OpenObject(context, obj, mode='WEIGHT_PAINT') as obj:
         bpy.ops.object.vertex_group_normalize_all()
 
@@ -250,6 +261,7 @@ def remove_mesh(mesh):
 
 
 def mesh_triangulate(me):
+    """对网格执行三角化"""
     bm = bmesh.new()
     bm.from_mesh(me)
     bmesh.ops.triangulate(bm, faces=bm.faces, quad_method='BEAUTY', ngon_method='BEAUTY')
@@ -258,10 +270,8 @@ def mesh_triangulate(me):
 
 
 def mesh_triangulate_beauty(obj):
-    '''
-    使用 Blender 内置的 BEAUTY 算法进行三角化
-    使用 bpy.ops.mesh.quads_convert_to_tris 确保一致的三角化结果
-    '''
+    """使用 Blender 内置 BEAUTY 算法进行三角化"""
+
     if obj.type != 'MESH':
         return
     
@@ -334,10 +344,12 @@ def get_layer_collection(col, layer_col=None):
 
 
 def collection_exists(col_name):
+    """判断集合是否存在"""
     return col_name in bpy.data.collections.keys()
 
 
 def assert_collection(col):
+    """断言集合存在并返回"""
     if isinstance(col, str):
         col = get_collection(col)
     elif col.name not in bpy.data.collections:
@@ -346,11 +358,13 @@ def assert_collection(col):
 
 
 def get_collection_objects(col):
+    """获取集合中的所有对象"""
     col = assert_collection(col)
     return col.objects
 
 
 def link_collection(col, col_parent):
+    """将集合链接到父集合"""
     col = assert_collection(col)
     col_parent = assert_collection(col_parent)
     col_parent.children.link(col)
@@ -397,12 +411,15 @@ def collection_is_hidden(col):
 
 
 def get_scene_collections():
+    """获取场景的所有子集合"""
     return bpy.context.scene.collection.children
 
 
     
 @dataclass
 class TempObject:
+    """临时对象数据类"""
+
     name: str
     object: bpy.types.Object
     vertex_count: int = 0
@@ -418,6 +435,8 @@ class MergedObjectComponent:
 
 @dataclass
 class MergedObjectShapeKeys:
+    """合并对象形态键数据类"""
+
     vertex_count: int = 0
 
 
@@ -433,6 +452,7 @@ class MergedObject:
 
 
 class OpenObject:
+    """上下文管理器：操作单个对象并恢复原始状态"""
     def __init__(self, context, obj, mode='OBJECT'):
         self.mode = mode
         self.object = ObjUtils.assert_object(obj)
@@ -575,6 +595,8 @@ class ObjUtils:
 
     @staticmethod
     def get_object(obj_name)->bpy.types.Object:
+        """根据名称获取对象"""
+        
         return bpy.data.objects[obj_name]
 
     @staticmethod
@@ -598,7 +620,8 @@ class ObjUtils:
 
     @staticmethod
     def get_obj_by_name(name: str) -> bpy.types.Object | None:
-        """根据名称拿到 Object；找不到返回 None"""
+        """根据名称获取对象，找不到返回 None"""
+
         return bpy.data.objects.get(name)          # 等价于 bpy.data.objects[name]，但不会抛 KeyError
     
     @staticmethod
@@ -610,6 +633,8 @@ class ObjUtils:
 
     @classmethod
     def split_obj_by_loose_parts_to_collection(cls,obj,collection_name:str):
+        """将对象按松散部分分离到指定集合"""
+        
         
         new_collection = bpy.data.collections.new(collection_name)
         bpy.context.scene.collection.children.link(new_collection)
@@ -708,10 +733,8 @@ class ObjUtils:
 
     @classmethod
     def mesh_triangulate(cls,me:bpy.types.Mesh):
-        '''
-        三角化一个mesh
-        注意这个三角化之后就变成新的mesh了
-        '''
+        """三角化网格"""
+
         bm = bmesh.new()
         bm.from_mesh(me)
         bmesh.ops.triangulate(bm, faces=bm.faces, quad_method='BEAUTY', ngon_method='BEAUTY')
@@ -780,6 +803,8 @@ class ObjUtils:
 
     @classmethod
     def reset_obj_location(cls, obj):
+        """重置对象位置为原点"""
+        
         if obj.type == "MESH":
             obj.location[0] = 0.0
             obj.location[1] = 0.0

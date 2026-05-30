@@ -27,6 +27,7 @@ def get_object_used_bones(obj, armature_obj=None):
 
 
 def hide_unused_bones(armature_obj, used_bones):
+    """隐藏骨架中未使用的骨骼，只显示使用的骨骼"""
     if not armature_obj or armature_obj.type != 'ARMATURE':
         return
     

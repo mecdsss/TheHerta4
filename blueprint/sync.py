@@ -1254,6 +1254,7 @@ def selection_sync_timer_callback():
 
 class SSMT_OT_ToggleSync(bpy.types.Operator):
     """切换节点-物体同步功能"""
+    """切换节点-物体同步功能"""
     bl_idname = "ssmt.toggle_sync"
     bl_label = "切换节点-物体同步"
     bl_options = {'REGISTER'}

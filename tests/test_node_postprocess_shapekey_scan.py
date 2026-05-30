@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 def _install_module(name, **attrs):
+    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -101,12 +102,16 @@ spec.loader.exec_module(module)
 
 
 class NodePostprocessShapeKeyScanTests(unittest.TestCase):
+    """测试形态键后处理扫描节点：收集和变量映射管理"""
+
     def setUp(self):
+        """每个测试前清空伪装数据"""
         _fake_bpy.data.objects.clear()
         _helper_state["collect_connected_start_nodes"] = lambda _tree: []
         _helper_state["blueprint_model"] = None
 
     def test_collect_blueprint_shape_key_names_uses_processing_chain_aliases(self):
+        """测试 collect_blueprint_shape_key_names 使用处理链别名收集形态键名"""
         _fake_bpy.data.objects["Body"] = _FakeObject("Body", "Smile", "Blink")
         _helper_state["blueprint_model"] = types.SimpleNamespace(
             processing_chains=[
@@ -131,6 +136,7 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
         self.assertEqual(result, ["Blink", "Smile"])
 
     def test_ensure_shape_key_variable_map_rebuilds_items_from_current_scan(self):
+        """测试 ensure_shape_key_variable_map 从当前扫描重建变量映射条目"""
         class _FakeItem:
             def __init__(self, shape_key_name="", assigned_variable_name="", custom_variable_name=""):
                 self.shape_key_name = shape_key_name
@@ -166,6 +172,7 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
         self.assertEqual(node.shapekey_variable_items[1].custom_variable_name, "Manual_B")
 
     def test_ensure_shape_key_variable_map_adds_new_items_after_pruning_stale_ones(self):
+        """测试 ensure_shape_key_variable_map 在裁剪过期条目后添加新条目"""
         class _FakeItem:
             def __init__(self, shape_key_name="", assigned_variable_name="", custom_variable_name=""):
                 self.shape_key_name = shape_key_name

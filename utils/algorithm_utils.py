@@ -5,32 +5,11 @@ from mathutils import *
 
 
 class AlgorithmUtils:
-    '''
-    SmoothNormal Algorithm.
-    SupportedGame: GI,HI3,HSR,ZZZ,WWMI
-    Designed For: ZZZ,WWMI
-
-    Nico：此方法不知道为什么只能近似还原TEXCOORD1中内容，猜测是缺少了加权平均？
-    缺少相关知识太多了，暂时放着
-
-    # 代码版权与来源：
-    # function 
-    # https://www.bilibili.com/video/BV13G411u75s/?spm_id_from=333.999.0.0 
-    # by 给你柠檬椰果养乐多你会跟我玩吗
-
-    # 将法线XY分量存储到UV贴图的坐标(X:法线x, Y:法线y)
-    # 灵感来自smoothtool from github 
-    # by dashu04
-
-    # 整合 by 失乡のKnight
-    # 拆解信息链、重构为工具类 by NicoMico
-    '''
+    """平滑法线算法工具类（用于 GI/HI3/HSR/ZZZ/WWMI 等游戏）"""
     @classmethod
     def vector_cross_product(cls,v1,v2):
-        '''
-        叉乘 (Cross Product): 两个不平行的三维向量的叉乘会生成一个新的向量，这个新向量与原来的两个向量都垂直。
-        因此，对于给定的三角形，使用其两边进行叉乘可以得到一个垂直于该三角形平面的向量，这就是所谓的法线向量。
-        '''
+        """计算两个向量的叉积"""
+
         return Vector((v1.y*v2.z-v2.y*v1.z,v1.z*v2.x-v2.z*v1.x,v1.x*v2.y-v2.x*v1.y))
     
     @classmethod
@@ -55,16 +34,14 @@ class AlgorithmUtils:
     
     @classmethod
     def vector_to_string(cls,v):
-        '''
-        把Vector变为string，方便放入dict
-        '''
+        """将向量转换为字符串，方便用作字典键"""
+
         return "x=" + str(v.x) + ",y=" + str(v.y) + ",z=" + str(v.z)
     
     @classmethod
     def need_outline(cls,vertex):
-        '''
-        仅用于测试，实际使用中应永远返回True
-        '''
+        """判断顶点是否需要轮廓线（仅测试用）"""
+
         need = False
         for g in vertex.groups:
             if g.group == 446:
@@ -74,6 +51,8 @@ class AlgorithmUtils:
     
     @classmethod
     def calculate_angle_between_vectors (cls,v1,v2):
+        """计算两个向量之间的夹角"""
+        
         ASIZE = cls.vector_calc_length(v1)
         BSIZE = cls.vector_calc_length(v2)
         D = ASIZE*BSIZE
@@ -85,6 +64,8 @@ class AlgorithmUtils:
     
     @classmethod
     def smooth_normal_save_to_uv(cls):
+        """将平滑法线数据保存到 UV 贴图中（用于游戏引擎的平滑法线传递）"""
+        
         mesh = bpy.context.active_object.data
         uvdata = mesh.uv_layers.active.data
         

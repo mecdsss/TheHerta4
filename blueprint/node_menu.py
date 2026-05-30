@@ -1,4 +1,4 @@
-﻿import re
+import re
 
 import bpy
 from bpy.types import NodeTree, Node, NodeSocket
@@ -1098,6 +1098,7 @@ class SSMT_MT_NodeMenu_PostProcess(bpy.types.Menu):
         _add_node_entry(layout, "贴图资源去重", 'PACKAGE', "SSMTNode_PostProcess_ResourceMerge")
         _add_node_entry(layout, "缓冲区清理", 'TRASH', "SSMTNode_PostProcess_BufferCleanup")
         _add_node_entry(layout, "多文件配置", 'FILE_FOLDER', "SSMTNode_PostProcess_MultiFile")
+        _add_node_entry(layout, "动画驱动蓝图", 'ACTION', "SSMTNode_PostProcess_AnimDriver")
 
 
 class SSMT_OT_AlignNodes(bpy.types.Operator):
@@ -1458,6 +1459,14 @@ def draw_node_add_menu(self, context):
     if not node_tree or node_tree.bl_idname != 'SSMTBlueprintTreeType':
         return
 
+    if node_tree.get("is_animation_driver"):
+        layout.operator("node.add_node", text="运行时间", icon='TIME').type = "SSMTNode_AnimDriver_Runtime"
+        layout.operator("node.add_node", text="索引播放", icon='PLAY').type = "SSMTNode_AnimDriver_ForwardPlay"
+        layout.operator("node.add_node", text="往返播放", icon='PLAY').type = "SSMTNode_AnimDriver_PingPong"
+        layout.operator("node.add_node", text="触发", icon='TIME').type = "SSMTNode_AnimDriver_Trigger"
+        layout.operator("node.add_node", text="动画驱动开关", icon='KEYFRAME').type = "SSMTNode_AnimDriver_Toggle"
+        return
+
     layout = self.layout
     layout.menu("SSMT_MT_NodeMenu_Object", text="物体", icon='OBJECT_DATAMODE')
     layout.menu("SSMT_MT_NodeMenu_ShapeKey", text="形态键", icon='SHAPEKEY_DATA')
@@ -1481,6 +1490,15 @@ def draw_node_context_menu(self, context):
         return
 
     layout = self.layout
+    if node_tree.get("is_animation_driver"):
+        layout.operator("node.add_node", text="运行时间", icon='TIME').type = "SSMTNode_AnimDriver_Runtime"
+        layout.operator("node.add_node", text="索引播放", icon='PLAY').type = "SSMTNode_AnimDriver_ForwardPlay"
+        layout.operator("node.add_node", text="往返播放", icon='PLAY').type = "SSMTNode_AnimDriver_PingPong"
+        layout.operator("node.add_node", text="触发", icon='TIME').type = "SSMTNode_AnimDriver_Trigger"
+        layout.operator("node.add_node", text="动画驱动开关", icon='KEYFRAME').type = "SSMTNode_AnimDriver_Toggle"
+        layout.separator()
+        return
+
     layout.separator()
     layout.menu("SSMT_MT_NodeMenu_Object", text="添加物体节点", icon='OBJECT_DATAMODE')
     layout.menu("SSMT_MT_NodeMenu_ShapeKey", text="添加形态键节点", icon='SHAPEKEY_DATA')

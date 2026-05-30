@@ -6,9 +6,11 @@ from ..common.global_config import GlobalConfig
 from ..common.global_properties import GlobalProterties
 
 class CommandUtils:
+    """命令行工具类"""
 
     @classmethod
     def OpenGeneratedModFolder(cls):
+        """打开生成的 Mod 文件夹"""
         '''
         This will be call after generate mod, it will open explorer and shows the result mod files generated.
 

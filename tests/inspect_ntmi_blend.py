@@ -17,10 +17,12 @@ TARGET_NAMES = {
 
 
 def _numeric_groups(obj):
+    """获取对象中所有数字命名的顶点组"""
     return [vg.name for vg in getattr(obj, "vertex_groups", []) if str(vg.name).isdigit()]
 
 
 def _workspace_unique(obj):
+    """获取对象的 3DMigoto:WorkspaceUniqueStr 自定义属性"""
     try:
         return str(obj.get("3DMigoto:WorkspaceUniqueStr", "") or "")
     except Exception:
@@ -28,6 +30,7 @@ def _workspace_unique(obj):
 
 
 def _collect_object_report():
+    """收集目标副本对象的属性报告（类型、顶点组等）"""
     report = []
     for name in sorted(TARGET_NAMES):
         obj = bpy.data.objects.get(name)
@@ -49,12 +52,14 @@ def _collect_object_report():
 
 
 def _iter_blueprint_trees():
+    """遍历场景中所有蓝图树"""
     for node_group in bpy.data.node_groups:
         if getattr(node_group, "bl_idname", "") == "SSMTBlueprintTreeType":
             yield node_group
 
 
 def _collect_node_report():
+    """收集蓝图树中与目标对象相关的 Object_Info 节点信息"""
     report = []
     for tree in _iter_blueprint_trees():
         for node in getattr(tree, "nodes", []):
@@ -79,6 +84,7 @@ def _collect_node_report():
 
 
 def main():
+    """Blend 文件探索主函数：收集副本对象和蓝图节点信息并输出 JSON"""
     payload = {
         "blend": bpy.data.filepath,
         "objects": _collect_object_report(),

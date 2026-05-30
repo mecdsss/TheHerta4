@@ -15,6 +15,7 @@ def _get_node_unique_key(node) -> str:
 
 
 class BlueprintExportHelper:
+    """蓝图导出辅助类，提供蓝图树查找、形状键管理、前/后处理协调等静态方法"""
 
     DEFAULT_RESULT_OUTPUT_NODE_TYPE = 'SSMTNode_Result_Output'
 

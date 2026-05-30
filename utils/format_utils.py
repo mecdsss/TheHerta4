@@ -1,7 +1,7 @@
 import re
-import numpy
 import struct
 import math
+
 import numpy
 
 from .tbn_codec import TBNCodec
@@ -9,10 +9,13 @@ from .tbn_codec import TBNCodec
 
 # This used to catch any exception in run time and raise it to blender output console.
 class Fatal(Exception):
+    """自定义致命异常类"""
     pass
 
 
 class FormatUtils:
+    """DXGI 格式解析与数据转换工具类"""
+
     f32_pattern = re.compile(r'''(?:DXGI_FORMAT_)?(?:[RGBAD]32)+_FLOAT''')
     f16_pattern = re.compile(r'''(?:DXGI_FORMAT_)?(?:[RGBAD]16)+_FLOAT''')
     u32_pattern = re.compile(r'''(?:DXGI_FORMAT_)?(?:[RGBAD]32)+_UINT''')
@@ -33,15 +36,8 @@ class FormatUtils:
 
     @classmethod
     def fit_component_width(cls, input_array, component_count: int, fill_value=0):
-        """
-        Clamp or pad a per-row component array to the exact width required by a
-        packed vertex field.
+        """将数组裁剪或填充到指定组件宽度"""
 
-        `input_array` may be 1D (`shape=(rows,)`) for scalar fields or 2D
-        (`shape=(rows, cols)`) for vector fields. Wider arrays are truncated to
-        the left-most `component_count` columns; narrower arrays are padded with
-        `fill_value`.
-        """
         if component_count <= 0:
             raise ValueError("component_count must be positive")
 

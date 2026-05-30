@@ -52,6 +52,7 @@ def _is_known_node_type(bl_idname: str) -> bool:
 
 
 class ChainTraverser:
+    """蓝图链式遍历器，从 Object_Info/多文件节点正向遍历到输出节点，构建去重处理链"""
 
     def __init__(self, blueprint_model):
         self._model = blueprint_model
