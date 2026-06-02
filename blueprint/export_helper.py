@@ -526,6 +526,21 @@ class BlueprintExportHelper:
 
                 for source_node in BlueprintExportHelper._iter_ordered_object_input_sources(current_node):
                     walk_node(source_node)
+
+                # 对于转接点(Reroute)等使用虚拟插槽(NodeSocketVirtual)的透传节点，
+                # 它们没有 SSMTSocketObject 类型的输入，需要遍历所有输入插槽才能继续回溯。
+                # 只有当前节点没有任何 SSMTSocketObject 输入时才走此回退路径，
+                # 避免与已有 Object 输入的正常节点重复遍历。
+                if not any(
+                    inp.is_linked and getattr(inp, "bl_idname", "") == 'SSMTSocketObject'
+                    for inp in getattr(current_node, "inputs", [])
+                ):
+                    for input_socket in getattr(current_node, "inputs", []):
+                        if input_socket.is_linked:
+                            for link in input_socket.links:
+                                source_node = getattr(link, "from_node", None)
+                                if source_node and source_node != current_node:
+                                    walk_node(source_node)
             finally:
                 visiting_node_keys.remove(node_key)
 

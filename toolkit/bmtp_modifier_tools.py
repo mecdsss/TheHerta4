@@ -241,7 +241,7 @@ class BMTP_OT_LatticeToShapekey(bpy.types.Operator):
 
 class BMTP_OT_DeleteModifiersByName(bpy.types.Operator):
     bl_idname = "toolkit.bmtp_delete_modifiers_by_name"
-    bl_label = "批量删除修改器"
+    bl_label = "批量删除修改器/约束"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -250,24 +250,38 @@ class BMTP_OT_DeleteModifiersByName(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.bmtp_props
-        names_to_remove = {name.strip() for name in props.mod_delete_names.split(',') if name.strip()}
+        names_to_remove = {name.strip().upper() for name in props.mod_delete_names.split(',') if name.strip()}
+        
         if not names_to_remove:
-            self.report({'WARNING'}, "未指定要删除的修改器名称")
+            self.report({'WARNING'}, "未指定要删除的名称")
             return {'CANCELLED'}
-        deleted_count = 0
+        
+        deleted_mod_count = 0
+        deleted_const_count = 0
+        
         for obj in context.selected_objects:
             if hasattr(obj, 'modifiers'):
-                mods_to_remove = [mod for mod in obj.modifiers if mod.name in names_to_remove]
+                mods_to_remove = [mod for mod in obj.modifiers if mod.name.upper() in names_to_remove]
                 for mod in mods_to_remove:
                     obj.modifiers.remove(mod)
-                    deleted_count += 1
-        self.report({'INFO'}, f"共删除了 {deleted_count} 个修改器")
+                    deleted_mod_count += 1
+            
+            if hasattr(obj, 'constraints'):
+                const_to_remove = [con for con in obj.constraints if con.name.upper() in names_to_remove]
+                for con in const_to_remove:
+                    obj.constraints.remove(con)
+                    deleted_const_count += 1
+        
+        message = f"共删除了 {deleted_mod_count} 个修改器"
+        if deleted_const_count > 0:
+            message += f"，{deleted_const_count} 个约束"
+        self.report({'INFO'}, message)
         return {'FINISHED'}
 
 
 class BMTP_OT_ApplyModifiersByName(bpy.types.Operator):
     bl_idname = "toolkit.bmtp_apply_modifiers_by_name"
-    bl_label = "批量应用修改器"
+    bl_label = "批量应用修改器/约束"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -276,85 +290,100 @@ class BMTP_OT_ApplyModifiersByName(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.bmtp_props
-        names_to_apply = {name.strip() for name in props.mod_apply_names.split(',') if name.strip()}
-        if not names_to_apply:
-            self.report({'WARNING'}, "未指定要应用的修改器名称")
-            return {'CANCELLED'}
+        names_to_apply = {name.strip().upper() for name in props.mod_apply_names.split(',') if name.strip()}
         
-        selected_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
-        if not selected_objects:
-            self.report({'WARNING'}, "请至少选择一个网格物体")
+        if not names_to_apply:
+            self.report({'WARNING'}, "未指定要应用的名称")
             return {'CANCELLED'}
         
         original_active = context.view_layer.objects.active
-        applied_count = 0
-        failed_count = 0
+        applied_mod_count = 0
+        baked_const_count = 0
+        failed_mod_count = 0
+        failed_const_count = 0
         shapekey_count = 0
         error_objects = []
+        
+        selected_objects = context.selected_objects
         
         for obj in selected_objects:
             if obj.mode != 'OBJECT':
                 context.view_layer.objects.active = obj
                 bpy.ops.object.mode_set(mode='OBJECT')
             
-            matching_mods = [mod for mod in obj.modifiers if mod.name in names_to_apply]
-            
-            if not matching_mods:
-                continue
+            if hasattr(obj, 'modifiers') and obj.type == 'MESH':
+                matching_mods = [mod for mod in obj.modifiers if mod.name.upper() in names_to_apply]
                 
-            has_shape_keys = obj.data.shape_keys is not None and len(obj.data.shape_keys.key_blocks) > 0
-            
-            if has_shape_keys:
-                shapekey_count += 1
-                try:
-                    selected_modifiers = [mod.name for mod in matching_mods]
+                if matching_mods:
+                    has_shape_keys = obj.data.shape_keys is not None and len(obj.data.shape_keys.key_blocks) > 0
                     
-                    problematic_modifiers = []
-                    for mod_name in selected_modifiers:
-                        mod = obj.modifiers.get(mod_name)
-                        if mod and mod.type == 'MIRROR' and hasattr(mod, 'use_mirror_merge') and mod.use_mirror_merge:
-                            problematic_modifiers.append(mod_name)
-                    
-                    if problematic_modifiers:
-                        self.report({'WARNING'}, 
-                            f"物体 '{obj.name}' 包含镜像修改器且启用了合并选项，这可能导致顶点数量不一致问题")
-                    
-                    context.view_layer.objects.active = obj
-                    success, error_info = bmtp_shape_key_utils.BMTP_ShapeKeyUtils.apply_modifiers_for_object_with_shape_keys(
-                        context, selected_modifiers, disable_armatures=False
-                    )
-                    
-                    if success:
-                        applied_count += len(selected_modifiers)
+                    if has_shape_keys:
+                        shapekey_count += 1
+                        try:
+                            selected_modifiers = [mod.name for mod in matching_mods]
+                            
+                            problematic_modifiers = []
+                            for mod_name in selected_modifiers:
+                                mod = obj.modifiers.get(mod_name)
+                                if mod and mod.type == 'MIRROR' and hasattr(mod, 'use_mirror_merge') and mod.use_mirror_merge:
+                                    problematic_modifiers.append(mod_name)
+                            
+                            if problematic_modifiers:
+                                self.report({'WARNING'}, 
+                                    f"物体 '{obj.name}' 包含镜像修改器且启用了合并选项，这可能导致顶点数量不一致问题")
+                            
+                            context.view_layer.objects.active = obj
+                            success, error_info = bmtp_shape_key_utils.BMTP_ShapeKeyUtils.apply_modifiers_for_object_with_shape_keys(
+                                context, selected_modifiers, disable_armatures=False
+                            )
+                            
+                            if success:
+                                applied_mod_count += len(selected_modifiers)
+                            else:
+                                self.report({'WARNING'}, f"无法为 '{obj.name}' 应用修改器: {error_info}")
+                                failed_mod_count += len(selected_modifiers)
+                                error_objects.append(obj.name)
+                        except Exception as e:
+                            self.report({'WARNING'}, f"处理 '{obj.name}' 的形态键时出错: {e}")
+                            failed_mod_count += len(matching_mods)
+                            error_objects.append(obj.name)
                     else:
-                        self.report({'WARNING'}, f"无法为 '{obj.name}' 应用修改器: {error_info}")
-                        failed_count += len(selected_modifiers)
-                        error_objects.append(obj.name)
-                except Exception as e:
-                    self.report({'WARNING'}, f"处理 '{obj.name}' 的形态键时出错: {e}")
-                    failed_count += len(matching_mods)
-                    error_objects.append(obj.name)
-            else:
-                for mod in matching_mods:
+                        for mod in matching_mods:
+                            context.view_layer.objects.active = obj
+                            try:
+                                bpy.ops.object.modifier_apply(modifier=mod.name)
+                                applied_mod_count += 1
+                            except RuntimeError as e:
+                                self.report({'WARNING'}, f"无法为 '{obj.name}' 应用修改器 '{mod.name}': {e}")
+                                failed_mod_count += 1
+                                error_objects.append(obj.name)
+            
+            if hasattr(obj, 'constraints'):
+                matching_constraints = [con for con in obj.constraints if con.name.upper() in names_to_apply]
+                
+                if matching_constraints:
                     context.view_layer.objects.active = obj
-                    try:
-                        bpy.ops.object.modifier_apply(modifier=mod.name)
-                        applied_count += 1
-                    except RuntimeError as e:
-                        self.report({'WARNING'}, f"无法为 '{obj.name}' 应用修改器 '{mod.name}': {e}")
-                        failed_count += 1
-                        error_objects.append(obj.name)
+                    for con in matching_constraints:
+                        try:
+                            bpy.ops.constraint.apply(constraint=con.name, owner='OBJECT')
+                            baked_const_count += 1
+                        except RuntimeError as e:
+                            self.report({'WARNING'}, f"无法应用 '{obj.name}' 的约束 '{con.name}': {e}")
+                            failed_const_count += 1
+                            error_objects.append(obj.name)
         
         if original_active and original_active.name in bpy.data.objects:
             context.view_layer.objects.active = original_active
         
-        report_message = f"操作完成: 成功应用 {applied_count} 个修改器。"
+        report_message = f"操作完成: 成功应用 {applied_mod_count} 个修改器"
+        if baked_const_count > 0:
+            report_message += f"，应用 {baked_const_count} 个约束"
         if shapekey_count > 0:
-            report_message += f" 其中处理了 {shapekey_count} 个包含形态键的物体。"
-        if failed_count > 0:
-            report_message += f" {failed_count} 个修改器应用失败。"
+            report_message += f" (含 {shapekey_count} 个形态键物体)"
+        if failed_mod_count > 0 or failed_const_count > 0:
+            report_message += f"。失败: {failed_mod_count} 个修改器, {failed_const_count} 个约束"
             if error_objects:
-                report_message += f" 失败的物体: {', '.join(error_objects)}"
+                report_message += f"。失败的物体: {', '.join(set(error_objects))}"
         self.report({'INFO'}, report_message)
         
         return {'FINISHED'}

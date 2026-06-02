@@ -1,4 +1,5 @@
 import bpy
+import hashlib
 import os
 from bpy.props import StringProperty, CollectionProperty, IntProperty, BoolProperty, EnumProperty
 from bpy.types import Operator, Panel, PropertyGroup, UIList
@@ -17,6 +18,15 @@ from ..utils.collection_utils import CollectionUtils, CollectionColor
 preview_collections = {}
 sword_reversed_workspace_items_cache = []
 sword_workspace_lod_items_cache = []
+_sword_reversed_safe_identifier_map: dict[str, str] = {}
+
+
+def _sword_make_safe_identifier(name: str) -> str:
+    return hashlib.md5(name.encode("utf-8")).hexdigest()[:16]
+
+
+def _sword_resolve_reversed_identifier(identifier: str) -> str:
+    return _sword_reversed_safe_identifier_map.get(identifier, identifier)
 
 
 def _load_preview_images(context, folder_path: str, target_collection_name: str = "sword_image_list") -> int:
@@ -139,6 +149,7 @@ def _get_sword_reversed_workspace_items(self, context):
         GlobalConfig.read_from_main_json_ssmt4()
         reversed_root = os.path.join(GlobalConfig.ssmtlocation, "Reversed")
         if not reversed_root or not os.path.isdir(reversed_root):
+            _sword_reversed_safe_identifier_map.clear()
             sword_reversed_workspace_items_cache = [
                 ("", "当前没有可用逆向工作空间", "请确认 SSMT 缓存目录下存在 Reversed 文件夹"),
             ]
@@ -148,14 +159,22 @@ def _get_sword_reversed_workspace_items(self, context):
             [entry.name for entry in os.scandir(reversed_root) if entry.is_dir()]
         )
         if not folder_names:
+            _sword_reversed_safe_identifier_map.clear()
             sword_reversed_workspace_items_cache = [
                 ("", "当前没有可用逆向工作空间", "Reversed 文件夹下未找到子文件夹"),
             ]
             return sword_reversed_workspace_items_cache
 
-        sword_reversed_workspace_items_cache = [(name, name, "") for name in folder_names]
+        _sword_reversed_safe_identifier_map.clear()
+        items = []
+        for name in folder_names:
+            identifier = _sword_make_safe_identifier(name)
+            _sword_reversed_safe_identifier_map[identifier] = name
+            items.append((identifier, name, ""))
+        sword_reversed_workspace_items_cache = items
         return sword_reversed_workspace_items_cache
     except Exception:
+        _sword_reversed_safe_identifier_map.clear()
         sword_reversed_workspace_items_cache = [
             ("", "当前没有可用逆向工作空间", "读取 Reversed 文件夹失败"),
         ]
@@ -354,7 +373,8 @@ class SwordImportAllReversed(bpy.types.Operator):
             if not selected_workspace_name:
                 self.report({"ERROR"}, "当前未选择指定工作空间，请先选择 Reversed 下的子文件夹")
                 return ""
-            return os.path.join(GlobalConfig.ssmtlocation, "Reversed", selected_workspace_name)
+            resolved_name = _sword_resolve_reversed_identifier(selected_workspace_name)
+            return os.path.join(GlobalConfig.ssmtlocation, "Reversed", resolved_name)
 
         if source_mode == "CUSTOM":
             custom_folder_path = str(context.scene.sword_custom_reverse_output_folder_path).strip()

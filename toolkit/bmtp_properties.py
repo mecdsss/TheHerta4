@@ -57,11 +57,11 @@ class BMTP_Properties(bpy.types.PropertyGroup):
     uv_add_name_template: bpy.props.StringProperty(name="名称模板", default="UVMap_{index}",
                                                    description="新UV贴图名称的模板，{index}将被替换为索引号")
 
-    mod_delete_names: bpy.props.StringProperty(name="修改器名称", default="Subdivision,Mirror,Solidify",
-                                               description="要删除的修改器名称列表，用逗号分隔")
+    mod_delete_names: bpy.props.StringProperty(name="名称", default="Subdivision,Mirror,Solidify",
+                                               description="要删除的修改器或约束名称列表，用逗号分隔")
     
-    mod_apply_names: bpy.props.StringProperty(name="修改器名称", default="Subdivision,Mirror,Solidify",
-                                             description="要应用的修改器名称列表，用逗号分隔")
+    mod_apply_names: bpy.props.StringProperty(name="名称", default="Subdivision,Mirror,Solidify",
+                                             description="要应用的修改器或约束名称列表，用逗号分隔")
 
     wt_source_obj: bpy.props.PointerProperty(type=bpy.types.Object, name="源物体", description="作为权重来源的标准物体")
     wt_cleanup: bpy.props.BoolProperty(name="清理目标顶点组", default=True,

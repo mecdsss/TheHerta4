@@ -1,5 +1,5 @@
 import bpy
-from bpy.props import IntProperty, FloatProperty, StringProperty, BoolProperty
+from bpy.props import FloatProperty, StringProperty, BoolProperty
 
 from .anim_driver_base import SSMTNode_AnimDriver_Base
 
@@ -9,16 +9,18 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
     bl_label = '索引播放'
     bl_icon = 'PLAY'
 
-    frame_start: IntProperty(
-        name="起始帧",
-        description="动画播放的起始帧",
-        default=0,
+    frame_start: FloatProperty(
+        name="起始数值",
+        description="动画播放的起始数值",
+        default=0.0,
+        precision=3,
     )
 
-    frame_end: IntProperty(
-        name="结束帧",
-        description="动画播放的结束帧",
-        default=14,
+    frame_end: FloatProperty(
+        name="结束数值",
+        description="动画播放的结束数值",
+        default=14.0,
+        precision=3,
     )
 
     driven_variable: StringProperty(
@@ -27,13 +29,13 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
         default="",
     )
 
-    play_interval: FloatProperty(
-        name="播放间隔",
-        description="每帧驱动的变量增量（0~1，1=每帧+1，0.5=每帧+0.5）",
+    play_total_duration: FloatProperty(
+        name="播放总时长",
+        description="动画播放的总时长（秒），系统自动计算播放间隔",
         default=1.0,
-        min=0.0,
-        max=1.0,
-        step=0.001,
+        min=0.001,
+        max=999.0,
+        step=1.0,
         precision=3,
     )
 
@@ -55,30 +57,65 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
         default=False,
     )
 
+    use_float_interval: BoolProperty(
+        name="浮点计算",
+        description="开启时播放间隔按浮点计算，关闭时取整为整数",
+        default=True,
+    )
+
     loop_playback: BoolProperty(
         name="循环播放",
-        description="播放到最后一帧后自动从头开始循环",
+        description="播放到最后一帧后自动从头开始循环（中间节点强制禁用）",
         default=True,
     )
 
     def init(self, context):
-        self.inputs.new('SSMTSocketAnimDriver', "Input")
-        self.outputs.new('SSMTSocketAnimDriver', "Output")
+        self.inputs.new('SSMTSocketAnimDriver', "链输入")
+        self.inputs.new('SSMTSocketAnimDriver', "时间输入")
+        self.inputs.new('SSMTSocketAnimDriver', "驱动输入")
+        self.outputs.new('SSMTSocketAnimDriver', "链输出")
+        self.outputs.new('SSMTSocketAnimDriver', "时间输出")
         self.width = 300
-        self._assign_auto_index()
+        self._assign_next_available_index()
         self.custom_paused_var = f"$animation_paused{self.auto_index}"
 
     def copy(self, node):
-        self._assign_auto_index()
+        self._assign_next_available_index()
         self.custom_paused_var = f"$animation_paused{self.auto_index}"
+
+    def _compute_play_interval(self):
+        runtime = self._find_runtime_node()
+        fps = runtime.fps if runtime else 30
+        playback_rate = runtime.playback_rate if runtime else 1
+        total_steps = abs(self.frame_end - self.frame_start)
+        total_frames = total_steps + 1
+        if self.play_total_duration <= 0 or total_steps <= 0:
+            return 1.0, total_frames, fps, playback_rate
+        effective_ticks = self.play_total_duration * fps / playback_rate
+        if effective_ticks <= 0:
+            return 1.0, total_frames, fps, playback_rate
+        interval = total_steps / effective_ticks
+        return interval, total_frames, fps, playback_rate
 
     def draw_buttons(self, context, layout):
         box = layout.box()
-        box.label(text=f"索引: {self.auto_index}", icon='LINENUMBERS_ON')
+        row = box.row(align=True)
+        row.label(text=f"索引: {self.auto_index}", icon='LINENUMBERS_ON')
+        row.prop(self, "use_float_interval", text="浮点", icon='IPO_BEZIER')
         box.prop(self, "frame_start")
         box.prop(self, "frame_end")
         box.prop(self, "driven_variable")
-        box.prop(self, "play_interval")
+
+        interval, total_frames, fps, playback_rate = self._compute_play_interval()
+
+        box.prop(self, "play_total_duration")
+        info_col = box.column(align=True)
+        info_col.label(text=f"总帧数: {total_frames}")
+        if self.use_float_interval:
+            info_col.label(text=f"播放间隔: {interval:.4f}")
+        else:
+            info_col.label(text=f"播放间隔: {interval:.4f} (取整为 {max(1, int(interval))})")
+        info_col.label(text=f"帧率: {fps} | 速率: {playback_rate}")
 
         box.separator()
         row = box.row(align=True)
@@ -90,7 +127,24 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
 
         row = box.row(align=True)
         row.prop(self, "reverse_playback", text="反向", icon='ARROW_LEFTRIGHT')
-        row.prop(self, "loop_playback", text="循环", icon='FILE_REFRESH')
+
+        if self._get_next_node_in_chain() is not None:
+            row.label(text="循环已禁用（下游有节点）", icon='FILE_REFRESH')
+        else:
+            row.prop(self, "loop_playback", text="循环", icon='FILE_REFRESH')
+
+        box.separator()
+        box.label(text="输入说明:", icon='INFO')
+        if self.inputs.get("时间输入") and self.inputs["时间输入"].is_linked:
+            box.label(text="  [时间输入] 已连接", icon='TIME')
+        else:
+            box.label(text="  [时间输入] 未连接", icon='ERROR')
+        if self.inputs.get("驱动输入") and self.inputs["驱动输入"].is_linked:
+            box.label(text="  [驱动输入] 已连接", icon='KEYFRAME')
+        else:
+            box.label(text="  [驱动输入] 未连接", icon='SNAP_FACE')
+        if self.outputs.get("时间输出") and self.outputs["时间输出"].is_linked:
+            box.label(text="  [时间输出] 已连接（传递到下一节点）", icon='FORWARD')
 
     def generate_ini_segment(self, connected_nodes=None) -> str:
         self._ensure_valid_index()
@@ -101,12 +155,8 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
         elif not var.startswith('$'):
             var = f"${var}"
 
-        playback_rate = 1
-        if connected_nodes:
-            for cn in connected_nodes:
-                if hasattr(cn, 'playback_rate'):
-                    playback_rate = cn.playback_rate
-                    break
+        runtime = self._find_runtime_node()
+        playback_rate = runtime.playback_rate if runtime else 1
 
         paused_state = 1 if self.default_paused else 0
         paused_var = self.custom_paused_var.strip()
@@ -114,6 +164,12 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
             paused_var = f"$animation_paused{idx}"
         elif not paused_var.startswith('$'):
             paused_var = f"${paused_var}"
+
+        interval, _, _, _ = self._compute_play_interval()
+        interval_str = f"{interval:.4f}" if self.use_float_interval else str(max(1, int(interval)))
+
+        has_next_in_chain = self._get_next_node_in_chain() is not None
+        can_loop = not has_next_in_chain and self.loop_playback
 
         if self.reverse_playback:
             check_bound = f"$frameStart{idx}"
@@ -134,25 +190,50 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
             "; 起始帧",
             f"global $frameEnd{idx} = {self.frame_end}",
             "; 结束帧",
-            f"global $animation_paused{idx} = {paused_state}",
+            f"global {paused_var} = {paused_state}",
             "; 默认暂停状态",
             "[Present]",
-            f"if $animation_paused{idx} == 1",
+            f"if {paused_var} == 1",
             f"    if $swapvar % $speed_auto{idx} == 0",
             f"        if {var} {check_op} {check_bound}",
-            f"            {var} = {var} {op} {self.play_interval:.3f}",
+            f"            {var} = {var} {op} {interval_str}",
             "        else",
         ]
 
-        if not self.loop_playback:
-            lines.append(f"            {paused_var} = 0")
-
-        lines.extend([
-            f"            {var} = {reset_target}",
-            "        endif",
-            "    endif",
-            "endif",
-        ])
+        if can_loop:
+            lines.extend([
+                f"            {var} = {reset_target}",
+                "        endif",
+                "    endif",
+                "endif",
+            ])
+        elif has_next_in_chain:
+            next_paused = self._get_next_paused_var()
+            if next_paused:
+                lines.extend([
+                    f"            {paused_var} = 0",
+                    f"            {next_paused} = 1",
+                    f"            {var} = {reset_target}",
+                    "        endif",
+                    "    endif",
+                    "endif",
+                ])
+            else:
+                lines.extend([
+                    f"            {paused_var} = 0",
+                    f"            {var} = {reset_target}",
+                    "        endif",
+                    "    endif",
+                    "endif",
+                ])
+        else:
+            lines.extend([
+                f"            {paused_var} = 0",
+                f"            {var} = {reset_target}",
+                "        endif",
+                "    endif",
+                "endif",
+            ])
 
         return "\n".join(lines)
 
@@ -168,6 +249,7 @@ def _forward_play_load_handler(dummy):
         for node in tree.nodes:
             if node.bl_idname == 'SSMTNode_AnimDriver_ForwardPlay':
                 try:
+                    SSMTNode_AnimDriver_Base._migrate_play_sockets(node)
                     if not node.custom_paused_var:
                         node.custom_paused_var = f"$animation_paused{node.auto_index}"
                 except Exception:

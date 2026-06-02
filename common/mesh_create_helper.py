@@ -1,4 +1,4 @@
-﻿import bpy
+import bpy
 import itertools
 import math
 import numpy
@@ -760,7 +760,6 @@ class MeshCreateHelper:
 
     @staticmethod
     def create_bsdf_with_diffuse_linked(obj, mesh_name: str, directory: str, logic_name: str | None = None):
-        material_name = f"{mesh_name}_Material"
         if logic_name is None:
             logic_name = GlobalConfig.logic_name
 
@@ -768,6 +767,7 @@ class MeshCreateHelper:
         if texture_path is None:
             return
 
+        material_name = f"DiffuseMap_{mesh_name}"
         material = bpy.data.materials.new(name=material_name)
         material.use_nodes = True
         if logic_name == LogicName.IdentityV:

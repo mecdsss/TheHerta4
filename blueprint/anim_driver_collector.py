@@ -16,7 +16,7 @@ class AnimationDriverCollector:
         graph, node_set = self._build_graph(driver_nodes)
         paragraphs = self._divide_into_paragraphs(graph, node_set)
 
-        seen_runtime_fps = set()
+        seen_runtime_segments = set()
         result = []
         for idx, paragraph_nodes in enumerate(paragraphs):
             ordered_nodes = self._topological_sort(paragraph_nodes, graph)
@@ -27,11 +27,11 @@ class AnimationDriverCollector:
                     segment = node.generate_ini_segment(connected_nodes=connected_upstream)
 
                     if hasattr(node, 'fps') and segment:
-                        fps_key = f"fps_{node.fps}"
-                        if fps_key in seen_runtime_fps:
+                        runtime_key = self._build_runtime_segment_key(node, segment)
+                        if runtime_key in seen_runtime_segments:
                             segment = ""
                         else:
-                            seen_runtime_fps.add(fps_key)
+                            seen_runtime_segments.add(runtime_key)
 
                     if segment:
                         ini_content_parts.append(segment)
@@ -48,9 +48,19 @@ class AnimationDriverCollector:
 
         return result
 
+    @staticmethod
+    def _build_runtime_segment_key(node, segment: str) -> tuple:
+        return (
+            getattr(node, "bl_idname", ""),
+            int(getattr(node, "fps", 0) or 0),
+            int(getattr(node, "playback_rate", 0) or 0),
+            str(segment or "").strip(),
+        )
+
     def _merge_paragraph_sections(self, segments):
         sections = {}
         section_order = []
+        current = None
 
         for segment in segments:
             for line in segment.split('\n'):

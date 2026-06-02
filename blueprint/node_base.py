@@ -53,15 +53,15 @@ class SSMTBlueprintTree(NodeTree):
 
 _NODE_COLOR_INPUT_SOURCE = (0.38, 0.39, 0.40)
 _NODE_COLOR_GROUP = (0.15, 0.16, 0.17)
-_NODE_COLOR_SWITCH = (0.22, 0.65, 0.34)
-_NODE_COLOR_VERTEX_GROUP = (0.53, 0.76, 0.95)
-_NODE_COLOR_POSTPROCESS = (0.78, 0.41, 0.10)
-_NODE_COLOR_OUTPUT = (0.82, 0.26, 0.26)
-_NODE_COLOR_SHAPEKEY = (0.94, 0.57, 0.15)
-_NODE_COLOR_BLUEPRINT = (0.55, 0.39, 0.76)
-_NODE_COLOR_SPECIALIZED = (0.67, 0.39, 0.66)
-_NODE_COLOR_HIGHLIGHT = (0.92, 0.74, 0.18)
-_NODE_COLOR_ANIM_DRIVER = (0.20, 0.70, 0.60)
+_NODE_COLOR_SWITCH = (0.19, 0.55, 0.29)
+_NODE_COLOR_VERTEX_GROUP = (0.45, 0.65, 0.81)
+_NODE_COLOR_POSTPROCESS = (0.54, 0.36, 0.20)
+_NODE_COLOR_OUTPUT = (0.57, 0.28, 0.28)
+_NODE_COLOR_SHAPEKEY = (0.22, 0.42, 0.40)
+_NODE_COLOR_BLUEPRINT = (0.47, 0.33, 0.65)
+_NODE_COLOR_SPECIALIZED = (0.57, 0.33, 0.56)
+_NODE_COLOR_HIGHLIGHT = (0.70, 0.60, 0.26)
+_NODE_COLOR_ANIM_DRIVER = (0.17, 0.60, 0.51)
 
 
 class SSMTNodeBase(Node):
@@ -112,7 +112,7 @@ class SSMTNodeBase(Node):
             return _NODE_COLOR_SWITCH
         if bl_idname in {'SSMTNode_VertexGroupMappingInput', 'SSMTNode_VertexGroupMatch', 'SSMTNode_VertexGroupProcess'}:
             return _NODE_COLOR_VERTEX_GROUP
-        if bl_idname in {'SSMTNode_ShapeKey', 'SSMTNode_ShapeKey_Output', 'SSMTNode_PostProcess_ShapeKey'}:
+        if bl_idname in {'SSMTNode_ShapeKey', 'SSMTNode_ShapeKey_Output'}:
             return _NODE_COLOR_SHAPEKEY
         if bl_idname in {'SSMTNode_Blueprint_Nest', 'SSMTNode_ModPanel'}:
             return _NODE_COLOR_BLUEPRINT

@@ -781,14 +781,10 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             return []
 
         texture_type_lower = mark_name.lower()
-        candidate_objects = [obj] if obj else []
-        for candidate_obj in self._get_material_candidate_objects(obj):
-            if candidate_obj not in candidate_objects:
-                candidate_objects.append(candidate_obj)
-
-        for candidate_obj in candidate_objects:
+        
+        def find_materials_in_object(target_obj):
             matching_materials = OrderedDict()
-            for material_slot in getattr(candidate_obj, "material_slots", []):
+            for material_slot in getattr(target_obj, "material_slots", []):
                 material = material_slot.material
                 if not material:
                     continue
@@ -803,8 +799,20 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 signature = self._build_material_signature(material)
                 if signature not in matching_materials:
                     matching_materials[signature] = material
-            if matching_materials:
-                return list(matching_materials.values())
+            return list(matching_materials.values())
+        
+        if obj:
+            obj_materials = find_materials_in_object(obj)
+            if obj_materials:
+                return obj_materials
+        
+        for candidate_obj in self._get_material_candidate_objects(obj):
+            if candidate_obj == obj:
+                continue
+            candidate_materials = find_materials_in_object(candidate_obj)
+            if candidate_materials:
+                return candidate_materials
+        
         return []
 
     def _create_workspace_texture_resource_entry(self, obj, slot_info, texture_folder, all_sections, texture_ini_folder="Textures"):
@@ -940,8 +948,9 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         if not obj:
             return slot_to_materials
 
-        for candidate_obj in self._get_material_candidate_objects(obj):
-            for material_slot in getattr(candidate_obj, "material_slots", []):
+        def collect_from_object(target_obj):
+            result = OrderedDict()
+            for material_slot in getattr(target_obj, "material_slots", []):
                 material = material_slot.material
                 if not material:
                     continue
@@ -949,7 +958,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 if not parsed_slot:
                     continue
                 param_name, texture_type = parsed_slot
-                slot_info = slot_to_materials.setdefault(
+                slot_info = result.setdefault(
                     param_name,
                     {
                         "texture_type": texture_type,
@@ -959,9 +968,18 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 signature = self._build_material_signature(material)
                 if signature not in slot_info["materials"]:
                     slot_info["materials"][signature] = material
-
-            if slot_to_materials:
-                break
+            return result
+        
+        obj_slots = collect_from_object(obj)
+        if obj_slots:
+            return obj_slots
+        
+        for candidate_obj in self._get_material_candidate_objects(obj):
+            if candidate_obj == obj:
+                continue
+            candidate_slots = collect_from_object(candidate_obj)
+            if candidate_slots:
+                return candidate_slots
 
         return slot_to_materials
 
@@ -981,9 +999,9 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
     def find_matching_materials(self, obj, texture_type):
         texture_type_lower = texture_type.lower()
 
-        matching_materials = OrderedDict()
-        for candidate_obj in self._get_material_candidate_objects(obj):
-            for material_slot in candidate_obj.material_slots:
+        def find_in_object(target_obj):
+            result = OrderedDict()
+            for material_slot in getattr(target_obj, "material_slots", []):
                 material = material_slot.material
                 if not material:
                     continue
@@ -994,10 +1012,23 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 material_first_word = material.name.split('_')[0].lower()
                 if material_first_word == texture_type_lower:
                     signature = self._build_material_signature(material)
-                    if signature not in matching_materials:
-                        matching_materials[signature] = material
-
-        return list(matching_materials.values())
+                    if signature not in result:
+                        result[signature] = material
+            return list(result.values())
+        
+        if obj:
+            obj_materials = find_in_object(obj)
+            if obj_materials:
+                return obj_materials
+        
+        for candidate_obj in self._get_material_candidate_objects(obj):
+            if candidate_obj == obj:
+                continue
+            candidate_materials = find_in_object(candidate_obj)
+            if candidate_materials:
+                return candidate_materials
+        
+        return []
 
     @staticmethod
     def _build_material_signature(material):
@@ -1006,16 +1037,35 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
         material_name = str(getattr(material, "name", "") or "")
         type_prefix = material_name.split('_')[0].lower()
-        texture_images = []
+        
+        main_texture_path = None
         if getattr(material, "use_nodes", False) and getattr(material, "node_tree", None):
-            for node in material.node_tree.nodes:
-                if node.type == 'TEX_IMAGE' and node.image:
-                    image = node.image
-                    image_path = bpy.path.abspath(getattr(image, "filepath", "") or "")
-                    texture_images.append(image_path or image.name)
+            try:
+                output_node = next(n for n in material.node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output)
+                surface_input = output_node.inputs.get('Surface')
+                if surface_input and surface_input.is_linked:
+                    def find_texture_node_recursively(node):
+                        if node.type == 'TEX_IMAGE' and node.image:
+                            image = node.image
+                            return bpy.path.abspath(getattr(image, "filepath", "") or "") or image.name
+                        for input_socket in node.inputs:
+                            if input_socket.is_linked:
+                                found = find_texture_node_recursively(input_socket.links[0].from_node)
+                                if found: return found
+                        return None
+                    main_texture_path = find_texture_node_recursively(surface_input.links[0].from_node)
+            except (StopIteration, AttributeError):
+                pass
+            
+            if not main_texture_path:
+                for node in material.node_tree.nodes:
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        image = node.image
+                        main_texture_path = bpy.path.abspath(getattr(image, "filepath", "") or "") or image.name
+                        break
 
-        if texture_images:
-            return (type_prefix, *sorted(set(texture_images)))
+        if main_texture_path:
+            return (type_prefix, main_texture_path)
         return (type_prefix, material_name)
 
     def get_texture_from_material(self, material):

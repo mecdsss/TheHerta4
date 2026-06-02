@@ -63,6 +63,30 @@ class SSMT_OT_TriggerTargetRemove(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SSMT_OT_TriggerTargetRefresh(bpy.types.Operator):
+    bl_idname = "ssmt.trigger_target_refresh"
+    bl_label = "刷新触发变量列表"
+    bl_description = "自动获取下游所有索引播放和往返播放节点的暂停变量"
+    bl_options = {'REGISTER', 'INTERNAL', 'UNDO'}
+
+    node_name: StringProperty(default="")
+
+    def execute(self, context):
+        tree = getattr(getattr(context, 'space_data', None), 'edit_tree', None)
+        if not tree:
+            return {'CANCELLED'}
+        node = tree.nodes.get(self.node_name) if self.node_name else tree.nodes.active
+        if not node:
+            return {'CANCELLED'}
+        downstream_vars = node._collect_downstream_pause_vars()
+        node.target_list.clear()
+        for var_name in downstream_vars:
+            item = node.target_list.add()
+            item.variable_name = var_name
+        node.target_list_active = 0
+        return {'FINISHED'}
+
+
 class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
     bl_idname = 'SSMTNode_AnimDriver_Trigger'
     bl_label = '触发'
@@ -91,14 +115,16 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
     )
 
     def init(self, context):
-        self.inputs.new('SSMTSocketAnimDriver', "Input")
-        self.outputs.new('SSMTSocketAnimDriver', "Output")
+        self.inputs.new('SSMTSocketAnimDriver', "链输入")
+        self.inputs.new('SSMTSocketAnimDriver', "时间输入")
+        self.inputs.new('SSMTSocketAnimDriver', "驱动输入")
+        self.outputs.new('SSMTSocketAnimDriver', "链输出")
         self.width = 300
-        self._assign_auto_index()
+        self._assign_next_available_index()
         self.custom_paused_var = f"$trigger_paused{self.auto_index}"
 
     def copy(self, node):
-        self._assign_auto_index()
+        self._assign_next_available_index()
         self.custom_paused_var = f"$trigger_paused{self.auto_index}"
 
     def draw_buttons(self, context, layout):
@@ -111,6 +137,8 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
         op.node_name = self.name
         op = row.operator("ssmt.trigger_target_remove", text="", icon='REMOVE')
         op.node_name = self.name
+        op = row.operator("ssmt.trigger_target_refresh", text="", icon='FILE_REFRESH')
+        op.node_name = self.name
 
         if self.target_list:
             box.template_list(
@@ -119,6 +147,8 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
                 self, "target_list_active",
                 rows=max(2, min(len(self.target_list), 6)),
             )
+        else:
+            box.label(text="点击刷新按钮自动获取下游变量", icon='INFO')
 
         box.separator()
         row = box.row(align=True)
@@ -128,16 +158,23 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
         else:
             row.label(text=f"$trigger_paused{self.auto_index}")
 
+        box.separator()
+        box.label(text="输入说明:", icon='INFO')
+        if self.inputs.get("时间输入") and self.inputs["时间输入"].is_linked:
+            box.label(text="  [时间输入] 已连接", icon='TIME')
+        else:
+            box.label(text="  [时间输入] 未连接", icon='ERROR')
+        if self.inputs.get("驱动输入") and self.inputs["驱动输入"].is_linked:
+            box.label(text="  [驱动输入] 已连接", icon='KEYFRAME')
+        else:
+            box.label(text="  [驱动输入] 未连接", icon='SNAP_FACE')
+
     def generate_ini_segment(self, connected_nodes=None) -> str:
         self._ensure_valid_index()
         idx = self.auto_index
 
-        playback_rate = 1
-        if connected_nodes:
-            for cn in connected_nodes:
-                if hasattr(cn, 'playback_rate'):
-                    playback_rate = cn.playback_rate
-                    break
+        runtime = self._find_runtime_node()
+        playback_rate = runtime.playback_rate if runtime else 1
 
         paused_state = 1 if self.default_paused else 0
         paused_var = self.custom_paused_var.strip()
@@ -188,6 +225,7 @@ def _trigger_load_handler(dummy):
         for node in tree.nodes:
             if node.bl_idname == 'SSMTNode_AnimDriver_Trigger':
                 try:
+                    SSMTNode_AnimDriver_Base._migrate_controlled_sockets(node)
                     if not node.custom_paused_var:
                         node.custom_paused_var = f"$trigger_paused{node.auto_index}"
                 except Exception:
@@ -199,6 +237,7 @@ classes = (
     SSMT_UL_TriggerTargets,
     SSMT_OT_TriggerTargetAdd,
     SSMT_OT_TriggerTargetRemove,
+    SSMT_OT_TriggerTargetRefresh,
     SSMTNode_AnimDriver_Trigger,
 )
 

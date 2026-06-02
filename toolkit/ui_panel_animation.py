@@ -15,7 +15,7 @@ class ATP_PT_MainPanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="版本: 4.4.5")
+        layout.label(text="版本: 4.4.6")
 
 
 class ATP_PT_ShapeKeyTools(bpy.types.Panel):

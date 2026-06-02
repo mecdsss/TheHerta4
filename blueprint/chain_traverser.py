@@ -392,6 +392,9 @@ class ChainTraverser:
             chain.node_path.append(current_node)
             chain.node_param_signatures.append(ProcessingChain.extract_node_signature(current_node))
 
+        elif node_type == 'NodeReroute':
+            pass
+
         elif node_type == _NODE_TYPE_DATA_TYPE:
             chain.node_path.append(current_node)
             chain.node_param_signatures.append(ProcessingChain.extract_node_signature(current_node))

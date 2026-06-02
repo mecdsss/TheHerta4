@@ -1465,6 +1465,7 @@ def draw_node_add_menu(self, context):
         layout.operator("node.add_node", text="往返播放", icon='PLAY').type = "SSMTNode_AnimDriver_PingPong"
         layout.operator("node.add_node", text="触发", icon='TIME').type = "SSMTNode_AnimDriver_Trigger"
         layout.operator("node.add_node", text="动画驱动开关", icon='KEYFRAME').type = "SSMTNode_AnimDriver_Toggle"
+        layout.operator("node.add_node", text="形态键动画序列", icon='SHAPEKEY_DATA').type = "SSMTNode_AnimDriver_ShapeKeySequence"
         return
 
     layout = self.layout
@@ -1496,6 +1497,7 @@ def draw_node_context_menu(self, context):
         layout.operator("node.add_node", text="往返播放", icon='PLAY').type = "SSMTNode_AnimDriver_PingPong"
         layout.operator("node.add_node", text="触发", icon='TIME').type = "SSMTNode_AnimDriver_Trigger"
         layout.operator("node.add_node", text="动画驱动开关", icon='KEYFRAME').type = "SSMTNode_AnimDriver_Toggle"
+        layout.operator("node.add_node", text="形态键动画序列", icon='SHAPEKEY_DATA').type = "SSMTNode_AnimDriver_ShapeKeySequence"
         layout.separator()
         return
 

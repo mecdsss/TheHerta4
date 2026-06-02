@@ -1,8 +1,20 @@
 import bpy
+import hashlib
 import os
 
 
 _blueprint_enum_items_cache = []
+_workspace_safe_identifier_map: dict[str, str] = {}
+
+
+def _make_safe_identifier(name: str) -> str:
+    return hashlib.md5(name.encode("utf-8")).hexdigest()[:16]
+
+
+def resolve_workspace_safe_identifier(identifier: str) -> str:
+    if not _workspace_safe_identifier_map:
+        _get_workspace_enum_items(None, None)
+    return _workspace_safe_identifier_map.get(identifier, identifier)
 
 
 def _get_blueprint_enum_items(self, context):
@@ -26,16 +38,25 @@ def _get_workspace_enum_items(self, context):
         GlobalConfig.read_from_main_json_ssmt4()
         workspace_root = GlobalConfig.path_current_game_total_workspace_folder()
         if not workspace_root or not os.path.isdir(workspace_root):
+            _workspace_safe_identifier_map.clear()
             return [("", "当前没有工作空间", "当前游戏配置下未找到可用工作空间")]
 
         workspace_names = sorted(
             [entry.name for entry in os.scandir(workspace_root) if entry.is_dir()]
         )
         if not workspace_names:
+            _workspace_safe_identifier_map.clear()
             return [("", "当前没有工作空间", "当前游戏配置下未找到可用工作空间")]
 
-        return [(name, name, "") for name in workspace_names]
+        _workspace_safe_identifier_map.clear()
+        items = []
+        for name in workspace_names:
+            identifier = _make_safe_identifier(name)
+            _workspace_safe_identifier_map[identifier] = name
+            items.append((identifier, name, ""))
+        return items
     except Exception:
+        _workspace_safe_identifier_map.clear()
         return [("", "当前没有工作空间", "当前游戏配置下未找到可用工作空间")]
 
 

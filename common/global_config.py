@@ -153,7 +153,8 @@ class GlobalConfig:
             if workspace_source_mode == "SPECIFIC":
                 specified_workspace_name = GlobalProterties.specific_workspace_name()
                 if specified_workspace_name:
-                    return specified_workspace_name
+                    from .global_properties import resolve_workspace_safe_identifier
+                    return resolve_workspace_safe_identifier(specified_workspace_name)
 
             if workspace_source_mode == "CUSTOM":
                 custom_workspace_folder_path = cls._normalize_workspace_folder_path(
