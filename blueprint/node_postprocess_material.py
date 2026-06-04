@@ -1539,7 +1539,8 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         for mesh_index, mesh_name in reversed(mesh_lines_info_phase2):
             transparency_shader_name, transparency_value = self.extract_transparency_info_from_mesh_name(mesh_name)
             if transparency_shader_name:
-                if transparency_shader_name not in transparency_sections_to_add:
+                is_new_section = transparency_shader_name not in transparency_sections_to_add
+                if is_new_section:
                     transparency_sections_to_add[transparency_shader_name] = [
                         "blend = ADD BLEND_FACTOR INV_BLEND_FACTOR",
                         f"blend_factor[0] = {transparency_value}", f"blend_factor[1] = {transparency_value}",
@@ -1572,7 +1573,8 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                                 final_block.append(line)
                         else:
                             final_block.append(line)
-                    transparency_sections_to_add[transparency_shader_name].extend(final_block)
+                    if is_new_section:
+                        transparency_sections_to_add[transparency_shader_name].extend(final_block)
                     del lines[start_move_idx:end_move_idx]
         return next_swap_key_num
 
