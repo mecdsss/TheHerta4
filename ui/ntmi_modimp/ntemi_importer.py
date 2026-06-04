@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Tuple
 import bpy
 
 from ...common.import_scene_settings import apply_import_render_environment
+from ...common.global_properties import GlobalProterties
 from .runtime_cache import (
     MODIMP_COLLECTOR_PROPS,
     MODIMP_PATH_PROPS,
@@ -304,7 +305,11 @@ def _create_diffuse_material_graph(material, texture_image):
     tex_node = nodes.new('ShaderNodeTexImage')
     tex_node.image = texture_image
     texture_image.colorspace_settings.name = "sRGB"
-    texture_image.alpha_mode = "CHANNEL_PACKED"
+    try:
+        ignore_texture_alpha = bool(GlobalProterties.ignore_texture_alpha())
+    except Exception:
+        ignore_texture_alpha = False
+    texture_image.alpha_mode = "NONE" if ignore_texture_alpha else "CHANNEL_PACKED"
     tex_node.location = (-520, 0)
 
     transparent_node = nodes.new('ShaderNodeBsdfTransparent')

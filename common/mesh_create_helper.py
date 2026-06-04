@@ -591,7 +591,6 @@ class MeshCreateHelper:
         tex_image = node_tree.nodes.new('ShaderNodeTexImage')
         tex_image.image = bpy.data.images.load(texture_path)
         tex_image.image.colorspace_settings.name = "sRGB"
-        tex_image.image.alpha_mode = "CHANNEL_PACKED"
         tex_image.location = (-520, 0)
 
         transparent = node_tree.nodes.new('ShaderNodeBsdfTransparent')
@@ -607,6 +606,16 @@ class MeshCreateHelper:
         output.location = (360, 0)
 
         node_tree.links.new(tex_image.outputs['Color'], diffuse.inputs['Color'])
+        # 开启"导入贴图时忽略透明度通道"时，贴图 Alpha 模式设为"无"，
+        # Alpha 输出始终为 1，等效于不透明，且不破坏着色器连接结构
+        try:
+            ignore_texture_alpha = bool(GlobalProterties.ignore_texture_alpha())
+        except Exception:
+            ignore_texture_alpha = False
+        if ignore_texture_alpha:
+            tex_image.image.alpha_mode = "NONE"
+        else:
+            tex_image.image.alpha_mode = "CHANNEL_PACKED"
         node_tree.links.new(tex_image.outputs['Alpha'], mix_shader.inputs[0])
         node_tree.links.new(transparent.outputs['BSDF'], mix_shader.inputs[1])
         node_tree.links.new(diffuse.outputs['BSDF'], mix_shader.inputs[2])

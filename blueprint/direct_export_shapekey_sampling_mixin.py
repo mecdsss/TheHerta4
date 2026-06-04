@@ -4,6 +4,7 @@ import math
 import os
 import re
 from collections import OrderedDict, defaultdict
+from types import SimpleNamespace
 
 import bpy
 import numpy as np
@@ -381,37 +382,18 @@ class DirectShapeKeySamplingMixin:
         }
 
     def _format_position_bytes_from_coords(self, sampled_coords, position_element, position_stride=12):
-        sampled_coords = self._convert_position_coords_for_export(sampled_coords)
-        if sampled_coords.size == 0:
-            return b""
-
-        position_format = getattr(position_element, "Format", "")
-        if position_format == "R32G32B32A32_FLOAT":
-            formatted = np.zeros((sampled_coords.shape[0], 4), dtype=np.float32)
-            formatted[:, :3] = sampled_coords
-            return formatted.tobytes()
-        if position_format == "R16G16B16A16_FLOAT":
-            formatted = np.zeros((sampled_coords.shape[0], 4), dtype=np.float16)
-            formatted[:, :3] = sampled_coords.astype(np.float16)
-            formatted[:, 3] = 1.0
-            return formatted.tobytes()
-        if position_stride == 16:
-            formatted = np.zeros((sampled_coords.shape[0], 4), dtype=np.float32)
-            formatted[:, :3] = sampled_coords
-            formatted[:, 3] = 1.0
-            return formatted.tobytes()
-        if position_stride == 8:
-            formatted = np.zeros((sampled_coords.shape[0], 4), dtype=np.float16)
-            formatted[:, :3] = sampled_coords.astype(np.float16)
-            formatted[:, 3] = 1.0
-            return formatted.tobytes()
-        return np.asarray(sampled_coords, dtype=np.float32).tobytes()
+        return ExportUtils.format_position_bytes_from_coords(
+            sampled_coords,
+            d3d11_game_type=self._wrap_position_element_as_game_type(position_element),
+            position_stride=position_stride,
+            logic_name=GlobalConfig.logic_name,
+        )
 
     def _convert_position_coords_for_export(self, sampled_coords):
-        return np.asarray(sampled_coords, dtype=np.float32)
+        return ExportUtils.convert_position_coords_for_export(sampled_coords, logic_name=GlobalConfig.logic_name)
 
     def _convert_position_deltas_for_export(self, sampled_deltas):
-        return self._convert_position_coords_for_export(sampled_deltas)
+        return ExportUtils.convert_position_deltas_for_export(sampled_deltas, logic_name=GlobalConfig.logic_name)
 
     def _reorder_position_bytes_by_loop_indices(
         self,
@@ -963,38 +945,13 @@ class DirectShapeKeySamplingMixin:
         return self._extract_original_name(obj_name)
 
     def _apply_export_space_transform_to_static_copy(self, copy_obj: bpy.types.Object):
-        if copy_obj is None:
-            return
+        ExportUtils.apply_export_space_transform_to_object(copy_obj, logic_name=GlobalConfig.logic_name)
 
-        if (GlobalConfig.logic_name == LogicName.SRMI
-            or GlobalConfig.logic_name == LogicName.GIMI
-            or GlobalConfig.logic_name == LogicName.HIMI
-            or GlobalConfig.logic_name == LogicName.YYSLS
-            or GlobalConfig.logic_name == LogicName.IdentityV):
-            ObjUtils.select_obj(copy_obj)
-            copy_obj.rotation_euler[0] = math.radians(-90)
-            copy_obj.rotation_euler[1] = 0
-            copy_obj.rotation_euler[2] = 0
-            ShapeKeyUtils.transform_apply_preserve_shape_keys(copy_obj, location=False, rotation=True, scale=True)
-            return
-
-        if GlobalConfig.logic_name == LogicName.SnowBreak:
-            ObjUtils.select_obj(copy_obj)
-            copy_obj.rotation_euler[0] = 0
-            copy_obj.rotation_euler[1] = 0
-            copy_obj.rotation_euler[2] = math.radians(180)
-            copy_obj.scale = (100, 100, 100)
-            ShapeKeyUtils.transform_apply_preserve_shape_keys(copy_obj, location=False, rotation=True, scale=True)
-            return
-
-        if GlobalConfig.logic_name == LogicName.EFMI:
-            copy_obj.rotation_euler[0] = 0
-            copy_obj.rotation_euler[1] = 0
-            copy_obj.rotation_euler[2] = 0
-            if all(abs(axis - 1.0) <= 1e-7 for axis in copy_obj.scale):
-                return
-            ObjUtils.select_obj(copy_obj)
-            ShapeKeyUtils.transform_apply_preserve_shape_keys(copy_obj, location=False, rotation=True, scale=True)
+    def _wrap_position_element_as_game_type(self, position_element):
+        return SimpleNamespace(
+            D3D11ElementList=[position_element] if position_element is not None else [],
+            ElementNameD3D11ElementDict={"POSITION": position_element} if position_element is not None else {},
+        )
 
     def _ensure_static_copy_for_source(self, source_name: str, static_copy_map: dict) -> str | None:
         resolved_source_name = self._resolve_static_source_object_name(source_name) or source_name

@@ -169,8 +169,12 @@ class SwapKeyINIIntegrator:
         ini_builder: M_IniBuilder,
         tree: bpy.types.NodeTree,
         registry: Optional[SwapKeyRegistry] = None,
+        swap_nodes: Optional[List[bpy.types.Node]] = None,
     ):
-        swap_nodes = list(registry.swapkey_nodes) if registry is not None else SwapKeyINIGenerator.collect_all_swap_nodes_from_blueprint(tree)
+        # 允许调用方传入预过滤的 swap_nodes 列表（如 WWMI 按 draw_ib 拆分 INI 时），
+        # 未提供时回退到原有的「全量收集」逻辑以保持向后兼容。
+        if swap_nodes is None:
+            swap_nodes = list(registry.swapkey_nodes) if registry is not None else SwapKeyINIGenerator.collect_all_swap_nodes_from_blueprint(tree)
         if not swap_nodes:
             LOG.info("未检测到物体切换节点")
             return

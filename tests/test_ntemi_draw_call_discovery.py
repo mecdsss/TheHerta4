@@ -27,6 +27,10 @@ _install_module(
     apply_import_render_environment=lambda *_args, **_kwargs: None,
 )
 _install_module(
+    f"{PKG}.common.global_properties",
+    GlobalProterties=types.SimpleNamespace(ignore_texture_alpha=lambda: False),
+)
+_install_module(
     f"{PKG}.ui.ntmi_modimp.runtime_cache",
     MODIMP_COLLECTOR_PROPS=(),
     MODIMP_PATH_PROPS=(),

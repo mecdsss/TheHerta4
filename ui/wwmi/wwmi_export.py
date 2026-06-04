@@ -19,6 +19,48 @@ def _get_component_index(draw_ib_model: DrawIBModelWWMI, component_tmp_obj_name:
     return int(fallback_index)
 
 
+def _build_swap_keys_by_draw_ib(blueprint_model: BluePrintModel) -> dict[str, set[str]]:
+    """按 draw_ib 聚合当前处理链中使用到的物体切换节点 key（格式：tree::node_name）。
+
+    WWMI 每个 draw_ib 单独输出一个 INI，因此只把当前 draw_ib 实际用到的
+    物体切换节点写进对应的 INI，避免在无关 INI 中生成 [KeySwap_*] / 变量声明。
+    """
+    aggregated: dict[str, set[str]] = {}
+    for chain in getattr(blueprint_model, "processing_chains", []) or []:
+        swap_node_keys = getattr(chain, "swap_node_option_values", None)
+        if not swap_node_keys:
+            continue
+        try:
+            draw_call_model = chain.to_draw_call_model()
+        except Exception:
+            continue
+        target_draw_ib = str(getattr(draw_call_model, "match_draw_ib", "") or "")
+        if not target_draw_ib:
+            continue
+        aggregated.setdefault(target_draw_ib, set()).update(swap_node_keys.keys())
+    return aggregated
+
+
+def _collect_swap_nodes_for_draw_ib(
+    blueprint_model: BluePrintModel,
+    draw_ib: str,
+    swap_keys_by_draw_ib: dict[str, set[str]],
+):
+    """根据预聚合的 swap_keys_by_draw_ib 过滤出当前 draw_ib 用到的物体切换节点。"""
+    registry = getattr(blueprint_model, "_swap_key_registry", None)
+    if registry is None:
+        return None, []
+    used_keys = swap_keys_by_draw_ib.get(draw_ib, set())
+    if not used_keys:
+        return registry, []
+    filtered = [
+        node
+        for node in getattr(registry, "swapkey_nodes", [])
+        if f"{node.id_data.name}::{node.name}" in used_keys
+    ]
+    return registry, filtered
+
+
 def _iter_blend_remap_components(draw_ib_model: DrawIBModelWWMI):
     for fallback_index, (component_tmp_obj_name, use_remap) in enumerate(draw_ib_model.blend_remap_used.items()):
         component_count = _get_component_index(draw_ib_model, component_tmp_obj_name, fallback_index)
@@ -607,6 +649,9 @@ class ExportWWMI:
     def generate_unreal_vs_config_ini(self):
         config_ini_builder = M_IniBuilder()
 
+        # 预聚合每个 draw_ib 实际用到的物体切换节点 key，避免在无关 INI 中注入 [KeySwap_*]
+        swap_keys_by_draw_ib = _build_swap_keys_by_draw_ib(self.blueprint_model)
+
         for draw_ib, draw_ib_model in self.drawib_drawibmodel_dict.items():
             self.add_constants_section(ini_builder=config_ini_builder, draw_ib_model=draw_ib_model)
             self.add_present_section(ini_builder=config_ini_builder, draw_ib_model=draw_ib_model)
@@ -629,10 +674,54 @@ class ExportWWMI:
             GlobalKeyCountHelper.generated_mod_number = GlobalKeyCountHelper.generated_mod_number + 1
             M_IniHelper.add_branch_key_sections(ini_builder=config_ini_builder, key_name_mkey_dict=self.blueprint_model.keyname_mkey_dict)
             M_IniHelperGUI.add_branch_mod_gui_section(ini_builder=config_ini_builder, key_name_mkey_dict=self.blueprint_model.keyname_mkey_dict)
+            # 集成当前 draw_ib 涉及到的物体切换节点配置（[KeySwap_*] / [Constants] 中 swap 变量声明等）
+            self._integrate_object_swap_for_draw_ib(
+                config_ini_builder,
+                draw_ib,
+                swap_keys_by_draw_ib,
+            )
             M_IniHelper.generate_hash_style_texture_ini(ini_builder=config_ini_builder, drawib_drawibmodel_dict=self.drawib_drawibmodel_dict)
             M_IniHelper.generate_shared_slot_style_texture_ini(ini_builder=config_ini_builder, drawib_drawibmodel_dict=self.drawib_drawibmodel_dict)
             config_ini_builder.save_to_file_not_reorder(os.path.join(GlobalConfig.path_generate_mod_folder(), GlobalConfig.get_workspace_name() + "_" + draw_ib + ".ini"))
             config_ini_builder.clear()
+
+    def _integrate_object_swap_for_draw_ib(
+        self,
+        ini_builder: M_IniBuilder,
+        draw_ib: str,
+        swap_keys_by_draw_ib: dict[str, set[str]],
+    ):
+        """将当前 draw_ib 用到的物体切换节点配置追加到对应 INI 中。
+
+        WWMI 不会在 [TextureOverride*] 中自动设置 `$active0 = 1`，因此 [KeySwap_*]
+        的 `condition = $active0 == 1` 仍依赖 add_branch_key_sections 中声明的
+        `$active0` 全局变量与外部激活手段；本方法只补齐 [KeySwap_*] / [Constants] 中
+        swap 变量声明，避免该节点在 WWMI 项目中完全静默失效。
+        """
+        try:
+            from ...blueprint.export_helper import BlueprintExportHelper
+            from ...blueprint.node_swap_ini import SwapKeyINIIntegrator
+        except ImportError:
+            return
+
+        registry, filtered_swap_nodes = _collect_swap_nodes_for_draw_ib(
+            self.blueprint_model,
+            draw_ib,
+            swap_keys_by_draw_ib,
+        )
+        if registry is None or not filtered_swap_nodes:
+            return
+
+        blueprint_tree = getattr(self.blueprint_model, "_tree", None) or BlueprintExportHelper.get_current_blueprint_tree()
+        if blueprint_tree is None:
+            return
+
+        SwapKeyINIIntegrator.integrate_to_export(
+            ini_builder,
+            blueprint_tree,
+            registry=registry,
+            swap_nodes=filtered_swap_nodes,
+        )
 
     def export(self):
         TimerUtils.start_stage("缓冲文件生成")

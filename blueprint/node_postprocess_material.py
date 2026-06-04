@@ -1365,9 +1365,25 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         return cleaned_lines
 
     def process_texture_override_section(self, section_name, all_sections,
-                                          material_group_to_swapkey, swap_key_prefix, next_swap_key_num,
-                                          used_swap_keys, transparency_sections_to_add):
+                                          material_group_to_swapkey, swap_key_prefix=None, next_swap_key_num=None,
+                                          used_swap_keys=None, transparency_sections_to_add=None):
         from ..utils.log_utils import LOG as _LOG
+        if material_group_to_swapkey is None or material_group_to_swapkey is Ellipsis:
+            material_group_to_swapkey = {}
+        if used_swap_keys is None or used_swap_keys is Ellipsis:
+            used_swap_keys = set()
+        if transparency_sections_to_add is None or transparency_sections_to_add is Ellipsis:
+            transparency_sections_to_add = OrderedDict()
+        if swap_key_prefix is Ellipsis:
+            swap_key_prefix = None
+        if next_swap_key_num is Ellipsis:
+            next_swap_key_num = None
+        if swap_key_prefix is None or next_swap_key_num is None:
+            base_swap_var = getattr(self, "material_switch_var", "") or "$swapkey0"
+            match = re.match(r'(\$\w+)(\d+)', str(base_swap_var))
+            swap_key_prefix = match.group(1) if match else str(base_swap_var)
+            next_swap_key_num = int(match.group(2)) if match else 0
+
         lines = all_sections[section_name]
         ini_mapping = self.build_mapping_for_section(lines)
         lines[:] = self._strip_generated_material_lines(lines)

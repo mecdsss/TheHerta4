@@ -1,3 +1,5 @@
+import math
+
 import bpy
 import numpy
 from contextlib import contextmanager
@@ -156,6 +158,208 @@ class ExportUtils:
             if d3d11_element.Category == "Position" and d3d11_element.ElementName == "POSITION":
                 return d3d11_element
         return None
+
+    @staticmethod
+    def get_effective_export_logic_name(logic_name: Optional[str] = None) -> str:
+        resolved_logic_name = str(logic_name or getattr(GlobalConfig, "logic_name", "") or "")
+        if resolved_logic_name == getattr(LogicName, "HTMI", "HTMI"):
+            return getattr(LogicName, "EFMI", "EFMI")
+        return resolved_logic_name
+
+    @staticmethod
+    def requires_export_space_transform(logic_name: Optional[str] = None) -> bool:
+        resolved_logic_name = ExportUtils.get_effective_export_logic_name(logic_name)
+        return resolved_logic_name in {
+            getattr(LogicName, "SRMI", "SRMI"),
+            getattr(LogicName, "GIMI", "GIMI"),
+            getattr(LogicName, "HIMI", "HIMI"),
+            getattr(LogicName, "YYSLS", "YYSLS"),
+            getattr(LogicName, "IdentityV", "IdentityV"),
+            getattr(LogicName, "SnowBreak", "SnowBreak"),
+            getattr(LogicName, "EFMI", "EFMI"),
+        }
+
+    @staticmethod
+    def convert_position_coords_for_export(sampled_coords, logic_name: Optional[str] = None) -> numpy.ndarray:
+        coords = numpy.asarray(sampled_coords, dtype=numpy.float32)
+        if coords.size == 0:
+            return coords
+
+        resolved_logic_name = ExportUtils.get_effective_export_logic_name(logic_name)
+        if resolved_logic_name in {
+            getattr(LogicName, "SRMI", "SRMI"),
+            getattr(LogicName, "GIMI", "GIMI"),
+            getattr(LogicName, "HIMI", "HIMI"),
+            getattr(LogicName, "YYSLS", "YYSLS"),
+            getattr(LogicName, "IdentityV", "IdentityV"),
+        }:
+            rot = numpy.array(
+                [[1, 0, 0],
+                 [0, 0, 1],
+                 [0, -1, 0]],
+                dtype=numpy.float32,
+            )
+            return coords @ rot
+
+        if resolved_logic_name == getattr(LogicName, "SnowBreak", "SnowBreak"):
+            rot = numpy.array(
+                [[-1, 0, 0],
+                 [0, -1, 0],
+                 [0, 0, 1]],
+                dtype=numpy.float32,
+            )
+            return 100.0 * (coords @ rot)
+
+        return coords
+
+    @staticmethod
+    def convert_position_deltas_for_export(sampled_deltas, logic_name: Optional[str] = None) -> numpy.ndarray:
+        return ExportUtils.convert_position_coords_for_export(sampled_deltas, logic_name=logic_name)
+
+    @staticmethod
+    def apply_export_space_transform_to_object(temp_obj: bpy.types.Object, logic_name: Optional[str] = None):
+        if temp_obj is None:
+            return
+
+        resolved_logic_name = ExportUtils.get_effective_export_logic_name(logic_name)
+        if resolved_logic_name in {
+            getattr(LogicName, "SRMI", "SRMI"),
+            getattr(LogicName, "GIMI", "GIMI"),
+            getattr(LogicName, "HIMI", "HIMI"),
+            getattr(LogicName, "YYSLS", "YYSLS"),
+            getattr(LogicName, "IdentityV", "IdentityV"),
+        }:
+            ObjUtils.select_obj(temp_obj)
+            temp_obj.rotation_euler[0] = math.radians(-90)
+            temp_obj.rotation_euler[1] = 0
+            temp_obj.rotation_euler[2] = 0
+            ShapeKeyUtils.transform_apply_preserve_shape_keys(temp_obj, location=False, rotation=True, scale=True)
+            return
+
+        if resolved_logic_name == getattr(LogicName, "SnowBreak", "SnowBreak"):
+            ObjUtils.select_obj(temp_obj)
+            temp_obj.rotation_euler[0] = 0
+            temp_obj.rotation_euler[1] = 0
+            temp_obj.rotation_euler[2] = math.radians(180)
+            temp_obj.scale = (100, 100, 100)
+            ShapeKeyUtils.transform_apply_preserve_shape_keys(temp_obj, location=False, rotation=True, scale=True)
+            return
+
+        if resolved_logic_name == getattr(LogicName, "EFMI", "EFMI"):
+            temp_obj.rotation_euler[0] = 0
+            temp_obj.rotation_euler[1] = 0
+            temp_obj.rotation_euler[2] = 0
+            if all(abs(axis - 1.0) <= 1e-7 for axis in temp_obj.scale):
+                return
+            ObjUtils.select_obj(temp_obj)
+            ShapeKeyUtils.transform_apply_preserve_shape_keys(temp_obj, location=False, rotation=True, scale=True)
+
+    @staticmethod
+    def _position_element_layout(position_element, position_stride: int):
+        position_stride = int(position_stride or 0)
+        if position_stride <= 0:
+            raise ValueError(f"Invalid POSITION stride: {position_stride}")
+
+        offset = int(getattr(position_element, "AlignedByteOffset", 0) or 0) if position_element is not None else 0
+        byte_width = int(getattr(position_element, "ByteWidth", 0) or 0) if position_element is not None else 0
+        if byte_width <= 0:
+            if position_stride == 8:
+                byte_width = 8
+            elif position_stride == 16:
+                byte_width = 16
+            else:
+                byte_width = 12
+
+        position_format = str(getattr(position_element, "Format", "") or "").upper() if position_element is not None else ""
+        if "16" in position_format and "FLOAT" in position_format:
+            dtype = numpy.float16
+            item_size = 2
+        else:
+            dtype = numpy.float32
+            item_size = 4
+
+        if offset < 0 or offset + byte_width > position_stride:
+            raise ValueError(
+                f"POSITION layout out of bounds: offset={offset}, byte_width={byte_width}, stride={position_stride}"
+            )
+
+        component_count = max(3, byte_width // item_size)
+        return offset, byte_width, dtype, component_count
+
+    @staticmethod
+    def format_position_bytes_from_coords(
+        sampled_coords,
+        d3d11_game_type: Optional[D3D11GameType] = None,
+        position_stride: int = 12,
+        logic_name: Optional[str] = None,
+    ) -> bytes:
+        coords = ExportUtils.convert_position_coords_for_export(sampled_coords, logic_name=logic_name)
+        if coords.size == 0:
+            return b""
+
+        position_element = ExportUtils._get_position_element(d3d11_game_type) if d3d11_game_type is not None else None
+        position_format = str(getattr(position_element, "Format", "") or "")
+        if position_format == "R32G32B32A32_FLOAT":
+            formatted = numpy.zeros((coords.shape[0], 4), dtype=numpy.float32)
+            formatted[:, :3] = coords
+            return formatted.tobytes()
+        if position_format == "R16G16B16A16_FLOAT":
+            formatted = numpy.zeros((coords.shape[0], 4), dtype=numpy.float16)
+            formatted[:, :3] = coords.astype(numpy.float16)
+            formatted[:, 3] = 1.0
+            return formatted.tobytes()
+        if int(position_stride) == 16:
+            formatted = numpy.zeros((coords.shape[0], 4), dtype=numpy.float32)
+            formatted[:, :3] = coords
+            formatted[:, 3] = 1.0
+            return formatted.tobytes()
+        if int(position_stride) == 8:
+            formatted = numpy.zeros((coords.shape[0], 4), dtype=numpy.float16)
+            formatted[:, :3] = coords.astype(numpy.float16)
+            formatted[:, 3] = 1.0
+            return formatted.tobytes()
+        return numpy.asarray(coords, dtype=numpy.float32).tobytes()
+
+    @staticmethod
+    def convert_position_buffer_bytes_for_export(
+        position_bytes: bytes,
+        d3d11_game_type: Optional[D3D11GameType],
+        position_stride: int,
+        logic_name: Optional[str] = None,
+    ) -> bytes:
+        if not position_bytes:
+            return b""
+
+        if not ExportUtils.requires_export_space_transform(logic_name):
+            return bytes(position_bytes)
+
+        position_stride = int(position_stride or 0)
+        if position_stride <= 0 or len(position_bytes) % position_stride != 0:
+            raise ValueError(
+                f"POSITION buffer size does not match stride: bytes={len(position_bytes)}, stride={position_stride}"
+            )
+
+        position_element = ExportUtils._get_position_element(d3d11_game_type) if d3d11_game_type is not None else None
+        offset, byte_width, dtype, component_count = ExportUtils._position_element_layout(position_element, position_stride)
+        vertex_count = int(len(position_bytes) / position_stride)
+        coords = numpy.zeros((vertex_count, 3), dtype=numpy.float32)
+
+        for vertex_index in range(vertex_count):
+            src_start = vertex_index * position_stride + offset
+            src_end = src_start + byte_width
+            values = numpy.frombuffer(position_bytes[src_start:src_end], dtype=dtype, count=component_count)
+            coords[vertex_index] = values[:3].astype(numpy.float32)
+
+        converted_coords = ExportUtils.convert_position_coords_for_export(coords, logic_name=logic_name)
+        converted_bytes = bytearray(position_bytes)
+        for vertex_index in range(vertex_count):
+            src_start = vertex_index * position_stride + offset
+            src_end = src_start + byte_width
+            values = numpy.frombuffer(position_bytes[src_start:src_end], dtype=dtype, count=component_count).copy()
+            values[:3] = converted_coords[vertex_index].astype(dtype)
+            converted_bytes[src_start:src_end] = values.astype(dtype, copy=False).tobytes()
+
+        return bytes(converted_bytes)
 
     @staticmethod
     def _loop_vertex_indices(mesh: bpy.types.Mesh, loop_indices: Optional[numpy.ndarray] = None) -> numpy.ndarray:

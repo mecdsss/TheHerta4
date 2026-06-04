@@ -5,6 +5,7 @@ import bpy
 import os
 
 from ..common.global_config import GlobalConfig
+from ..common.global_properties import GlobalProterties
 from ..common.logic_name import LogicName
 from ..blueprint.export_helper import BlueprintExportHelper
 
@@ -45,6 +46,30 @@ class SSMT4RefreshWorkspaceList(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SSMT_OT_ToggleUseNormalMap(bpy.types.Operator):
+    bl_idname = "ssmt.toggle_use_normal_map"
+    bl_label = "自动上贴图时使用法线贴图"
+    bl_description = "启用后在导入模型时自动附加法线贴图节点，在材质预览模式下得到略微更好的视觉效果"
+
+    def execute(self, context):
+        new_value = GlobalProterties.toggle_use_normal_map()
+        state_text = "已开启" if new_value else "已关闭"
+        self.report({'INFO'}, f"自动上贴图时使用法线贴图: {state_text}")
+        return {'FINISHED'}
+
+
+class SSMT_OT_ToggleIgnoreTextureAlpha(bpy.types.Operator):
+    bl_idname = "ssmt.toggle_ignore_texture_alpha"
+    bl_label = "导入贴图时忽略透明度通道"
+    bl_description = '开启后，一键导入透明材质时，贴图的 Alpha 模式会被设为"无"，使透明度通道始终输出 1（不透明），且不破坏着色器连接结构'
+
+    def execute(self, context):
+        new_value = GlobalProterties.toggle_ignore_texture_alpha()
+        state_text = "已开启" if new_value else "已关闭"
+        self.report({'INFO'}, f"导入贴图时忽略透明度通道: {state_text}")
+        return {'FINISHED'}
+
+
 class PanelBasicInformation(bpy.types.Panel):
     bl_label = "基础信息"
     bl_idname = "VIEW3D_PT_SSMT4_Basic_Information"
@@ -74,7 +99,7 @@ class PanelBasicInformation(bpy.types.Panel):
             or BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
         )
 
-        layout.label(text="TheHerta4 v4.4.6", icon='INFO')
+        layout.label(text="TheHerta4 v4.4.7", icon='INFO')
         layout.label(text=TR.translate("SSMT缓存文件夹路径: ") + GlobalConfig.ssmtlocation)
         layout.label(text=TR.translate("当前配置名称: ") + GlobalConfig.gamename)
         layout.label(text=TR.translate("当前游戏预设: ") + GlobalConfig.logic_name)
@@ -96,6 +121,22 @@ class PanelBasicInformation(bpy.types.Panel):
             layout.operator("model.switch_to_main_panel", text="返回主面板", icon='BACK')
 
         layout.prop(global_properties, "enable_non_mirror_workflow", text="非镜像工作流", toggle=True)
+
+        # 自动上贴图时使用法线贴图 — 以按钮呈现，按下时表示已开启
+        layout.operator(
+            SSMT_OT_ToggleUseNormalMap.bl_idname,
+            text="自动上贴图时使用法线贴图",
+            icon='NORMALS_FACE',
+            depress=GlobalProterties.use_normal_map(),
+        )
+
+        # 导入贴图时忽略透明度通道 — 以按钮呈现，按下时表示已开启
+        layout.operator(
+            SSMT_OT_ToggleIgnoreTextureAlpha.bl_idname,
+            text="导入贴图时忽略透明度通道",
+            icon='IMAGE_ALPHA',
+            depress=GlobalProterties.ignore_texture_alpha(),
+        )
 
         workspace_box = layout.box()
         workspace_box.label(text="工作空间来源", icon='FILE_FOLDER')
@@ -177,7 +218,6 @@ class PanelBasicInformation(bpy.types.Panel):
             import_box = layout.box()
             import_box.operator("import_mesh.migoto_raw_buffers_mmt", text="导入FMT格式模型", icon='IMPORT')
             import_box.operator(SSMT4ImportRaw.bl_idname, text="导入SSMT格式模型", icon='IMPORT')
-            import_box.prop(global_properties, "use_normal_map", text="自动上贴图时使用法线贴图")
 
         ui_prefix_quick_ops.draw_prefix_quick_section(layout, context)
 
@@ -246,10 +286,14 @@ class PanelBasicInformation(bpy.types.Panel):
 def register():
     bpy.utils.register_class(SSMT_OT_ClearPreprocessCache)
     bpy.utils.register_class(SSMT4RefreshWorkspaceList)
+    bpy.utils.register_class(SSMT_OT_ToggleUseNormalMap)
+    bpy.utils.register_class(SSMT_OT_ToggleIgnoreTextureAlpha)
     bpy.utils.register_class(PanelBasicInformation)
 
 
 def unregister():
     bpy.utils.unregister_class(PanelBasicInformation)
+    bpy.utils.unregister_class(SSMT_OT_ToggleIgnoreTextureAlpha)
+    bpy.utils.unregister_class(SSMT_OT_ToggleUseNormalMap)
     bpy.utils.unregister_class(SSMT4RefreshWorkspaceList)
     bpy.utils.unregister_class(SSMT_OT_ClearPreprocessCache)

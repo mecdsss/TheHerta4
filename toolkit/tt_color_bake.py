@@ -132,25 +132,54 @@ class TT_OT_bake_color_maps(bpy.types.Operator):
         return new_mesh, original_positions, None
     
     def render_material_preview(self, material, output_path, preview_type, size, unfold_by_uv=False, source_obj=None):
+        """把选中的材质渲染成 RGBA PNG（双 pass + ShaderToRGB + Eevee）。
+
+        流程：
+        1.  在材质的 Mix Shader 后插入 ShaderToRGB + Emission 节点，链路为
+            Mix Shader → ShaderToRGB → Emission → Output。
+        2.  **Pass 1（RGB）**：保持 Fac 连线不变，贴图 alpha_mode 设为 STRAIGHT
+            （直线透明 = 无特殊处理），连接 ShaderToRGB.Color → Emission，
+            Eevee 渲染得到颜色图片。
+        3.  **Pass 2（Alpha）**：贴图 alpha_mode 设为 CHANNEL_PACKED
+            （通道打包），连接 ShaderToRGB.Alpha → Emission，
+            渲染得到黑白灰度图（黑=0，白=1）。
+        4.  合成：Pass1 RGB + Pass2 R 通道（灰度→alpha）→ RGBA PNG。
+        5.  恢复原始节点树。
+        """
         original_scene = bpy.context.window.scene
         original_engine = original_scene.render.engine
         before_data = {
-            'scenes': set(bpy.data.scenes), 
-            'objects': set(bpy.data.objects), 
-            'meshes': set(bpy.data.meshes), 
-            'cameras': set(bpy.data.cameras), 
-            'lights': set(bpy.data.lights)
+            'scenes': set(bpy.data.scenes),
+            'objects': set(bpy.data.objects),
+            'meshes': set(bpy.data.meshes),
+            'cameras': set(bpy.data.cameras),
+            'lights': set(bpy.data.lights),
         }
-        
+
+        created_images = []
+        created_files = []
+        rgb_path = output_path + ".rgb.tmp.png"
+        a_path = output_path + ".a.tmp.png"
+        created_files.append(rgb_path)
+        created_files.append(a_path)
+
+        # ---- 节点树状态快照 ----
+        node_tree = material.node_tree
+        saved_links = list(node_tree.links)
+        saved_nodes = set(node_tree.nodes)
+        saved_alpha_modes = {}
+
         try:
+            # --- 临时场景（Eevee，自带默认环境光） ---
             temp_scene = bpy.data.scenes.new("TempMaterialRender_Scene")
             bpy.context.window.scene = temp_scene
-            temp_scene.world = original_scene.world 
+            temp_scene.world = original_scene.world
             temp_scene.render.engine = _pick_preview_render_engine()
             if hasattr(temp_scene, "eevee"):
                 temp_scene.eevee.taa_render_samples = 64
             temp_scene.view_settings.view_transform = 'Standard'
-            
+
+            # --- 预览物体 / 相机 ---
             if source_obj and unfold_by_uv:
                 new_mesh, _, _ = self.unfold_mesh_by_uv(source_obj)
                 if new_mesh:
@@ -172,39 +201,186 @@ class TT_OT_bake_color_maps(bpy.types.Operator):
                     coll.objects.unlink(render_obj)
                 temp_scene.collection.objects.link(render_obj)
                 render_obj.data.materials.append(material)
-            
+
             bpy.ops.object.camera_add(location=cam_loc, rotation=cam_rot)
             camera = bpy.context.active_object
             camera.data.type = 'ORTHO'
-            
             if source_obj and unfold_by_uv:
                 camera.data.ortho_scale = 10.0
             else:
                 camera.data.ortho_scale = 2.0
-            
             temp_scene.camera = camera
             temp_scene.render.resolution_x = size
             temp_scene.render.resolution_y = size
-            temp_scene.render.film_transparent = True
             temp_scene.render.image_settings.file_format = 'PNG'
-            temp_scene.render.filepath = output_path
+            temp_scene.render.image_settings.color_mode = 'RGBA'
+
+            # --- 找到 Mix Shader ---
+            output_node = next(
+                (n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL'
+                 and getattr(n, 'is_active_output', False)),
+                next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None),
+            )
+            mix_shaders = [n for n in node_tree.nodes if n.type == 'MIX_SHADER']
+            if not mix_shaders:
+                raise RuntimeError("材质中没有 Mix Shader 节点，无法渲染。")
+            target_mix = mix_shaders[-1]
+
+            tex_nodes = [n for n in node_tree.nodes if n.type == 'TEX_IMAGE']
+
+            # 保存贴图 image 的 alpha_mode
+            saved_alpha_modes = {}
+            for tn in tex_nodes:
+                if tn.image:
+                    saved_alpha_modes[tn.image] = tn.image.alpha_mode
+
+            # --- 插入临时节点：ShaderToRGB + Emission ---
+            shader_to_rgb = node_tree.nodes.new('ShaderNodeShaderToRGB')
+            shader_to_rgb.location = (target_mix.location.x + 280, target_mix.location.y)
+
+            emission = node_tree.nodes.new('ShaderNodeEmission')
+            emission.location = (shader_to_rgb.location.x + 200, shader_to_rgb.location.y)
+
+            # 断开 Mix Shader → Output，改为 Mix → ShaderToRGB → Emission → Output
+            for link in list(node_tree.links):
+                if link.from_node == target_mix and link.to_node == output_node:
+                    node_tree.links.remove(link)
+            node_tree.links.new(target_mix.outputs['Shader'], shader_to_rgb.inputs['Shader'])
+            node_tree.links.new(emission.outputs['Emission'], output_node.inputs['Surface'])
+
+            # ================================================================
+            # Pass 1：RGB（image.alpha_mode = 'NONE' → 无透明度
+            #            → Image Texture 完全忽略 alpha 通道
+            #            → Mix Shader Fac=1 → 纯 Diffuse → 颜色完整不受 alpha 影响）
+            # ================================================================
+            for tn in tex_nodes:
+                if tn.image:
+                    tn.image.alpha_mode = 'NONE'
+
+            node_tree.links.new(shader_to_rgb.outputs['Color'], emission.inputs['Color'])
+
+            temp_scene.render.filepath = rgb_path
             bpy.ops.render.render(write_still=True)
+
+            # ================================================================
+            # Pass 2：Alpha（image.alpha_mode = CHANNEL_PACKED
+            #            → 材质真实 alpha 驱动 → ShaderToRGB.Alpha 输出灰度）
+            # ================================================================
+            for tn in tex_nodes:
+                if tn.image:
+                    tn.image.alpha_mode = 'CHANNEL_PACKED'
+
+            # 切换为 ShaderToRGB.Alpha → Emission.Color（float → 灰度颜色）
+            for l in list(node_tree.links):
+                if l.from_node == shader_to_rgb and l.to_node == emission:
+                    node_tree.links.remove(l)
+            node_tree.links.new(shader_to_rgb.outputs['Alpha'], emission.inputs['Color'])
+
+            temp_scene.render.filepath = a_path
+            bpy.ops.render.render(write_still=True)
+
+            # ================================================================
+            # 合成：Pass1 RGB + Pass2 R（灰度 alpha）→ RGBA
+            # ================================================================
+            rgb_image = bpy.data.images.load(rgb_path)
+            a_image = bpy.data.images.load(a_path)
+            created_images.extend([rgb_image, a_image])
+
+            rgb_pixels = list(rgb_image.pixels[:])
+            a_pixels = list(a_image.pixels[:])
+
+            width, height = rgb_image.size
+            num_pixels = width * height
+            combined = [0.0] * (num_pixels * 4)
+            for i in range(num_pixels):
+                base = i * 4
+                # RGB 仅从 Pass 1（颜色渲染）取，灰度 alpha 完全不参与
+                combined[base + 0] = rgb_pixels[base + 0]
+                combined[base + 1] = rgb_pixels[base + 1]
+                combined[base + 2] = rgb_pixels[base + 2]
+                # Alpha 仅从 Pass 2 的 R 通道取
+                # （Pass 2 中 ShaderToRGB.Alpha → Emission.Color，float 被广播到
+                #  R=G=B=alpha，所以任一通道的值都等于 ShaderToRGB 的 alpha 输出）
+                combined[base + 3] = a_pixels[base + 0]
+
+            final_image = bpy.data.images.new(
+                name="TT_ColorBake_Combined",
+                width=width,
+                height=height,
+                alpha=True,
+                float_buffer=False,
+            )
+            created_images.append(final_image)
+            final_image.pixels[:] = combined
+            final_image.filepath_raw = output_path
+            final_image.file_format = 'PNG'
+            final_image.save()
+
             return True
+
         except Exception as e:
             self.report({'ERROR'}, f"渲染预览失败: {e}")
             traceback.print_exc()
             return False
+
         finally:
+            # --- 恢复节点树 ---
+            if node_tree:
+                try:
+                    # 删除本轮新创建的节点（ShaderToRGB + Emission）
+                    current_nodes = set(node_tree.nodes)
+                    new_nodes = current_nodes - saved_nodes
+                    for n in sorted(new_nodes, key=lambda x: x.type, reverse=True):
+                        try:
+                            node_tree.nodes.remove(n)
+                        except Exception:
+                            pass
+                    # 恢复原始连线
+                    for l in list(node_tree.links):
+                        if l not in saved_links:
+                            node_tree.links.remove(l)
+                    for l in saved_links:
+                        try:
+                            if l not in list(node_tree.links):
+                                node_tree.links.new(l.from_socket, l.to_socket)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # --- 恢复贴图 image.alpha_mode ---
+            if saved_alpha_modes:
+                for img, mode in saved_alpha_modes.items():
+                    try:
+                        if img and img.alpha_mode != mode:
+                            img.alpha_mode = mode
+                    except Exception:
+                        pass
+
+            # --- 恢复场景 ---
             bpy.context.window.scene = original_scene
             original_scene.render.engine = original_engine
-            
+
+            for img in created_images:
+                try:
+                    bpy.data.images.remove(img)
+                except Exception:
+                    pass
+
+            for f in created_files:
+                try:
+                    if os.path.exists(f):
+                        os.remove(f)
+                except Exception:
+                    pass
+
             for data_type, old_items in before_data.items():
                 current_items = set(getattr(bpy.data, data_type))
                 new_items = current_items - old_items
                 for item in new_items:
                     try:
                         getattr(bpy.data, data_type).remove(item, do_unlink=True)
-                    except:
+                    except Exception:
                         pass
     
     def _create_preview_primitive(self, preview_type):

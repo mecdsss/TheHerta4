@@ -205,6 +205,12 @@ class GlobalProterties(bpy.types.PropertyGroup):
         default=False,
     ) # type: ignore
 
+    ignore_texture_alpha: bpy.props.BoolProperty(
+        name="导入贴图时忽略透明度通道",
+        description='开启后，一键导入透明材质时，贴图的 Alpha 模式会被设为"无"，使透明度通道始终输出 1（不透明），且不破坏着色器连接结构',
+        default=False,
+    ) # type: ignore
+
     enable_non_mirror_workflow: bpy.props.BoolProperty(
         name="非镜像工作流",
         description="启用后，导入时会先将模型镜像、应用变换并翻转面；导出前处理时会对副本再次执行同样操作以恢复原始朝向",
@@ -343,6 +349,11 @@ class GlobalProterties(bpy.types.PropertyGroup):
         return bpy.context.scene.global_properties
 
     @classmethod
+    def _bool_attr(cls, name: str, default: bool = False) -> bool:
+        instance = cls._instance()
+        return bool(getattr(instance, name, default))
+
+    @classmethod
     def open_mod_folder_after_generate_mod(cls):
         return cls._instance().open_mod_folder_after_generate_mod
 
@@ -428,7 +439,33 @@ class GlobalProterties(bpy.types.PropertyGroup):
 
     @classmethod
     def use_normal_map(cls):
-        return cls._instance().use_normal_map
+        return cls._bool_attr("use_normal_map", False)
+
+    @classmethod
+    def set_use_normal_map(cls, value: bool):
+        setattr(cls._instance(), "use_normal_map", bool(value))
+
+    @classmethod
+    def toggle_use_normal_map(cls) -> bool:
+        """翻转 use_normal_map，返回翻转后的新值。"""
+        instance = cls._instance()
+        instance.use_normal_map = not bool(getattr(instance, "use_normal_map", False))
+        return bool(instance.use_normal_map)
+
+    @classmethod
+    def ignore_texture_alpha(cls):
+        return cls._bool_attr("ignore_texture_alpha", False)
+
+    @classmethod
+    def set_ignore_texture_alpha(cls, value: bool):
+        setattr(cls._instance(), "ignore_texture_alpha", bool(value))
+
+    @classmethod
+    def toggle_ignore_texture_alpha(cls) -> bool:
+        """翻转 ignore_texture_alpha，返回翻转后的新值。"""
+        instance = cls._instance()
+        instance.ignore_texture_alpha = not bool(getattr(instance, "ignore_texture_alpha", False))
+        return bool(instance.ignore_texture_alpha)
 
     @classmethod
     def enable_non_mirror_workflow(cls):

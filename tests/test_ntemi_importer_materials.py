@@ -154,6 +154,10 @@ _install_module(
     f"{PKG}.common.import_scene_settings",
     apply_import_render_environment=lambda *_args, **_kwargs: None,
 )
+_install_module(
+    f"{PKG}.common.global_properties",
+    GlobalProterties=types.SimpleNamespace(ignore_texture_alpha=lambda: False),
+)
 
 
 module_path = Path(__file__).resolve().parents[1] / "ui" / "ntmi_modimp" / "ntemi_importer.py"
@@ -207,6 +211,34 @@ class NTEMIImporterMaterialTests(unittest.TestCase):
             tex_node = next(node for node in material.node_tree.nodes if node.bl_idname == "ShaderNodeTexImage")
             self.assertEqual(tex_node.image.colorspace_settings.name, "sRGB")
             self.assertEqual(tex_node.image.alpha_mode, "CHANNEL_PACKED")
+
+    def test_ignore_texture_alpha_switch_sets_ntemi_texture_to_none(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diffuse = os.path.join(temp_dir, "diffuse.dds")
+            with open(diffuse, "wb") as file_obj:
+                file_obj.write(b"texture")
+
+            sys.modules[f"{PKG}.common.global_properties"].GlobalProterties.ignore_texture_alpha = lambda: True
+            try:
+                obj = _FakeObject("LOD0.fd054d1d-30030-0.Body")
+                ntemi_importer._apply_material_from_texture_slots(
+                    obj,
+                    {
+                        "ps-t0": {
+                            "source_path": diffuse,
+                            "mark_name": "DiffuseMap",
+                        },
+                    },
+                )
+            finally:
+                sys.modules[f"{PKG}.common.global_properties"].GlobalProterties.ignore_texture_alpha = lambda: False
+
+            tex_node = next(
+                node
+                for node in obj.material_slots[0].material.node_tree.nodes
+                if node.bl_idname == "ShaderNodeTexImage"
+            )
+            self.assertEqual(tex_node.image.alpha_mode, "NONE")
 
     def test_collect_modimp_props_only_returns_non_empty_modimp_custom_props(self):
         obj = types.SimpleNamespace(

@@ -7,6 +7,7 @@ from collections import OrderedDict, defaultdict
 import bpy
 import numpy as np
 
+from ..common.global_config import GlobalConfig
 from ..common.mod_path_compat import ensure_resource_alias_section
 from ..common.mod_path_compat import section_to_resource_name
 from ..common.mod_path_compat import resolve_position_buffer_candidate
@@ -471,6 +472,12 @@ class DirectMultiFileGenerator:
             full_position_bytes = position_buffer.tobytes()
         else:
             full_position_bytes = bytes(position_buffer)
+        full_position_bytes = ExportUtils.convert_position_buffer_bytes_for_export(
+            full_position_bytes,
+            d3d11_game_type=d3d11_game_type,
+            position_stride=position_stride,
+            logic_name=GlobalConfig.logic_name,
+        )
 
         export_indices = np.asarray(object_entry.get("export_indices", []), dtype=np.int32)
         if export_indices.size == 0:

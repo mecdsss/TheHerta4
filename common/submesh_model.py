@@ -138,13 +138,7 @@ class SubMeshModel:
         TimerUtils.start_stage("对象处理与合并")
 
         need_normalize = self.d3d11_game_type is not None and "Blend" in self.d3d11_game_type.OrderedCategoryNameList
-        need_rotate = (GlobalConfig.logic_name == LogicName.SRMI
-            or GlobalConfig.logic_name == LogicName.GIMI
-            or GlobalConfig.logic_name == LogicName.HIMI
-            or GlobalConfig.logic_name == LogicName.YYSLS
-            or GlobalConfig.logic_name == LogicName.IdentityV
-            or GlobalConfig.logic_name == LogicName.SnowBreak
-            or GlobalConfig.logic_name == LogicName.EFMI)
+        need_rotate = ExportUtils.requires_export_space_transform(GlobalConfig.logic_name)
 
         for i, draw_call_model in enumerate(self.drawcall_model_list):
             blender_obj_name = draw_call_model.get_blender_obj_name()
@@ -640,28 +634,4 @@ class SubMeshModel:
             return
 
     def _apply_export_rotation_for_logic(self, temp_obj: bpy.types.Object):
-        if (GlobalConfig.logic_name == LogicName.SRMI
-            or GlobalConfig.logic_name == LogicName.GIMI
-            or GlobalConfig.logic_name == LogicName.HIMI
-            or GlobalConfig.logic_name == LogicName.YYSLS
-            or GlobalConfig.logic_name == LogicName.IdentityV):
-            ObjUtils.select_obj(temp_obj)
-            temp_obj.rotation_euler[0] = math.radians(-90)
-            temp_obj.rotation_euler[1] = 0
-            temp_obj.rotation_euler[2] = 0
-            ShapeKeyUtils.transform_apply_preserve_shape_keys(temp_obj, location=False, rotation=True, scale=True)
-        elif GlobalConfig.logic_name == LogicName.SnowBreak:
-            ObjUtils.select_obj(temp_obj)
-            temp_obj.rotation_euler[0] = 0
-            temp_obj.rotation_euler[1] = 0
-            temp_obj.rotation_euler[2] = math.radians(180)
-            temp_obj.scale = (100, 100, 100)
-            ShapeKeyUtils.transform_apply_preserve_shape_keys(temp_obj, location=False, rotation=True, scale=True)
-        elif GlobalConfig.logic_name == LogicName.EFMI:
-            temp_obj.rotation_euler[0] = 0
-            temp_obj.rotation_euler[1] = 0
-            temp_obj.rotation_euler[2] = 0
-            if all(abs(axis - 1.0) <= 1e-7 for axis in temp_obj.scale):
-                return
-            ObjUtils.select_obj(temp_obj)
-            ShapeKeyUtils.transform_apply_preserve_shape_keys(temp_obj, location=False, rotation=True, scale=True)
+        ExportUtils.apply_export_space_transform_to_object(temp_obj, logic_name=GlobalConfig.logic_name)
