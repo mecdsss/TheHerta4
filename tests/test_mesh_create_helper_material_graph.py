@@ -161,6 +161,7 @@ _install_module("bpy_extras.io_utils", unpack_list=lambda seq: seq, axis_convers
 _install_module(f"{PKG}.utils.format_utils", Fatal=RuntimeError, FormatUtils=types.SimpleNamespace())
 _install_module(f"{PKG}.utils.mesh_utils", MeshUtils=types.SimpleNamespace())
 _install_module(f"{PKG}.utils.obj_utils", ObjUtils=types.SimpleNamespace())
+_install_module(f"{PKG}.utils.color_attribute_utils", write_color_attribute_data=lambda *_args, **_kwargs: None)
 _install_module(
     f"{PKG}.utils.texture_utils",
     TextureUtils=types.SimpleNamespace(find_texture=lambda prefix, suffix, directory: os.path.join(directory, f"{prefix}{suffix}")),

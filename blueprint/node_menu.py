@@ -1459,16 +1459,17 @@ def draw_node_add_menu(self, context):
     if not node_tree or node_tree.bl_idname != 'SSMTBlueprintTreeType':
         return
 
+    layout = self.layout
     if node_tree.get("is_animation_driver"):
         layout.operator("node.add_node", text="运行时间", icon='TIME').type = "SSMTNode_AnimDriver_Runtime"
         layout.operator("node.add_node", text="索引播放", icon='PLAY').type = "SSMTNode_AnimDriver_ForwardPlay"
         layout.operator("node.add_node", text="往返播放", icon='PLAY').type = "SSMTNode_AnimDriver_PingPong"
-        layout.operator("node.add_node", text="触发", icon='TIME').type = "SSMTNode_AnimDriver_Trigger"
+        layout.operator("node.add_node", text="计时触发", icon='TIME').type = "SSMTNode_AnimDriver_Trigger"
+        layout.operator("node.add_node", text="条件触发", icon='ORIENTATION_CURSOR').type = "SSMTNode_AnimDriver_ConditionalTrigger"
         layout.operator("node.add_node", text="动画驱动开关", icon='KEYFRAME').type = "SSMTNode_AnimDriver_Toggle"
         layout.operator("node.add_node", text="形态键动画序列", icon='SHAPEKEY_DATA').type = "SSMTNode_AnimDriver_ShapeKeySequence"
         return
 
-    layout = self.layout
     layout.menu("SSMT_MT_NodeMenu_Object", text="物体", icon='OBJECT_DATAMODE')
     layout.menu("SSMT_MT_NodeMenu_ShapeKey", text="形态键", icon='SHAPEKEY_DATA')
     layout.menu("SSMT_MT_NodeMenu_DataType", text="数据类型", icon='FILE_FOLDER')
@@ -1495,7 +1496,8 @@ def draw_node_context_menu(self, context):
         layout.operator("node.add_node", text="运行时间", icon='TIME').type = "SSMTNode_AnimDriver_Runtime"
         layout.operator("node.add_node", text="索引播放", icon='PLAY').type = "SSMTNode_AnimDriver_ForwardPlay"
         layout.operator("node.add_node", text="往返播放", icon='PLAY').type = "SSMTNode_AnimDriver_PingPong"
-        layout.operator("node.add_node", text="触发", icon='TIME').type = "SSMTNode_AnimDriver_Trigger"
+        layout.operator("node.add_node", text="计时触发", icon='TIME').type = "SSMTNode_AnimDriver_Trigger"
+        layout.operator("node.add_node", text="条件触发", icon='ORIENTATION_CURSOR').type = "SSMTNode_AnimDriver_ConditionalTrigger"
         layout.operator("node.add_node", text="动画驱动开关", icon='KEYFRAME').type = "SSMTNode_AnimDriver_Toggle"
         layout.operator("node.add_node", text="形态键动画序列", icon='SHAPEKEY_DATA').type = "SSMTNode_AnimDriver_ShapeKeySequence"
         layout.separator()

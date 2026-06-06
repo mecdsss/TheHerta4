@@ -336,11 +336,18 @@ class ExportEFMI:
             ("ShaderOverridevs1006", "1bd133ecc1915893", "201"),
             ("ShaderOverridevs1007", "b30cc5ad521e0700", "202"),
             ("ShaderOverridevs1008", "5eb5517c9d2c7e6c", "202"),
-            ("ShaderOverridevs1009", "4921f64a7c74226d", "203"),
-            ("ShaderOverridevs1010", "1b835d0e8dbbfb8f", "203"),
-            ("ShaderOverridevs1011", "06c94dd56f447210", "204"),
-            ("ShaderOverridevs1012", "f47b1f797f5831d0", "204"),
-            ("ShaderOverridevs1013", "906a3976f3e33cfb", "204"),
+            ("ShaderOverridevs1009", "1eaaa259e9a4285b", "202"),
+            ("ShaderOverridevs1010", "4921f64a7c74226d", "203"),
+            ("ShaderOverridevs1011", "1b835d0e8dbbfb8f", "203"),
+            ("ShaderOverridevs1012", "0742626cbcda30ed", "203"),
+            ("ShaderOverridevs1013", "0ba16985f9f74f8d", "204"),
+            ("ShaderOverridevs1014", "06c94dd56f447210", "204"),
+            ("ShaderOverridevs1015", "f47b1f797f5831d0", "204"),
+            ("ShaderOverridevs1016", "906a3976f3e33cfb", "204"),
+            ("ShaderOverridevs1017", "837329f2db1a1aa7", "202"),
+            ("ShaderOverridevs1018", "7c07eb49eebc45b0", "202"),
+            ("ShaderOverridevs1019", "79f0a91fbaadcbd4", "202"),
+            ("ShaderOverridevs1020", "6c3ac1e2c6ca8ffe", "202"),
         ]
 
         for name, hash_val, filter_idx in shader_overrides:

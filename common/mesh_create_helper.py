@@ -10,6 +10,7 @@ from bpy_extras.io_utils import unpack_list, axis_conversion
 from ..utils.format_utils import Fatal, FormatUtils
 from ..utils.mesh_utils import MeshUtils
 from ..utils.obj_utils import ObjUtils
+from ..utils.color_attribute_utils import write_color_attribute_data
 from ..utils.texture_utils import TextureUtils
 from ..utils.timer_utils import TimerUtils
 from ..utils.vertexgroup_utils import VertexGroupUtils
@@ -23,6 +24,18 @@ from ..ui.wwmi.extracted_object import ExtractedObjectHelper
 
 
 class MeshCreateHelper:
+    @staticmethod
+    def _get_color_attribute_type_by_format(dxgi_format: str) -> str:
+        normalized_format = str(dxgi_format or "").upper()
+        if (
+            normalized_format.endswith("_FLOAT")
+            or normalized_format.endswith("_SNORM")
+            or "16" in normalized_format
+            or "32" in normalized_format
+        ):
+            return "FLOAT_COLOR"
+        return "BYTE_COLOR"
+
     @staticmethod
     def _get_mesh_prefix_parts(mesh_name: str) -> dict:
         normalized_mesh_name = str(mesh_name or "").strip()
@@ -115,8 +128,12 @@ class MeshCreateHelper:
                     colors_flat[:, 0] = data[loop_vertex_indices].astype(numpy.float32)
 
                 if hasattr(mesh, 'color_attributes'):
-                    color_attr = mesh.color_attributes.new(name=element.ElementName, type='BYTE_COLOR', domain='CORNER')
-                    color_attr.data.foreach_set('color', colors_flat.ravel())
+                    color_attr = mesh.color_attributes.new(
+                        name=element.ElementName,
+                        type=MeshCreateHelper._get_color_attribute_type_by_format(element.Format),
+                        domain='CORNER',
+                    )
+                    write_color_attribute_data(color_attr, colors_flat)
                 else:
                     mesh.vertex_colors.new(name=element.ElementName)
                     mesh.vertex_colors[element.ElementName].data.foreach_set('color', colors_flat.ravel())

@@ -49,6 +49,10 @@ _install_module(
     ),
 )
 _install_module(
+    f"{PKG}.utils.color_attribute_utils",
+    read_color_attribute_data=lambda color_attr, count=None: np.asarray(color_attr.data.records, dtype=np.float32),
+)
+_install_module(
     f"{PKG}.common.object_prefix_helper",
     ObjectPrefixHelper=types.SimpleNamespace(resolve_source_object_name=lambda name: name),
 )
@@ -107,12 +111,17 @@ class _ColorAttribute:
         self.data = _ForeachData("color", colors)
 
 
+class _LegacyVertexColorLayer(_ColorAttribute):
+    pass
+
+
 class _Mesh:
-    def __init__(self, coords, uvs, color_attributes):
+    def __init__(self, coords, uvs, color_attributes, vertex_colors=None):
         self.vertices = _Vertices(coords)
         self.loops = _Loops(len(uvs))
         self.uv_layers = [_UVLayer("TEXCOORD.xy", uvs)]
         self.color_attributes = list(color_attributes)
+        self.vertex_colors = list(vertex_colors or [])
         self.shape_keys = None
 
 
@@ -180,6 +189,30 @@ class PreProcessCacheHashTests(unittest.TestCase):
         original_hash = PreProcessCache.compute_object_hash("Body")
 
         mesh.color_attributes[0] = _ColorAttribute(
+            "COLOR",
+            [(0.9, 0.2, 0.3, 1.0), (0.2, 0.8, 0.4, 1.0), (0.3, 0.4, 0.7, 1.0)],
+        )
+        updated_hash = PreProcessCache.compute_object_hash("Body")
+
+        self.assertNotEqual(updated_hash, original_hash)
+
+    def test_legacy_vertex_colors_still_affect_hash(self):
+        mesh = _Mesh(
+            coords=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            uvs=[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+            color_attributes=[],
+            vertex_colors=[
+                _LegacyVertexColorLayer(
+                    "COLOR",
+                    [(0.1, 0.2, 0.3, 1.0), (0.2, 0.3, 0.4, 1.0), (0.3, 0.4, 0.5, 1.0)],
+                )
+            ],
+        )
+        _fake_bpy.data.objects["Body"] = _Object("Body", mesh)
+
+        original_hash = PreProcessCache.compute_object_hash("Body")
+
+        mesh.vertex_colors[0] = _LegacyVertexColorLayer(
             "COLOR",
             [(0.9, 0.2, 0.3, 1.0), (0.2, 0.8, 0.4, 1.0), (0.3, 0.4, 0.7, 1.0)],
         )

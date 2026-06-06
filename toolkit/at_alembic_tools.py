@@ -7,6 +7,7 @@ import traceback
 from collections import defaultdict
 
 from .at_utils import is_alembic_object, move_object_to_collection
+from ..utils.color_attribute_utils import read_color_attribute_data, write_color_attribute_data
 
 
 class ATP_OT_BakeAndImportAlembic(bpy.types.Operator):
@@ -178,6 +179,8 @@ class ATP_OT_SplitAnimation(bpy.types.Operator):
             for src_col_layer in source_mesh.color_attributes:
                 if src_col_layer.domain != 'CORNER': continue
                 dst_col_layer = target_mesh.color_attributes.new(name=src_col_layer.name, type=src_col_layer.data_type, domain=src_col_layer.domain)
+                src_color_values = read_color_attribute_data(src_col_layer)
+                dst_color_values = read_color_attribute_data(dst_col_layer)
                 for poly in target_mesh.polygons:
                     for loop_idx in poly.loop_indices:
                         new_vert_idx = target_mesh.loops[loop_idx].vertex_index
@@ -185,10 +188,11 @@ class ATP_OT_SplitAnimation(bpy.types.Operator):
                         for src_poly in source_mesh.polygons:
                             for src_loop_idx in src_poly.loop_indices:
                                 if source_mesh.loops[src_loop_idx].vertex_index == old_vert_idx:
-                                    dst_col_layer.data[loop_idx].color = src_col_layer.data[src_loop_idx].color
+                                    dst_color_values[loop_idx] = src_color_values[src_loop_idx]
                                     break
                             else: continue
                             break
+                write_color_attribute_data(dst_col_layer, dst_color_values)
 
     def analyze_static_vertices(self, context, objects, props):
         """分析动画，找出在整个范围内位置不变的静态顶点"""

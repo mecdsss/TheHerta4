@@ -7,8 +7,14 @@ from .anim_driver_base import SSMTNode_AnimDriver_Base
 class TriggerTargetItem(bpy.types.PropertyGroup):
     variable_name: StringProperty(
         name="变量名",
-        description="触发时设置为1的变量名称（如 $myTrigger）",
+        description="触发时要设置的变量名称（如 $myTrigger）",
         default="",
+    )
+
+    trigger_value: StringProperty(
+        name="赋值",
+        description="触发时将变量设置为此值",
+        default="1",
     )
 
 
@@ -20,6 +26,7 @@ class SSMT_UL_TriggerTargets(bpy.types.UIList):
             row = layout.row(align=True)
             icon_val = 'VIEWZOOM' if item.variable_name else 'ERROR'
             row.prop(item, "variable_name", text="", icon=icon_val)
+            row.prop(item, "trigger_value", text="")
 
 
 class SSMT_OT_TriggerTargetAdd(bpy.types.Operator):
@@ -89,7 +96,7 @@ class SSMT_OT_TriggerTargetRefresh(bpy.types.Operator):
 
 class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
     bl_idname = 'SSMTNode_AnimDriver_Trigger'
-    bl_label = '触发'
+    bl_label = '计时触发'
     bl_icon = 'TIME'
 
     target_list: CollectionProperty(
@@ -128,8 +135,9 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
         self.custom_paused_var = f"$trigger_paused{self.auto_index}"
 
     def draw_buttons(self, context, layout):
+        safe_idx = self._read_safe_index()
         box = layout.box()
-        box.label(text=f"索引: {self.auto_index}", icon='LINENUMBERS_ON')
+        box.label(text=f"索引: {safe_idx}", icon='LINENUMBERS_ON')
 
         row = box.row(align=True)
         row.label(text="触发变量:", icon='VIEWZOOM')
@@ -152,11 +160,11 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
 
         box.separator()
         row = box.row(align=True)
-        row.prop(self, "default_paused", text="默认播放")
+        row.prop(self, "default_paused", text="默认暂停")
         if self.custom_paused_var.strip():
             row.prop(self, "custom_paused_var", text="")
         else:
-            row.label(text=f"$trigger_paused{self.auto_index}")
+            row.label(text=f"$trigger_paused{safe_idx}")
 
         box.separator()
         box.label(text="输入说明:", icon='INFO')
@@ -170,13 +178,12 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
             box.label(text="  [驱动输入] 未连接", icon='SNAP_FACE')
 
     def generate_ini_segment(self, connected_nodes=None) -> str:
-        self._ensure_valid_index()
-        idx = self.auto_index
+        idx = self._read_safe_index()
 
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
 
-        paused_state = 1 if self.default_paused else 0
+        paused_state = 0 if self.default_paused else 1
         paused_var = self.custom_paused_var.strip()
         if not paused_var:
             paused_var = f"$trigger_paused{idx}"
@@ -189,7 +196,10 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
             if target:
                 if not target.startswith('$'):
                     target = f"${target}"
-                target_assignments.append(f"        {target} = 1")
+                val = item.trigger_value.strip()
+                if not val:
+                    val = "1"
+                target_assignments.append(f"        {target} = {val}")
 
         if not target_assignments:
             target_assignments.append("        $trigger_target = 1")

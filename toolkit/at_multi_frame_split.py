@@ -5,6 +5,7 @@ import mathutils
 from mathutils import Matrix, Vector
 import numpy as np
 import math
+import ast
 
 
 def is_matrix_close(matrix1, matrix2, tolerance=1e-6):
@@ -385,6 +386,9 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
                 self._temp_start_obj["atp_base_frame"] = True
                 self._temp_start_obj["atp_original_object"] = current_obj.name
                 self._temp_start_obj["atp_frame_number"] = props.multi_object_start_frame
+                flat = self._matrix_to_flat_list(current_obj.matrix_world)
+                if flat is not None:
+                    self._temp_start_obj["atp_original_matrix_world"] = str(flat)
                 expected_base_name = f"{current_obj.name}_{props.multi_object_start_frame:03d}_Base"
                 if self._temp_start_obj.name != expected_base_name:
                     self._temp_start_obj.name = expected_base_name
@@ -400,6 +404,9 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
                     frame_base_obj["atp_base_frame"] = True
                     frame_base_obj["atp_original_object"] = current_obj.name
                     frame_base_obj["atp_frame_number"] = current_pair.end_frame
+                    flat = self._matrix_to_flat_list(current_obj.matrix_world)
+                    if flat is not None:
+                        frame_base_obj["atp_original_matrix_world"] = str(flat)
                     
                     for collection in current_obj.users_collection:
                         collection.objects.link(frame_base_obj)
@@ -428,7 +435,14 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
             self._temp_end_obj = None
         
         if self._temp_collection and self._temp_collection.name in bpy.data.collections:
-            self.cleanup_temp_collection(context, self._temp_collection, self._temp_start_obj, current_obj)
+            preserve_start_obj = bool(self._temp_start_obj and self._temp_start_obj.get("atp_base_frame"))
+            self.cleanup_temp_collection(
+                context,
+                self._temp_collection,
+                self._temp_start_obj,
+                current_obj,
+                preserve_start_obj=preserve_start_obj,
+            )
             self._temp_collection = None
         
         self._state = self.STATE_NEXT_ITEM
@@ -456,6 +470,15 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         processed_count = sum(1 for pair in props.frame_shape_key_pairs if pair.is_processed)
         
         self.report({'INFO'}, f"主处理完成！处理了 {total_objects} 个物体，{processed_count}/{total_pairs} 个帧/形态键对")
+        
+        if not props.copy_shape_keys_back:
+            self._cleanup_intermediate_bases_keep_first(context)
+            self._force_cleanup_all_temp_split_collections(context)
+            self.report({'INFO'}, "已清理连续模式生成的中间_Base物体与Temp_Split合集，仅保留起始帧对应的_Base物体")
+            props.current_processing_status = "处理完成（未回拷形态键）"
+            props.current_processing_progress = 1.0
+            self._state = self.STATE_FINAL_CLEANUP
+            return 'YIELD'
         
         props.current_processing_status = "复制形态键到原始物体..."
         
@@ -524,6 +547,8 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
     
     def state_final_cleanup(self, context, props):
         """状态: 最终清理"""
+        context.view_layer.update()
+        
         bpy.ops.object.select_all(action='DESELECT')
         for obj in self._selected_objects:
             obj.select_set(True)
@@ -537,9 +562,9 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         current_item = self._current_object_index * len(props.frame_shape_key_pairs) + self._current_frame_index
         props.current_processing_progress = current_item / max(total_items, 1)
     
-    def cleanup_temp_collection(self, context, temp_collection, start_obj, original_obj):
+    def cleanup_temp_collection(self, context, temp_collection, start_obj, original_obj, preserve_start_obj=False):
         """清理临时集合但保留起始帧物体"""
-        if start_obj and start_obj.name:
+        if preserve_start_obj and start_obj and start_obj.name:
             original_collections = list(original_obj.users_collection)
             if not original_collections:
                 original_collections = [context.scene.collection]
@@ -561,6 +586,12 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         for sub_coll in list(temp_collection.children):
             for temp_obj in list(sub_coll.objects):
                 if temp_obj and temp_obj.name in bpy.data.objects:
+                    if preserve_start_obj and start_obj and temp_obj.name == start_obj.name:
+                        try:
+                            sub_coll.objects.unlink(temp_obj)
+                        except Exception:
+                            pass
+                        continue
                     try:
                         bpy.data.objects.remove(temp_obj, do_unlink=True)
                     except Exception:
@@ -570,6 +601,12 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         
         for temp_obj in list(temp_collection.objects):
             if temp_obj and temp_obj.name in bpy.data.objects:
+                if preserve_start_obj and start_obj and temp_obj.name == start_obj.name:
+                    try:
+                        temp_collection.objects.unlink(temp_obj)
+                    except Exception:
+                        pass
+                    continue
                 try:
                     bpy.data.objects.remove(temp_obj, do_unlink=True)
                 except Exception:
@@ -603,6 +640,96 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
                     intermediate_objects.append(obj)
         
         return intermediate_objects, original_to_intermediate
+
+    def _cleanup_intermediate_bases_keep_first(self, context):
+        """清理连续模式产生的中间 _Base 物体，仅保留起始帧对应的 _Base 物体"""
+        props = context.scene.atp_props
+        start_frame = props.multi_object_start_frame
+        
+        intermediate_objects, _ = self.find_intermediate_objects(context)
+        
+        removed_count = 0
+        kept_count = 0
+        
+        for intermediate_obj in intermediate_objects:
+            original_name = intermediate_obj.get("atp_original_object")
+            frame_number = intermediate_obj.get("atp_frame_number")
+            
+            if original_name is None or frame_number is None:
+                continue
+            
+            if frame_number == start_frame:
+                kept_count += 1
+                continue
+            
+            if frame_number > start_frame:
+                obj_name = intermediate_obj.name
+                try:
+                    bpy.data.objects.remove(intermediate_obj, do_unlink=True)
+                    removed_count += 1
+                    print(f"[DEBUG] 清理中间_Base: '{obj_name}'")
+                except Exception as e:
+                    print(f"[DEBUG] 清理中间_Base '{obj_name}' 失败: {e}")
+        
+        self.report({'INFO'}, f"清理完成：保留 {kept_count} 个起始_Base，删除 {removed_count} 个中间_Base")
+
+    def _force_cleanup_all_temp_split_collections(self, context):
+        """强制清理所有 Temp_Split_* 合集（包括其子合集），仅保留起始帧 _Base 物体"""
+        protected_obj_names = set()
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH' and obj.get("atp_base_frame"):
+                if obj.get("atp_frame_number") == context.scene.atp_props.multi_object_start_frame:
+                    protected_obj_names.add(obj.name)
+        
+        collections_to_remove = []
+        for coll in list(bpy.data.collections):
+            if coll.name.startswith("Temp_Split_"):
+                collections_to_remove.append(coll)
+        
+        removed_collections = 0
+        for coll in collections_to_remove:
+            try:
+                for sub_coll in list(coll.children):
+                    for temp_obj in list(sub_coll.objects):
+                        if temp_obj and temp_obj.name in bpy.data.objects:
+                            if temp_obj.name in protected_obj_names:
+                                for c in list(temp_obj.users_collection):
+                                    if c == sub_coll or c == coll:
+                                        c.objects.unlink(temp_obj)
+                                continue
+                            try:
+                                bpy.data.objects.remove(temp_obj, do_unlink=True)
+                            except Exception:
+                                pass
+                    if sub_coll.name in bpy.data.collections:
+                        try:
+                            bpy.data.collections.remove(sub_coll)
+                            removed_collections += 1
+                        except Exception:
+                            pass
+                
+                for temp_obj in list(coll.objects):
+                    if temp_obj and temp_obj.name in bpy.data.objects:
+                        if temp_obj.name in protected_obj_names:
+                            for c in list(temp_obj.users_collection):
+                                if c == coll:
+                                    c.objects.unlink(temp_obj)
+                            continue
+                        try:
+                            bpy.data.objects.remove(temp_obj, do_unlink=True)
+                        except Exception:
+                            pass
+                
+                if coll.name in bpy.data.collections:
+                    try:
+                        bpy.data.collections.remove(coll)
+                        removed_collections += 1
+                    except Exception as e:
+                        print(f"[DEBUG] 移除合集 '{coll.name}' 失败: {e}")
+            except Exception as e:
+                print(f"[DEBUG] 处理合集 '{coll.name}' 时出错: {e}")
+        
+        self.report({'INFO'}, f"已强制清理 {removed_collections} 个 Temp_Split 合集")
     
     def copy_shape_keys_from_intermediate_objects(self, context):
         """将中间物体的形态键复制到原始物体并删除中间物体"""
@@ -674,47 +801,12 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         if target_vtx_count != source_vtx_count:
             return False
         
-        print(f"[DEBUG] 复制形态键: '{source_obj.name}' -> '{target_obj.name}'")
-        
-        depsgraph = context.evaluated_depsgraph_get()
-        eval_target = target_obj.evaluated_get(depsgraph)
-        
-        target_local_coords = np.zeros(target_vtx_count * 3, dtype=np.float32)
-        eval_target.data.vertices.foreach_get('co', target_local_coords)
-        target_local_coords = target_local_coords.reshape(-1, 3)
-        
         source_keys = source_mesh.shape_keys
         if not source_keys.reference_key:
             return False
         
         basis_key = source_keys.reference_key
-        
-        source_basis_coords = np.zeros(source_vtx_count * 3, dtype=np.float32)
-        basis_key.data.foreach_get("co", source_basis_coords)
-        source_basis_coords = source_basis_coords.reshape(-1, 3)
-        
-        keys_deltas = {}
-        for kb in source_keys.key_blocks:
-            if kb == basis_key:
-                continue
 
-            key_coords = np.zeros(source_vtx_count * 3, dtype=np.float32)
-            kb.data.foreach_get("co", key_coords)
-            key_coords = key_coords.reshape(-1, 3)
-            
-            delta = key_coords - source_basis_coords
-            
-            keys_deltas[kb.name] = {
-                'delta': delta,
-                'value': kb.value,
-                'slider_min': kb.slider_min,
-                'slider_max': kb.slider_max,
-                'mute': kb.mute
-            }
-
-        print(f"[DEBUG] 需要复制的形态键数量: {len(keys_deltas)}")
-
-        print(f"[DEBUG] 更新目标物体的 Basis 形态键...")
         depsgraph = context.evaluated_depsgraph_get()
         eval_target = target_obj.evaluated_get(depsgraph)
         
@@ -729,25 +821,20 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         target_basis_key = target_keys.reference_key
         
         if not target_basis_key:
-            print(f"[DEBUG] 错误: 目标物体缺少基础形态键")
             return False
 
         target_basis_key.data.foreach_set("co", target_local_coords.reshape(-1))
-        
-        print(f"[DEBUG] 复制中间物体的形态键...")
-        
-        source_keys = source_mesh.shape_keys
-        if not source_keys.reference_key:
-            print(f"[DEBUG] 错误: 源物体缺少基础形态键 (reference_key)")
-            return False
-        
-        basis_key = source_keys.reference_key
-        
-        source_basis_coords = np.zeros(source_vtx_count * 3, dtype=np.float32)
-        basis_key.data.foreach_get("co", source_basis_coords)
-        source_basis_coords = source_basis_coords.reshape(-1, 3)
-        
-        keys_world_coords = {}
+
+        source_to_target = target_obj.matrix_world.inverted() @ source_obj.matrix_world
+        transform_linear = np.asarray(
+            [[float(source_to_target[row][col]) for col in range(3)] for row in range(3)],
+            dtype=np.float32,
+        )
+        transform_translation = np.asarray(
+            [float(source_to_target[row][3]) for row in range(3)],
+            dtype=np.float32,
+        )
+
         for kb in source_keys.key_blocks:
             if kb == basis_key:
                 continue
@@ -755,22 +842,19 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
             key_coords = np.zeros(source_vtx_count * 3, dtype=np.float32)
             kb.data.foreach_get("co", key_coords)
             key_coords = key_coords.reshape(-1, 3)
-            
-            keys_world_coords[kb.name] = key_coords
 
-        print(f"[DEBUG] 复制 {len(keys_world_coords)} 个形态键...")
+            transformed_coords = key_coords @ transform_linear.T + transform_translation
 
-        for key_name, key_world_coords in keys_world_coords.items():
-            target_kb = target_keys.key_blocks.get(key_name)
+            target_kb = target_keys.key_blocks.get(kb.name)
             if not target_kb:
-                target_kb = target_obj.shape_key_add(name=key_name, from_mix=False)
+                target_kb = target_obj.shape_key_add(name=kb.name, from_mix=False)
 
-            target_kb.data.foreach_set("co", key_world_coords.reshape(-1))
+            target_kb.data.foreach_set("co", transformed_coords.reshape(-1))
             
-            target_kb.value = 0.0
-            target_kb.slider_min = 0.0
-            target_kb.slider_max = 1.0
-            target_kb.mute = False
+            target_kb.value = kb.value
+            target_kb.slider_min = kb.slider_min
+            target_kb.slider_max = kb.slider_max
+            target_kb.mute = kb.mute
 
         target_mesh.update()
         
@@ -902,6 +986,28 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         
         return start_obj, end_obj, temp_collection
     
+    @staticmethod
+    def _matrix_to_flat_list(matrix):
+        """将 Matrix 序列化为扁平列表（4x4 = 16 个 float）"""
+        try:
+            result = []
+            for i in range(4):
+                for j in range(4):
+                    result.append(float(matrix[i][j]))
+            return result
+        except Exception:
+            return None
+
+    @staticmethod
+    def _flat_list_to_matrix(flat_list):
+        """将扁平列表还原为 Matrix"""
+        if not flat_list or len(flat_list) != 16:
+            return None
+        try:
+            return Matrix((flat_list[0:4], flat_list[4:8], flat_list[8:12], flat_list[12:16]))
+        except Exception:
+            return None
+
     def find_or_create_base_frame_object(self, context, original_obj, frame):
         """查找或创建指定帧的基础物体"""
         base_obj_name = f"{original_obj.name}_{frame:03d}_Base"
@@ -910,8 +1016,22 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         if existing_base_obj and existing_base_obj.type == 'MESH':
             self.report({'INFO'}, f"找到已存在的基础帧物体 '{base_obj_name}'")
             
-            if not is_matrix_close(existing_base_obj.matrix_world, original_obj.matrix_world, 1e-6):
-                self.report({'WARNING'}, f"基础帧物体 '{base_obj_name}' 的变换矩阵与原始物体不一致，可能导致形态键扭曲")
+            stored_matrix_str = existing_base_obj.get("atp_original_matrix_world")
+            stored_matrix = None
+            if stored_matrix_str and isinstance(stored_matrix_str, str):
+                try:
+                    parsed = ast.literal_eval(stored_matrix_str)
+                    if isinstance(parsed, list) and len(parsed) == 16:
+                        stored_matrix = self._flat_list_to_matrix(parsed)
+                except (ValueError, SyntaxError):
+                    stored_matrix = None
+            
+            if stored_matrix is not None:
+                if not is_matrix_close(stored_matrix, original_obj.matrix_world, 1e-6):
+                    self.report({'WARNING'}, f"基础帧物体 '{base_obj_name}' 的变换矩阵与原始物体不一致，可能导致形态键扭曲")
+            else:
+                if not is_matrix_close(existing_base_obj.matrix_world, original_obj.matrix_world, 1e-6):
+                    self.report({'WARNING'}, f"基础帧物体 '{base_obj_name}' 的变换矩阵与原始物体不一致，可能导致形态键扭曲")
             
             return existing_base_obj
         
@@ -923,6 +1043,10 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
                 standard_obj["atp_base_frame"] = True
                 standard_obj["atp_original_object"] = original_obj.name
                 standard_obj["atp_frame_number"] = frame
+                
+                flat = self._matrix_to_flat_list(original_obj.matrix_world)
+                if flat is not None:
+                    standard_obj["atp_original_matrix_world"] = str(flat)
                 
                 if not is_matrix_close(standard_obj.matrix_world, original_obj.matrix_world, 1e-6):
                     self.report({'WARNING'}, f"基础帧物体 '{base_obj_name}' 的变换矩阵与原始物体不一致，可能导致形态键扭曲")

@@ -19,16 +19,26 @@ def convert_color_srgb_to_linear(color_rgba):
     return linear_color
 
 
-def build_vertex_color_payload(num_loops, color_rgba_srgb, vc_mode, existing_colors=None):
+def build_vertex_color_payload(
+    num_loops,
+    color_rgba_srgb,
+    vc_mode,
+    existing_colors=None,
+    attr_data_type="BYTE_COLOR",
+):
     """Build the normalized float payload expected by Blender color attributes."""
     if num_loops < 0:
         raise ValueError("num_loops must be non-negative")
 
-    color_rgba_linear = convert_color_srgb_to_linear(color_rgba_srgb)
+    color_rgba = np.clip(np.asarray(color_rgba_srgb, dtype=np.float32), 0.0, 1.0)
+    if attr_data_type == "FLOAT_COLOR":
+        color_payload = convert_color_srgb_to_linear(color_rgba)
+    else:
+        color_payload = color_rgba
     expected_size = num_loops * 4
 
     if vc_mode == "FULL_COLOR":
-        return np.tile(color_rgba_linear, num_loops).astype(np.float32)
+        return np.tile(color_payload, num_loops).astype(np.float32)
 
     if vc_mode != "ALPHA_ONLY":
         raise ValueError(f"Unsupported vertex color mode: {vc_mode}")
@@ -42,7 +52,7 @@ def build_vertex_color_payload(num_loops, color_rgba_srgb, vc_mode, existing_col
             f"existing_colors has {color_data.size} values, expected {expected_size}"
         )
 
-    color_data[3::4] = color_rgba_linear[3]
+    color_data[3::4] = color_payload[3]
     return color_data
 
 

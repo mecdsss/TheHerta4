@@ -45,6 +45,7 @@ class VertexColorUtilsTests(unittest.TestCase):
             num_loops=2,
             color_rgba_srgb=(0.5, 1.0, 0.0, 1.0),
             vc_mode="FULL_COLOR",
+            attr_data_type="FLOAT_COLOR",
         )
 
         expected_color = np.array(
@@ -69,6 +70,7 @@ class VertexColorUtilsTests(unittest.TestCase):
             color_rgba_srgb=(0.8, 0.1, 0.2, 0.25),
             vc_mode="ALPHA_ONLY",
             existing_colors=existing_colors,
+            attr_data_type="BYTE_COLOR",
         )
 
         expected_payload = existing_colors.copy()
@@ -109,6 +111,19 @@ class VertexColorUtilsTests(unittest.TestCase):
         self.assertEqual(len(collection.created), 1)
         self.assertEqual(attr.domain, "CORNER")
         self.assertEqual(attr.data_type, "BYTE_COLOR")
+
+    def test_full_color_byte_color_keeps_srgb_payload(self):
+        payload = build_vertex_color_payload(
+            num_loops=1,
+            color_rgba_srgb=(0.5, 0.25, 0.75, 0.8),
+            vc_mode="FULL_COLOR",
+            attr_data_type="BYTE_COLOR",
+        )
+
+        expected_payload = np.array([0.5, 0.25, 0.75, 0.8], dtype=np.float32)
+
+        self.assertEqual(payload.dtype, np.float32)
+        np.testing.assert_allclose(payload, expected_payload, rtol=1e-6, atol=1e-6)
 
 
 if __name__ == "__main__":

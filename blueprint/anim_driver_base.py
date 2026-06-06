@@ -1,9 +1,69 @@
 from collections import deque
 
 import bpy
+from bpy.props import IntProperty, StringProperty, CollectionProperty
 from bpy.types import NodeSocket, Node
 
 from .node_base import SSMTNodeBase
+
+
+class DrivenVariableItem(bpy.types.PropertyGroup):
+    variable_name: StringProperty(
+        name="驱动变量",
+        description="要驱动的变量名称（如 $myVar）",
+        default="",
+    )
+
+
+class SSMT_UL_DrivenVariables(bpy.types.UIList):
+    bl_idname = "SSMT_UL_DRIVEN_VARIABLES"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            icon_val = 'VIEWZOOM' if item.variable_name else 'ERROR'
+            row.prop(item, "variable_name", text="", icon=icon_val)
+
+
+class SSMT_OT_DrivenVariableAdd(bpy.types.Operator):
+    bl_idname = "ssmt.driven_variable_add"
+    bl_label = "添加驱动变量"
+    bl_options = {'REGISTER', 'INTERNAL', 'UNDO'}
+
+    node_name: StringProperty(default="")
+
+    def execute(self, context):
+        tree = getattr(getattr(context, 'space_data', None), 'edit_tree', None)
+        if not tree:
+            return {'CANCELLED'}
+        node = tree.nodes.get(self.node_name) if self.node_name else tree.nodes.active
+        if not node:
+            return {'CANCELLED'}
+        item = node.driven_variable_list.add()
+        item.variable_name = "$driven_var"
+        node.driven_variable_list_active = len(node.driven_variable_list) - 1
+        return {'FINISHED'}
+
+
+class SSMT_OT_DrivenVariableRemove(bpy.types.Operator):
+    bl_idname = "ssmt.driven_variable_remove"
+    bl_label = "删除驱动变量"
+    bl_options = {'REGISTER', 'INTERNAL', 'UNDO'}
+
+    node_name: StringProperty(default="")
+
+    def execute(self, context):
+        tree = getattr(getattr(context, 'space_data', None), 'edit_tree', None)
+        if not tree:
+            return {'CANCELLED'}
+        node = tree.nodes.get(self.node_name) if self.node_name else tree.nodes.active
+        if not node:
+            return {'CANCELLED'}
+        idx = node.driven_variable_list_active
+        if 0 <= idx < len(node.driven_variable_list):
+            node.driven_variable_list.remove(idx)
+            node.driven_variable_list_active = min(idx, len(node.driven_variable_list) - 1)
+        return {'FINISHED'}
 
 
 class SSMTSocketAnimDriver(NodeSocket):
@@ -69,6 +129,23 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
             for i, n in enumerate(sorted_nodes, 1):
                 n.auto_index = i
 
+    def _read_safe_index(self):
+        """只读方式获取 auto_index，不会写入 ID 属性。
+        用于 draw 回调等不允许写入的上下文。"""
+        tree = self.id_data
+        if not tree:
+            return self.auto_index or 1
+        all_indexed = self._get_indexed_nodes(tree)
+        indices = [n.auto_index for n in all_indexed]
+        if len(set(indices)) != len(indices) or any(i <= 0 for i in indices):
+            # 索引无效，按名称排序计算本节点应有的索引
+            sorted_nodes = sorted(all_indexed, key=lambda n: n.name)
+            for i, n in enumerate(sorted_nodes, 1):
+                if n == self:
+                    return i
+            return 1
+        return self.auto_index
+
     def _assign_next_available_index(self):
         self.auto_index = 1
         tree = self.id_data
@@ -122,6 +199,10 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
                 return var
         return None
 
+    def _is_play_node(self, node):
+        """判断节点是否为播放节点（索引播放、往返播放、形态键动画序列等）"""
+        return (hasattr(node, 'driven_variable') or hasattr(node, 'driven_variable_list')) and hasattr(node, 'custom_paused_var')
+
     def _collect_upstream_play_pause_vars(self):
         tree = self.id_data
         if not tree:
@@ -136,7 +217,7 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
                     upstream_node = link.from_node
                     if upstream_node.name not in visited:
                         visited.add(upstream_node.name)
-                        if hasattr(upstream_node, 'driven_variable') and hasattr(upstream_node, 'custom_paused_var'):
+                        if self._is_play_node(upstream_node):
                             var = upstream_node.custom_paused_var.strip()
                             if var:
                                 if not var.startswith('$'):
@@ -160,7 +241,7 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
                     downstream_node = link.to_node
                     if downstream_node.name not in visited:
                         visited.add(downstream_node.name)
-                        if hasattr(downstream_node, 'driven_variable') and hasattr(downstream_node, 'custom_paused_var'):
+                        if self._is_play_node(downstream_node):
                             var = downstream_node.custom_paused_var.strip()
                             if var:
                                 if not var.startswith('$'):
@@ -236,6 +317,10 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
 
 
 classes = (
+    DrivenVariableItem,
+    SSMT_UL_DrivenVariables,
+    SSMT_OT_DrivenVariableAdd,
+    SSMT_OT_DrivenVariableRemove,
     SSMTSocketAnimDriver,
     SSMTNode_AnimDriver_Base,
 )

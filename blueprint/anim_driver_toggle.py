@@ -130,8 +130,9 @@ class SSMTNode_AnimDriver_Toggle(SSMTNode_AnimDriver_Base):
         self._assign_next_available_index()
 
     def draw_buttons(self, context, layout):
+        safe_idx = self._read_safe_index()
         box = layout.box()
-        box.label(text=f"索引: {self.auto_index}", icon='LINENUMBERS_ON')
+        box.label(text=f"索引: {safe_idx}", icon='LINENUMBERS_ON')
         box.prop(self, "key_binding")
         box.prop(self, "toggle_values")
         box.prop(self, "comment", text="备注")
@@ -157,8 +158,7 @@ class SSMTNode_AnimDriver_Toggle(SSMTNode_AnimDriver_Base):
             box.label(text="点击刷新按钮自动获取下游变量", icon='INFO')
 
     def generate_ini_segment(self, connected_nodes=None) -> str:
-        self._ensure_valid_index()
-        idx = self.auto_index
+        idx = self._read_safe_index()
 
         key = self.key_binding.strip() or "no_modifiers k"
 
@@ -180,6 +180,7 @@ class SSMTNode_AnimDriver_Toggle(SSMTNode_AnimDriver_Base):
         raw = self.toggle_values.strip() or "0 1"
         values = ",".join(raw.replace(",", " ").split())
         toggle_vals = values if values else "0,1"
+        comment = self.comment.strip()
 
         lines = [
             f"[KeyToggle_Anim{idx}]",
@@ -187,6 +188,8 @@ class SSMTNode_AnimDriver_Toggle(SSMTNode_AnimDriver_Base):
             f"key = {key}",
             "type = cycle",
         ]
+        if comment:
+            lines.insert(1, f"; {comment}")
         for var in target_vars:
             lines.append(f"{var} = {toggle_vals}")
 

@@ -83,6 +83,7 @@ class VariableRegistryTests(unittest.TestCase):
     def setUp(self):
         _fake_global_properties.clear()
         _fake_bpy.data.node_groups[:] = []
+        variable_registry.bpy = _fake_bpy
 
     def test_object_swap_reuses_first_free_index(self):
         _fake_bpy.data.node_groups[:] = [

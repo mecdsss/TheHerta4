@@ -1,7 +1,7 @@
 import bpy
-from bpy.props import FloatProperty, StringProperty, BoolProperty
+from bpy.props import FloatProperty, StringProperty, BoolProperty, IntProperty, CollectionProperty
 
-from .anim_driver_base import SSMTNode_AnimDriver_Base
+from .anim_driver_base import SSMTNode_AnimDriver_Base, DrivenVariableItem
 
 
 class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
@@ -24,9 +24,20 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
     )
 
     driven_variable: StringProperty(
-        name="驱动变量",
-        description="要驱动的变量名称（如 $myVar）",
+        name="驱动变量(旧)",
+        description="旧版驱动变量（已迁移到列表）",
         default="",
+        options={'HIDDEN'},
+    )
+
+    driven_variable_list: CollectionProperty(
+        type=DrivenVariableItem,
+        name="驱动变量列表",
+    )
+
+    driven_variable_list_active: IntProperty(
+        name="当前驱动变量",
+        default=0,
     )
 
     play_total_duration: FloatProperty(
@@ -69,6 +80,26 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         default=True,
     )
 
+    def _get_driven_vars(self):
+        """获取所有驱动变量名列表（自动补$前缀）"""
+        vars_list = []
+        for item in self.driven_variable_list:
+            var = item.variable_name.strip()
+            if var:
+                if not var.startswith('$'):
+                    var = f"${var}"
+                vars_list.append(var)
+        # 向后兼容：如果列表为空但旧字段有值
+        if not vars_list:
+            old_var = self.driven_variable.strip()
+            if old_var:
+                if not old_var.startswith('$'):
+                    old_var = f"${old_var}"
+                vars_list.append(old_var)
+        if not vars_list:
+            vars_list.append("$driven_var")
+        return vars_list
+
     def init(self, context):
         self.inputs.new('SSMTSocketAnimDriver', "链输入")
         self.inputs.new('SSMTSocketAnimDriver', "时间输入")
@@ -99,13 +130,31 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         return interval, total_frames, fps, playback_rate
 
     def draw_buttons(self, context, layout):
+        safe_idx = self._read_safe_index()
         box = layout.box()
         row = box.row(align=True)
-        row.label(text=f"索引: {self.auto_index}", icon='LINENUMBERS_ON')
+        row.label(text=f"索引: {safe_idx}", icon='LINENUMBERS_ON')
         row.prop(self, "use_float_interval", text="浮点", icon='IPO_BEZIER')
         box.prop(self, "frame_start")
         box.prop(self, "frame_end")
-        box.prop(self, "driven_variable")
+
+        # 驱动变量列表
+        row = box.row(align=True)
+        row.label(text="驱动变量:", icon='VIEWZOOM')
+        op = row.operator("ssmt.driven_variable_add", text="", icon='ADD')
+        op.node_name = self.name
+        op = row.operator("ssmt.driven_variable_remove", text="", icon='REMOVE')
+        op.node_name = self.name
+
+        if self.driven_variable_list:
+            box.template_list(
+                "SSMT_UL_DRIVEN_VARIABLES", "",
+                self, "driven_variable_list",
+                self, "driven_variable_list_active",
+                rows=max(2, min(len(self.driven_variable_list), 6)),
+            )
+        else:
+            box.label(text="点击 + 添加驱动变量", icon='INFO')
 
         interval, total_frames, fps, playback_rate = self._compute_play_interval()
 
@@ -120,11 +169,11 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
 
         box.separator()
         row = box.row(align=True)
-        row.prop(self, "default_paused", text="默认播放")
+        row.prop(self, "default_paused", text="默认暂停")
         if self.custom_paused_var.strip():
             row.prop(self, "custom_paused_var", text="")
         else:
-            row.label(text=f"$animation_paused{self.auto_index}")
+            row.label(text=f"$animation_paused{safe_idx}")
 
         row = box.row(align=True)
         row.prop(self, "reverse_playback", text="反向", icon='ARROW_LEFTRIGHT')
@@ -147,18 +196,14 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
             box.label(text="  [时间输出] 已连接（传递到下一节点）", icon='FORWARD')
 
     def generate_ini_segment(self, connected_nodes=None) -> str:
-        self._ensure_valid_index()
-        idx = self.auto_index
-        var = self.driven_variable.strip()
-        if not var:
-            var = "$driven_var"
-        elif not var.startswith('$'):
-            var = f"${var}"
+        idx = self._read_safe_index()
+        driven_vars = self._get_driven_vars()
+        primary_var = driven_vars[0]
 
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
 
-        paused_state = 1 if self.default_paused else 0
+        paused_state = 0 if self.default_paused else 1
         paused_var = self.custom_paused_var.strip()
         if not paused_var:
             paused_var = f"$animation_paused{idx}"
@@ -171,7 +216,6 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         has_next_in_chain = self._get_next_node_in_chain() is not None
         can_loop = not has_next_in_chain and self.loop_playback
         init_direction = -1 if self.reverse_playback else 1
-        init_var = self.frame_end if self.reverse_playback else self.frame_start
 
         lines = [
             "[Constants]",
@@ -189,20 +233,43 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
             f"if {paused_var} == 1",
             f"    if $swapvar % $speed_auto{idx} == 0",
             f"        if $direction{idx} == 1",
-            f"            if {var} < $frameEnd{idx}",
-            f"                {var} = {var} + {interval_str}",
-            "            else",
-            f"                $direction{idx} = -1",
-            "            endif",
-            "        else",
-            f"            if {var} > $frameStart{idx}",
-            f"                {var} = {var} - {interval_str}",
-            "            else",
+            f"            if {primary_var} < $frameEnd{idx}",
         ]
 
+        # 正向：所有驱动变量递增
+        for var in driven_vars:
+            lines.append(f"                {var} = {var} + {interval_str}")
+
+        lines.append(f"                if {primary_var} > $frameEnd{idx}")
+        for var in driven_vars:
+            lines.append(f"                    {var} = $frameEnd{idx}")
+        lines.append("                endif")
+
+        lines.append("            else")
+
+        # 正向到达边界：翻转方向
+        lines.append(f"                $direction{idx} = -1")
+
+        lines.extend([
+            "            endif",
+            "        else",
+            f"            if {primary_var} > $frameStart{idx}",
+        ])
+
+        # 反向：所有驱动变量递减
+        for var in driven_vars:
+            lines.append(f"                {var} = {var} - {interval_str}")
+
+        lines.append(f"                if {primary_var} < $frameStart{idx}")
+        for var in driven_vars:
+            lines.append(f"                    {var} = $frameStart{idx}")
+        lines.append("                endif")
+
+        lines.append("            else")
+
         if can_loop:
+            lines.append(f"                $direction{idx} = 1")
             lines.extend([
-                f"                $direction{idx} = 1",
                 "            endif",
                 "        endif",
                 "    endif",
@@ -211,28 +278,28 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         elif has_next_in_chain:
             next_paused = self._get_next_paused_var()
             if next_paused:
+                lines.append(f"                {paused_var} = 0")
+                lines.append(f"                {next_paused} = 1")
+                lines.append(f"                $direction{idx} = 1")
                 lines.extend([
-                    f"                {paused_var} = 0",
-                    f"                {next_paused} = 1",
-                    f"                $direction{idx} = 1",
                     "            endif",
                     "        endif",
                     "    endif",
                     "endif",
                 ])
             else:
+                lines.append(f"                {paused_var} = 0")
+                lines.append(f"                $direction{idx} = 1")
                 lines.extend([
-                    f"                {paused_var} = 0",
-                    f"                $direction{idx} = 1",
                     "            endif",
                     "        endif",
                     "    endif",
                     "endif",
                 ])
         else:
+            lines.append(f"                {paused_var} = 0")
+            lines.append(f"                $direction{idx} = 1")
             lines.extend([
-                f"                {paused_var} = 0",
-                f"                $direction{idx} = 1",
                 "            endif",
                 "        endif",
                 "    endif",
@@ -256,6 +323,12 @@ def _pingpong_load_handler(dummy):
                     SSMTNode_AnimDriver_Base._migrate_play_sockets(node)
                     if not node.custom_paused_var:
                         node.custom_paused_var = f"$animation_paused{node.auto_index}"
+                    # 迁移旧 driven_variable 到 driven_variable_list
+                    old_var = node.driven_variable.strip()
+                    if old_var and len(node.driven_variable_list) == 0:
+                        item = node.driven_variable_list.add()
+                        item.variable_name = old_var
+                        node.driven_variable = ""
                 except Exception:
                     pass
 

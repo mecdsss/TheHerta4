@@ -8,6 +8,7 @@ from ..utils.format_utils import FormatUtils
 from ..utils.vertexgroup_utils import VertexGroupUtils
 from ..utils.timer_utils import TimerUtils
 from ..utils.tbn_codec import TBNCodec
+from ..utils.color_attribute_utils import read_color_attribute_data, sample_color_attribute_to_loops
 from ..utils.ssmt_error_utils import SSMTErrorUtils, Fatal
 from .logic_name import LogicName
 from .global_config import GlobalConfig
@@ -39,7 +40,16 @@ class ObjBufferHelper:
                 color_coll = obj.data.color_attributes if hasattr(obj.data, 'color_attributes') else obj.data.vertex_colors
                 if d3d11_element_name not in color_coll:
                     if hasattr(obj.data, 'color_attributes'):
-                        obj.data.color_attributes.new(name=d3d11_element_name, type='BYTE_COLOR', domain='CORNER')
+                        color_attr_type = 'BYTE_COLOR'
+                        normalized_format = str(getattr(d3d11_element, "Format", "") or "").upper()
+                        if (
+                            normalized_format.endswith("_FLOAT")
+                            or normalized_format.endswith("_SNORM")
+                            or "16" in normalized_format
+                            or "32" in normalized_format
+                        ):
+                            color_attr_type = 'FLOAT_COLOR'
+                        obj.data.color_attributes.new(name=d3d11_element_name, type=color_attr_type, domain='CORNER')
                     else:
                         obj.data.vertex_colors.new(name=d3d11_element_name)
                     print("当前obj ["+ obj.name +"] 缺少游戏渲染所需的COLOR: ["+  "COLOR" + "]，已自动补全")
@@ -310,9 +320,9 @@ class ObjBufferHelper:
     @staticmethod
     def _parse_color(mesh, mesh_loops_length, d3d11_element_name, d3d11_element):
         if hasattr(mesh, 'color_attributes') and d3d11_element_name in mesh.color_attributes:
-            color_data = mesh.color_attributes[d3d11_element_name].data
+            color_data = mesh.color_attributes[d3d11_element_name]
         elif d3d11_element_name in mesh.vertex_colors:
-            color_data = mesh.vertex_colors[d3d11_element_name].data
+            color_data = mesh.vertex_colors[d3d11_element_name]
         else:
             color_data = None
 
@@ -320,21 +330,25 @@ class ObjBufferHelper:
             # Blender 颜色层读取接口统一返回 0-1 的 RGBA 浮点值，这里按 float32 处理中间结果。
             result = numpy.zeros(mesh_loops_length, dtype=(numpy.float32, 4))
 
-            color_data.foreach_get("color", result.ravel())
+            if hasattr(color_data, "domain"):
+                result = sample_color_attribute_to_loops(mesh, color_data)
+            else:
+                result = read_color_attribute_data(color_data, mesh_loops_length)
             
             if d3d11_element.Format == 'R16G16B16A16_FLOAT':
                 result = result.astype(numpy.float16)
+            elif d3d11_element.Format == 'R16G16B16A16_UNORM':
+                result = FormatUtils.convert_4x_float32_to_r16g16b16a16_unorm(result)
             elif d3d11_element.Format == "R16G16_UNORM":
                 # 鸣潮的平滑法线存UV，在WWMI中的处理方式是转为R16G16_UNORM。
                 # 但是这里很可能存在转换问题。
-                result = result.astype(numpy.float16)
-                result = result[:, :2]
-                result = FormatUtils.convert_2x_float32_to_r16g16_unorm(result)
+                result = FormatUtils.convert_2x_float32_to_r16g16_unorm(result[:, :2])
             # TODO 添加八面体压缩法线到R32_UINT的代码
 
             elif d3d11_element.Format == "R16G16_FLOAT":
-                # 
-                result = result[:, :2]
+                result = result[:, :2].astype(numpy.float16)
+            elif d3d11_element.Format == 'R8G8B8A8_SNORM':
+                result = FormatUtils.convert_4x_float32_to_r8g8b8a8_snorm(result)
             elif d3d11_element.Format == 'R8G8B8A8_UNORM':
                 result = FormatUtils.convert_4x_float32_to_r8g8b8a8_unorm(result)
 

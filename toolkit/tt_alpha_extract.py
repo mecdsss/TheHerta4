@@ -3,6 +3,7 @@ import numpy as np
 import os
 from pathlib import Path
 from collections import defaultdict
+from ..utils.color_attribute_utils import write_color_attribute_data
 
 
 class TT_OT_extract_alpha_channel(bpy.types.Operator):
@@ -110,7 +111,7 @@ class TT_OT_extract_alpha_channel(bpy.types.Operator):
         alpha_data[2::4] = 1.0
         alpha_data[3::4] = sampled_alpha
 
-        alpha_attr.data.foreach_set("color", alpha_data)
+        write_color_attribute_data(alpha_attr, alpha_data)
         mesh.update()
         return True
 

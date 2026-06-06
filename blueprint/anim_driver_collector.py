@@ -8,6 +8,16 @@ class AnimationDriverCollector:
     def __init__(self, node_group):
         self.node_group = node_group
 
+    def count_paragraphs(self) -> int:
+        """轻量方法：只统计段落数，不调用 generate_ini_segment。
+        适用于 draw 回调等只读上下文。"""
+        driver_nodes = self._find_animation_driver_nodes()
+        if not driver_nodes:
+            return 0
+        graph, node_set = self._build_graph(driver_nodes)
+        paragraphs = self._divide_into_paragraphs(graph, node_set)
+        return len(paragraphs)
+
     def collect(self) -> List[Dict]:
         driver_nodes = self._find_animation_driver_nodes()
         if not driver_nodes:

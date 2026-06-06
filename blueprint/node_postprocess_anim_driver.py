@@ -107,8 +107,8 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
 
                 if driver_node_count > 0:
                     collector = AnimationDriverCollector(blueprint)
-                    paragraphs = collector.collect()
-                    box.label(text=f"段落数: {len(paragraphs)}", icon='FILE_TEXT')
+                    paragraph_count = collector.count_paragraphs()
+                    box.label(text=f"段落数: {paragraph_count}", icon='FILE_TEXT')
 
                 box.separator()
                 row = box.row(align=True)
@@ -135,6 +135,14 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
         if not blueprint.get("is_animation_driver"):
             print(f"错误: 蓝图 '{self.blueprint_name}' 不是动画驱动蓝图")
             return
+
+        # 在 execute 上下文中修正所有驱动节点的 auto_index
+        for node in blueprint.nodes:
+            if hasattr(node, '_ensure_valid_index') and callable(node._ensure_valid_index):
+                try:
+                    node._ensure_valid_index()
+                except Exception:
+                    pass
 
         collector = AnimationDriverCollector(blueprint)
         paragraphs = collector.collect()

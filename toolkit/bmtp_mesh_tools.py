@@ -2,6 +2,7 @@ import bpy
 import numpy as np
 import bmesh
 import math
+from ..utils.color_attribute_utils import read_color_attribute_data, write_color_attribute_data
 from ..utils.vertex_color_utils import build_vertex_color_payload, ensure_color_attribute
 
 
@@ -114,17 +115,17 @@ class BMTP_OT_SetVertexColor(bpy.types.Operator):
 
             existing_colors = None
             if props.vc_mode == 'ALPHA_ONLY':
-                existing_colors = np.zeros(element_count * 4, dtype=np.float32)
-                color_attr.data.foreach_get("color", existing_colors)
+                existing_colors = read_color_attribute_data(color_attr, element_count).reshape(-1)
 
             color_data = build_vertex_color_payload(
                 num_loops=element_count,
                 color_rgba_srgb=color_rgba_srgb,
                 vc_mode=props.vc_mode,
                 existing_colors=existing_colors,
+                attr_data_type=attr_data_type,
             )
             
-            color_attr.data.foreach_set("color", color_data)
+            write_color_attribute_data(color_attr, color_data)
             mesh.update()
         
         self.report({'INFO'}, f"顶点色操作完成，处理了 {len(selected_objects)} 个对象")

@@ -15,7 +15,7 @@ class ATP_PT_MainPanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="版本: 4.4.6")
+        layout.label(text="版本: 4.4.8")
 
 
 class ATP_PT_ShapeKeyTools(bpy.types.Panel):
@@ -213,6 +213,7 @@ class ATP_PT_ShapeKeyCreation(bpy.types.Panel):
         row = col.row(align=True)
         row.prop(props, "use_precise_frame_mode", text="高精度模式")
         row.prop(props, "use_continuous_mode", text="连续模式")
+        col.prop(props, "copy_shape_keys_back", text="将形态键复制回原物体")
         
         if props.show_processing_status:
             col.prop(props, "show_processing_status", text="显示处理状态", icon='HIDE_OFF')

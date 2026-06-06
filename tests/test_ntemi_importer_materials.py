@@ -16,7 +16,7 @@ def _install_module(name, **attrs):
 
 
 PKG = "_ntemi_importer_materials_test_pkg"
-for package_name in (PKG, f"{PKG}.ui", f"{PKG}.ui.ntmi_modimp"):
+for package_name in (PKG, f"{PKG}.ui", f"{PKG}.ui.ntmi_modimp", f"{PKG}.utils"):
     package = _install_module(package_name)
     package.__path__ = []
 common_package = _install_module(f"{PKG}.common")
@@ -158,6 +158,7 @@ _install_module(
     f"{PKG}.common.global_properties",
     GlobalProterties=types.SimpleNamespace(ignore_texture_alpha=lambda: False),
 )
+_install_module(f"{PKG}.utils.color_attribute_utils", write_color_attribute_data=lambda *_args, **_kwargs: None)
 
 
 module_path = Path(__file__).resolve().parents[1] / "ui" / "ntmi_modimp" / "ntemi_importer.py"

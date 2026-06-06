@@ -288,8 +288,9 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
         self.driven_variable = f"$shapekey_seq{self.auto_index}"
 
     def draw_buttons(self, context, layout):
+        safe_idx = self._read_safe_index()
         box = layout.box()
-        box.label(text=f"索引: {self.auto_index}", icon='LINENUMBERS_ON')
+        box.label(text=f"索引: {safe_idx}", icon='LINENUMBERS_ON')
 
         row = box.row(align=True)
         row.label(text="形态键:", icon='SHAPEKEY_DATA')
@@ -334,11 +335,11 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
         box.prop(self, "driven_variable")
 
         row = box.row(align=True)
-        row.prop(self, "default_paused", text="默认播放")
+        row.prop(self, "default_paused", text="默认暂停")
         if self.custom_paused_var.strip():
             row.prop(self, "custom_paused_var", text="")
         else:
-            row.label(text=f"$shapekey_seq_paused{self.auto_index}")
+            row.label(text=f"$shapekey_seq_paused{safe_idx}")
 
         row = box.row(align=True)
         row.prop(self, "loop_playback", text="循环", icon='FILE_REFRESH')
@@ -355,13 +356,12 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
             box.label(text="  [驱动输入] 未连接", icon='SNAP_FACE')
 
     def generate_ini_segment(self, connected_nodes=None) -> str:
-        self._ensure_valid_index()
-        idx = self.auto_index
+        idx = self._read_safe_index()
 
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
 
-        paused_state = 1 if self.default_paused else 0
+        paused_state = 0 if self.default_paused else 1
         paused_var = self.custom_paused_var.strip()
         if not paused_var:
             paused_var = f"$shapekey_seq_paused{idx}"

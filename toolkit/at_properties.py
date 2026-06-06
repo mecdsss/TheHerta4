@@ -179,6 +179,11 @@ class ATP_Properties(bpy.types.PropertyGroup):
         default=False,
         description="连续模式：以上一个形态键帧为基准进行连续计算（如1→5→10）\n独立模式：每个形态键帧均以起始帧为基准进行独立计算（如1→5、1→10）"
     )
+    copy_shape_keys_back: bpy.props.BoolProperty(
+        name="将形态键复制回原物体",
+        default=True,
+        description="启用后，处理完成时会将形态键重新复制回原始物体\n关闭后，形态键仅保留在中间_Base物体上"
+    )
     show_processing_status: bpy.props.BoolProperty(
         name="显示处理状态",
         default=True,

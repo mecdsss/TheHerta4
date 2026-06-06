@@ -25,6 +25,7 @@ import bpy
 
 from ...common.import_scene_settings import apply_import_render_environment
 from ...common.global_properties import GlobalProterties
+from ...utils.color_attribute_utils import write_color_attribute_data
 from .runtime_cache import (
     MODIMP_COLLECTOR_PROPS,
     MODIMP_PATH_PROPS,
@@ -389,8 +390,11 @@ def _store_outline_param_attributes(mesh: bpy.types.Mesh, values: list):
         attribute = color_attributes.new(name="NTMI_OutlineParam", type="BYTE_COLOR", domain="POINT")
     except TypeError:
         return
-    for item, value in zip(attribute.data, values):
-        item.color = tuple(max(0, min(255, int(component))) / 255.0 for component in value)
+    normalized = [
+        tuple(max(0, min(255, int(component))) / 255.0 for component in value)
+        for value in values
+    ]
+    write_color_attribute_data(attribute, normalized)
 
 
 def _read_outline_buffer(outline_buf_path: str) -> list | None:

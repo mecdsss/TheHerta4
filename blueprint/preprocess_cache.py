@@ -10,6 +10,7 @@ import shutil
 
 from ..common.global_properties import GlobalProterties
 from ..utils.log_utils import LOG
+from ..utils.color_attribute_utils import read_color_attribute_data
 from ..common.object_prefix_helper import ObjectPrefixHelper
 
 
@@ -340,15 +341,24 @@ class PreProcessCache:
                     uv_layer.data.foreach_get('uv', uv_data)
                     hasher.update(uv_data.tobytes())
 
-            if hasattr(mesh, 'color_attributes'):
-                for color_attr in mesh.color_attributes:
+            color_attributes = getattr(mesh, 'color_attributes', None)
+            vertex_colors = getattr(mesh, 'vertex_colors', None)
+            if color_attributes:
+                for color_attr in color_attributes:
                     if not cls._should_hash_color_attribute(color_attr):
                         continue
                     hasher.update(color_attr.name.encode('utf-8'))
-                    if n_loops > 0:
-                        color_data = numpy.empty(n_loops * 4, dtype=numpy.float32)
-                        color_attr.data.foreach_get('color', color_data)
-                        hasher.update(color_data.tobytes())
+                    color_data = read_color_attribute_data(color_attr)
+                    if color_data.size > 0:
+                        hasher.update(color_data.astype(numpy.float32).tobytes())
+            elif vertex_colors:
+                for color_attr in vertex_colors:
+                    if not cls._should_hash_color_attribute(color_attr):
+                        continue
+                    hasher.update(color_attr.name.encode('utf-8'))
+                    color_data = read_color_attribute_data(color_attr)
+                    if color_data.size > 0:
+                        hasher.update(color_data.astype(numpy.float32).tobytes())
 
         for modifier in obj.modifiers:
             hasher.update(modifier.type.encode('utf-8'))

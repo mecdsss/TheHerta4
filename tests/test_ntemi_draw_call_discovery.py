@@ -17,7 +17,7 @@ def _install_module(name, **attrs):
 
 
 PKG = "_ntemi_draw_call_discovery_test_pkg"
-for package_name in (PKG, f"{PKG}.ui", f"{PKG}.ui.ntmi_modimp", f"{PKG}.common"):
+for package_name in (PKG, f"{PKG}.ui", f"{PKG}.ui.ntmi_modimp", f"{PKG}.common", f"{PKG}.utils"):
     package = _install_module(package_name)
     package.__path__ = []
 
@@ -30,6 +30,7 @@ _install_module(
     f"{PKG}.common.global_properties",
     GlobalProterties=types.SimpleNamespace(ignore_texture_alpha=lambda: False),
 )
+_install_module(f"{PKG}.utils.color_attribute_utils", write_color_attribute_data=lambda *_args, **_kwargs: None)
 _install_module(
     f"{PKG}.ui.ntmi_modimp.runtime_cache",
     MODIMP_COLLECTOR_PROPS=(),
