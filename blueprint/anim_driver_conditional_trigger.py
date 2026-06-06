@@ -486,100 +486,120 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
                     val = "1"
                 else_target_assignments.append((target, val))
 
+        state_var = f"$cond_state{idx}"
+        flag_var = f"$cond_flag{idx}"
+
         lines = [
             "[Constants]",
             f"global {paused_var} = {paused_state}",
             "; 暂停状态",
+            f"global {state_var} = 0",
+            "; 条件触发状态（0=未触发，1=已触发）",
         ]
 
-        flag_var = f"$cond_flag{idx}"
-        # 仅当 flag_var 真正会被使用时才在 [Constants] 中声明
-        # - OR 模式下 met 分支使用
-        # - AND 模式且存在 else 触发目标时使用
-        needs_flag = bool(conditions) and (
-            self.logic_operator == 'OR'
-            or (self.logic_operator == 'AND' and else_target_assignments)
-        )
+        # flag_var 仅在 OR 模式下用于判断"任一条件成立"
+        needs_flag = bool(conditions) and self.logic_operator == 'OR'
         if needs_flag:
             lines.append(f"global {flag_var} = 0")
-            lines.append("; 条件标志")
+            lines.append("; OR 条件临时标志")
+
+        # 边沿触发：避免在条件持续满足期间每帧强制覆盖目标变量
+        # - state=0 + 条件由不满足翻转为满足：执行 met 目标，state 置 1
+        # - state=1 + 条件由满足翻转为不满足：执行 else 目标（若有），state 置 0
+        # state 重置始终执行（保证状态机可再次触发），else 目标可选
+        # 仅在 paused==1 时检查翻转，避免暂停时误触发
 
         if not conditions:
-            # 没有条件时，只要暂停状态为1就触发
+            # 无条件：paused 0→1 触发 met，1→0 触发 else
             lines.append("[Present]")
-            lines.append(f"if {paused_var} == 1")
+            lines.append(f"if {state_var} == 0")
+            lines.append(f"    if {paused_var} == 1")
             for target, val in target_assignments:
-                lines.append(f"    {target} = {val}")
+                lines.append(f"        {target} = {val}")
+            lines.append(f"        {state_var} = 1")
+            lines.append("    endif")
+            lines.append("endif")
+
+            lines.append("[Present]")
+            lines.append(f"if {state_var} == 1")
+            lines.append(f"    if {paused_var} == 0")
+            for target, val in else_target_assignments:
+                lines.append(f"        {target} = {val}")
+            lines.append(f"        {state_var} = 0")
+            lines.append("    endif")
             lines.append("endif")
         elif self.logic_operator == 'AND':
-            # AND: 嵌套 if
+            # AND: met=全部条件成立，not met=任一条件不成立
+            # state=0 + paused=1 + 全部条件成立 → 触发 met
             lines.append("[Present]")
-            indent = ""
-            lines.append(f"if {paused_var} == 1")
-            indent = "    "
+            lines.append(f"if {state_var} == 0")
+            lines.append(f"    if {paused_var} == 1")
+            indent = "        "
             for var, op, val in conditions:
                 lines.append(f"{indent}if {var} {op} {val}")
                 indent += "    "
             for target, val in target_assignments:
                 lines.append(f"{indent}{target} = {val}")
+            lines.append(f"{indent}{state_var} = 1")
             for _ in conditions:
                 indent = indent[:-4]
                 lines.append(f"{indent}endif")
-            lines.append("endif")
-        else:
-            # OR: 使用标志变量
-            lines.append("[Present]")
-            lines.append(f"if {paused_var} == 1")
-            for var, op, val in conditions:
-                lines.append(f"    if {var} {op} {val}")
-                lines.append(f"        {flag_var} = 1")
-                lines.append(f"    endif")
-            lines.append(f"    if {flag_var} == 1")
-            for target, val in target_assignments:
-                lines.append(f"        {target} = {val}")
-            lines.append(f"        {flag_var} = 0")
-            lines.append(f"    endif")
+            lines.append("    endif")
             lines.append("endif")
 
-        # 不满足条件时的 else 分支
-        if else_target_assignments:
-            if not conditions:
-                # 没有条件时，不满足即暂停为0
-                lines.append("[Present]")
-                lines.append(f"if {paused_var} == 0")
-                for target, val in else_target_assignments:
-                    lines.append(f"    {target} = {val}")
-                lines.append("endif")
-            elif self.logic_operator == 'AND':
-                # AND 的否命题：任一条件不满足（对取反条件取 OR）
-                lines.append("[Present]")
-                lines.append(f"if {paused_var} == 1")
-                for var, op, val in conditions:
-                    inv_op = _invert_comparison_op(op)
-                    lines.append(f"    if {var} {inv_op} {val}")
-                    lines.append(f"        {flag_var} = 1")
-                    lines.append(f"    endif")
-                lines.append(f"    if {flag_var} == 1")
-                for target, val in else_target_assignments:
-                    lines.append(f"        {target} = {val}")
-                lines.append(f"        {flag_var} = 0")
-                lines.append(f"    endif")
-                lines.append("endif")
-            else:
-                # OR 的否命题：所有条件均不满足（对取反条件取 AND，使用嵌套 if）
-                lines.append("[Present]")
-                lines.append(f"if {paused_var} == 1")
-                indent = "    "
-                for var, op, val in conditions:
-                    inv_op = _invert_comparison_op(op)
-                    lines.append(f"{indent}if {var} {inv_op} {val}")
-                    indent += "    "
-                for target, val in else_target_assignments:
-                    lines.append(f"{indent}{target} = {val}")
-                for _ in conditions:
-                    indent = indent[:-4]
-                    lines.append(f"{indent}endif")
-                lines.append("endif")
+            # state=1 + paused=1 + 任一条件不成立 → 触发 else（可选），state 置 0
+            lines.append("[Present]")
+            lines.append(f"if {state_var} == 1")
+            lines.append(f"    if {paused_var} == 1")
+            indent = "        "
+            for var, op, val in conditions:
+                inv_op = _invert_comparison_op(op)
+                lines.append(f"{indent}if {var} {inv_op} {val}")
+                indent += "    "
+            for target, val in else_target_assignments:
+                lines.append(f"{indent}{target} = {val}")
+            lines.append(f"{indent}{state_var} = 0")
+            for _ in conditions:
+                indent = indent[:-4]
+                lines.append(f"{indent}endif")
+            lines.append("    endif")
+            lines.append("endif")
+        else:
+            # OR: met=任一条件成立，not met=全部条件不成立
+            # state=0 + paused=1 + 任一条件成立 → 触发 met
+            lines.append("[Present]")
+            lines.append(f"if {state_var} == 0")
+            lines.append(f"    if {paused_var} == 1")
+            lines.append(f"        {flag_var} = 0")
+            for var, op, val in conditions:
+                lines.append(f"        if {var} {op} {val}")
+                lines.append(f"            {flag_var} = 1")
+                lines.append("        endif")
+            lines.append(f"        if {flag_var} == 1")
+            for target, val in target_assignments:
+                lines.append(f"            {target} = {val}")
+            lines.append(f"            {state_var} = 1")
+            lines.append("        endif")
+            lines.append("    endif")
+            lines.append("endif")
+
+            # state=1 + paused=1 + 全部条件不成立 → 触发 else（可选），state 置 0
+            lines.append("[Present]")
+            lines.append(f"if {state_var} == 1")
+            lines.append(f"    if {paused_var} == 1")
+            indent = "        "
+            for var, op, val in conditions:
+                inv_op = _invert_comparison_op(op)
+                lines.append(f"{indent}if {var} {inv_op} {val}")
+                indent += "    "
+            for target, val in else_target_assignments:
+                lines.append(f"{indent}{target} = {val}")
+            lines.append(f"{indent}{state_var} = 0")
+            for _ in conditions:
+                indent = indent[:-4]
+                lines.append(f"{indent}endif")
+            lines.append("    endif")
+            lines.append("endif")
 
         return "\n".join(lines)
 
