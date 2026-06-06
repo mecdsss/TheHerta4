@@ -144,7 +144,7 @@ class AnimDriverBaseTests(unittest.TestCase):
         self.assertIn("if $varA > $frameEnd1", ini)
         self.assertIn("$varA = $frameEnd1", ini)
         self.assertIn("$varB = $frameEnd1", ini)
-        self.assertIn("global $paused = 0", ini)
+        self.assertIn("global $paused = 1", ini)
 
     def test_pingpong_clamps_all_driven_vars_on_both_bounds_after_overshoot(self):
         node = pingpong_module.SSMTNode_AnimDriver_PingPong()
@@ -175,7 +175,7 @@ class AnimDriverBaseTests(unittest.TestCase):
         self.assertIn("if $varA < $frameStart1", ini)
         self.assertIn("$varA = $frameStart1", ini)
         self.assertIn("$varB = $frameStart1", ini)
-        self.assertIn("global $paused = 0", ini)
+        self.assertIn("global $paused = 1", ini)
 
     def test_toggle_comment_is_emitted_into_ini(self):
         node = toggle_module.SSMTNode_AnimDriver_Toggle()

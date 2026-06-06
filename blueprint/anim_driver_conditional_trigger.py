@@ -4,6 +4,20 @@ from bpy.props import IntProperty, StringProperty, BoolProperty, EnumProperty, C
 from .anim_driver_base import SSMTNode_AnimDriver_Base
 
 
+_INVERTED_COMPARISON_OPS = {
+    '==': '!=',
+    '!=': '==',
+    '>': '<=',
+    '<': '>=',
+    '>=': '<',
+    '<=': '>',
+}
+
+
+def _invert_comparison_op(op: str) -> str:
+    return _INVERTED_COMPARISON_OPS.get(op, '!=')
+
+
 class ConditionItem(bpy.types.PropertyGroup):
     variable_name: StringProperty(
         name="条件变量",
@@ -46,6 +60,20 @@ class CondTriggerTargetItem(bpy.types.PropertyGroup):
     )
 
 
+class CondTriggerElseTargetItem(bpy.types.PropertyGroup):
+    variable_name: StringProperty(
+        name="变量名",
+        description="条件不满足时要设置的变量名称（如 $myTrigger），留空跳过",
+        default="",
+    )
+
+    trigger_value: StringProperty(
+        name="赋值",
+        description="条件不满足时将变量设置为此值",
+        default="1",
+    )
+
+
 class SSMT_UL_Conditions(bpy.types.UIList):
     bl_idname = "SSMT_UL_CONDITIONS"
 
@@ -60,6 +88,17 @@ class SSMT_UL_Conditions(bpy.types.UIList):
 
 class SSMT_UL_CondTriggerTargets(bpy.types.UIList):
     bl_idname = "SSMT_UL_COND_TRIGGER_TARGETS"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            icon_val = 'VIEWZOOM' if item.variable_name else 'ERROR'
+            row.prop(item, "variable_name", text="", icon=icon_val)
+            row.prop(item, "trigger_value", text="")
+
+
+class SSMT_UL_CondTriggerElseTargets(bpy.types.UIList):
+    bl_idname = "SSMT_UL_COND_TRIGGER_ELSE_TARGETS"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
@@ -177,6 +216,71 @@ class SSMT_OT_CondTriggerTargetRefresh(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SSMT_OT_CondTriggerElseTargetAdd(bpy.types.Operator):
+    bl_idname = "ssmt.cond_trigger_else_target_add"
+    bl_label = "添加不满足触发变量"
+    bl_options = {'REGISTER', 'INTERNAL', 'UNDO'}
+
+    node_name: StringProperty(default="")
+
+    def execute(self, context):
+        tree = getattr(getattr(context, 'space_data', None), 'edit_tree', None)
+        if not tree:
+            return {'CANCELLED'}
+        node = tree.nodes.get(self.node_name) if self.node_name else tree.nodes.active
+        if not node:
+            return {'CANCELLED'}
+        item = node.else_target_list.add()
+        item.variable_name = "$else_trigger_target"
+        node.else_target_list_active = len(node.else_target_list) - 1
+        return {'FINISHED'}
+
+
+class SSMT_OT_CondTriggerElseTargetRemove(bpy.types.Operator):
+    bl_idname = "ssmt.cond_trigger_else_target_remove"
+    bl_label = "删除不满足触发变量"
+    bl_options = {'REGISTER', 'INTERNAL', 'UNDO'}
+
+    node_name: StringProperty(default="")
+
+    def execute(self, context):
+        tree = getattr(getattr(context, 'space_data', None), 'edit_tree', None)
+        if not tree:
+            return {'CANCELLED'}
+        node = tree.nodes.get(self.node_name) if self.node_name else tree.nodes.active
+        if not node:
+            return {'CANCELLED'}
+        idx = node.else_target_list_active
+        if 0 <= idx < len(node.else_target_list):
+            node.else_target_list.remove(idx)
+            node.else_target_list_active = min(idx, len(node.else_target_list) - 1)
+        return {'FINISHED'}
+
+
+class SSMT_OT_CondTriggerElseTargetRefresh(bpy.types.Operator):
+    bl_idname = "ssmt.cond_trigger_else_target_refresh"
+    bl_label = "刷新不满足触发变量列表"
+    bl_description = "自动获取下游所有索引播放和往返播放节点的暂停变量"
+    bl_options = {'REGISTER', 'INTERNAL', 'UNDO'}
+
+    node_name: StringProperty(default="")
+
+    def execute(self, context):
+        tree = getattr(getattr(context, 'space_data', None), 'edit_tree', None)
+        if not tree:
+            return {'CANCELLED'}
+        node = tree.nodes.get(self.node_name) if self.node_name else tree.nodes.active
+        if not node:
+            return {'CANCELLED'}
+        downstream_vars = node._collect_downstream_pause_vars()
+        node.else_target_list.clear()
+        for var_name in downstream_vars:
+            item = node.else_target_list.add()
+            item.variable_name = var_name
+        node.else_target_list_active = 0
+        return {'FINISHED'}
+
+
 class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
     bl_idname = 'SSMTNode_AnimDriver_ConditionalTrigger'
     bl_label = '条件触发'
@@ -212,9 +316,19 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
         default=0,
     )
 
+    else_target_list: CollectionProperty(
+        type=CondTriggerElseTargetItem,
+        name="不满足触发变量列表",
+    )
+
+    else_target_list_active: IntProperty(
+        name="当前不满足触发变量",
+        default=0,
+    )
+
     default_paused: BoolProperty(
-        name="默认暂停",
-        description="节点默认处于暂停状态",
+        name="默认播放",
+        description="节点默认处于播放状态",
         default=True,
     )
 
@@ -266,7 +380,7 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
         # 触发变量列表
         box.separator()
         row = box.row(align=True)
-        row.label(text="触发变量:", icon='VIEWZOOM')
+        row.label(text="触发变量(满足):", icon='VIEWZOOM')
         op = row.operator("ssmt.cond_trigger_target_add", text="", icon='ADD')
         op.node_name = self.name
         op = row.operator("ssmt.cond_trigger_target_remove", text="", icon='REMOVE')
@@ -284,10 +398,31 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
         else:
             box.label(text="点击刷新按钮自动获取下游变量", icon='INFO')
 
+        # 不满足触发变量列表
+        box.separator()
+        row = box.row(align=True)
+        row.label(text="触发变量(不满足):", icon='ORPHAN_DATA')
+        op = row.operator("ssmt.cond_trigger_else_target_add", text="", icon='ADD')
+        op.node_name = self.name
+        op = row.operator("ssmt.cond_trigger_else_target_remove", text="", icon='REMOVE')
+        op.node_name = self.name
+        op = row.operator("ssmt.cond_trigger_else_target_refresh", text="", icon='FILE_REFRESH')
+        op.node_name = self.name
+
+        if self.else_target_list:
+            box.template_list(
+                "SSMT_UL_COND_TRIGGER_ELSE_TARGETS", "",
+                self, "else_target_list",
+                self, "else_target_list_active",
+                rows=max(2, min(len(self.else_target_list), 6)),
+            )
+        else:
+            box.label(text="不满足条件时触发的变量（留空跳过）", icon='INFO')
+
         # 暂停变量
         box.separator()
         row = box.row(align=True)
-        row.prop(self, "default_paused", text="默认暂停")
+        row.prop(self, "default_paused", text="默认播放")
         if self.custom_paused_var.strip():
             row.prop(self, "custom_paused_var", text="")
         else:
@@ -304,7 +439,7 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
     def generate_ini_segment(self, connected_nodes=None) -> str:
         idx = self._read_safe_index()
 
-        paused_state = 0 if self.default_paused else 1
+        paused_state = 1 if self.default_paused else 0
         paused_var = self.custom_paused_var.strip()
         if not paused_var:
             paused_var = f"$cond_trigger_paused{idx}"
@@ -339,11 +474,35 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
         if not target_assignments:
             target_assignments.append(("$trigger_target", "1"))
 
+        # 收集不满足条件时的触发目标（留空则跳过 else 分支）
+        else_target_assignments = []
+        for item in self.else_target_list:
+            target = item.variable_name.strip()
+            if target:
+                if not target.startswith('$'):
+                    target = f"${target}"
+                val = item.trigger_value.strip()
+                if not val:
+                    val = "1"
+                else_target_assignments.append((target, val))
+
         lines = [
             "[Constants]",
             f"global {paused_var} = {paused_state}",
             "; 暂停状态",
         ]
+
+        flag_var = f"$cond_flag{idx}"
+        # 仅当 flag_var 真正会被使用时才在 [Constants] 中声明
+        # - OR 模式下 met 分支使用
+        # - AND 模式且存在 else 触发目标时使用
+        needs_flag = bool(conditions) and (
+            self.logic_operator == 'OR'
+            or (self.logic_operator == 'AND' and else_target_assignments)
+        )
+        if needs_flag:
+            lines.append(f"global {flag_var} = 0")
+            lines.append("; 条件标志")
 
         if not conditions:
             # 没有条件时，只要暂停状态为1就触发
@@ -369,9 +528,6 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
             lines.append("endif")
         else:
             # OR: 使用标志变量
-            flag_var = f"$cond_flag{idx}"
-            lines.append(f"global {flag_var} = 0")
-            lines.append("; 条件标志")
             lines.append("[Present]")
             lines.append(f"if {paused_var} == 1")
             for var, op, val in conditions:
@@ -384,6 +540,46 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
             lines.append(f"        {flag_var} = 0")
             lines.append(f"    endif")
             lines.append("endif")
+
+        # 不满足条件时的 else 分支
+        if else_target_assignments:
+            if not conditions:
+                # 没有条件时，不满足即暂停为0
+                lines.append("[Present]")
+                lines.append(f"if {paused_var} == 0")
+                for target, val in else_target_assignments:
+                    lines.append(f"    {target} = {val}")
+                lines.append("endif")
+            elif self.logic_operator == 'AND':
+                # AND 的否命题：任一条件不满足（对取反条件取 OR）
+                lines.append("[Present]")
+                lines.append(f"if {paused_var} == 1")
+                for var, op, val in conditions:
+                    inv_op = _invert_comparison_op(op)
+                    lines.append(f"    if {var} {inv_op} {val}")
+                    lines.append(f"        {flag_var} = 1")
+                    lines.append(f"    endif")
+                lines.append(f"    if {flag_var} == 1")
+                for target, val in else_target_assignments:
+                    lines.append(f"        {target} = {val}")
+                lines.append(f"        {flag_var} = 0")
+                lines.append(f"    endif")
+                lines.append("endif")
+            else:
+                # OR 的否命题：所有条件均不满足（对取反条件取 AND，使用嵌套 if）
+                lines.append("[Present]")
+                lines.append(f"if {paused_var} == 1")
+                indent = "    "
+                for var, op, val in conditions:
+                    inv_op = _invert_comparison_op(op)
+                    lines.append(f"{indent}if {var} {inv_op} {val}")
+                    indent += "    "
+                for target, val in else_target_assignments:
+                    lines.append(f"{indent}{target} = {val}")
+                for _ in conditions:
+                    indent = indent[:-4]
+                    lines.append(f"{indent}endif")
+                lines.append("endif")
 
         return "\n".join(lines)
 
@@ -411,13 +607,18 @@ def _cond_trigger_load_handler(dummy):
 classes = (
     ConditionItem,
     CondTriggerTargetItem,
+    CondTriggerElseTargetItem,
     SSMT_UL_Conditions,
     SSMT_UL_CondTriggerTargets,
+    SSMT_UL_CondTriggerElseTargets,
     SSMT_OT_ConditionAdd,
     SSMT_OT_ConditionRemove,
     SSMT_OT_CondTriggerTargetAdd,
     SSMT_OT_CondTriggerTargetRemove,
     SSMT_OT_CondTriggerTargetRefresh,
+    SSMT_OT_CondTriggerElseTargetAdd,
+    SSMT_OT_CondTriggerElseTargetRemove,
+    SSMT_OT_CondTriggerElseTargetRefresh,
     SSMTNode_AnimDriver_ConditionalTrigger,
 )
 

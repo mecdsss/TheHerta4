@@ -254,8 +254,8 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
     )
 
     default_paused: BoolProperty(
-        name="默认暂停",
-        description="节点默认处于暂停状态",
+        name="默认播放",
+        description="节点默认处于播放状态",
         default=True,
     )
 
@@ -335,7 +335,7 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
         box.prop(self, "driven_variable")
 
         row = box.row(align=True)
-        row.prop(self, "default_paused", text="默认暂停")
+        row.prop(self, "default_paused", text="默认播放")
         if self.custom_paused_var.strip():
             row.prop(self, "custom_paused_var", text="")
         else:
@@ -361,7 +361,7 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
 
-        paused_state = 0 if self.default_paused else 1
+        paused_state = 1 if self.default_paused else 0
         paused_var = self.custom_paused_var.strip()
         if not paused_var:
             paused_var = f"$shapekey_seq_paused{idx}"
