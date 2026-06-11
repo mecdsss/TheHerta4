@@ -2,6 +2,8 @@ import bpy
 import re
 from collections import defaultdict
 
+from ..utils.vertexgroup_utils import VertexGroupUtils
+
 
 class CreateVGsAndUV(bpy.types.Operator):
     """创建全权重顶点组、空顶点组和UV层"""
@@ -48,26 +50,25 @@ class CleanVertexGroups(bpy.types.Operator):
         total_removed = 0
 
         for obj in context.selected_objects:
-            if obj.type != 'MESH' or not obj.vertex_groups: continue
+            if obj.type != 'MESH' or not obj.vertex_groups:
+                continue
 
             if props.vg_cleanup_remove_zero:
-                vgs_to_remove = set()
+                used_group_indices = VertexGroupUtils.get_nonzero_vertex_group_indices(obj)
+                vgs_to_remove = []
 
                 for vg in obj.vertex_groups:
-                    if vg.name in names_to_remove:
-                        vgs_to_remove.add(vg)
-                    
-                    total_weight = sum(g.weight for v in obj.data.vertices for g in v.groups if g.group == vg.index)
-                    if total_weight < 1e-6:
-                        vgs_to_remove.add(vg)
+                    if vg.name in names_to_remove or vg.index not in used_group_indices:
+                        vgs_to_remove.append(vg)
                 
-                if vgs_to_remove:
-                    for vg in [v for v in vgs_to_remove if v.name in obj.vertex_groups]:
+                for vg in sorted(vgs_to_remove, key=lambda item: item.index, reverse=True):
+                    obj.vertex_groups.remove(vg)
+                    total_removed += 1
+            else:
+                for vg in list(obj.vertex_groups):
+                    if vg.name in names_to_remove:
                         obj.vertex_groups.remove(vg)
                         total_removed += 1
-            else:
-                total_removed += len(obj.vertex_groups)
-                obj.vertex_groups.clear()
 
         self.report({'INFO'}, f"总计删除了 {total_removed} 个顶点组")
         return {'FINISHED'}

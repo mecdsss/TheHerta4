@@ -9,23 +9,42 @@ from .format_utils import Fatal
 
 class VertexGroupUtils:
     @classmethod
+    def get_nonzero_vertex_group_indices(cls, obj, weight_threshold=1e-6):
+        """
+        单次扫描物体顶点，收集所有拥有非零权重的顶点组索引。
+        """
+        if obj.type != "MESH":
+            return set()
+
+        try:
+            obj.update_from_editmode()
+        except Exception:
+            pass
+
+        used_group_indices = set()
+        for vertex in obj.data.vertices:
+            for group in vertex.groups:
+                if group.weight > weight_threshold:
+                    used_group_indices.add(group.group)
+        return used_group_indices
+    @classmethod
     def remove_unused_vertex_groups(cls,obj):
         '''
         移除给定obj的未使用的顶点组
         '''
-        if obj.type == "MESH":
-            # obj = bpy.context.active_object
-            obj.update_from_editmode()
-            vgroup_used = {i: False for i, k in enumerate(obj.vertex_groups)}
+        if obj.type != "MESH":
+            return 0
 
-            for v in obj.data.vertices:
-                for g in v.groups:
-                    if g.weight > 0.0:
-                        vgroup_used[g.group] = True
+        used_group_indices = cls.get_nonzero_vertex_group_indices(obj)
+        removable_groups = [
+            vg for vg in obj.vertex_groups
+            if vg.index not in used_group_indices
+        ]
 
-            for i, used in sorted(vgroup_used.items(), reverse=True):
-                if not used:
-                    obj.vertex_groups.remove(obj.vertex_groups[i])
+        for vg in sorted(removable_groups, key=lambda item: item.index, reverse=True):
+            obj.vertex_groups.remove(vg)
+
+        return len(removable_groups)
 
     @classmethod
     def remove_all_vertex_groups(cls,obj):

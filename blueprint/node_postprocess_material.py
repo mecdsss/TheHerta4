@@ -805,14 +805,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             obj_materials = find_materials_in_object(obj)
             if obj_materials:
                 return obj_materials
-        
-        for candidate_obj in self._get_material_candidate_objects(obj):
-            if candidate_obj == obj:
-                continue
-            candidate_materials = find_materials_in_object(candidate_obj)
-            if candidate_materials:
-                return candidate_materials
-        
+
         return []
 
     def _create_workspace_texture_resource_entry(self, obj, slot_info, texture_folder, all_sections, texture_ini_folder="Textures"):
@@ -856,12 +849,13 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         return f"{param_name} = {resource_name}", resource_name
 
     def _has_strict_fxmap_material(self, obj):
-        for candidate_obj in self._get_material_candidate_objects(obj):
-            for material_slot in getattr(candidate_obj, "material_slots", []):
-                material = material_slot.material
-                material_name = str(getattr(material, "name", "") or "")
-                if material_name.lower().startswith("fxmap_"):
-                    return True
+        if not obj:
+            return False
+        for material_slot in getattr(obj, "material_slots", []):
+            material = material_slot.material
+            material_name = str(getattr(material, "name", "") or "")
+            if material_name.lower().startswith("fxmap_"):
+                return True
         return False
 
     def _collect_ntemifx_texture_slots(self, obj, workspace_resource_by_slot=None) -> dict[str, str]:
@@ -885,63 +879,6 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             if material:
                 result[slot_label] = self._workspace_material_resource_name(material)
         return result
-
-    def _get_material_candidate_objects(self, obj):
-        try:
-            from .preprocess_cache import PreProcessCache
-            from ..common.object_prefix_helper import ObjectPrefixHelper
-        except Exception:
-            PreProcessCache = None
-            ObjectPrefixHelper = None
-
-        candidate_objects = []
-        candidate_names = []
-
-        def append_candidate_name(name):
-            name = str(name or "").strip()
-            if not name or name in candidate_names:
-                return
-            candidate_names.append(name)
-
-        source_obj = None
-        if obj and PreProcessCache is not None:
-            try:
-                source_obj, _ = PreProcessCache.resolve_source_object(getattr(obj, "name", ""))
-            except Exception:
-                source_obj = None
-
-        if obj:
-            if PreProcessCache is not None:
-                append_candidate_name(obj.get(PreProcessCache.COPY_SOURCE_PROP, ""))
-
-            append_candidate_name(getattr(obj, "original_object_name", ""))
-
-            if ObjectPrefixHelper is not None:
-                append_candidate_name(ObjectPrefixHelper.resolve_source_object_name(obj.name))
-
-            for stripped_name in self._strip_all_suffixes(obj.name):
-                append_candidate_name(stripped_name)
-
-            append_candidate_name(obj.name)
-
-        for name in candidate_names:
-            candidate_obj = bpy.data.objects.get(name)
-            if candidate_obj and candidate_obj not in candidate_objects:
-                candidate_objects.append(candidate_obj)
-
-        if source_obj and source_obj in candidate_objects:
-            candidate_objects.remove(source_obj)
-            candidate_objects.insert(0, source_obj)
-        elif source_obj:
-            candidate_objects.insert(0, source_obj)
-
-        if obj and obj in candidate_objects:
-            candidate_objects.remove(obj)
-            candidate_objects.append(obj)
-        elif obj:
-            candidate_objects.append(obj)
-
-        return candidate_objects
 
     def _collect_ps_texture_slot_materials(self, obj):
         slot_to_materials = OrderedDict()
@@ -973,13 +910,6 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         obj_slots = collect_from_object(obj)
         if obj_slots:
             return obj_slots
-        
-        for candidate_obj in self._get_material_candidate_objects(obj):
-            if candidate_obj == obj:
-                continue
-            candidate_slots = collect_from_object(candidate_obj)
-            if candidate_slots:
-                return candidate_slots
 
         return slot_to_materials
 
@@ -1020,14 +950,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             obj_materials = find_in_object(obj)
             if obj_materials:
                 return obj_materials
-        
-        for candidate_obj in self._get_material_candidate_objects(obj):
-            if candidate_obj == obj:
-                continue
-            candidate_materials = find_in_object(candidate_obj)
-            if candidate_materials:
-                return candidate_materials
-        
+
         return []
 
     @staticmethod

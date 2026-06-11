@@ -353,6 +353,23 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.process_texture_override_section("[TextureOverride_Test]", sections, ...)
             self.assertIn("ps-t0 = Resource_DiffuseMap_Current", sections["[TextureOverride_Test]"])
 
+    def test_htmi_does_not_fallback_to_source_candidate_when_current_object_has_no_materials(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_texture = os.path.join(temp_dir, "source-candidate.png")
+            with open(source_texture, "wb") as file_obj:
+                file_obj.write(b"wrong-source")
+            texture_slots = {"ps-t0": {"mark_name": "DiffuseMap", "mark_type": "Slot", "mark_slot": "ps-t0"}}
+            source_obj = _FakeObject("SharedSource", {}, [("DiffuseMap_Source", source_texture)])
+            obj = _FakeObject("LOD0.ae1ab184-29187-0.Current", texture_slots, [], original_object_name="SharedSource")
+            _fake_bpy.data.objects[source_obj.name] = source_obj
+            _fake_bpy.data.objects[obj.name] = obj
+            sections = OrderedDict([("[TextureOverride_Test]", [f"[mesh:{obj.name}]", "hash = ae1ab184", "ps-t0 = Resource-old-DiffuseMap", "drawindexed = 3, 0, 0"]), ("_config_path", temp_dir)])
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"; node.material_to_resource_override = False; node.material_switch_var = "$swapkey150"
+            node.process_texture_override_section("[TextureOverride_Test]", sections, ...)
+            self.assertNotIn("ps-t0 = Resource_DiffuseMap_Source", sections["[TextureOverride_Test]"])
+            self.assertFalse(any(line.startswith("ps-t0 = ") for line in sections["[TextureOverride_Test]"]))
+
     def test_htmi_workspace_slot_multiple_materials_reuse_existing_if_switch_rules(self):
         """测试 HTMI 工作空间槽的多材质复用现有 switch 规则"""
         with tempfile.TemporaryDirectory() as temp_dir:
