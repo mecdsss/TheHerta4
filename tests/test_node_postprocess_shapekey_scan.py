@@ -206,5 +206,54 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
             ["A", "B", "F"],
         )
 
+    def test_compute_dispatch_group_count_rounds_up_by_thread_group(self):
+        node = module.SSMTNode_PostProcess_ShapeKey()
+
+        self.assertEqual(node._compute_dispatch_group_count(0, threads_per_group=16), 1)
+        self.assertEqual(node._compute_dispatch_group_count(1, threads_per_group=16), 1)
+        self.assertEqual(node._compute_dispatch_group_count(16, threads_per_group=16), 1)
+        self.assertEqual(node._compute_dispatch_group_count(17, threads_per_group=16), 2)
+        self.assertEqual(node._compute_dispatch_group_count(128, threads_per_group=64), 2)
+
+    def test_update_shader_file_optimized_mode_skips_vertex_range_definitions(self):
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        node.INTENSITY_START_INDEX = 100
+        node.VERTEX_RANGE_START_INDEX = 200
+        node._get_vertex_struct_definition = lambda: (
+            "struct VertexAttributes {\n"
+            "    float3 position;\n"
+            "    float3 normal;\n"
+            "    float4 tangent;\n"
+            "};"
+        )
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shader_path = Path(temp_dir) / "shader.hlsl"
+            shader_path.write_text(
+                "// --- [PYTHON-MANAGED BLOCK START] ---\n"
+                "// --- [PYTHON-MANAGED BLOCK END] ---\n"
+                "// --- [PYTHON-MANAGED LOGIC START] ---\n"
+                "// --- [PYTHON-MANAGED LOGIC END] ---\n",
+                encoding="utf-8",
+            )
+
+            success = node._update_shader_file(
+                str(shader_path),
+                hash_slot_data={1: {"Smile": ["ObjA"]}},
+                use_packed=True,
+                use_delta=True,
+                unique_names=["Smile"],
+                unique_objects=["ObjA"],
+                use_optimized=True,
+                merge_slot_files=False,
+            )
+
+            self.assertTrue(success)
+            shader_source = shader_path.read_text(encoding="utf-8")
+            self.assertIn("FREQ1", shader_source)
+            self.assertNotIn("START1", shader_source)
+            self.assertNotIn("END1", shader_source)
+
 if __name__ == "__main__":
     unittest.main()

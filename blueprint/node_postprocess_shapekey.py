@@ -626,6 +626,12 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     def _get_merged_map_resource_name(self, hash_val):
         return f"Resource_{self._hash_to_resource_prefix(hash_val)}_Position_Merged_Map"
 
+    @staticmethod
+    def _compute_dispatch_group_count(vertex_count, threads_per_group=16):
+        vertex_count = int(vertex_count or 0)
+        threads_per_group = max(1, int(threads_per_group or 1))
+        return max(1, (vertex_count + threads_per_group - 1) // threads_per_group)
+
     def _parse_classification_text_final(self, text_content):
         slot_to_name_to_objects, hash_to_objects, all_objects = OrderedDict(), OrderedDict(), []
         current_slot, current_shapekey_name = None, None
@@ -1714,19 +1720,20 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     constants_lines.append(f"; 控制形态键 '{name}' 的强度")
                     constants_lines.append(f"global persist {param} = 0.0")
 
-            constants_lines.append("\n; --- Auto-generated Vertex Ranges for Shape Keys ---")
-            existing_vertex_range_names = set()
             vertex_range_vars = {}
-            for obj_name, (start_v, end_v) in calculated_ranges.items():
-                if start_v is None:
-                    continue
-                safe_name = self._create_safe_var_name(obj_name.replace("-", "_"), existing_names=existing_vertex_range_names)
-                start_var, end_var = f"$SV_{safe_name}", f"$EV_{safe_name}"
-                vertex_range_vars[obj_name] = (start_var, end_var)
-                if start_var not in constants_content:
-                    constants_lines.append(f"global {start_var} = {start_v}")
-                if end_var not in constants_content:
-                    constants_lines.append(f"global {end_var} = {end_v}")
+            if not use_optimized:
+                constants_lines.append("\n; --- Auto-generated Vertex Ranges for Shape Keys ---")
+                existing_vertex_range_names = set()
+                for obj_name, (start_v, end_v) in calculated_ranges.items():
+                    if start_v is None:
+                        continue
+                    safe_name = self._create_safe_var_name(obj_name.replace("-", "_"), existing_names=existing_vertex_range_names)
+                    start_var, end_var = f"$SV_{safe_name}", f"$EV_{safe_name}"
+                    vertex_range_vars[obj_name] = (start_var, end_var)
+                    if start_var not in constants_content:
+                        constants_lines.append(f"global {start_var} = {start_v}")
+                    if end_var not in constants_content:
+                        constants_lines.append(f"global {end_var} = {end_v}")
 
             for h in unique_hashes:
                 h_prefix = self._extract_hash_prefix(h)
@@ -1782,12 +1789,13 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     for i, name in enumerate(hash_unique_names):
                         if shapekey_freq_params.get(name):
                             block_lines.append(f"    x{self.INTENSITY_START_INDEX + i} = {shapekey_freq_params.get(name)} \n; {name}")
-                    block_lines.append("\n    ; --- Per-Object Vertex Range Controls ---")
-                    for i, obj_name in enumerate(hash_unique_objects):
-                        if obj_name in calculated_ranges and calculated_ranges[obj_name][0] is not None:
-                            start_var, end_var = vertex_range_vars.get(obj_name, (f"$SV_unknown", f"$EV_unknown"))
-                            block_lines.append(f"    x{self.VERTEX_RANGE_START_INDEX + i*2} = {start_var} \n; {obj_name} Start")
-                            block_lines.append(f"    x{self.VERTEX_RANGE_START_INDEX + i*2 + 1} = {end_var} \n; {obj_name} End")
+                    if not use_optimized:
+                        block_lines.append("\n    ; --- Per-Object Vertex Range Controls ---")
+                        for i, obj_name in enumerate(hash_unique_objects):
+                            if obj_name in calculated_ranges and calculated_ranges[obj_name][0] is not None:
+                                start_var, end_var = vertex_range_vars.get(obj_name, (f"$SV_unknown", f"$EV_unknown"))
+                                block_lines.append(f"    x{self.VERTEX_RANGE_START_INDEX + i*2} = {start_var} \n; {obj_name} Start")
+                                block_lines.append(f"    x{self.VERTEX_RANGE_START_INDEX + i*2 + 1} = {end_var} \n; {obj_name} End")
 
                     t_registers_to_null = []
                     slots_for_hash = sorted(hash_slot_data.keys())
@@ -1857,9 +1865,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         )
                         block_lines.extend([f"    cs-u5 = copy {res_name}_0", f"    {res_name} = ref cs-u5"])
 
-                    dispatch_count = vertex_counts.get(h_prefix, 10000)
-                    if dispatch_count == 0:
-                        dispatch_count = 10000
+                    dispatch_count = self._compute_dispatch_group_count(vertex_counts.get(h_prefix, 0), threads_per_group=16)
                     block_lines.extend([f"    Dispatch = {dispatch_count}, 1, 1", "    cs-u5 = null", *[f"    {reg} = null" for reg in sorted(list(set(t_registers_to_null)))]])
                     compute_blocks_to_add[block_name] = block_lines
 

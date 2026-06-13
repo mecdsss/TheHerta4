@@ -96,10 +96,10 @@ class ATP_PT_ShapeKeyOperations(bpy.types.Panel):
         row.operator(at_shape_key_operations.ATP_OT_SetActiveShapeKey.bl_idname, text="设为活动", icon='SHAPEKEY_DATA')
         
         col.separator()
-        col.label(text="批量重命名形态键:", icon='OUTLINER_OB_GROUP_INSTANCE')
+        col.label(text="批量替换形态键名称:", icon='OUTLINER_OB_GROUP_INSTANCE')
         row = col.row(align=True)
-        col.prop(props, "sk_rename_old_name", text="原名称")
-        col.prop(props, "sk_rename_new_name", text="新名称")
+        col.prop(props, "sk_rename_old_name", text="旧片段")
+        col.prop(props, "sk_rename_new_name", text="新片段")
         row = col.row(align=True)
         row.operator(at_shape_key_operations.ATP_OT_BatchRenameShapeKey.bl_idname, text="重命名", icon='OUTLINER_OB_GROUP_INSTANCE')
 
@@ -210,6 +210,7 @@ class ATP_PT_ShapeKeyCreation(bpy.types.Panel):
             col.label(text="暂无帧/形态键对", icon='INFO')
         
         col.prop(props, "multi_object_start_frame", text="起始帧")
+        col.prop(props, "frame_shape_key_step", text="形态键步长")
         row = col.row(align=True)
         row.prop(props, "use_precise_frame_mode", text="高精度模式")
         row.prop(props, "use_continuous_mode", text="连续模式")

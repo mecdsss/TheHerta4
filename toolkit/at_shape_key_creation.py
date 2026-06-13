@@ -215,15 +215,16 @@ class ATP_OT_AddFrameShapeKeyPair(bpy.types.Operator):
     
     def execute(self, context):
         props = context.scene.atp_props
+        frame_step = max(1, int(getattr(props, "frame_shape_key_step", 5) or 1))
         
         new_pair = props.frame_shape_key_pairs.add()
         
         if len(props.frame_shape_key_pairs) > 1:
             prev_pair = props.frame_shape_key_pairs[-2]
-            new_pair.end_frame = prev_pair.end_frame + 5
+            new_pair.end_frame = prev_pair.end_frame + frame_step
             new_pair.shape_key_name = f"Motion_Key_{len(props.frame_shape_key_pairs)}"
         else:
-            new_pair.end_frame = 10
+            new_pair.end_frame = props.multi_object_start_frame + frame_step
             new_pair.shape_key_name = "Motion_Key_1"
         
         props.frame_shape_key_index = len(props.frame_shape_key_pairs) - 1
@@ -300,17 +301,16 @@ class ATP_OT_AddDefaultFrameShapeKeyPairs(bpy.types.Operator):
     
     def execute(self, context):
         props = context.scene.atp_props
+        frame_step = max(1, int(getattr(props, "frame_shape_key_step", 5) or 1))
+        start_frame = int(getattr(props, "multi_object_start_frame", 1) or 1)
         
         props.frame_shape_key_pairs.clear()
-        
+
         default_pairs = [
-            (5, "1"),
-            (10, "2"),
-            (15, "3"),
-            (20, "4"),
-            (25, "5")
+            (start_frame + frame_step * (index + 1), str(index + 1))
+            for index in range(5)
         ]
-        
+
         for end_frame, shape_key_name in default_pairs:
             pair = props.frame_shape_key_pairs.add()
             pair.end_frame = end_frame

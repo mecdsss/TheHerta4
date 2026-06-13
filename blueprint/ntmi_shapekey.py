@@ -811,27 +811,28 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
             constants_lines.append("\n; --- NTMI Auto-generated Shape Key Intensity Controls ---")
             constants_lines.extend(intensity_lines)
 
-        existing_vertex_range_names = set()
         vertex_range_vars = {}
-        vertex_range_lines = []
-        for obj_name, range_tuple in calculated_ranges.items():
-            start_v, end_v = range_tuple[:2]
-            if start_v is None:
-                continue
-            safe_name = self.node._create_safe_var_name(
-                obj_name.replace("-", "_"),
-                existing_names=existing_vertex_range_names,
-            )
-            start_var = f"$SV_{safe_name}"
-            end_var = f"$EV_{safe_name}"
-            vertex_range_vars[obj_name] = (start_var, end_var)
-            if start_var not in constants_content:
-                vertex_range_lines.append(f"global {start_var} = {start_v}")
-            if end_var not in constants_content:
-                vertex_range_lines.append(f"global {end_var} = {end_v}")
-        if vertex_range_lines:
-            constants_lines.append("\n; --- NTMI Auto-generated Vertex Ranges For Shape Keys ---")
-            constants_lines.extend(vertex_range_lines)
+        if not use_optimized:
+            existing_vertex_range_names = set()
+            vertex_range_lines = []
+            for obj_name, range_tuple in calculated_ranges.items():
+                start_v, end_v = range_tuple[:2]
+                if start_v is None:
+                    continue
+                safe_name = self.node._create_safe_var_name(
+                    obj_name.replace("-", "_"),
+                    existing_names=existing_vertex_range_names,
+                )
+                start_var = f"$SV_{safe_name}"
+                end_var = f"$EV_{safe_name}"
+                vertex_range_vars[obj_name] = (start_var, end_var)
+                if start_var not in constants_content:
+                    vertex_range_lines.append(f"global {start_var} = {start_v}")
+                if end_var not in constants_content:
+                    vertex_range_lines.append(f"global {end_var} = {end_v}")
+            if vertex_range_lines:
+                constants_lines.append("\n; --- NTMI Auto-generated Vertex Ranges For Shape Keys ---")
+                constants_lines.extend(vertex_range_lines)
 
         self._clone_base_position_resources(sections, list(unique_hashes))
 
@@ -924,21 +925,26 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
                 block_lines.append(
                     f"    x{self.node.INTENSITY_START_INDEX + index} = {shapekey_freq_params[name]} \n; {name}"
                 )
-            block_lines.append("\n    ; --- Per-Object Vertex Range Controls ---")
-            for index, obj_name in enumerate(hash_unique_objects):
-                start_var, end_var = vertex_range_vars.get(obj_name, ("$SV_unknown", "$EV_unknown"))
-                block_lines.append(
-                    f"    x{self.node.VERTEX_RANGE_START_INDEX + index * 2} = {start_var} \n; {obj_name} Start"
-                )
-                block_lines.append(
-                    f"    x{self.node.VERTEX_RANGE_START_INDEX + index * 2 + 1} = {end_var} \n; {obj_name} End"
-                )
+            if not use_optimized:
+                block_lines.append("\n    ; --- Per-Object Vertex Range Controls ---")
+                for index, obj_name in enumerate(hash_unique_objects):
+                    start_var, end_var = vertex_range_vars.get(obj_name, ("$SV_unknown", "$EV_unknown"))
+                    block_lines.append(
+                        f"    x{self.node.VERTEX_RANGE_START_INDEX + index * 2} = {start_var} \n; {obj_name} Start"
+                    )
+                    block_lines.append(
+                        f"    x{self.node.VERTEX_RANGE_START_INDEX + index * 2 + 1} = {end_var} \n; {obj_name} End"
+                    )
 
             block_lines.append(
                 "\n    ; --- NTMI pre-skin ShapeKey injection ---"
             )
             block_lines.append(f"    cs = ./res/shapekey_anim_{logical_hash}.hlsl")
-            block_lines.append(f"    dispatch = {int(hash_to_vertex_count.get(logical_hash, 0) or 0)}/64+1, 1, 1")
+            dispatch_count = self.node._compute_dispatch_group_count(
+                hash_to_vertex_count.get(logical_hash, 0),
+                threads_per_group=64,
+            )
+            block_lines.append(f"    dispatch = {dispatch_count}, 1, 1")
             compute_sections[f"[{shader_section_name}]"] = block_lines
 
         self._patch_skin_commandlists(sections, unique_hashes, hash_to_vertex_count)

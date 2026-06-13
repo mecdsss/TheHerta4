@@ -32,6 +32,11 @@ Texture1D<float4> IniParams : register(t120);
 void main(uint3 threadID : SV_DispatchThreadID)
 {
     uint i = threadID.x;
+    uint vertex_count = rw_buffer.Length;
+    if (i >= vertex_count)
+    {
+        return;
+    }
     
     // Start with the base mesh attributes
     VertexAttributes output = rw_buffer[i];

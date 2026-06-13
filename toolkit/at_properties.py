@@ -77,8 +77,8 @@ class ATP_Properties(bpy.types.PropertyGroup):
     shape_key_list_index: bpy.props.IntProperty(name="形态键列表索引", default=0)
     sk_add_new_name: bpy.props.StringProperty(name="形态键名称", default="NewKey", description="要批量添加或删除的形态键的名称")
     sk_set_active_name: bpy.props.StringProperty(name="活动形态键名称", default="", description="要设置为活动项的形态键名称")
-    sk_rename_old_name: bpy.props.StringProperty(name="原形态键名称", default="", description="要重命名的形态键的原名称")
-    sk_rename_new_name: bpy.props.StringProperty(name="新形态键名称", default="", description="形态键的新名称")
+    sk_rename_old_name: bpy.props.StringProperty(name="旧名称片段", default="", description="要在形态键名称中查找并替换的文本片段")
+    sk_rename_new_name: bpy.props.StringProperty(name="新名称片段", default="", description="用于替换旧名称片段的新文本")
     sk_rebase_remove_source: bpy.props.BoolProperty(
         name="删除源形态键",
         default=True,
@@ -168,6 +168,12 @@ class ATP_Properties(bpy.types.PropertyGroup):
         default=1,
         min=1,
         description="所有物体的起始帧"
+    )
+    frame_shape_key_step: bpy.props.IntProperty(
+        name="形态键步长",
+        default=5,
+        min=1,
+        description="自动新增或生成默认帧/形态键对时使用的帧步长，例如 1=每帧一个，2=每两帧一个，5=每五帧一个"
     )
     use_precise_frame_mode: bpy.props.BoolProperty(
         name="高精度模式",

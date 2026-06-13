@@ -15,6 +15,20 @@ class DrivenVariableItem(bpy.types.PropertyGroup):
     )
 
 
+class ContinuousShapeKeyItem(bpy.types.PropertyGroup):
+    shape_key_name: StringProperty(
+        name="形态键名称",
+        description="连续形态键名称",
+        default="",
+    )
+
+    variable_name: StringProperty(
+        name="导出变量",
+        description="对应的预分配导出变量",
+        default="",
+    )
+
+
 class SSMT_UL_DrivenVariables(bpy.types.UIList):
     bl_idname = "SSMT_UL_DRIVEN_VARIABLES"
 
@@ -23,6 +37,17 @@ class SSMT_UL_DrivenVariables(bpy.types.UIList):
             row = layout.row(align=True)
             icon_val = 'VIEWZOOM' if item.variable_name else 'ERROR'
             row.prop(item, "variable_name", text="", icon=icon_val)
+
+
+class SSMT_UL_ContinuousShapeKeys(bpy.types.UIList):
+    bl_idname = "SSMT_UL_CONTINUOUS_SHAPEKEYS"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            icon_val = 'SHAPEKEY_DATA' if item.shape_key_name else 'ERROR'
+            row.label(text=item.shape_key_name or "<未命名>", icon=icon_val)
+            row.label(text=item.variable_name or "<未匹配变量>", icon='VIEWZOOM')
 
 
 class SSMT_OT_DrivenVariableAdd(bpy.types.Operator):
@@ -66,6 +91,59 @@ class SSMT_OT_DrivenVariableRemove(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SSMT_OT_ContinuousShapeKeyRefresh(bpy.types.Operator):
+    bl_idname = "ssmt.continuous_shapekey_refresh"
+    bl_label = "刷新连续形态键"
+    bl_description = "按物体上的形态键顺序自动读取连续形态键，并匹配父级形态键配置节点中的预分配变量"
+    bl_options = {'REGISTER', 'INTERNAL', 'UNDO'}
+
+    node_name: StringProperty(default="")
+
+    def execute(self, context):
+        tree = getattr(getattr(context, 'space_data', None), 'edit_tree', None)
+        if not tree:
+            return {'CANCELLED'}
+
+        node = tree.nodes.get(self.node_name) if self.node_name else tree.nodes.active
+        if not node:
+            return {'CANCELLED'}
+        if not hasattr(node, "continuous_target_object") or not hasattr(node, "continuous_shape_key_items"):
+            self.report({'WARNING'}, "当前节点不支持连续形态键刷新")
+            return {'CANCELLED'}
+
+        obj_name = str(getattr(node, "continuous_target_object", "") or "").strip()
+        if not obj_name:
+            self.report({'WARNING'}, "请先指定目标物体")
+            return {'CANCELLED'}
+
+        obj = bpy.data.objects.get(obj_name)
+        if not obj or getattr(obj, "type", "") != "MESH":
+            self.report({'WARNING'}, f"目标物体 '{obj_name}' 不存在或不是网格物体")
+            return {'CANCELLED'}
+
+        key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
+        if not key_blocks or len(key_blocks) <= 1:
+            self.report({'WARNING'}, f"物体 '{obj_name}' 没有可用的非 Basis 形态键")
+            return {'CANCELLED'}
+
+        var_map = SSMTNode_AnimDriver_Base._find_parent_shapekey_variable_map(tree)
+        item_count, missing_count = SSMTNode_AnimDriver_Base._rebuild_continuous_shape_key_items(
+            node,
+            key_blocks,
+            var_map,
+        )
+
+        if item_count <= 0:
+            self.report({'WARNING'}, "未找到可用的连续形态键")
+            return {'CANCELLED'}
+
+        if missing_count > 0:
+            self.report({'WARNING'}, f"已导入 {item_count} 个连续形态键，其中 {missing_count} 个未匹配到预分配变量")
+        else:
+            self.report({'INFO'}, f"已导入 {item_count} 个连续形态键，并完成预分配变量匹配")
+        return {'FINISHED'}
+
+
 class SSMTSocketAnimDriver(NodeSocket):
     bl_idname = 'SSMTSocketAnimDriver'
     bl_label = 'Anim Driver Socket'
@@ -95,6 +173,107 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
 
     def generate_ini_segment(self, connected_nodes=None) -> str:
         raise NotImplementedError("子类必须实现 generate_ini_segment 方法")
+
+    @staticmethod
+    def _resolve_shapekey_variable(item):
+        custom = str(getattr(item, 'custom_variable_name', '') or '').strip()
+        if custom:
+            return custom[1:] if custom.startswith('$') else custom
+        assigned = str(getattr(item, 'assigned_variable_name', '') or '').strip()
+        if assigned:
+            return assigned[1:] if assigned.startswith('$') else assigned
+        return ""
+
+    @staticmethod
+    def _find_parent_shapekey_variable_map(current_tree) -> dict:
+        result = {}
+        for tree in getattr(getattr(bpy, "data", None), "node_groups", []):
+            if getattr(tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
+                continue
+            if tree.get("is_animation_driver"):
+                continue
+
+            has_ref = False
+            for node in getattr(tree, "nodes", []):
+                if getattr(node, "bl_idname", "") == 'SSMTNode_PostProcess_AnimDriver':
+                    if getattr(node, 'blueprint_name', '') == getattr(current_tree, "name", ""):
+                        has_ref = True
+                        break
+            if not has_ref:
+                continue
+
+            for node in getattr(tree, "nodes", []):
+                if getattr(node, "bl_idname", "") != 'SSMTNode_PostProcess_ShapeKey':
+                    continue
+                for item in getattr(node, 'shapekey_variable_items', []):
+                    name = str(getattr(item, 'shape_key_name', '') or '').strip()
+                    resolved = SSMTNode_AnimDriver_Base._resolve_shapekey_variable(item)
+                    if name and resolved:
+                        result[name] = f"${resolved}"
+        return result
+
+    @staticmethod
+    def _rebuild_continuous_shape_key_items(node, key_blocks, var_map) -> tuple[int, int]:
+        shape_key_names = []
+        for index, key_block in enumerate(key_blocks):
+            key_name = str(getattr(key_block, "name", "") or "").strip()
+            if not key_name:
+                continue
+            if index == 0 or key_name.lower() == "basis":
+                continue
+            shape_key_names.append(key_name)
+
+        while len(node.continuous_shape_key_items) > 0:
+            node.continuous_shape_key_items.remove(len(node.continuous_shape_key_items) - 1)
+
+        missing_count = 0
+        for key_name in shape_key_names:
+            item = node.continuous_shape_key_items.add()
+            item.shape_key_name = key_name
+            item.variable_name = var_map.get(key_name, "")
+            if not item.variable_name:
+                missing_count += 1
+
+        return len(shape_key_names), missing_count
+
+    def _get_continuous_primary_var(self):
+        return f"$continuous_shapekey_frame{self._read_safe_index()}"
+
+    def _get_continuous_shape_key_entries(self):
+        result = []
+        for offset, item in enumerate(getattr(self, "continuous_shape_key_items", [])):
+            key_name = str(getattr(item, "shape_key_name", "") or "").strip()
+            variable_name = str(getattr(item, "variable_name", "") or "").strip()
+            if not key_name or not variable_name:
+                continue
+            if not variable_name.startswith('$'):
+                variable_name = f"${variable_name}"
+            result.append((offset, key_name, variable_name))
+        return result
+
+    def _append_continuous_shape_key_mapping_lines(self, lines, primary_var, indent="        "):
+        entries = self._get_continuous_shape_key_entries()
+        if not entries:
+            return
+
+        frame_start = float(getattr(self, "frame_start", 0.0) or 0.0)
+        lines.append(f"{indent}; --- 连续形态键映射 ---")
+        for offset, shape_key_name, variable_name in entries:
+            threshold = frame_start + offset
+            lines.append(f"{indent}{variable_name} = {primary_var} - {threshold}")
+            lines.append(f"{indent}if {variable_name} < 0")
+            lines.append(f"{indent}    {variable_name} = 0")
+            lines.append(f"{indent}endif")
+            lines.append(f"{indent}if {variable_name} > 1")
+            lines.append(f"{indent}    {variable_name} = 1")
+            lines.append(f"{indent}endif")
+            lines.append(f"{indent}; {shape_key_name}")
+
+    def _get_continuous_primary_initial_value(self):
+        frame_start = float(getattr(self, "frame_start", 0.0) or 0.0)
+        frame_end = float(getattr(self, "frame_end", frame_start) or frame_start)
+        reverse_playback = bool(getattr(self, "reverse_playback", False))
+        return frame_end if reverse_playback else frame_start
 
     def _get_indexed_nodes(self, tree):
         result = []
@@ -318,9 +497,12 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
 
 classes = (
     DrivenVariableItem,
+    ContinuousShapeKeyItem,
     SSMT_UL_DrivenVariables,
+    SSMT_UL_ContinuousShapeKeys,
     SSMT_OT_DrivenVariableAdd,
     SSMT_OT_DrivenVariableRemove,
+    SSMT_OT_ContinuousShapeKeyRefresh,
     SSMTSocketAnimDriver,
     SSMTNode_AnimDriver_Base,
 )

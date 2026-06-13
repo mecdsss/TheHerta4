@@ -31,6 +31,59 @@ def _refresh_shape_key_list_from_context(context):
     refresh_shape_key_list(context.scene.atp_props, refresh_targets)
 
 
+def _allocate_shape_key_temp_name(existing_names, base_name):
+    candidate = f"__tmp__{base_name or 'ShapeKey'}"
+    if candidate not in existing_names:
+        existing_names.add(candidate)
+        return candidate
+
+    index = 1
+    while True:
+        numbered = f"{candidate}_{index}"
+        if numbered not in existing_names:
+            existing_names.add(numbered)
+            return numbered
+        index += 1
+
+
+def _build_shape_key_rename_plan(key_blocks, old_text, new_text):
+    rename_candidates = []
+    existing_names = {
+        str(getattr(key_block, "name", "") or "")
+        for key_block in key_blocks
+    }
+
+    for key_block in key_blocks:
+        current_name = str(getattr(key_block, "name", "") or "")
+        if old_text not in current_name:
+            continue
+
+        replaced_name = current_name.replace(old_text, new_text)
+        rename_candidates.append((key_block, current_name, replaced_name))
+
+    if not rename_candidates:
+        return []
+
+    rename_plan = []
+    final_targets = {}
+    current_candidate_names = {
+        current_name
+        for _key_block, current_name, _replaced_name in rename_candidates
+    }
+
+    for key_block, current_name, replaced_name in rename_candidates:
+        occupied_by_unrenamed = replaced_name in (existing_names - current_candidate_names)
+        occupied_by_other_target = replaced_name in final_targets.values()
+        has_conflict = occupied_by_unrenamed or occupied_by_other_target
+        temp_name = ""
+        if not has_conflict:
+            temp_name = _allocate_shape_key_temp_name(existing_names, current_name)
+            final_targets[current_name] = replaced_name
+        rename_plan.append((key_block, current_name, temp_name, replaced_name, has_conflict))
+
+    return rename_plan
+
+
 class ATP_OT_BatchAddShapeKey(bpy.types.Operator):
     """为所有选中的物体批量添加一个新的形态键，并将其设为活动项"""
     bl_idname = "atp.batch_add_shape_key"
@@ -214,10 +267,10 @@ class ATP_OT_SetActiveShapeKey(bpy.types.Operator):
 
 
 class ATP_OT_BatchRenameShapeKey(bpy.types.Operator):
-    """批量重命名选中物体中指定名称的形态键"""
+    """批量替换选中物体中的形态键名称片段"""
     bl_idname = "atp.batch_rename_shape_key"
     bl_label = "批量重命名形态键"
-    bl_description = "将选中物体中指定名称的形态键批量重命名为新名称"
+    bl_description = "对选中物体中的形态键名称执行文本替换式批量重命名"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -239,36 +292,58 @@ class ATP_OT_BatchRenameShapeKey(bpy.types.Operator):
             self.report({'WARNING'}, "原名称和新名称相同，无需重命名。")
             return {'CANCELLED'}
 
-        success_count = 0
-        not_found_count = 0
-        already_exists_count = 0
+        renamed_key_count = 0
+        affected_object_count = 0
+        no_match_object_count = 0
+        conflict_count = 0
         
         for obj in selected_objects:
             if obj.type == 'MESH' and obj.data and obj.data.shape_keys:
-                key_block = obj.data.shape_keys.key_blocks.get(old_name)
-                
-                if key_block:
-                    if obj.data.shape_keys.key_blocks.get(new_name):
-                        already_exists_count += 1
+                rename_plan = _build_shape_key_rename_plan(
+                    obj.data.shape_keys.key_blocks,
+                    old_name,
+                    new_name,
+                )
+                if not rename_plan:
+                    no_match_object_count += 1
+                    continue
+
+                renamed_in_object = 0
+                for key_block, _current_name, temp_name, _replaced_name, has_conflict in rename_plan:
+                    if has_conflict:
+                        conflict_count += 1
                         continue
-                        
-                    key_block.name = new_name
-                    success_count += 1
-                else:
-                    not_found_count += 1
+                    key_block.name = temp_name
+
+                for key_block, _current_name, _temp_name, replaced_name, has_conflict in rename_plan:
+                    if has_conflict:
+                        continue
+                    key_block.name = replaced_name
+                    renamed_key_count += 1
+                    renamed_in_object += 1
+
+                if renamed_in_object > 0:
+                    affected_object_count += 1
             else:
-                not_found_count += 1
+                no_match_object_count += 1
         
-        if success_count > 0:
-            self.report({'INFO'}, f"成功在 {success_count} 个物体中将形态键 '{old_name}' 重命名为 '{new_name}'。")
+        if renamed_key_count > 0:
+            self.report(
+                {'INFO'},
+                f"成功在 {affected_object_count} 个物体中替换了 {renamed_key_count} 个形态键名称片段：'{old_name}' -> '{new_name}'。"
+            )
+            _refresh_shape_key_list_from_context(context)
         else:
-            self.report({'WARNING'}, f"未在任何选中物体中找到名为 '{old_name}' 的形态键。")
+            self.report({'WARNING'}, f"未在任何选中物体中找到包含 '{old_name}' 的形态键名称片段。")
             
-        if not_found_count > 0:
-            self.report({'INFO'}, f"在 {not_found_count} 个物体中未找到指定形态键。")
+        if no_match_object_count > 0:
+            self.report({'INFO'}, f"在 {no_match_object_count} 个物体中未找到包含指定名称片段的形态键。")
             
-        if already_exists_count > 0:
-            self.report({'WARNING'}, f"在 {already_exists_count} 个物体中已存在名为 '{new_name}' 的形态键，未进行重命名。")
+        if conflict_count > 0:
+            self.report(
+                {'WARNING'},
+                f"有 {conflict_count} 个形态键在替换后会与现有名称冲突，已跳过。"
+            )
             
         return {'FINISHED'}
 

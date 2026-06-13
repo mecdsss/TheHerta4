@@ -1,7 +1,7 @@
 import bpy
 from bpy.props import FloatProperty, StringProperty, BoolProperty, IntProperty, CollectionProperty
 
-from .anim_driver_base import SSMTNode_AnimDriver_Base, DrivenVariableItem
+from .anim_driver_base import SSMTNode_AnimDriver_Base, DrivenVariableItem, ContinuousShapeKeyItem
 
 
 class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
@@ -80,8 +80,33 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         default=True,
     )
 
+    use_continuous_shapekey_mode: BoolProperty(
+        name="连续形态键",
+        description="开启后，驱动变量改为按目标物体上的连续形态键顺序自动映射到预分配变量",
+        default=False,
+    )
+
+    continuous_target_object: StringProperty(
+        name="目标物体",
+        description="用于读取连续形态键顺序的目标物体名称",
+        default="",
+    )
+
+    continuous_shape_key_items: CollectionProperty(
+        type=ContinuousShapeKeyItem,
+        name="连续形态键列表",
+    )
+
+    continuous_shape_key_items_active: IntProperty(
+        name="当前连续形态键",
+        default=0,
+    )
+
     def _get_driven_vars(self):
         """获取所有驱动变量名列表（自动补$前缀）"""
+        if getattr(self, "use_continuous_shapekey_mode", False):
+            return [self._get_continuous_primary_var()]
+
         vars_list = []
         for item in self.driven_variable_list:
             var = item.variable_name.strip()
@@ -138,23 +163,40 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         box.prop(self, "frame_start")
         box.prop(self, "frame_end")
 
-        # 驱动变量列表
-        row = box.row(align=True)
-        row.label(text="驱动变量:", icon='VIEWZOOM')
-        op = row.operator("ssmt.driven_variable_add", text="", icon='ADD')
-        op.node_name = self.name
-        op = row.operator("ssmt.driven_variable_remove", text="", icon='REMOVE')
-        op.node_name = self.name
+        box.prop(self, "use_continuous_shapekey_mode", text="连续形态键模式", icon='SHAPEKEY_DATA')
 
-        if self.driven_variable_list:
-            box.template_list(
-                "SSMT_UL_DRIVEN_VARIABLES", "",
-                self, "driven_variable_list",
-                self, "driven_variable_list_active",
-                rows=max(2, min(len(self.driven_variable_list), 6)),
-            )
+        if getattr(self, "use_continuous_shapekey_mode", False):
+            box.prop(self, "continuous_target_object")
+            row = box.row(align=True)
+            row.label(text=f"索引变量: {self._get_continuous_primary_var()}", icon='VIEWZOOM')
+            op = row.operator("ssmt.continuous_shapekey_refresh", text="刷新", icon='FILE_REFRESH')
+            op.node_name = self.name
+            if self.continuous_shape_key_items:
+                box.template_list(
+                    "SSMT_UL_CONTINUOUS_SHAPEKEYS", "",
+                    self, "continuous_shape_key_items",
+                    self, "continuous_shape_key_items_active",
+                    rows=max(2, min(len(self.continuous_shape_key_items), 6)),
+                )
+            else:
+                box.label(text="指定物体后点击刷新，自动读取连续形态键和预分配变量", icon='INFO')
         else:
-            box.label(text="点击 + 添加驱动变量", icon='INFO')
+            row = box.row(align=True)
+            row.label(text="驱动变量:", icon='VIEWZOOM')
+            op = row.operator("ssmt.driven_variable_add", text="", icon='ADD')
+            op.node_name = self.name
+            op = row.operator("ssmt.driven_variable_remove", text="", icon='REMOVE')
+            op.node_name = self.name
+
+            if self.driven_variable_list:
+                box.template_list(
+                    "SSMT_UL_DRIVEN_VARIABLES", "",
+                    self, "driven_variable_list",
+                    self, "driven_variable_list_active",
+                    rows=max(2, min(len(self.driven_variable_list), 6)),
+                )
+            else:
+                box.label(text="点击 + 添加驱动变量", icon='INFO')
 
         interval, total_frames, fps, playback_rate = self._compute_play_interval()
 
@@ -199,6 +241,8 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         idx = self._read_safe_index()
         driven_vars = self._get_driven_vars()
         primary_var = driven_vars[0]
+        continuous_mode = getattr(self, "use_continuous_shapekey_mode", False)
+        continuous_entries = self._get_continuous_shape_key_entries() if continuous_mode else []
 
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
@@ -229,12 +273,19 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
             "; 播放方向（1=正向，-1=反向）",
             f"global {paused_var} = {paused_state}",
             "; 暂停状态",
+        ]
+        if continuous_mode:
+            lines.extend([
+                f"global {primary_var} = {self._get_continuous_primary_initial_value()}",
+                "; 连续形态键索引变量",
+            ])
+        lines.extend([
             "[Present]",
             f"if {paused_var} == 1",
             f"    if $swapvar % $speed_auto{idx} == 0",
             f"        if $direction{idx} == 1",
             f"            if {primary_var} < $frameEnd{idx}",
-        ]
+        ])
 
         # 正向：所有驱动变量递增
         for var in driven_vars:
@@ -244,6 +295,8 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         for var in driven_vars:
             lines.append(f"                    {var} = $frameEnd{idx}")
         lines.append("                endif")
+        if continuous_mode and continuous_entries:
+            self._append_continuous_shape_key_mapping_lines(lines, primary_var, indent="                ")
 
         lines.append("            else")
 
@@ -264,6 +317,8 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         for var in driven_vars:
             lines.append(f"                    {var} = $frameStart{idx}")
         lines.append("                endif")
+        if continuous_mode and continuous_entries:
+            self._append_continuous_shape_key_mapping_lines(lines, primary_var, indent="                ")
 
         lines.append("            else")
 

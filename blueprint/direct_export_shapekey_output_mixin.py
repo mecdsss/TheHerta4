@@ -409,28 +409,29 @@ class DirectShapeKeyOutputMixin:
             constants_lines.append("\n; --- Auto-generated Shape Key Intensity Controls (Additive Blending) ---")
             constants_lines.extend(intensity_lines)
 
-        existing_vertex_range_names = set()
         vertex_range_vars = {}
-        vertex_range_lines = []
-        for obj_name, range_tuple in calculated_ranges.items():
-            start_v, end_v = range_tuple[:2]
-            if start_v is None:
-                continue
-            safe_name = self.node._create_safe_var_name(
-                obj_name.replace("-", "_"),
-                existing_names=existing_vertex_range_names,
-            )
-            start_var = f"$SV_{safe_name}"
-            end_var = f"$EV_{safe_name}"
-            vertex_range_vars[obj_name] = (start_var, end_var)
-            if start_var not in constants_content:
-                vertex_range_lines.append(f"global {start_var} = {start_v}")
-            if end_var not in constants_content:
-                vertex_range_lines.append(f"global {end_var} = {end_v}")
+        if not use_optimized:
+            existing_vertex_range_names = set()
+            vertex_range_lines = []
+            for obj_name, range_tuple in calculated_ranges.items():
+                start_v, end_v = range_tuple[:2]
+                if start_v is None:
+                    continue
+                safe_name = self.node._create_safe_var_name(
+                    obj_name.replace("-", "_"),
+                    existing_names=existing_vertex_range_names,
+                )
+                start_var = f"$SV_{safe_name}"
+                end_var = f"$EV_{safe_name}"
+                vertex_range_vars[obj_name] = (start_var, end_var)
+                if start_var not in constants_content:
+                    vertex_range_lines.append(f"global {start_var} = {start_v}")
+                if end_var not in constants_content:
+                    vertex_range_lines.append(f"global {end_var} = {end_v}")
 
-        if vertex_range_lines:
-            constants_lines.append("\n; --- Auto-generated Vertex Ranges for Shape Keys ---")
-            constants_lines.extend(vertex_range_lines)
+            if vertex_range_lines:
+                constants_lines.append("\n; --- Auto-generated Vertex Ranges for Shape Keys ---")
+                constants_lines.extend(vertex_range_lines)
 
         for logical_hash in unique_hashes:
             hash_prefix = self.node._extract_hash_prefix(logical_hash)
@@ -523,13 +524,14 @@ class DirectShapeKeyOutputMixin:
                 freq_param = shapekey_freq_params.get(name)
                 if freq_param:
                     block_lines.append(f"    x{self.node.INTENSITY_START_INDEX + index} = {freq_param} \n; {name}")
-            block_lines.append("\n    ; --- Per-Object Vertex Range Controls ---")
-            for index, obj_name in enumerate(hash_unique_objects):
-                if obj_name not in calculated_ranges or calculated_ranges[obj_name][0] is None:
-                    continue
-                start_var, end_var = vertex_range_vars.get(obj_name, ("$SV_unknown", "$EV_unknown"))
-                block_lines.append(f"    x{self.node.VERTEX_RANGE_START_INDEX + index * 2} = {start_var} \n; {obj_name} Start")
-                block_lines.append(f"    x{self.node.VERTEX_RANGE_START_INDEX + index * 2 + 1} = {end_var} \n; {obj_name} End")
+            if not use_optimized:
+                block_lines.append("\n    ; --- Per-Object Vertex Range Controls ---")
+                for index, obj_name in enumerate(hash_unique_objects):
+                    if obj_name not in calculated_ranges or calculated_ranges[obj_name][0] is None:
+                        continue
+                    start_var, end_var = vertex_range_vars.get(obj_name, ("$SV_unknown", "$EV_unknown"))
+                    block_lines.append(f"    x{self.node.VERTEX_RANGE_START_INDEX + index * 2} = {start_var} \n; {obj_name} Start")
+                    block_lines.append(f"    x{self.node.VERTEX_RANGE_START_INDEX + index * 2 + 1} = {end_var} \n; {obj_name} End")
 
             t_registers_to_null = []
             slots_for_hash = sorted(hash_slot_data.keys())
@@ -596,7 +598,10 @@ class DirectShapeKeyOutputMixin:
                 )
                 block_lines.extend([f"    cs-u5 = copy {res_name}_0", f"    {res_name} = ref cs-u5"])
 
-            dispatch_count = hash_to_vertex_count.get(hash_prefix, 10000) or 10000
+            dispatch_count = self.node._compute_dispatch_group_count(
+                hash_to_vertex_count.get(hash_prefix, 0),
+                threads_per_group=16,
+            )
             block_lines.extend([f"    Dispatch = {dispatch_count}, 1, 1", "    cs-u5 = null", *[f"    {reg} = null" for reg in sorted(list(set(t_registers_to_null)))]] )
             compute_blocks_to_add[block_name] = block_lines
 
