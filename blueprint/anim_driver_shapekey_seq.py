@@ -425,13 +425,13 @@ global {paused_var} = {paused_state}
             lines.append("        endif")
 
         for f_idx in range(frame_count - 1):
-            keyword = "elif" if f_idx > 0 else "if"
+            keyword = "else if" if f_idx > 0 else "if"
             lines.append(f"        {keyword} {drv} < {float(f_idx + 1)}")
             for var, parts in frame_values:
                 val = parts[f_idx] if f_idx < len(parts) else "0.000"
                 lines.append(f"            {var} = {val}")
 
-        keyword = "elif" if frame_count > 1 else "if"
+        keyword = "else if" if frame_count > 1 else "if"
         lines.append(f"        {keyword} {drv} >= 0")
         for var, parts in frame_values:
             val = parts[-1] if parts else "0.000"

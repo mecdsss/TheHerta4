@@ -1,4 +1,5 @@
 from collections import deque
+import time
 
 import bpy
 from bpy.props import IntProperty, StringProperty, CollectionProperty
@@ -144,6 +145,182 @@ class SSMT_OT_ContinuousShapeKeyRefresh(bpy.types.Operator):
         return {'FINISHED'}
 
 
+_picking_continuous_target_node_name = None
+_picking_continuous_target_tree_name = None
+_PICK_CONTINUOUS_TARGET_TIMEOUT_SECONDS = 30.0
+
+
+class SSMT_OT_StartPickContinuousTargetObject(bpy.types.Operator):
+    bl_idname = "ssmt.start_pick_continuous_target_object"
+    bl_label = "Pick Continuous Target Object"
+    bl_description = "点击后在3D视图中选择一个目标物体，写入连续形态键模式的目标物体"
+
+    node_name: StringProperty(default="")
+
+    def execute(self, context):
+        global _picking_continuous_target_node_name, _picking_continuous_target_tree_name
+
+        tree = getattr(getattr(context, 'space_data', None), 'edit_tree', None)
+        if not tree:
+            self.report({'WARNING'}, "无法获取当前动画驱动蓝图")
+            return {'CANCELLED'}
+
+        _picking_continuous_target_node_name = self.node_name
+        _picking_continuous_target_tree_name = tree.name
+        self.report({'INFO'}, "请在3D视图中点击选择一个网格物体")
+        bpy.ops.ssmt.pick_continuous_target_object_modal('INVOKE_DEFAULT')
+        return {'FINISHED'}
+
+
+class SSMT_OT_PickContinuousTargetObjectModal(bpy.types.Operator):
+    bl_idname = "ssmt.pick_continuous_target_object_modal"
+    bl_label = "Pick Continuous Target Object"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    def _finish(self, context, status, clear_globals=True):
+        global _picking_continuous_target_node_name, _picking_continuous_target_tree_name
+
+        timer = getattr(self, "_timer", None)
+        if timer is not None:
+            context.window_manager.event_timer_remove(timer)
+            self._timer = None
+
+        if clear_globals:
+            _picking_continuous_target_node_name = None
+            _picking_continuous_target_tree_name = None
+
+        return status
+
+    @staticmethod
+    def _get_current_selected_object(context):
+        active_obj = getattr(getattr(context, "view_layer", None), "objects", None)
+        active_obj = getattr(active_obj, "active", None)
+        if active_obj and active_obj in getattr(context, "selected_objects", []):
+            return active_obj
+
+        selected_objects = getattr(context, "selected_objects", []) or []
+        if selected_objects:
+            return selected_objects[0]
+        return None
+
+    def _try_apply_selected_object(self, context):
+        global _picking_continuous_target_node_name, _picking_continuous_target_tree_name
+
+        current_obj = self._get_current_selected_object(context)
+        if current_obj is None:
+            return None
+
+        if current_obj == self._last_selected_obj and current_obj in self._initial_selected_objs:
+            return None
+
+        tree = getattr(getattr(bpy, "data", None), "node_groups", {}).get(_picking_continuous_target_tree_name)
+        if tree is None:
+            self.report({'WARNING'}, "动画驱动蓝图已失效，已取消吸管选择")
+            return self._finish(context, {'CANCELLED'})
+
+        node = tree.nodes.get(_picking_continuous_target_node_name)
+        if node is None:
+            self.report({'WARNING'}, "目标驱动节点已不存在，已取消吸管选择")
+            return self._finish(context, {'CANCELLED'})
+
+        if getattr(current_obj, "type", "") != "MESH":
+            self.report({'WARNING'}, f"物体 '{current_obj.name}' 不是网格物体")
+            return self._finish(context, {'CANCELLED'})
+
+        node.continuous_target_object = current_obj.name
+        self.report({'INFO'}, f"已选择目标物体: {current_obj.name}")
+        return self._finish(context, {'FINISHED'})
+
+    def invoke(self, context, event):
+        if not _picking_continuous_target_node_name:
+            return {'CANCELLED'}
+
+        self._initial_selected_objs = set(getattr(context, "selected_objects", []) or [])
+        self._last_selected_obj = self._get_current_selected_object(context)
+        self._started_at = time.monotonic()
+        self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if not _picking_continuous_target_node_name or not _picking_continuous_target_tree_name:
+            return self._finish(context, {'CANCELLED'}, clear_globals=False)
+
+        if time.monotonic() - self._started_at > _PICK_CONTINUOUS_TARGET_TIMEOUT_SECONDS:
+            self.report({'WARNING'}, "吸管选择超时，已自动取消")
+            return self._finish(context, {'CANCELLED'})
+
+        if event.type in {'ESC', 'RIGHTMOUSE'}:
+            return self._finish(context, {'CANCELLED'})
+
+        if event.type == 'TIMER':
+            result = self._try_apply_selected_object(context)
+            if result is not None:
+                return result
+            return {'RUNNING_MODAL'}
+
+        if event.type in {
+            'LEFTMOUSE',
+            'MIDDLEMOUSE',
+            'MOUSEMOVE',
+            'WHEELUPMOUSE',
+            'WHEELDOWNMOUSE',
+            'TRACKPADPAN',
+            'TRACKPADZOOM',
+        }:
+            return {'PASS_THROUGH'}
+
+        return {'RUNNING_MODAL'}
+
+
+class SSMT_OT_ContinuousShapeKeyRemove(bpy.types.Operator):
+    bl_idname = "ssmt.continuous_shapekey_remove"
+    bl_label = "删除连续形态键"
+    bl_options = {'REGISTER', 'INTERNAL', 'UNDO'}
+
+    node_name: StringProperty(default="")
+
+    def execute(self, context):
+        tree = getattr(getattr(context, 'space_data', None), 'edit_tree', None)
+        if not tree:
+            return {'CANCELLED'}
+
+        node = tree.nodes.get(self.node_name) if self.node_name else tree.nodes.active
+        if not node or not hasattr(node, "continuous_shape_key_items"):
+            return {'CANCELLED'}
+
+        idx = int(getattr(node, "continuous_shape_key_items_active", -1))
+        if 0 <= idx < len(node.continuous_shape_key_items):
+            node.continuous_shape_key_items.remove(idx)
+            node.continuous_shape_key_items_active = min(idx, len(node.continuous_shape_key_items) - 1)
+            return {'FINISHED'}
+
+        self.report({'WARNING'}, "当前没有可删除的连续形态键")
+        return {'CANCELLED'}
+
+
+class SSMT_OT_ContinuousShapeKeyClear(bpy.types.Operator):
+    bl_idname = "ssmt.continuous_shapekey_clear"
+    bl_label = "清空连续形态键"
+    bl_options = {'REGISTER', 'INTERNAL', 'UNDO'}
+
+    node_name: StringProperty(default="")
+
+    def execute(self, context):
+        tree = getattr(getattr(context, 'space_data', None), 'edit_tree', None)
+        if not tree:
+            return {'CANCELLED'}
+
+        node = tree.nodes.get(self.node_name) if self.node_name else tree.nodes.active
+        if not node or not hasattr(node, "continuous_shape_key_items"):
+            return {'CANCELLED'}
+
+        while len(node.continuous_shape_key_items) > 0:
+            node.continuous_shape_key_items.remove(len(node.continuous_shape_key_items) - 1)
+        node.continuous_shape_key_items_active = 0
+        return {'FINISHED'}
+
+
 class SSMTSocketAnimDriver(NodeSocket):
     bl_idname = 'SSMTSocketAnimDriver'
     bl_label = 'Anim Driver Socket'
@@ -214,12 +391,15 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
 
     @staticmethod
     def _rebuild_continuous_shape_key_items(node, key_blocks, var_map) -> tuple[int, int]:
+        prefix_filter = str(getattr(node, "continuous_shape_key_prefix_filter", "") or "").strip()
         shape_key_names = []
         for index, key_block in enumerate(key_blocks):
             key_name = str(getattr(key_block, "name", "") or "").strip()
             if not key_name:
                 continue
             if index == 0 or key_name.lower() == "basis":
+                continue
+            if prefix_filter and not key_name.startswith(prefix_filter):
                 continue
             shape_key_names.append(key_name)
 
@@ -274,6 +454,38 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
         frame_end = float(getattr(self, "frame_end", frame_start) or frame_start)
         reverse_playback = bool(getattr(self, "reverse_playback", False))
         return frame_end if reverse_playback else frame_start
+
+    def _draw_continuous_shape_key_controls(self, box):
+        row = box.row(align=True)
+        row.prop_search(self, "continuous_target_object", bpy.data, "objects", text="目标物体", icon='OBJECT_DATA')
+        op = row.operator("ssmt.start_pick_continuous_target_object", text="", icon='EYEDROPPER')
+        op.node_name = self.name
+        target_object_name = str(getattr(self, "continuous_target_object", "") or "").strip()
+        if target_object_name:
+            op = row.operator("ssmt.select_node_object", text="", icon='RESTRICT_SELECT_OFF')
+            op.object_name = target_object_name
+
+        box.prop(self, "continuous_shape_key_prefix_filter", text="前缀过滤")
+
+        row = box.row(align=True)
+        row.label(text=f"索引变量: {self._get_continuous_primary_var()}", icon='VIEWZOOM')
+        op = row.operator("ssmt.continuous_shapekey_refresh", text="刷新", icon='FILE_REFRESH')
+        op.node_name = self.name
+        op = row.operator("ssmt.continuous_shapekey_remove", text="", icon='REMOVE')
+        op.node_name = self.name
+        op = row.operator("ssmt.continuous_shapekey_clear", text="", icon='TRASH')
+        op.node_name = self.name
+
+        if self.continuous_shape_key_items:
+            box.template_list(
+                "SSMT_UL_CONTINUOUS_SHAPEKEYS", "",
+                self, "continuous_shape_key_items",
+                self, "continuous_shape_key_items_active",
+                rows=max(2, min(len(self.continuous_shape_key_items), 6)),
+            )
+            box.label(text="可刷新后按需删减，用于保留当前动画段所需的连续形态键", icon='INFO')
+        else:
+            box.label(text="指定物体后点击刷新，自动读取连续形态键和预分配变量", icon='INFO')
 
     def _get_indexed_nodes(self, tree):
         result = []
@@ -503,6 +715,10 @@ classes = (
     SSMT_OT_DrivenVariableAdd,
     SSMT_OT_DrivenVariableRemove,
     SSMT_OT_ContinuousShapeKeyRefresh,
+    SSMT_OT_StartPickContinuousTargetObject,
+    SSMT_OT_PickContinuousTargetObjectModal,
+    SSMT_OT_ContinuousShapeKeyRemove,
+    SSMT_OT_ContinuousShapeKeyClear,
     SSMTSocketAnimDriver,
     SSMTNode_AnimDriver_Base,
 )

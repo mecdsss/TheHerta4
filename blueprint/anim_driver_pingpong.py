@@ -92,6 +92,12 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         default="",
     )
 
+    continuous_shape_key_prefix_filter: StringProperty(
+        name="前缀过滤",
+        description="刷新连续形态键时仅保留指定前缀的形态键，留空则不过滤",
+        default="",
+    )
+
     continuous_shape_key_items: CollectionProperty(
         type=ContinuousShapeKeyItem,
         name="连续形态键列表",
@@ -166,20 +172,7 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         box.prop(self, "use_continuous_shapekey_mode", text="连续形态键模式", icon='SHAPEKEY_DATA')
 
         if getattr(self, "use_continuous_shapekey_mode", False):
-            box.prop(self, "continuous_target_object")
-            row = box.row(align=True)
-            row.label(text=f"索引变量: {self._get_continuous_primary_var()}", icon='VIEWZOOM')
-            op = row.operator("ssmt.continuous_shapekey_refresh", text="刷新", icon='FILE_REFRESH')
-            op.node_name = self.name
-            if self.continuous_shape_key_items:
-                box.template_list(
-                    "SSMT_UL_CONTINUOUS_SHAPEKEYS", "",
-                    self, "continuous_shape_key_items",
-                    self, "continuous_shape_key_items_active",
-                    rows=max(2, min(len(self.continuous_shape_key_items), 6)),
-                )
-            else:
-                box.label(text="指定物体后点击刷新，自动读取连续形态键和预分配变量", icon='INFO')
+            self._draw_continuous_shape_key_controls(box)
         else:
             row = box.row(align=True)
             row.label(text="驱动变量:", icon='VIEWZOOM')

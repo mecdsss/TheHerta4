@@ -181,6 +181,46 @@ class AnimDriverContinuousShapeKeyTests(unittest.TestCase):
             [("Frame_001", "$Freq_Frame_001"), ("Frame_002", "$Freq_Frame_002")],
         )
 
+    def test_refresh_applies_prefix_filter_before_building_continuous_list(self):
+        anim_tree = _FakeTree("动画驱动蓝图", is_animation_driver=True)
+        source_tree = _FakeTree(
+            "主蓝图",
+            nodes=[
+                _FakeAnimDriverRefNode("动画驱动蓝图"),
+                _FakeShapeKeyConfigNode([
+                    _FakeShapeKeyVarItem("Idle_001", assigned_variable_name="Freq_Idle_001"),
+                    _FakeShapeKeyVarItem("Idle_002", assigned_variable_name="Freq_Idle_002"),
+                    _FakeShapeKeyVarItem("Talk_001", assigned_variable_name="Freq_Talk_001"),
+                ]),
+            ],
+        )
+        _fake_bpy.data.node_groups = [anim_tree, source_tree]
+        key_blocks = _FakeShapeKeyBlocks([
+            _FakeShapeKeyBlock("Basis"),
+            _FakeShapeKeyBlock("Idle_001"),
+            _FakeShapeKeyBlock("Idle_002"),
+            _FakeShapeKeyBlock("Talk_001"),
+        ])
+
+        node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
+        node.name = "Forward"
+        node.id_data = anim_tree
+        node.continuous_shape_key_prefix_filter = "Idle_"
+        node.continuous_shape_key_items = _FakeContinuousCollection()
+
+        count, missing = anim_driver_base.SSMTNode_AnimDriver_Base._rebuild_continuous_shape_key_items(
+            node,
+            key_blocks,
+            anim_driver_base.SSMTNode_AnimDriver_Base._find_parent_shapekey_variable_map(anim_tree),
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(missing, 0)
+        self.assertEqual(
+            [(item.shape_key_name, item.variable_name) for item in node.continuous_shape_key_items],
+            [("Idle_001", "$Freq_Idle_001"), ("Idle_002", "$Freq_Idle_002")],
+        )
+
     def test_forward_play_continuous_mode_emits_mapping_lines(self):
         node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
         node.name = "Forward"
@@ -267,6 +307,34 @@ class AnimDriverContinuousShapeKeyTests(unittest.TestCase):
 
         self.assertIn("global $continuous_shapekey_frame3 = 5.0", ini)
 
+    def test_forward_play_continuous_mode_uses_remaining_items_after_manual_prune(self):
+        node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
+        node.name = "Forward"
+        node.auto_index = 5
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.frame_start = 20.0
+        node.frame_end = 30.0
+        node.play_total_duration = 0.1
+        node.use_float_interval = True
+        node.default_paused = True
+        node.custom_paused_var = "$paused"
+        node.reverse_playback = False
+        node.loop_playback = False
+        node.use_continuous_shapekey_mode = True
+        node.continuous_shape_key_items = [
+            types.SimpleNamespace(shape_key_name="Talk_001", variable_name="$Freq_Talk_001"),
+            types.SimpleNamespace(shape_key_name="Talk_002", variable_name="$Freq_Talk_002"),
+        ]
+        node.driven_variable_list = []
+        node.driven_variable = ""
+        node._find_runtime_node = lambda: types.SimpleNamespace(fps=30, playback_rate=1)
+        node._get_next_node_in_chain = lambda: None
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("$Freq_Talk_001 = $continuous_shapekey_frame5 - 20.0", ini)
+        self.assertIn("$Freq_Talk_002 = $continuous_shapekey_frame5 - 21.0", ini)
+
     def test_pingpong_continuous_mode_emits_mapping_lines(self):
         node = pingpong_module.SSMTNode_AnimDriver_PingPong()
         node.name = "PingPong"
@@ -320,6 +388,25 @@ class AnimDriverContinuousShapeKeyTests(unittest.TestCase):
         ini = node.generate_ini_segment()
 
         self.assertIn("global $continuous_shapekey_frame4 = 6.0", ini)
+
+    def test_remove_operator_deletes_active_continuous_shape_key_item(self):
+        node = types.SimpleNamespace(
+            continuous_shape_key_items=_FakeContinuousCollection(),
+            continuous_shape_key_items_active=1,
+        )
+        node.continuous_shape_key_items.add().shape_key_name = "Idle_001"
+        node.continuous_shape_key_items.add().shape_key_name = "Idle_002"
+        tree = types.SimpleNamespace(nodes=types.SimpleNamespace(get=lambda _name: node, active=node))
+        context = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=tree))
+
+        operator = anim_driver_base.SSMT_OT_ContinuousShapeKeyRemove()
+        operator.node_name = "Forward"
+        operator.report = lambda *_args, **_kwargs: None
+
+        result = operator.execute(context)
+
+        self.assertEqual(result, {"FINISHED"})
+        self.assertEqual([item.shape_key_name for item in node.continuous_shape_key_items], ["Idle_001"])
 
 
 if __name__ == "__main__":

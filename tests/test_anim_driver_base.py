@@ -87,8 +87,26 @@ def _load_blueprint_module(module_name):
 
 forward_play_module = _load_blueprint_module("anim_driver_forward_play")
 pingpong_module = _load_blueprint_module("anim_driver_pingpong")
+runtime_module = _load_blueprint_module("anim_driver_runtime")
 toggle_module = _load_blueprint_module("anim_driver_toggle")
 node_menu_module = _load_blueprint_module("node_menu")
+
+
+def _assert_balanced_conditionals(test_case, ini_text):
+    stack = []
+    for lineno, raw_line in enumerate(ini_text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith(";") or (line.startswith("[") and line.endswith("]")):
+            continue
+        if line.startswith("if "):
+            stack.append((lineno, line))
+        elif line == "else":
+            test_case.assertTrue(stack, f"Line {lineno} has else without matching if")
+        elif line == "endif":
+            test_case.assertTrue(stack, f"Line {lineno} has endif without matching if")
+            stack.pop()
+
+    test_case.assertEqual(stack, [], f"Unclosed if blocks: {stack}")
 
 
 class AnimDriverBaseTests(unittest.TestCase):
@@ -176,6 +194,81 @@ class AnimDriverBaseTests(unittest.TestCase):
         self.assertIn("$varA = $frameStart1", ini)
         self.assertIn("$varB = $frameStart1", ini)
         self.assertIn("global $paused = 1", ini)
+
+    def test_pingpong_generated_ini_has_balanced_conditionals(self):
+        node = pingpong_module.SSMTNode_AnimDriver_PingPong()
+        node.name = "PingPong"
+        node.auto_index = 1
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.frame_start = 0.0
+        node.frame_end = 3.0
+        node.play_total_duration = 0.1
+        node.use_float_interval = True
+        node.default_paused = True
+        node.custom_paused_var = "$paused"
+        node.reverse_playback = True
+        node.loop_playback = True
+        node.use_continuous_shapekey_mode = True
+        node.continuous_shape_key_items = [
+            types.SimpleNamespace(shape_key_name="Frame_001", variable_name="$Freq_Frame_001"),
+            types.SimpleNamespace(shape_key_name="Frame_002", variable_name="$Freq_Frame_002"),
+        ]
+        node.driven_variable_list = []
+        node.driven_variable = ""
+        node._find_runtime_node = lambda: types.SimpleNamespace(fps=30, playback_rate=1)
+        node._get_next_node_in_chain = lambda: None
+
+        ini = node.generate_ini_segment()
+
+        _assert_balanced_conditionals(self, ini)
+
+    def test_runtime_and_pingpong_segments_merge_with_balanced_conditionals(self):
+        runtime_node = runtime_module.SSMTNode_AnimDriver_Runtime()
+        runtime_node.name = "Runtime"
+        runtime_node.auto_index = 1
+        runtime_node.fps = 30
+        runtime_node.playback_rate = 1
+
+        pingpong_node = pingpong_module.SSMTNode_AnimDriver_PingPong()
+        pingpong_node.name = "PingPong"
+        pingpong_node.auto_index = 2
+        pingpong_node.frame_start = 0.0
+        pingpong_node.frame_end = 3.0
+        pingpong_node.play_total_duration = 0.1
+        pingpong_node.use_float_interval = True
+        pingpong_node.default_paused = True
+        pingpong_node.custom_paused_var = "$paused"
+        pingpong_node.reverse_playback = False
+        pingpong_node.loop_playback = False
+        pingpong_node.driven_variable_list = [types.SimpleNamespace(variable_name="$varA")]
+        pingpong_node.driven_variable = ""
+
+        class _FakeSocket:
+            def __init__(self, name):
+                self.bl_idname = "SSMTSocketAnimDriver"
+                self.name = name
+
+        class _FakeLink:
+            def __init__(self, from_node, to_node, from_name, to_name):
+                self.from_node = from_node
+                self.to_node = to_node
+                self.from_socket = _FakeSocket(from_name)
+                self.to_socket = _FakeSocket(to_name)
+
+        node_group = types.SimpleNamespace(
+            nodes=[runtime_node, pingpong_node],
+            links=[
+                _FakeLink(runtime_node, pingpong_node, "链输出", "链输入"),
+                _FakeLink(runtime_node, pingpong_node, "链输出", "时间输入"),
+            ],
+        )
+        runtime_node.id_data = node_group
+        pingpong_node.id_data = node_group
+
+        collector_module = _load_blueprint_module("anim_driver_collector")
+        merged = collector_module.AnimationDriverCollector(node_group).collect()[0]["ini_content"]
+
+        _assert_balanced_conditionals(self, merged)
 
     def test_toggle_comment_is_emitted_into_ini(self):
         node = toggle_module.SSMTNode_AnimDriver_Toggle()

@@ -9,6 +9,7 @@ from bpy.props import StringProperty
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 from .anim_driver_collector import AnimationDriverCollector
+from ..common.global_config import GlobalConfig
 
 _ANIM_DRIVER_SECTION_MARKER_START = "; --- ANIMATION DRIVER SECTION ---"
 _ANIM_DRIVER_SECTION_MARKER_END = "; --- END ANIMATION DRIVER SECTION ---"
@@ -58,6 +59,41 @@ class SSMT_OT_CreateAnimDriverBlueprint(bpy.types.Operator):
 
         self.report({'INFO'}, f"已创建动画驱动蓝图: {blueprint_name}")
         return {'FINISHED'}
+
+
+class SSMT_OT_RefreshAnimDriverExportSection(bpy.types.Operator):
+    bl_idname = "ssmt.refresh_anim_driver_export_section"
+    bl_label = "刷新已导出动画驱动"
+    bl_description = "不重新导出整个 Mod，仅按当前动画驱动蓝图重写已导出 INI 中的动画驱动段"
+    bl_options = {'REGISTER'}
+
+    node_name: StringProperty(
+        name="Node Name",
+        description="关联的动画驱动后处理节点名称",
+        default="",
+    )
+
+    def execute(self, context):
+        tree = getattr(getattr(context, "space_data", None), "edit_tree", None)
+        if not tree:
+            self.report({'ERROR'}, "未找到当前蓝图编辑上下文")
+            return {'CANCELLED'}
+
+        node = tree.nodes.get(self.node_name) if self.node_name else tree.nodes.active
+        if node is None or getattr(node, "bl_idname", "") != 'SSMTNode_PostProcess_AnimDriver':
+            self.report({'ERROR'}, "未找到动画驱动后处理节点")
+            return {'CANCELLED'}
+
+        GlobalConfig.read_from_main_json_ssmt4()
+        mod_export_path = str(GlobalConfig.path_generate_mod_folder() or "").strip()
+        if not mod_export_path or not os.path.isdir(mod_export_path):
+            self.report({'ERROR'}, "当前导出目录不存在，请先确认 Generate Mod 输出路径")
+            return {'CANCELLED'}
+
+        success, message = node.refresh_exported_anim_driver_section(mod_export_path)
+        report_level = {'INFO'} if success else {'ERROR'}
+        self.report(report_level, message)
+        return {'FINISHED'} if success else {'CANCELLED'}
 
 
 class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
@@ -113,6 +149,8 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
                 box.separator()
                 row = box.row(align=True)
                 row.operator("ssmt.blueprint_nest_navigate", text="进入动画驱动蓝图", icon='FORWARD')
+                refresh_op = row.operator("ssmt.refresh_anim_driver_export_section", text="刷新已导出驱动", icon='FILE_REFRESH')
+                refresh_op.node_name = self.name
             elif blueprint:
                 box = layout.box()
                 box.label(text="警告: 选中的不是SSMT蓝图", icon='ERROR')
@@ -120,22 +158,34 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
                 box = layout.box()
                 box.label(text="警告: 蓝图不存在", icon='ERROR')
 
-    def execute_postprocess(self, mod_export_path):
-        print(f"动画驱动蓝图后处理节点开始执行，Mod导出路径: {mod_export_path}")
-
+    def _get_anim_driver_blueprint(self):
         if not self.blueprint_name or self.blueprint_name == 'NONE':
-            print("警告: 未选择动画驱动蓝图")
-            return
+            return None, "未选择动画驱动蓝图"
 
         blueprint = bpy.data.node_groups.get(self.blueprint_name)
         if not blueprint or blueprint.bl_idname != 'SSMTBlueprintTreeType':
-            print(f"错误: 蓝图 '{self.blueprint_name}' 不存在或不是SSMT蓝图")
-            return
+            return None, f"蓝图 '{self.blueprint_name}' 不存在或不是SSMT蓝图"
 
         if not blueprint.get("is_animation_driver"):
-            print(f"错误: 蓝图 '{self.blueprint_name}' 不是动画驱动蓝图")
-            return
+            return None, f"蓝图 '{self.blueprint_name}' 不是动画驱动蓝图"
 
+        return blueprint, ""
+
+    @staticmethod
+    def _strip_existing_anim_driver_section(content: str):
+        if _ANIM_DRIVER_SECTION_MARKER_START not in content:
+            return content, False
+
+        start_idx = content.find(_ANIM_DRIVER_SECTION_MARKER_START)
+        end_idx = content.find(_ANIM_DRIVER_SECTION_MARKER_END, start_idx)
+        if end_idx == -1:
+            return content[:start_idx], True
+
+        end_idx += len(_ANIM_DRIVER_SECTION_MARKER_END)
+        remaining = content[:start_idx] + content[end_idx:]
+        return remaining, True
+
+    def _collect_ini_paragraphs(self, blueprint):
         # 在 execute 上下文中修正所有驱动节点的 auto_index
         for node in blueprint.nodes:
             if hasattr(node, '_ensure_valid_index') and callable(node._ensure_valid_index):
@@ -145,53 +195,108 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
                     pass
 
         collector = AnimationDriverCollector(blueprint)
-        paragraphs = collector.collect()
+        return collector.collect()
 
-        if not paragraphs:
-            print(f"动画驱动蓝图 '{self.blueprint_name}' 中没有找到动画驱动节点")
-            return
+    def _compose_updated_ini_content(self, original_content: str, ini_content: str):
+        content_without_section, _removed = self._strip_existing_anim_driver_section(original_content)
+        base_content, tail_content = SSMTNode_PostProcess_Base.split_auto_appended_tail_content(content_without_section)
 
-        ini_content = self._build_ini_content(paragraphs)
+        content_parts = []
+        stripped_ini = str(ini_content or "").strip()
+        stripped_base = str(base_content or "").strip()
+        stripped_tail = str(tail_content or "").strip()
 
+        if stripped_ini:
+            content_parts.append(stripped_ini)
+        if stripped_base:
+            content_parts.append(stripped_base)
+
+        merged_content = "\n\n".join(content_parts)
+        if stripped_tail:
+            if merged_content:
+                merged_content = f"{merged_content}\n\n{stripped_tail}"
+            else:
+                merged_content = stripped_tail
+
+        return merged_content
+
+    @staticmethod
+    def _find_target_ini_file(mod_export_path):
         ini_files = glob.glob(os.path.join(mod_export_path, "*.ini"))
         if not ini_files:
-            print("路径中未找到任何.ini文件")
-            return
+            return "", "导出目录中未找到任何 .ini 文件"
 
-        target_ini_file = ini_files[0]
-        self._create_cumulative_backup(target_ini_file, mod_export_path)
+        workspace_name = str(GlobalConfig.get_workspace_name() or "").strip()
+        if workspace_name:
+            exact_candidates = [
+                path for path in ini_files
+                if os.path.splitext(os.path.basename(path))[0] == workspace_name
+            ]
+            if len(exact_candidates) == 1:
+                return exact_candidates[0], ""
+
+            prefixed_candidates = [
+                path for path in ini_files
+                if os.path.basename(path).startswith(f"{workspace_name}_")
+            ]
+            all_workspace_candidates = exact_candidates + [
+                path for path in prefixed_candidates if path not in exact_candidates
+            ]
+            if len(all_workspace_candidates) == 1:
+                return all_workspace_candidates[0], ""
+            if len(all_workspace_candidates) > 1:
+                candidate_names = ", ".join(sorted(os.path.basename(path) for path in all_workspace_candidates))
+                return "", f"导出目录中存在多个匹配当前工作空间的 INI 文件，请先清理或仅保留目标文件: {candidate_names}"
+
+        if len(ini_files) == 1:
+            return ini_files[0], ""
+
+        candidate_names = ", ".join(sorted(os.path.basename(path) for path in ini_files))
+        return "", f"导出目录中存在多个 INI 文件，无法确定应刷新哪一个: {candidate_names}"
+
+    def refresh_exported_anim_driver_section(self, mod_export_path):
+        blueprint, error_message = self._get_anim_driver_blueprint()
+        if blueprint is None:
+            return False, error_message
+
+        paragraphs = self._collect_ini_paragraphs(blueprint)
+        ini_content = self._build_ini_content(paragraphs) if paragraphs else ""
+
+        target_ini_file, target_ini_error = self._find_target_ini_file(mod_export_path)
+        if not target_ini_file:
+            return False, target_ini_error
 
         try:
             with open(target_ini_file, 'r', encoding='utf-8') as f:
                 original_content = f.read()
         except Exception as e:
-            print(f"读取目标INI文件失败: {e}")
-            return
+            return False, f"读取目标INI文件失败: {e}"
 
-        if _ANIM_DRIVER_SECTION_MARKER_START in original_content:
-            start_idx = original_content.find(_ANIM_DRIVER_SECTION_MARKER_START)
-            end_idx = original_content.find(_ANIM_DRIVER_SECTION_MARKER_END, start_idx)
-            if end_idx != -1:
-                end_idx += len(_ANIM_DRIVER_SECTION_MARKER_END)
-                remaining = original_content[:start_idx] + original_content[end_idx:]
-            else:
-                remaining = original_content[:start_idx]
-            original_content = remaining
-            print("检测到旧动画驱动段，已自动覆盖")
+        new_content = self._compose_updated_ini_content(original_content, ini_content)
+        if new_content == original_content:
+            if paragraphs:
+                return True, f"动画驱动段已是最新状态: {os.path.basename(target_ini_file)}"
+            return True, f"未检测到动画驱动段变更: {os.path.basename(target_ini_file)}"
 
-        base_content, tail_content = SSMTNode_PostProcess_Base.split_auto_appended_tail_content(original_content)
-
-        new_content = f"{ini_content}\n\n{base_content}"
-        if tail_content:
-            new_content = f"{new_content}\n\n{tail_content}"
+        self._create_cumulative_backup(target_ini_file, mod_export_path)
 
         try:
             with open(target_ini_file, 'w', encoding='utf-8') as f:
                 f.write(new_content)
-            print(f"动画驱动INI配置已插入到: {os.path.basename(target_ini_file)}")
-            print(f"段落数: {len(paragraphs)}")
         except Exception as e:
-            print(f"写入INI文件失败: {e}")
+            return False, f"写入INI文件失败: {e}"
+
+        if paragraphs:
+            return True, f"已刷新 {os.path.basename(target_ini_file)} 中的动画驱动段，共 {len(paragraphs)} 个段落"
+        return True, f"未找到动画驱动节点，已清除 {os.path.basename(target_ini_file)} 中旧的动画驱动段"
+
+    def execute_postprocess(self, mod_export_path):
+        print(f"动画驱动蓝图后处理节点开始执行，Mod导出路径: {mod_export_path}")
+        success, message = self.refresh_exported_anim_driver_section(mod_export_path)
+        if success:
+            print(message)
+        else:
+            print(f"错误: {message}")
 
     def _build_ini_content(self, paragraphs) -> str:
         lines = [
@@ -235,6 +340,7 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
 
 classes = (
     SSMT_OT_CreateAnimDriverBlueprint,
+    SSMT_OT_RefreshAnimDriverExportSection,
     SSMTNode_PostProcess_AnimDriver,
 )
 
