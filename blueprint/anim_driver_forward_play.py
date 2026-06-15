@@ -140,10 +140,20 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
         self.width = 300
         self._assign_next_available_index()
         self.custom_paused_var = f"$animation_paused{self.auto_index}"
+        self.assigned_continuous_index_variable_name = ""
+        self.custom_continuous_index_variable_name = ""
+        self.continuous_index_var_initialized = False
+        self._ensure_continuous_index_variable_name(context=context)
+        self._ensure_initial_visible_continuous_index_variable_name(context=context)
 
     def copy(self, node):
         self._assign_next_available_index()
         self.custom_paused_var = f"$animation_paused{self.auto_index}"
+        self.assigned_continuous_index_variable_name = ""
+        self.custom_continuous_index_variable_name = ""
+        self.continuous_index_var_initialized = False
+        self._ensure_continuous_index_variable_name()
+        self._ensure_initial_visible_continuous_index_variable_name()
 
     def _compute_play_interval(self):
         runtime = self._find_runtime_node()
@@ -366,6 +376,9 @@ def _forward_play_load_handler(dummy):
                     SSMTNode_AnimDriver_Base._migrate_play_sockets(node)
                     if not node.custom_paused_var:
                         node.custom_paused_var = f"$animation_paused{node.auto_index}"
+                    if getattr(node, "use_continuous_shapekey_mode", False):
+                        node.continuous_index_var_initialized = False
+                        node._ensure_initial_visible_continuous_index_variable_name()
                     # 迁移旧 driven_variable 到 driven_variable_list
                     old_var = node.driven_variable.strip()
                     if old_var and len(node.driven_variable_list) == 0:

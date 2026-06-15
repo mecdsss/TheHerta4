@@ -107,6 +107,7 @@ from .ntmi_shapekey import execute_ntmi_shapekey_postprocess
 RESULT_NODE_TYPE = "SSMTNode_Result_Output_NTMIModImp"
 MODIMP_MIRROR_FLIP_PROP = "modimp_mirror_flip"
 COMPATIBLE_POSTPROCESS_NODE_TYPES = {
+    "SSMTNode_PostProcess_AnimDriver",
     "SSMTNode_PostProcess_BufferCleanup",
     "SSMTNode_PostProcess_Material",
     "SSMTNode_PostProcess_MultiFile",
@@ -494,17 +495,6 @@ def _execute_supported_postprocess_nodes(blueprint_model: BluePrintModel, output
         for node in getattr(blueprint_model, "multi_file_export_nodes", []) or []
         if len(getattr(node, "object_list", []) or []) > 1
     ]
-
-    node_priority = {
-        "SSMTNode_PostProcess_MultiFile": 0,
-        "SSMTNode_PostProcess_ShapeKey": 1,
-    }
-    compatible_nodes.sort(
-        key=lambda node: (
-            node_priority.get(str(getattr(node, "bl_idname", "") or ""), 10),
-            str(getattr(node, "name", "") or ""),
-        )
-    )
 
     for node in compatible_nodes:
         execute_postprocess = getattr(node, "execute_postprocess", None)

@@ -6,6 +6,7 @@ from bpy.props import IntProperty, StringProperty, CollectionProperty
 from bpy.types import NodeSocket, Node
 
 from .node_base import SSMTNodeBase
+from .variable_registry import allocate_continuous_shapekey_index_variable_name, mark_variable_name_used, normalize_variable_name
 
 
 class DrivenVariableItem(bpy.types.PropertyGroup):
@@ -342,6 +343,57 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
         options={'HIDDEN'},
     )
 
+    continuous_index_var_initialized: bpy.props.BoolProperty(
+        name="Continuous Index Variable Initialized",
+        default=False,
+        options={'HIDDEN'},
+    )
+
+    def _ensure_initial_visible_continuous_index_variable_name(self, context=None):
+        if getattr(self, "continuous_index_var_initialized", False):
+            return False
+
+        assigned_name = self._ensure_continuous_index_variable_name(context=context)
+        if not assigned_name:
+            return False
+
+        if str(getattr(self, "custom_continuous_index_variable_name", "") or "").strip():
+            self.continuous_index_var_initialized = True
+            return False
+
+        self.continuous_index_var_initialized = True
+        self.custom_continuous_index_variable_name = assigned_name
+        return True
+
+    def update_continuous_index_variable_name(self, context):
+        if self._ensure_initial_visible_continuous_index_variable_name(context=context):
+            return
+        normalized = normalize_variable_name(self.custom_continuous_index_variable_name)
+        if normalized != str(self.custom_continuous_index_variable_name or "").strip().lstrip("$"):
+            self.custom_continuous_index_variable_name = normalized
+            return
+        if normalized:
+            mark_variable_name_used(normalized, context=context)
+        self._ensure_continuous_index_variable_name(context=context)
+        self.update_node_width([
+            getattr(self, "custom_continuous_index_variable_name", ""),
+            getattr(self, "assigned_continuous_index_variable_name", ""),
+        ])
+
+    custom_continuous_index_variable_name: bpy.props.StringProperty(
+        name="连续索引变量",
+        description="连续形态键模式的主索引变量名；创建时会自动填入预分配变量名，可直接复制或手动修改。",
+        default="",
+        update=update_continuous_index_variable_name,
+    )
+
+    assigned_continuous_index_variable_name: bpy.props.StringProperty(
+        name="Assigned Continuous Index Variable Name",
+        description="Preallocated primary variable name for continuous shape key mode.",
+        default="",
+        options={'HIDDEN'},
+    )
+
     @classmethod
     def poll(cls, ntree):
         if ntree.bl_idname != 'SSMTBlueprintTreeType':
@@ -417,7 +469,10 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
         return len(shape_key_names), missing_count
 
     def _get_continuous_primary_var(self):
-        return f"$continuous_shapekey_frame{self._read_safe_index()}"
+        assigned_name = self._ensure_continuous_index_variable_name()
+        custom_name = normalize_variable_name(getattr(self, "custom_continuous_index_variable_name", "") or "")
+        resolved_name = custom_name or assigned_name
+        return f"${resolved_name}"
 
     def _get_continuous_shape_key_entries(self):
         result = []
@@ -467,8 +522,12 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
 
         box.prop(self, "continuous_shape_key_prefix_filter", text="前缀过滤")
 
+        box.prop(self, "custom_continuous_index_variable_name", text="索引变量")
+        assigned_name = normalize_variable_name(getattr(self, "assigned_continuous_index_variable_name", "") or "")
+        if not str(getattr(self, "custom_continuous_index_variable_name", "") or "").strip() and assigned_name:
+            box.label(text=f"预分配变量: ${assigned_name}", icon='INFO')
+
         row = box.row(align=True)
-        row.label(text=f"索引变量: {self._get_continuous_primary_var()}", icon='VIEWZOOM')
         op = row.operator("ssmt.continuous_shapekey_refresh", text="刷新", icon='FILE_REFRESH')
         op.node_name = self.name
         op = row.operator("ssmt.continuous_shapekey_remove", text="", icon='REMOVE')
@@ -545,6 +604,29 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
         existing = {n.auto_index for n in self._get_indexed_nodes(tree) if n != self}
         while self.auto_index in existing:
             self.auto_index += 1
+
+    def _ensure_continuous_index_variable_name(self, context=None):
+        owned_names = (
+            getattr(self, "assigned_continuous_index_variable_name", ""),
+            getattr(self, "custom_continuous_index_variable_name", ""),
+        )
+        assigned_name = normalize_variable_name(getattr(self, "assigned_continuous_index_variable_name", "") or "")
+        if not assigned_name:
+            assigned_name = allocate_continuous_shapekey_index_variable_name(
+                preferred=getattr(self, "custom_continuous_index_variable_name", ""),
+                context=context,
+                owned_names=owned_names,
+            )
+            self.assigned_continuous_index_variable_name = assigned_name
+
+        custom_name = normalize_variable_name(getattr(self, "custom_continuous_index_variable_name", "") or "")
+        if not custom_name:
+            self.custom_continuous_index_variable_name = assigned_name
+        return assigned_name
+
+    def update(self):
+        if getattr(self, "use_continuous_shapekey_mode", False):
+            self._ensure_initial_visible_continuous_index_variable_name()
 
     def _get_chain_links(self):
         tree = self.id_data

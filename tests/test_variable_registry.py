@@ -72,6 +72,14 @@ def _make_shapekey_node(*var_names: str):
     )
 
 
+def _make_anim_driver_node(assigned_name: str = "", custom_name: str = ""):
+    return types.SimpleNamespace(
+        bl_idname="SSMTNode_AnimDriver_ForwardPlay",
+        assigned_continuous_index_variable_name=assigned_name,
+        custom_continuous_index_variable_name=custom_name,
+    )
+
+
 def _make_tree(*nodes):
     return types.SimpleNamespace(
         bl_idname="SSMTBlueprintTreeType",
@@ -129,6 +137,18 @@ class VariableRegistryTests(unittest.TestCase):
         )
 
         self.assertEqual(allocated, "Freq_Blink")
+
+    def test_continuous_anim_driver_variable_reuses_first_free_suffix(self):
+        _fake_bpy.data.node_groups[:] = [
+            _make_tree(
+                _make_anim_driver_node("continuous_shapekey_frame1"),
+                _make_anim_driver_node("continuous_shapekey_frame3"),
+            )
+        ]
+
+        allocated = variable_registry.allocate_continuous_shapekey_index_variable_name()
+
+        self.assertEqual(allocated, "continuous_shapekey_frame2")
 
 
 if __name__ == "__main__":

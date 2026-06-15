@@ -349,6 +349,120 @@ class SplitCleanupTests(unittest.TestCase):
         self.assertEqual(smile_key.slider_max, 2.0)
         self.assertTrue(smile_key.mute)
 
+    def test_copy_shape_keys_between_objects_rebases_existing_target_keys_when_baking_new_basis(self):
+        operator = split_module.ATP_OT_SplitFramesToShapeKeyMulti()
+
+        class _FakeShapeKeyData:
+            def __init__(self, coords):
+                self._coords = np.asarray(coords, dtype=np.float32)
+
+            def foreach_get(self, _attr, output):
+                output[:] = self._coords.reshape(-1)
+
+            def foreach_set(self, _attr, values):
+                self._coords = np.asarray(values, dtype=np.float32).reshape(-1, 3)
+
+            def __len__(self):
+                return len(self._coords)
+
+        class _FakeKeyBlock:
+            def __init__(self, name, coords):
+                self.name = name
+                self.data = _FakeShapeKeyData(coords)
+                self.value = 0.0
+                self.slider_min = 0.0
+                self.slider_max = 1.0
+                self.mute = False
+
+        class _FakeKeyBlocks(list):
+            def get(self, name):
+                for item in self:
+                    if item.name == name:
+                        return item
+                return None
+
+        class _FakeShapeKeys:
+            def __init__(self, key_blocks):
+                self.key_blocks = _FakeKeyBlocks(key_blocks)
+                self.reference_key = self.key_blocks[0]
+
+        class _FakeVertices:
+            def __init__(self, coords):
+                self._coords = np.asarray(coords, dtype=np.float32)
+
+            def foreach_get(self, _attr, output):
+                output[:] = self._coords.reshape(-1)
+
+            def __len__(self):
+                return len(self._coords)
+
+        class _FakeMesh:
+            def __init__(self, coords, shape_keys=None):
+                self.vertices = _FakeVertices(coords)
+                self.shape_keys = shape_keys
+                self.updated = False
+
+            def update(self):
+                self.updated = True
+
+        class _FakeTargetObject(_FakeObject):
+            def __init__(self, name, coords, matrix_rows, shape_keys):
+                super().__init__(name)
+                self.data = _FakeMesh(coords, shape_keys=shape_keys)
+                self.matrix_world = _FakeMatrix(matrix_rows)
+
+            def evaluated_get(self, _depsgraph):
+                return self
+
+            def shape_key_add(self, name, from_mix=False):
+                del from_mix
+                if self.data.shape_keys is None:
+                    basis_coords = np.asarray(self.data.vertices._coords, dtype=np.float32)
+                    self.data.shape_keys = _FakeShapeKeys([_FakeKeyBlock(name, basis_coords)])
+                    return self.data.shape_keys.reference_key
+                new_block = _FakeKeyBlock(name, np.asarray(self.data.vertices._coords, dtype=np.float32))
+                self.data.shape_keys.key_blocks.append(new_block)
+                return new_block
+
+        source_basis = np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+        source_key = np.asarray([[2.0, 0.0, 0.0]], dtype=np.float32)
+        source_obj = _FakeObject("Source")
+        source_obj.data = _FakeMesh(
+            source_basis,
+            _FakeShapeKeys([
+                _FakeKeyBlock("Basis", source_basis),
+                _FakeKeyBlock("Smile", source_key),
+            ]),
+        )
+        source_obj.matrix_world = _FakeMatrix(
+            ((2.0, 0.0, 0.0, 3.0), (0.0, 2.0, 0.0, 0.0), (0.0, 0.0, 2.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        )
+
+        target_shape_keys = _FakeShapeKeys([
+            _FakeKeyBlock("Basis", np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32)),
+            _FakeKeyBlock("Blink", np.asarray([[0.0, 1.0, 0.0]], dtype=np.float32)),
+        ])
+        target_obj = _FakeTargetObject(
+            "Target",
+            np.asarray([[0.5, 0.0, 0.0]], dtype=np.float32),
+            ((4.0, 0.0, 0.0, 1.0), (0.0, 4.0, 0.0, 0.0), (0.0, 0.0, 4.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+            shape_keys=target_shape_keys,
+        )
+
+        context = types.SimpleNamespace(
+            evaluated_depsgraph_get=lambda: object(),
+        )
+
+        self.assertTrue(operator.copy_shape_keys_between_objects(context, source_obj, target_obj))
+
+        basis_key = target_obj.data.shape_keys.reference_key
+        blink_key = target_obj.data.shape_keys.key_blocks.get("Blink")
+        smile_key = target_obj.data.shape_keys.key_blocks.get("Smile")
+
+        np.testing.assert_allclose(basis_key.data._coords, np.asarray([[0.5, 0.0, 0.0]], dtype=np.float32))
+        np.testing.assert_allclose(blink_key.data._coords, np.asarray([[0.5, 1.0, 0.0]], dtype=np.float32))
+        np.testing.assert_allclose(smile_key.data._coords, np.asarray([[1.5, 0.0, 0.0]], dtype=np.float32))
+
 
 if __name__ == "__main__":
     unittest.main()

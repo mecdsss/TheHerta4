@@ -7,6 +7,7 @@ import bpy
 
 OBJECT_SWAP_PREFIX = "swapkey"
 SHAPEKEY_PREFIX = "Freq_"
+CONTINUOUS_SHAPEKEY_INDEX_PREFIX = "continuous_shapekey_frame"
 
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_]")
 
@@ -53,6 +54,12 @@ def _iter_node_variable_names(node):
         yield custom_name
     if assigned_name:
         yield assigned_name
+    continuous_custom_name = normalize_variable_name(getattr(node, "custom_continuous_index_variable_name", "") or "")
+    continuous_assigned_name = normalize_variable_name(getattr(node, "assigned_continuous_index_variable_name", "") or "")
+    if continuous_custom_name:
+        yield continuous_custom_name
+    if continuous_assigned_name:
+        yield continuous_assigned_name
 
 
 def _iter_shapekey_item_variable_names(item):
@@ -69,11 +76,14 @@ def _collect_used_variable_name_counts(context=None) -> Counter:
 
     for node in _iter_blueprint_nodes() or ():
         bl_idname = getattr(node, "bl_idname", "")
-        if bl_idname == "SSMTNode_ObjectSwap":
-            counts.update(_iter_node_variable_names(node))
-        elif bl_idname == "SSMTNode_PostProcess_ShapeKey":
+        if bl_idname == "SSMTNode_PostProcess_ShapeKey":
             for item in getattr(node, "shapekey_variable_items", []):
                 counts.update(_iter_shapekey_item_variable_names(item))
+            continue
+
+        node_variable_names = tuple(_iter_node_variable_names(node))
+        if node_variable_names:
+            counts.update(node_variable_names)
 
     _sync_variable_usage_cache(counts, context=context)
     return counts
@@ -185,3 +195,25 @@ def get_node_variable_name(node, context=None) -> str:
     resolved = manual_name or assigned_name
     mark_variable_name_used(resolved, context=context)
     return f"${resolved}"
+
+
+def allocate_continuous_shapekey_index_variable_name(
+    *,
+    preferred: Optional[str] = None,
+    context=None,
+    owned_names: Optional[Iterable[str]] = None,
+) -> str:
+    preferred_normalized = normalize_variable_name(preferred or "")
+    used_counts = _collect_used_variable_name_counts(context)
+    owned_counts = _normalize_owned_counts(owned_names)
+
+    if preferred_normalized:
+        if not _is_name_used_by_other_owner(preferred_normalized, used_counts, owned_counts):
+            return preferred_normalized
+
+    suffix = 1
+    while True:
+        candidate = f"{CONTINUOUS_SHAPEKEY_INDEX_PREFIX}{suffix}"
+        if not _is_name_used_by_other_owner(candidate, used_counts, owned_counts):
+            return candidate
+        suffix += 1

@@ -148,6 +148,53 @@ class NTMIModImpOutputDirTests(unittest.TestCase):
 
         self.assertEqual(resolved, ntmi_export_modimp.os.path.normpath(r"D:\Manual\Out"))
 
+    def test_execute_supported_postprocess_nodes_runs_anim_driver_in_chain_order(self):
+        calls = []
+
+        shape_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_ShapeKey",
+            name="ShapeKey",
+            execute_postprocess=lambda _output_dir: calls.append(("shape_execute", _output_dir)),
+        )
+        anim_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_AnimDriver",
+            name="AnimDriver",
+            execute_postprocess=lambda output_dir: calls.append(("anim_execute", output_dir)),
+        )
+
+        blueprint_model = types.SimpleNamespace(
+            postprocess_nodes=[shape_node, anim_node],
+            multi_file_export_nodes=[],
+        )
+
+        original_mapping = getattr(ntmi_export_modimp.BluePrintModel, "_object_name_mapping", None)
+        ntmi_export_modimp.BluePrintModel._object_name_mapping = {}
+
+        original_shapekey = ntmi_export_modimp.execute_ntmi_shapekey_postprocess
+        ntmi_export_modimp.execute_ntmi_shapekey_postprocess = lambda **kwargs: calls.append(
+            ("shape_special", kwargs["output_dir"])
+        )
+        try:
+            ntmi_export_modimp._execute_supported_postprocess_nodes(
+                blueprint_model=blueprint_model,
+                output_dir="E:/Out",
+                exporter=None,
+            )
+        finally:
+            ntmi_export_modimp.execute_ntmi_shapekey_postprocess = original_shapekey
+            if original_mapping is None:
+                delattr(ntmi_export_modimp.BluePrintModel, "_object_name_mapping")
+            else:
+                ntmi_export_modimp.BluePrintModel._object_name_mapping = original_mapping
+
+        self.assertEqual(
+            calls,
+            [
+                ("shape_special", "E:/Out"),
+                ("anim_execute", "E:/Out"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

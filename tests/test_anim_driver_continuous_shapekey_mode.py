@@ -57,6 +57,12 @@ _install_module(
     SSMTNodeBase=object,
     refresh_blueprint_node_colors=lambda *_args, **_kwargs: None,
 )
+_install_module(
+    f"{PKG}.blueprint.variable_registry",
+    allocate_continuous_shapekey_index_variable_name=lambda **_kwargs: "continuous_shapekey_frame1",
+    mark_variable_name_used=lambda *_args, **_kwargs: None,
+    normalize_variable_name=lambda value: str(value or "").strip().lstrip("$"),
+)
 
 
 def _load_blueprint_module(module_name):
@@ -252,6 +258,36 @@ class AnimDriverContinuousShapeKeyTests(unittest.TestCase):
         self.assertIn("if $Freq_Frame_001 > 1", ini)
         self.assertIn("if $Freq_Frame_002 < 0", ini)
 
+    def test_forward_play_continuous_mode_uses_customizable_primary_variable(self):
+        node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
+        node.name = "Forward"
+        node.auto_index = 1
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.frame_start = 0.0
+        node.frame_end = 3.0
+        node.play_total_duration = 0.1
+        node.use_float_interval = True
+        node.default_paused = True
+        node.custom_paused_var = "$paused"
+        node.reverse_playback = False
+        node.loop_playback = False
+        node.use_continuous_shapekey_mode = True
+        node.assigned_continuous_index_variable_name = "continuous_shapekey_frame1"
+        node.custom_continuous_index_variable_name = "my_continuous_index"
+        node.continuous_shape_key_items = [
+            types.SimpleNamespace(shape_key_name="Frame_001", variable_name="$Freq_Frame_001"),
+        ]
+        node.driven_variable_list = []
+        node.driven_variable = ""
+        node._find_runtime_node = lambda: types.SimpleNamespace(fps=30, playback_rate=1)
+        node._get_next_node_in_chain = lambda: None
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("global $my_continuous_index = 0.0", ini)
+        self.assertIn("$Freq_Frame_001 = $my_continuous_index - 0.0", ini)
+        self.assertNotIn("$continuous_shapekey_frame1 = 0.0", ini)
+
     def test_forward_play_continuous_mode_preserves_shape_key_offsets_when_middle_variable_is_missing(self):
         node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
         node.name = "Forward"
@@ -305,7 +341,7 @@ class AnimDriverContinuousShapeKeyTests(unittest.TestCase):
 
         ini = node.generate_ini_segment()
 
-        self.assertIn("global $continuous_shapekey_frame3 = 5.0", ini)
+        self.assertIn("global $continuous_shapekey_frame1 = 5.0", ini)
 
     def test_forward_play_continuous_mode_uses_remaining_items_after_manual_prune(self):
         node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
@@ -332,8 +368,8 @@ class AnimDriverContinuousShapeKeyTests(unittest.TestCase):
 
         ini = node.generate_ini_segment()
 
-        self.assertIn("$Freq_Talk_001 = $continuous_shapekey_frame5 - 20.0", ini)
-        self.assertIn("$Freq_Talk_002 = $continuous_shapekey_frame5 - 21.0", ini)
+        self.assertIn("$Freq_Talk_001 = $continuous_shapekey_frame1 - 20.0", ini)
+        self.assertIn("$Freq_Talk_002 = $continuous_shapekey_frame1 - 21.0", ini)
 
     def test_pingpong_continuous_mode_emits_mapping_lines(self):
         node = pingpong_module.SSMTNode_AnimDriver_PingPong()
@@ -359,9 +395,38 @@ class AnimDriverContinuousShapeKeyTests(unittest.TestCase):
 
         ini = node.generate_ini_segment()
 
-        self.assertIn("global $continuous_shapekey_frame2", ini)
-        self.assertIn("$Freq_Frame_001 = $continuous_shapekey_frame2 - 0.0", ini)
+        self.assertIn("global $continuous_shapekey_frame1", ini)
+        self.assertIn("$Freq_Frame_001 = $continuous_shapekey_frame1 - 0.0", ini)
         self.assertIn("if $Freq_Frame_001 > 1", ini)
+
+    def test_pingpong_continuous_mode_falls_back_to_assigned_primary_variable(self):
+        node = pingpong_module.SSMTNode_AnimDriver_PingPong()
+        node.name = "PingPong"
+        node.auto_index = 2
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.frame_start = 0.0
+        node.frame_end = 2.0
+        node.play_total_duration = 0.1
+        node.use_float_interval = True
+        node.default_paused = True
+        node.custom_paused_var = "$paused"
+        node.reverse_playback = False
+        node.loop_playback = False
+        node.use_continuous_shapekey_mode = True
+        node.assigned_continuous_index_variable_name = "continuous_shapekey_frame_custom"
+        node.custom_continuous_index_variable_name = ""
+        node.continuous_shape_key_items = [
+            types.SimpleNamespace(shape_key_name="Frame_001", variable_name="$Freq_Frame_001"),
+        ]
+        node.driven_variable_list = []
+        node.driven_variable = ""
+        node._find_runtime_node = lambda: types.SimpleNamespace(fps=30, playback_rate=1)
+        node._get_next_node_in_chain = lambda: None
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("global $continuous_shapekey_frame_custom = 0.0", ini)
+        self.assertIn("$Freq_Frame_001 = $continuous_shapekey_frame_custom - 0.0", ini)
 
     def test_pingpong_continuous_mode_reverse_initializes_from_frame_end(self):
         node = pingpong_module.SSMTNode_AnimDriver_PingPong()
@@ -387,7 +452,7 @@ class AnimDriverContinuousShapeKeyTests(unittest.TestCase):
 
         ini = node.generate_ini_segment()
 
-        self.assertIn("global $continuous_shapekey_frame4 = 6.0", ini)
+        self.assertIn("global $continuous_shapekey_frame1 = 6.0", ini)
 
     def test_remove_operator_deletes_active_continuous_shape_key_item(self):
         node = types.SimpleNamespace(

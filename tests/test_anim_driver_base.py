@@ -49,6 +49,7 @@ _install_module(
             load_post=[],
         )
     ),
+    data=types.SimpleNamespace(objects={}, node_groups=[]),
 )
 _install_module(
     f"{PKG}.blueprint.node_base",
@@ -66,6 +67,12 @@ _install_module(
         extract_prefix_info=lambda _name: None,
         parse_prefix_parts=lambda _prefix: {},
     ),
+)
+_install_module(
+    f"{PKG}.blueprint.variable_registry",
+    allocate_continuous_shapekey_index_variable_name=lambda **_kwargs: "continuous_shapekey_frame1",
+    mark_variable_name_used=lambda *_args, **_kwargs: None,
+    normalize_variable_name=lambda value: str(value or "").strip().lstrip("$"),
 )
 
 
@@ -221,6 +228,132 @@ class AnimDriverBaseTests(unittest.TestCase):
         ini = node.generate_ini_segment()
 
         _assert_balanced_conditionals(self, ini)
+
+    def test_draw_continuous_controls_does_not_allocate_or_write_scene_state(self):
+        base_cls = anim_driver_base.SSMTNode_AnimDriver_Base
+        node = base_cls()
+        node.name = "Base"
+        node.continuous_target_object = ""
+        node.continuous_shape_key_prefix_filter = ""
+        node.custom_continuous_index_variable_name = "continuous_shapekey_frame1"
+        node.assigned_continuous_index_variable_name = "continuous_shapekey_frame1"
+        node.continuous_shape_key_items = []
+        node.continuous_shape_key_items_active = 0
+
+        calls = []
+
+        class _FakeOperator:
+            node_name = ""
+            object_name = ""
+
+        class _FakeRow:
+            def align(self):
+                return self
+
+            def prop_search(self, *_args, **_kwargs):
+                calls.append("prop_search")
+
+            def operator(self, *_args, **_kwargs):
+                calls.append("operator")
+                return _FakeOperator()
+
+        class _FakeBox:
+            def row(self, align=False):
+                del align
+                return _FakeRow()
+
+            def prop(self, *_args, **_kwargs):
+                calls.append("prop")
+
+            def label(self, *_args, **_kwargs):
+                calls.append("label")
+
+            def template_list(self, *_args, **_kwargs):
+                calls.append("template_list")
+
+        node._ensure_continuous_index_variable_name = lambda context=None: (_ for _ in ()).throw(
+            AssertionError("draw should not allocate variables")
+        )
+
+        node._draw_continuous_shape_key_controls(_FakeBox())
+
+        self.assertIn("prop", calls)
+
+    def test_update_backfills_continuous_index_variable_for_legacy_node(self):
+        node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
+        node.name = "Forward"
+        node.use_continuous_shapekey_mode = True
+        node.assigned_continuous_index_variable_name = ""
+        node.custom_continuous_index_variable_name = ""
+        node.continuous_index_var_initialized = False
+        node._ensure_continuous_index_variable_name = lambda context=None: setattr(
+            node, "assigned_continuous_index_variable_name", "continuous_shapekey_frame1"
+        ) or "continuous_shapekey_frame1"
+
+        node.update()
+
+        self.assertEqual(node.custom_continuous_index_variable_name, "continuous_shapekey_frame1")
+        self.assertTrue(node.continuous_index_var_initialized)
+
+    def test_forward_play_load_handler_backfills_continuous_index_variable_for_legacy_node(self):
+        node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
+        node.bl_idname = 'SSMTNode_AnimDriver_ForwardPlay'
+        node.id_data = None
+        node.auto_index = 1
+        node.custom_paused_var = ""
+        node.use_continuous_shapekey_mode = True
+        node.continuous_index_var_initialized = True
+        node.driven_variable = ""
+        node.driven_variable_list = []
+        node.inputs = []
+        node.outputs = []
+        anim_driver_base.SSMTNode_AnimDriver_Base._migrate_play_sockets = staticmethod(lambda _node: None)
+        node._ensure_initial_visible_continuous_index_variable_name = lambda: setattr(
+            node, "custom_continuous_index_variable_name", "continuous_shapekey_frame1"
+        ) or setattr(node, "continuous_index_var_initialized", True)
+
+        forward_play_module.bpy.data.node_groups = [
+            types.SimpleNamespace(
+                bl_idname='SSMTBlueprintTreeType',
+                nodes=[node],
+            )
+        ]
+
+        forward_play_module._forward_play_load_handler(dummy=None)
+
+        self.assertEqual(node.custom_paused_var, "$animation_paused1")
+        self.assertEqual(node.custom_continuous_index_variable_name, "continuous_shapekey_frame1")
+        self.assertTrue(node.continuous_index_var_initialized)
+
+    def test_pingpong_load_handler_backfills_continuous_index_variable_for_legacy_node(self):
+        node = pingpong_module.SSMTNode_AnimDriver_PingPong()
+        node.bl_idname = 'SSMTNode_AnimDriver_PingPong'
+        node.id_data = None
+        node.auto_index = 2
+        node.custom_paused_var = ""
+        node.use_continuous_shapekey_mode = True
+        node.continuous_index_var_initialized = True
+        node.driven_variable = ""
+        node.driven_variable_list = []
+        node.inputs = []
+        node.outputs = []
+        anim_driver_base.SSMTNode_AnimDriver_Base._migrate_play_sockets = staticmethod(lambda _node: None)
+        node._ensure_initial_visible_continuous_index_variable_name = lambda: setattr(
+            node, "custom_continuous_index_variable_name", "continuous_shapekey_frame2"
+        ) or setattr(node, "continuous_index_var_initialized", True)
+
+        pingpong_module.bpy.data.node_groups = [
+            types.SimpleNamespace(
+                bl_idname='SSMTBlueprintTreeType',
+                nodes=[node],
+            )
+        ]
+
+        pingpong_module._pingpong_load_handler(dummy=None)
+
+        self.assertEqual(node.custom_paused_var, "$animation_paused2")
+        self.assertEqual(node.custom_continuous_index_variable_name, "continuous_shapekey_frame2")
+        self.assertTrue(node.continuous_index_var_initialized)
 
     def test_runtime_and_pingpong_segments_merge_with_balanced_conditionals(self):
         runtime_node = runtime_module.SSMTNode_AnimDriver_Runtime()

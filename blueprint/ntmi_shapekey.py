@@ -164,6 +164,12 @@ class NTMIShapeKeyNodeAdapter:
     def _get_merged_data_file_suffix(self, use_delta):
         return self.original_node._get_merged_data_file_suffix(use_delta)
 
+    def _compute_dispatch_group_count(self, vertex_count, threads_per_group=16):
+        return self.original_node._compute_dispatch_group_count(
+            vertex_count,
+            threads_per_group=threads_per_group,
+        )
+
     def get_shape_key_export_variable_name(self, shape_key_name: str) -> str:
         return self.original_node.get_shape_key_export_variable_name(shape_key_name)
 

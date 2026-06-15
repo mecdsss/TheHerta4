@@ -45,6 +45,20 @@ class ShapeKeyVariableItem(bpy.types.PropertyGroup):
         update=update_custom_variable_name,
     ) # type: ignore
 
+
+class SSMT_UL_ShapeKeyVariableMappings(bpy.types.UIList):
+    bl_idname = "SSMT_UL_SHAPEKEY_VARIABLE_MAPPINGS"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        del context, data, icon, active_data, active_propname, index
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.label(text=getattr(item, "shape_key_name", "") or "<未命名>", icon='SHAPEKEY_DATA')
+            value_col = row.column(align=True)
+            value_col.prop(item, "custom_variable_name", text="导出变量")
+            assigned_name = normalize_variable_name(getattr(item, "assigned_variable_name", "") or "")
+            value_col.label(text=f"预分配: ${assigned_name}" if assigned_name else "预分配: 未分配", icon='INFO')
+
 _name_mapping_cache = {}
 
 
@@ -302,13 +316,12 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         if self.shapekey_variable_items:
             box = layout.box()
             box.label(text=f"形态键变量映射 ({len(self.shapekey_variable_items)})", icon='SHAPEKEY_DATA')
-            for item in self.shapekey_variable_items:
-                row = box.row(align=True)
-                row.label(text=item.shape_key_name)
-                value_col = row.column(align=True)
-                value_col.prop(item, "custom_variable_name", text="导出变量")
-                assigned_name = normalize_variable_name(item.assigned_variable_name)
-                value_col.label(text=f"预分配: ${assigned_name}" if assigned_name else "预分配: 未分配")
+            box.template_list(
+                "SSMT_UL_SHAPEKEY_VARIABLE_MAPPINGS", "",
+                self, "shapekey_variable_items",
+                self, "shapekey_variable_index",
+                rows=max(4, min(len(self.shapekey_variable_items), 12)),
+            )
 
         layout.prop(self, "use_packed_Meshess")
         layout.prop(self, "store_deltas")
@@ -2009,6 +2022,7 @@ class SSMT_OT_ScanShapeKeyVariables(bpy.types.Operator):
 
 classes = (
     ShapeKeyVariableItem,
+    SSMT_UL_ShapeKeyVariableMappings,
     SSMTNode_PostProcess_ShapeKey,
     SSMT_OT_ScanShapeKeyVariables,
 )

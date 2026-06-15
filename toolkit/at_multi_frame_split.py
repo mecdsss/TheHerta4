@@ -7,6 +7,11 @@ import numpy as np
 import math
 import ast
 
+try:
+    from ..utils.shapekey_rebase_utils import rebase_shape_key_coordinates
+except ImportError:
+    from utils.shapekey_rebase_utils import rebase_shape_key_coordinates
+
 
 def is_matrix_close(matrix1, matrix2, tolerance=1e-6):
     """检查两个矩阵是否在容差范围内相等"""
@@ -24,6 +29,59 @@ def is_matrix_identity(matrix, tolerance=1e-6):
     """检查矩阵是否在容差范围内为单位矩阵"""
     identity = Matrix.Identity(4)
     return is_matrix_close(matrix, identity, tolerance)
+
+
+def _snapshot_shape_key_coordinates(key_blocks):
+    coordinates = {}
+    for key_block in key_blocks:
+        key_coords = np.empty(len(key_block.data) * 3, dtype=np.float32)
+        key_block.data.foreach_get("co", key_coords)
+        coordinates[key_block.name] = key_coords.reshape(-1, 3)
+    return coordinates
+
+
+def _restore_shape_key_coordinates(key_blocks, coordinates_by_name):
+    for key_block in key_blocks:
+        key_coords = coordinates_by_name.get(key_block.name)
+        if key_coords is None:
+            continue
+        key_block.data.foreach_set("co", np.asarray(key_coords, dtype=np.float32).reshape(-1))
+
+
+def _allocate_temp_shape_key_name(existing_names, base_name):
+    candidate = base_name
+    index = 1
+    while candidate in existing_names:
+        candidate = f"{base_name}_{index}"
+        index += 1
+    return candidate
+
+
+def _rebase_target_shape_keys_to_baked_basis(target_keys, baked_basis_coords):
+    basis_key = getattr(target_keys, "reference_key", None)
+    if basis_key is None:
+        raise ValueError("target object is missing a Basis shape key")
+
+    baked_basis_coords = np.asarray(baked_basis_coords, dtype=np.float32)
+    non_basis_keys = [key_block for key_block in target_keys.key_blocks if key_block != basis_key]
+    if not non_basis_keys:
+        basis_key.data.foreach_set("co", baked_basis_coords.reshape(-1))
+        return
+
+    coordinate_snapshot = _snapshot_shape_key_coordinates(target_keys.key_blocks)
+    temp_basis_name = _allocate_temp_shape_key_name(
+        set(coordinate_snapshot.keys()),
+        "__atp_baked_basis__",
+    )
+    coordinate_snapshot[temp_basis_name] = np.array(baked_basis_coords, copy=True)
+
+    rebased_coordinates = rebase_shape_key_coordinates(
+        coordinates_by_name=coordinate_snapshot,
+        basis_name=basis_key.name,
+        new_basis_name=temp_basis_name,
+        remove_new_basis_key=True,
+    )
+    _restore_shape_key_coordinates(target_keys.key_blocks, rebased_coordinates)
 
 
 class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
@@ -823,7 +881,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         if not target_basis_key:
             return False
 
-        target_basis_key.data.foreach_set("co", target_local_coords.reshape(-1))
+        _rebase_target_shape_keys_to_baked_basis(target_keys, target_local_coords)
 
         source_to_target = target_obj.matrix_world.inverted() @ source_obj.matrix_world
         transform_linear = np.asarray(

@@ -38,7 +38,7 @@ class _FakeObject:
 
 
 _fake_bpy = types.SimpleNamespace(
-    types=types.SimpleNamespace(PropertyGroup=object, Operator=object),
+    types=types.SimpleNamespace(PropertyGroup=object, Operator=object, UIList=object),
     props=types.SimpleNamespace(
         StringProperty=lambda **_kwargs: None,
         BoolProperty=lambda **_kwargs: None,
@@ -254,6 +254,55 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
             self.assertIn("FREQ1", shader_source)
             self.assertNotIn("START1", shader_source)
             self.assertNotIn("END1", shader_source)
+
+    def test_draw_buttons_renders_shape_key_variable_mappings_as_template_list(self):
+        class _FakeItem:
+            def __init__(self, shape_key_name="", assigned_variable_name="", custom_variable_name=""):
+                self.shape_key_name = shape_key_name
+                self.assigned_variable_name = assigned_variable_name
+                self.custom_variable_name = custom_variable_name
+
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        node.name = "ShapeKey"
+        node.shapekey_variable_items = [
+            _FakeItem("A", "Freq_A", "Freq_A"),
+            _FakeItem("B", "Freq_B", "Manual_B"),
+        ]
+        node.shapekey_variable_index = 0
+
+        calls = []
+
+        class _FakeOperator:
+            node_name = ""
+
+        class _FakeBox:
+            def label(self, *args, **kwargs):
+                calls.append(("label", args, kwargs))
+
+            def template_list(self, *args, **kwargs):
+                calls.append(("template_list", args, kwargs))
+
+        class _FakeLayout:
+            def operator(self, *args, **kwargs):
+                calls.append(("operator", args, kwargs))
+                return _FakeOperator()
+
+            def box(self):
+                calls.append(("box", (), {}))
+                return _FakeBox()
+
+            def prop(self, *args, **kwargs):
+                calls.append(("prop", args, kwargs))
+
+            def label(self, *args, **kwargs):
+                calls.append(("label", args, kwargs))
+
+        node.draw_buttons(context=None, layout=_FakeLayout())
+
+        self.assertTrue(any(call[0] == "template_list" for call in calls))
+
+    def test_shape_key_variable_mapping_ui_list_is_registered(self):
+        self.assertIn(module.SSMT_UL_ShapeKeyVariableMappings, module.classes)
 
 if __name__ == "__main__":
     unittest.main()
