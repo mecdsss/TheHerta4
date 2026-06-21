@@ -1,11 +1,30 @@
 from .format_utils import Fatal
-import sys
+import builtins
 import io
-import unicodedata
+import os
+import sys
+import traceback
+
+
+UTF8_ENCODING = "utf-8"
+_ORIGINAL_PRINT = builtins.print
+
+
+def _force_windows_console_utf8():
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleOutputCP(65001)
+        kernel32.SetConsoleCP(65001)
+    except Exception:
+        pass
 
 
 def _reconfigure_stdio_utf8():
-    # Blender 外部进程和 Windows 终端编码经常不一致，这里统一切到 UTF-8 以免日志提示乱码。
+    _force_windows_console_utf8()
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         if stream is None:
@@ -14,9 +33,14 @@ def _reconfigure_stdio_utf8():
         if not callable(reconfigure):
             continue
         try:
-            reconfigure(encoding="utf-8", errors="replace")
+            reconfigure(encoding=UTF8_ENCODING, errors="replace")
         except Exception:
             pass
+
+
+def _join_print_values(*values, sep=" ", end=""):
+    parts = ["" if value is None else str(value) for value in values]
+    return str(sep).join(parts) + str(end)
 
 
 _reconfigure_stdio_utf8()
@@ -24,29 +48,92 @@ _reconfigure_stdio_utf8()
 
 class LOG:
     _original_stdout = None
+    _original_stderr = None
     _log_capture = None
     _is_collecting = False
+    _print_hook_installed = False
+    _installed_print = None
+    _print_passthrough_depth = 0
+
+    @classmethod
+    def install_print_hook(cls):
+        if cls._print_hook_installed:
+            return
+
+        def _hooked_print(*values, sep=" ", end="\n", file=None, flush=False):
+            target = file if file is not None else sys.stdout
+            text = _join_print_values(*values, sep=sep, end=end)
+
+            if cls._print_passthrough_depth > 0:
+                _ORIGINAL_PRINT(*values, sep=sep, end=end, file=target, flush=flush)
+                return
+
+            if target in (sys.stdout, cls._original_stdout, None):
+                cls._write_stdout_text(text, flush=flush)
+                return
+
+            if target in (sys.stderr, cls._original_stderr):
+                cls._write_stderr_text(text, flush=flush)
+                return
+
+            _ORIGINAL_PRINT(*values, sep=sep, end=end, file=target, flush=flush)
+
+        builtins.print = _hooked_print
+        cls._installed_print = _hooked_print
+        cls._print_hook_installed = True
+
+    @classmethod
+    def uninstall_print_hook(cls):
+        if not cls._print_hook_installed:
+            return
+        if builtins.print is cls._installed_print:
+            builtins.print = _ORIGINAL_PRINT
+        cls._installed_print = None
+        cls._print_hook_installed = False
+
+    @classmethod
+    def _passthrough_print(cls, text, *, stream=None, flush=False):
+        cls._print_passthrough_depth += 1
+        try:
+            _ORIGINAL_PRINT(text, sep="", end="", file=stream, flush=flush)
+        finally:
+            cls._print_passthrough_depth -= 1
+
+    @classmethod
+    def _write_stdout_text(cls, text, *, flush=False):
+        target = sys.stdout
+        cls._passthrough_print(text, stream=target, flush=flush)
+        if cls._is_collecting and cls._log_capture is not None:
+            cls._log_capture.write(text)
+
+    @classmethod
+    def _write_stderr_text(cls, text, *, flush=False):
+        target = sys.stderr
+        cls._passthrough_print(text, stream=target, flush=flush)
+        if cls._is_collecting and cls._log_capture is not None:
+            cls._log_capture.write(text)
 
     @classmethod
     def start_collecting(cls):
         """开始收集日志输出"""
         _reconfigure_stdio_utf8()
+        cls.install_print_hook()
         cls._log_capture = io.StringIO()
         cls._original_stdout = sys.stdout
-        sys.stdout = _TeeOutput(cls._original_stdout, cls._log_capture)
+        cls._original_stderr = sys.stderr
         cls._is_collecting = True
 
     @classmethod
     def stop_collecting(cls):
-        if cls._original_stdout is not None:
-            sys.stdout = cls._original_stdout
-            cls._original_stdout = None
         cls._is_collecting = False
+        cls._original_stdout = None
+        cls._original_stderr = None
 
     @classmethod
-    def get_log_content(cls) -> str:
+    def get_log_content(cls, strip_ansi: bool = False) -> str:
         if cls._log_capture:
-            return cls._log_capture.getvalue()
+            content = cls._log_capture.getvalue()
+            return cls._strip_ansi_codes(content) if strip_ansi else content
         return ""
 
     @classmethod
@@ -59,67 +146,67 @@ class LOG:
     def _normalize_log_text(cls, text) -> str:
         if text is None:
             return ""
-
-        normalized_chars = []
-        for ch in str(text):
-            if ch in ("\ufe0f", "\ufe0e", "\u200d"):
-                continue
-
-            # Windows + Blender 的控制台链路对 emoji 等符号兼容性很差，
-            # 这里统一剥离掉，优先保证中文提示稳定可读。
-            if unicodedata.category(ch) == "So":
-                continue
-
-            normalized_chars.append(ch)
-
-        return "".join(normalized_chars)
+        return str(text)
 
     @classmethod
-    def info(cls,input):
+    def _print_line(cls, text):
+        print(cls._normalize_log_text(text))
+
+    @classmethod
+    def info(cls, input):
         if type(input) == list:
             for something in input:
-                print(cls._normalize_log_text(something))
+                cls._print_line(something)
         else:
-            print(cls._normalize_log_text(input))
+            cls._print_line(input)
 
     @classmethod
-    def error(cls,input:str):
+    def error(cls, input: str):
         raise Fatal(input)
 
     @classmethod
-    def warning(cls,input:str):
+    def warning(cls, input: str):
         """输出警告日志（黄色文本）"""
-        print("\033[33m" + "Warning: " + cls._normalize_log_text(input) + "\033[0m")
+        cls._print_line("\033[33m" + "Warning: " + cls._normalize_log_text(input) + "\033[0m")
         cls.newline()
 
     @classmethod
     def debug(cls, input: str):
         """输出调试日志（青色文本）"""
-        print("\033[36m" + "Debug: " + cls._normalize_log_text(input) + "\033[0m")
+        cls._print_line("\033[36m" + "Debug: " + cls._normalize_log_text(input) + "\033[0m")
+
+    @classmethod
+    def exception(cls, exc: BaseException | None = None):
+        """输出异常堆栈，并纳入现有日志收集链。"""
+        if exc is None:
+            formatted = traceback.format_exc()
+        else:
+            formatted = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        if not formatted or formatted == "NoneType: None\n":
+            return
+        cls._write_stderr_text(formatted)
 
     @classmethod
     def newline(cls):
         """输出分隔线（绿色）"""
-        print("\033[32m" + "-" * 110 + "\033[0m")
+        cls._print_line("\033[32m" + "-" * 110 + "\033[0m")
 
     @classmethod
     def save_to_text_editor(cls, text_name: str = "导出流程日志"):
         import bpy
-        
-        log_content = cls.get_log_content()
+
+        log_content = cls.get_log_content(strip_ansi=True)
         if not log_content:
             return
-        
-        clean_content = cls._strip_ansi_codes(log_content)
-        
+
         if text_name in bpy.data.texts:
             text_block = bpy.data.texts[text_name]
             text_block.clear()
         else:
             text_block = bpy.data.texts.new(text_name)
-        
-        text_block.write(clean_content)
-        
+
+        text_block.write(log_content)
+
         return text_name
 
     @classmethod
@@ -129,22 +216,4 @@ class LOG:
         return ansi_escape.sub('', text)
 
 
-class _TeeOutput:
-    """将输出同时写入多个流的 Tee 类"""
-    def __init__(self, *outputs):
-        self.outputs = outputs
-
-    def write(self, text):
-        normalized_text = LOG._normalize_log_text(text)
-        for output in self.outputs:
-            output.write(normalized_text)
-
-    def flush(self):
-        for output in self.outputs:
-            try:
-                output.flush()
-            except:
-                pass
-
-    def __getattr__(self, name):
-        return getattr(self.outputs[0], name)
+LOG.install_print_hook()

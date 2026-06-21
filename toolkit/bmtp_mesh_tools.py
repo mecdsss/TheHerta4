@@ -6,6 +6,348 @@ from ..utils.color_attribute_utils import read_color_attribute_data, write_color
 from ..utils.vertex_color_utils import build_vertex_color_payload, ensure_color_attribute
 
 
+def _iter_face_convert_target_objects(context):
+    if getattr(context, "mode", "") == 'EDIT_MESH':
+        objects = getattr(context, "objects_in_mode_unique_data", None) or [getattr(context, "active_object", None)]
+    else:
+        objects = getattr(context, "selected_objects", []) or []
+
+    for obj in objects:
+        if obj is not None and getattr(obj, "type", "") == 'MESH':
+            yield obj
+
+
+def _get_active_uv_layer(bm):
+    loop_layers = getattr(getattr(getattr(bm, "loops", None), "layers", None), "uv", None)
+    return getattr(loop_layers, "active", None)
+
+
+def _get_loop_uv(loop, uv_layer):
+    uv_data = loop[uv_layer]
+    uv = getattr(uv_data, "uv", uv_data)
+    return (float(uv[0]), float(uv[1]))
+
+
+def _uvs_equal(left_uv, right_uv, epsilon=1e-6):
+    return abs(float(left_uv[0]) - float(right_uv[0])) <= epsilon and abs(float(left_uv[1]) - float(right_uv[1])) <= epsilon
+
+
+def _get_face_edge_uv_map(face, edge, uv_layer):
+    if uv_layer is None:
+        return {}
+    for loop in getattr(face, "loops", []) or []:
+        if getattr(loop, "edge", None) != edge:
+            continue
+        next_loop = getattr(loop, "link_loop_next", None)
+        if next_loop is None:
+            return {}
+        return {
+            getattr(loop, "vert", None): _get_loop_uv(loop, uv_layer),
+            getattr(next_loop, "vert", None): _get_loop_uv(next_loop, uv_layer),
+        }
+    return {}
+
+
+def _is_uv_continuous_across_edge(edge, uv_layer):
+    if uv_layer is None:
+        return True
+    linked_faces = list(getattr(edge, "link_faces", []) or [])
+    if len(linked_faces) != 2:
+        return False
+    face_uv_maps = [_get_face_edge_uv_map(face, edge, uv_layer) for face in linked_faces]
+    for vert in getattr(edge, "verts", []) or []:
+        left_uv = face_uv_maps[0].get(vert)
+        right_uv = face_uv_maps[1].get(vert)
+        if left_uv is None or right_uv is None:
+            return False
+        if not _uvs_equal(left_uv, right_uv):
+            return False
+    return True
+
+
+def _collect_uv_islands(faces, uv_layer):
+    face_set = set(faces)
+    if not face_set:
+        return []
+    if uv_layer is None:
+        return [face_set]
+
+    remaining = set(face_set)
+    islands = []
+    while remaining:
+        seed = remaining.pop()
+        island = {seed}
+        stack = [seed]
+        while stack:
+            face = stack.pop()
+            for edge in getattr(face, "edges", []) or []:
+                if not _is_uv_continuous_across_edge(edge, uv_layer):
+                    continue
+                for linked_face in getattr(edge, "link_faces", []) or []:
+                    if linked_face not in remaining or linked_face not in face_set:
+                        continue
+                    remaining.remove(linked_face)
+                    island.add(linked_face)
+                    stack.append(linked_face)
+        islands.append(island)
+    return islands
+
+
+def _triangle_pair_merge_score(face_a, face_b, edge):
+    normal_score = 0.0
+    normal_a = getattr(face_a, "normal", None)
+    normal_b = getattr(face_b, "normal", None)
+    if normal_a is not None and normal_b is not None:
+        try:
+            normal_score = float(normal_a.normalized().dot(normal_b.normalized()))
+        except Exception:
+            normal_score = 0.0
+
+    edge_length = 0.0
+    calc_length = getattr(edge, "calc_length", None)
+    if callable(calc_length):
+        try:
+            edge_length = float(calc_length())
+        except Exception:
+            edge_length = 0.0
+    return (normal_score, edge_length)
+
+
+def _pick_triangle_pair_edges_for_dissolve(faces, uv_layer):
+    candidate_edges = []
+    for island_faces in _collect_uv_islands(faces, uv_layer):
+        triangle_faces = {face for face in island_faces if len(getattr(face, "verts", []) or []) == 3}
+        seen_edges = set()
+        scored_edges = []
+        for face in triangle_faces:
+            for edge in getattr(face, "edges", []) or []:
+                if edge in seen_edges:
+                    continue
+                seen_edges.add(edge)
+                linked_faces = [linked_face for linked_face in getattr(edge, "link_faces", []) or [] if linked_face in triangle_faces]
+                if len(linked_faces) != 2:
+                    continue
+                face_a, face_b = linked_faces
+                if len(set(getattr(face_a, "verts", []) or []) | set(getattr(face_b, "verts", []) or [])) != 4:
+                    continue
+                if getattr(face_a, "material_index", 0) != getattr(face_b, "material_index", 0):
+                    continue
+                if getattr(face_a, "smooth", True) != getattr(face_b, "smooth", True):
+                    continue
+                if uv_layer is not None and not _is_uv_continuous_across_edge(edge, uv_layer):
+                    continue
+                scored_edges.append((_triangle_pair_merge_score(face_a, face_b, edge), edge, face_a, face_b))
+
+        used_faces = set()
+        for _score, edge, face_a, face_b in sorted(scored_edges, key=lambda item: item[0], reverse=True):
+            if face_a in used_faces or face_b in used_faces:
+                continue
+            used_faces.add(face_a)
+            used_faces.add(face_b)
+            candidate_edges.append(edge)
+    return candidate_edges
+
+
+def _convert_tris_to_quads_in_bmesh(bm, selected_only):
+    bm.faces.ensure_lookup_table()
+    target_faces = [face for face in bm.faces if len(face.verts) == 3 and (face.select or not selected_only)]
+    if not target_faces:
+        return 0
+    dissolve_edges = _pick_triangle_pair_edges_for_dissolve(target_faces, _get_active_uv_layer(bm))
+    if not dissolve_edges:
+        return 0
+    bmesh.ops.dissolve_edges(bm, edges=dissolve_edges, use_verts=False, use_face_split=False)
+    return len(dissolve_edges)
+
+
+def _triangulate_faces_in_bmesh(bm, selected_only):
+    bm.faces.ensure_lookup_table()
+    target_faces = [face for face in bm.faces if len(face.verts) > 3 and (face.select or not selected_only)]
+    if not target_faces:
+        return 0
+    try:
+        bmesh.ops.triangulate(bm, faces=target_faces, quad_method='BEAUTY', ngon_method='BEAUTY')
+    except TypeError:
+        bmesh.ops.triangulate(bm, faces=target_faces)
+    return len(target_faces)
+
+
+def _apply_face_converter_to_object(obj, converter, selected_only, edit_mode):
+    if edit_mode:
+        bm = bmesh.from_edit_mesh(obj.data)
+        affected_faces = converter(bm, selected_only)
+        if affected_faces > 0:
+            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        return affected_faces
+
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(obj.data)
+        affected_faces = converter(bm, False)
+        if affected_faces > 0:
+            bm.to_mesh(obj.data)
+            obj.data.update()
+        return affected_faces
+    finally:
+        bm.free()
+
+
+def _run_face_converter(context, converter):
+    edit_mode = getattr(context, "mode", "") == 'EDIT_MESH'
+    processed_objects = 0
+    affected_faces = 0
+    for obj in _iter_face_convert_target_objects(context):
+        current_affected = _apply_face_converter_to_object(
+            obj=obj,
+            converter=converter,
+            selected_only=edit_mode,
+            edit_mode=edit_mode,
+        )
+        if current_affected > 0:
+            processed_objects += 1
+            affected_faces += current_affected
+    return processed_objects, affected_faces
+
+
+def _has_face_convert_target(context):
+    return any(True for _obj in _iter_face_convert_target_objects(context))
+
+
+def _iter_selected_mesh_objects(context):
+    for obj in getattr(context, "selected_objects", []) or []:
+        if obj is not None and getattr(obj, "type", "") == "MESH":
+            yield obj
+
+
+def _object_has_shape_keys(obj):
+    shape_keys = getattr(getattr(obj, "data", None), "shape_keys", None)
+    key_blocks = getattr(shape_keys, "key_blocks", None)
+    return bool(key_blocks)
+
+
+def _create_temp_subsurf_modifier(obj, levels=1):
+    modifiers = getattr(obj, "modifiers", None)
+    if modifiers is None or not hasattr(modifiers, "new"):
+        return None
+    modifier = modifiers.new(name="TH4_TempLimitSurface", type='SUBSURF')
+    if modifier is None:
+        return None
+    modifier.subdivision_type = 'CATMULL_CLARK'
+    modifier.levels = int(levels)
+    modifier.render_levels = int(levels)
+    if hasattr(modifier, "quality"):
+        modifier.quality = max(3, int(getattr(modifier, "quality", 3) or 3))
+    if hasattr(modifier, "use_limit_surface"):
+        modifier.use_limit_surface = True
+    return modifier
+
+
+def _build_temp_limit_surface_object(context, obj, levels=1):
+    object_name = str(getattr(obj, "name", "") or "").strip() or "TH4_LimitSurface"
+    source_mesh = getattr(obj, "data", None)
+    if source_mesh is None or not hasattr(source_mesh, "copy"):
+        return None, None
+
+    temp_mesh = source_mesh.copy()
+    temp_mesh.name = f"{object_name}_TempLimitSurfaceMesh"
+
+    object_factory = getattr(getattr(bpy, "data", None), "objects", None)
+    temp_obj = None
+    if object_factory is not None and hasattr(object_factory, "new"):
+        temp_obj = object_factory.new(f"{object_name}_TempLimitSurface", temp_mesh)
+    else:
+        return None, temp_mesh
+
+    temp_obj.matrix_world = getattr(obj, "matrix_world", None)
+    temp_obj.parent = None
+    for modifier in reversed(list(getattr(temp_obj, "modifiers", []) or [])):
+        _remove_modifier(temp_obj, modifier)
+    _create_temp_subsurf_modifier(temp_obj, levels=levels)
+    collection = getattr(context, "collection", None) or getattr(getattr(context, "scene", None), "collection", None)
+    if collection is not None and hasattr(getattr(collection, "objects", None), "link"):
+        try:
+            collection.objects.link(temp_obj)
+        except Exception:
+            pass
+    return temp_obj, temp_mesh
+
+
+def _remove_modifier(obj, modifier):
+    modifiers = getattr(obj, "modifiers", None)
+    if modifiers is None or modifier is None:
+        return
+    remove = getattr(modifiers, "remove", None)
+    if callable(remove):
+        remove(modifier)
+
+
+def _new_mesh_from_evaluated_object(context, obj):
+    depsgraph = context.evaluated_depsgraph_get()
+    evaluated_obj = obj.evaluated_get(depsgraph)
+    meshes = getattr(getattr(bpy, "data", None), "meshes", None)
+    new_from_object = getattr(meshes, "new_from_object", None)
+    if callable(new_from_object):
+        for kwargs in (
+            {"preserve_all_data_layers": True, "depsgraph": depsgraph},
+            {"depsgraph": depsgraph},
+            {},
+        ):
+            try:
+                return new_from_object(evaluated_obj, **kwargs)
+            except TypeError:
+                continue
+    raise RuntimeError("unable_to_create_evaluated_mesh")
+
+
+def _replace_object_mesh_data(obj, new_mesh):
+    old_mesh = getattr(obj, "data", None)
+    if old_mesh is None or new_mesh is None:
+        return False
+    old_name = getattr(old_mesh, "name", "")
+    if old_name and hasattr(new_mesh, "name"):
+        new_mesh.name = old_name
+    obj.data = new_mesh
+    remove_mesh = getattr(getattr(getattr(bpy, "data", None), "meshes", None), "remove", None)
+    if callable(remove_mesh) and old_mesh is not None and getattr(old_mesh, "users", 0) <= 0:
+        try:
+            remove_mesh(old_mesh)
+        except Exception:
+            pass
+    return True
+
+
+def _bake_limit_surface_from_temp_subsurf(context, obj, levels=1):
+    temp_obj, temp_mesh = _build_temp_limit_surface_object(context, obj, levels=levels)
+    if temp_obj is None:
+        return False, 0, 0, "no_temp_object"
+    try:
+        baked_mesh = _new_mesh_from_evaluated_object(context, temp_obj)
+        if baked_mesh is None:
+            return False, 0, 0, "no_evaluated_mesh"
+        vertex_count = len(getattr(baked_mesh, "vertices", []) or [])
+        polygon_count = len(getattr(baked_mesh, "polygons", []) or [])
+        if not _replace_object_mesh_data(obj, baked_mesh):
+            return False, 0, 0, "replace_mesh_failed"
+        if hasattr(obj.data, "update"):
+            obj.data.update()
+        return True, vertex_count, polygon_count, ""
+    except Exception as exc:
+        return False, 0, 0, str(exc)
+    finally:
+        if temp_obj is not None:
+            try:
+                bpy.data.objects.remove(temp_obj, do_unlink=True)
+            except Exception:
+                pass
+        elif temp_mesh is not None:
+            remove_mesh = getattr(getattr(getattr(bpy, "data", None), "meshes", None), "remove", None)
+            if callable(remove_mesh):
+                try:
+                    remove_mesh(temp_mesh)
+                except Exception:
+                    pass
+
+
 def srgb_to_linear(srgb_value):
     """将 SRGB 值转换为线性值"""
     if srgb_value <= 0.04045:
@@ -72,6 +414,96 @@ class BMTP_OT_DynamicBridge(bpy.types.Operator):
         
         bmesh.update_edit_mesh(obj.data)
         
+        return {'FINISHED'}
+
+
+class BMTP_OT_TrisToQuadsPreserveUV(bpy.types.Operator):
+    bl_idname = "toolkit.bmtp_tris_to_quads_preserve_uv"
+    bl_label = "Tris to Quads (UV Island Safe)"
+    bl_description = "Convert triangles to quads without crossing active UV island boundaries"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context, "mode", "") in {'OBJECT', 'EDIT_MESH'} and _has_face_convert_target(context)
+
+    def execute(self, context):
+        processed_objects, affected_faces = _run_face_converter(context, _convert_tris_to_quads_in_bmesh)
+        if processed_objects <= 0:
+            self.report({'WARNING'}, "No triangle pairs were merged")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Merged {affected_faces} triangle pairs on {processed_objects} object(s)")
+        return {'FINISHED'}
+
+
+class BMTP_OT_QuadsToTris(bpy.types.Operator):
+    bl_idname = "toolkit.bmtp_quads_to_tris"
+    bl_label = "Quads to Tris"
+    bl_description = "Triangulate selected quads and ngons"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context, "mode", "") in {'OBJECT', 'EDIT_MESH'} and _has_face_convert_target(context)
+
+    def execute(self, context):
+        processed_objects, affected_faces = _run_face_converter(context, _triangulate_faces_in_bmesh)
+        if processed_objects <= 0:
+            self.report({'WARNING'}, "No quads or ngons were triangulated")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Triangulated {affected_faces} face(s) on {processed_objects} object(s)")
+        return {'FINISHED'}
+
+
+class BMTP_OT_EnableSubdivisionLimitSurface(bpy.types.Operator):
+    bl_idname = "toolkit.bmtp_enable_subdivision_limit_surface"
+    bl_label = "应用极限表面"
+    bl_description = "临时执行 Catmull-Clark 表面细分并启用极限表面，再将结果直接烘焙回网格"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context, "mode", "") == 'OBJECT' and any(True for _obj in _iter_selected_mesh_objects(context))
+
+    def execute(self, context):
+        props = getattr(getattr(context, "scene", None), "bmtp_props", None)
+        levels = int(getattr(props, "limit_surface_subdiv_levels", 2) or 2)
+        processed_objects = 0
+        baked_vertices = 0
+        baked_faces = 0
+        skipped_shape_key_objects = []
+        failed_objects = []
+
+        for obj in _iter_selected_mesh_objects(context):
+            if _object_has_shape_keys(obj):
+                skipped_shape_key_objects.append(getattr(obj, "name", ""))
+                continue
+
+            success, vertex_count, polygon_count, _error = _bake_limit_surface_from_temp_subsurf(context, obj, levels=levels)
+            if not success:
+                failed_objects.append(getattr(obj, "name", ""))
+                continue
+
+            processed_objects += 1
+            baked_vertices += vertex_count
+            baked_faces += polygon_count
+
+        if processed_objects <= 0:
+            if skipped_shape_key_objects and not failed_objects:
+                self.report({'WARNING'}, "No object was baked; shape-key objects were skipped")
+            else:
+                self.report({'WARNING'}, "No object was baked to the limit surface")
+            return {'CANCELLED'}
+
+        message = (
+            f"Baked limit surface on {processed_objects} object(s), "
+            f"{baked_vertices} vertices, {baked_faces} faces, level {levels}"
+        )
+        if skipped_shape_key_objects:
+            message += f"; skipped {len(skipped_shape_key_objects)} shape-key object(s)"
+        if failed_objects:
+            message += f"; failed {len(failed_objects)} object(s)"
+        self.report({'INFO'}, message)
         return {'FINISHED'}
 
 
@@ -238,6 +670,9 @@ class BMTP_OT_CleanUselessShapeKeys(bpy.types.Operator):
 
 bmtp_mesh_tools_list = (
     BMTP_OT_DynamicBridge,
+    BMTP_OT_TrisToQuadsPreserveUV,
+    BMTP_OT_QuadsToTris,
+    BMTP_OT_EnableSubdivisionLimitSurface,
     BMTP_OT_SetVertexColor,
     BMTP_OT_DeleteEmptyMeshes,
     BMTP_OT_SyncDataNames,

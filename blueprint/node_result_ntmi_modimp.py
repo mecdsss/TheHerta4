@@ -67,9 +67,7 @@ class SSMT_OT_GenerateNTMIModImpBlueprint(bpy.types.Operator):
                 os.startfile(output_dir)
             return {"FINISHED"}
         except Exception as exc:
-            import traceback
-
-            traceback.print_exc()
+            LOG.exception(exc)
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         finally:
@@ -152,6 +150,12 @@ class SSMTNode_Result_Output_NTMIModImp(SSMTNodeBase):
         default=True,
     )  # type: ignore
 
+    extra_ps_t2_diffuse_map: bpy.props.BoolProperty(
+        name="ps-t2 = DiffuseMap",
+        description="Also emit ps-t2 using the generated DiffuseMap resource during NTMI ModImp postprocess",
+        default=False,
+    )  # type: ignore
+
     flip_uv_v: bpy.props.BoolProperty(
         name="Flip UV V",
         default=True,
@@ -222,6 +226,7 @@ class SSMTNode_Result_Output_NTMIModImp(SSMTNodeBase):
         layout.prop(self, "force_buffer_only_when_contract_missing", text="缺少合同字段时只导出 Buffer")
         layout.prop(self, "flip_uv_v", text="翻转 UV V")
         layout.prop(self, "run_postprocess_nodes", text="运行兼容后处理节点")
+        layout.prop(self, "extra_ps_t2_diffuse_map", text="ps-t2 = DiffuseMap")
 
     def update(self):
         if self.inputs and self.inputs[-1].is_linked:

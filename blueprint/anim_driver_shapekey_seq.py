@@ -2,6 +2,7 @@ import bpy
 from bpy.props import IntProperty, StringProperty, BoolProperty, CollectionProperty
 
 from .anim_driver_base import SSMTNode_AnimDriver_Base
+from .variable_registry import normalize_variable_name
 
 
 def _resolve_shapekey_variable(item):
@@ -279,13 +280,25 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
         self.outputs.new('SSMTSocketAnimDriver', "时间输出")
         self.width = 350
         self._assign_next_available_index()
-        self.custom_paused_var = f"$shapekey_seq_paused{self.auto_index}"
-        self.driven_variable = f"$shapekey_seq{self.auto_index}"
+        self._ensure_paused_variable_name("shapekey_seq_paused")
+        self._ensure_sequence_driver_variable_name()
 
     def copy(self, node):
         self._assign_next_available_index()
-        self.custom_paused_var = f"$shapekey_seq_paused{self.auto_index}"
-        self.driven_variable = f"$shapekey_seq{self.auto_index}"
+        self.custom_paused_var = ""
+        self.driven_variable = ""
+        self._ensure_paused_variable_name("shapekey_seq_paused")
+        self._ensure_sequence_driver_variable_name()
+
+    def _ensure_sequence_driver_variable_name(self):
+        current_value = str(getattr(self, "driven_variable", "") or "").strip()
+        normalized = normalize_variable_name(current_value)
+        if normalized:
+            self.driven_variable = f"${normalized}"
+            return self.driven_variable
+        allocated = self._allocate_unique_anim_driver_variable_name("shapekey_seq")
+        self.driven_variable = f"${allocated}"
+        return self.driven_variable
 
     def draw_buttons(self, context, layout):
         safe_idx = self._read_safe_index()
@@ -361,7 +374,7 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
 
-        paused_state = 1 if self.default_paused else 0
+        paused_state = self._resolve_default_play_state(self.default_paused)
         paused_var = self.custom_paused_var.strip()
         if not paused_var:
             paused_var = f"$shapekey_seq_paused{idx}"
@@ -380,12 +393,14 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
         ]
 
         if not items_with_data:
-            return f"""[Constants]
-global $shapekey_seq_frame_count{idx} = 0
-global $speed_auto{idx} = {playback_rate}
-; 切换速度
-global {paused_var} = {paused_state}
-; 暂停状态"""
+            return "\n".join([
+                "[Constants]",
+                self._format_global_assignment(f"$shapekey_seq_frame_count{idx}", 0, persist=True),
+                self._format_global_assignment(f"$speed_auto{idx}", playback_rate, persist=True),
+                "; 切换速度",
+                self._format_global_assignment(paused_var, paused_state, persist=True),
+                "; 暂停状态",
+            ])
 
         frame_values = []
         for item in items_with_data:
@@ -399,13 +414,13 @@ global {paused_var} = {paused_state}
 
         lines = [
             "[Constants]",
-            f"global $speed_auto{idx} = {playback_rate}",
+            self._format_global_assignment(f"$speed_auto{idx}", playback_rate, persist=True),
             "; 切换速度（由运行时间的播放速率控制）",
-            f"global {paused_var} = {paused_state}",
+            self._format_global_assignment(paused_var, paused_state, persist=True),
             "; 暂停状态",
-            f"global {drv} = 0",
+            self._format_global_assignment(drv, 0, persist=True),
             "; 当前动画帧索引（自驱动）",
-            f"global $shapekey_seq_frame_count{idx} = {frame_count}",
+            self._format_global_assignment(f"$shapekey_seq_frame_count{idx}", frame_count, persist=True),
             "; 总帧数",
             "[Present]",
             f"; 形态键动画序列 - 自驱动 {drv}",
@@ -457,11 +472,12 @@ def _shapekey_seq_load_handler(dummy):
         for node in tree.nodes:
             if node.bl_idname == 'SSMTNode_AnimDriver_ShapeKeySequence':
                 try:
+                    SSMTNode_AnimDriver_Base.migrate_default_play_state_flag(node)
                     SSMTNode_AnimDriver_Base._migrate_play_sockets(node)
                     if not node.custom_paused_var:
-                        node.custom_paused_var = f"$shapekey_seq_paused{node.auto_index}"
+                        node._ensure_indexed_paused_variable_name("shapekey_seq_paused")
                     if not node.driven_variable:
-                        node.driven_variable = f"$shapekey_seq{node.auto_index}"
+                        node._ensure_sequence_driver_variable_name()
                 except Exception:
                     pass
 

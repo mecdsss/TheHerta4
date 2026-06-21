@@ -37,9 +37,9 @@ class SSMTNode_AnimDriver_Runtime(SSMTNode_AnimDriver_Base):
 
     def generate_ini_segment(self, connected_nodes=None) -> str:
         return f"""[Constants]
-global $fps = {self.fps}
+global persist $fps = {self.fps}
 ; 固定帧率
-global $swapvar = 0
+global persist $swapvar = 0
 ; 当前帧索引（整数）
 [Present]
 ; 基于系统时间的自动计算（每帧执行）

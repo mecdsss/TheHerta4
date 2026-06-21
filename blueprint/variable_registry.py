@@ -60,6 +60,16 @@ def _iter_node_variable_names(node):
         yield continuous_custom_name
     if continuous_assigned_name:
         yield continuous_assigned_name
+    paused_name = normalize_variable_name(getattr(node, "custom_paused_var", "") or "")
+    driven_name = normalize_variable_name(getattr(node, "driven_variable", "") or "")
+    if paused_name:
+        yield paused_name
+    if driven_name:
+        yield driven_name
+    for item in getattr(node, "driven_variable_list", []) or []:
+        variable_name = normalize_variable_name(getattr(item, "variable_name", "") or "")
+        if variable_name:
+            yield variable_name
 
 
 def _iter_shapekey_item_variable_names(item):

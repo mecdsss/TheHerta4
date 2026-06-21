@@ -2,6 +2,8 @@ import bpy
 from bpy.types import Operator
 from bpy.props import StringProperty
 
+from ..utils.log_utils import LOG
+
 
 _ANIM_DRIVER_NODE_TYPE = 'SSMTNode_PostProcess_AnimDriver'
 
@@ -45,7 +47,7 @@ class SSMT_OT_BlueprintNestNavigate(Operator):
         for node in nested_tree.nodes:
             node.select = False
 
-        print(f"[Blueprint Nest] 进入嵌套蓝图: {blueprint_name}")
+        LOG.info(f"[Blueprint Nest] 进入嵌套蓝图: {blueprint_name}")
 
     def return_to_parent_blueprint(self, context):
         space_data = getattr(context, "space_data", None)
@@ -59,15 +61,15 @@ class SSMT_OT_BlueprintNestNavigate(Operator):
         parent_blueprints = self.find_parent_blueprints(current_blueprint_name)
 
         if not parent_blueprints:
-            print(f"[Blueprint Nest] 未找到引用蓝图 '{current_blueprint_name}' 的父蓝图")
+            LOG.info(f"[Blueprint Nest] 未找到引用蓝图 '{current_blueprint_name}' 的父蓝图")
             return
 
         parent_tree, nest_node = parent_blueprints[0]
 
         if len(parent_blueprints) > 1:
-            print(f"[Blueprint Nest] 警告: 找到 {len(parent_blueprints)} 个父蓝图，选择第一个: {parent_tree.name}")
+            LOG.warning(f"[Blueprint Nest] 找到 {len(parent_blueprints)} 个父蓝图，选择第一个: {parent_tree.name}")
             for tree, node in parent_blueprints:
-                print(f"  - {tree.name} (节点: {node.name})")
+                LOG.info(f"  - {tree.name} (节点: {node.name})")
 
         space_data.node_tree = parent_tree
 
@@ -76,7 +78,7 @@ class SSMT_OT_BlueprintNestNavigate(Operator):
                 node.select = False
             nest_node.select = True
 
-        print(f"[Blueprint Nest] 返回父蓝图: {parent_tree.name}")
+        LOG.info(f"[Blueprint Nest] 返回父蓝图: {parent_tree.name}")
 
     def find_parent_blueprints(self, blueprint_name):
         parent_blueprints = []
@@ -208,7 +210,7 @@ def register_keymaps():
     )
     _keymaps.append((km, kmi))
 
-    print("[Blueprint Nest] 已注册 Tab 键导航")
+    LOG.info("[Blueprint Nest] 已注册 Tab 键导航")
 
 
 def unregister_keymaps():
@@ -216,7 +218,7 @@ def unregister_keymaps():
         km.keymap_items.remove(kmi)
     _keymaps.clear()
 
-    print("[Blueprint Nest] 已注销 Tab 键导航")
+    LOG.info("[Blueprint Nest] 已注销 Tab 键导航")
 
 
 def register():

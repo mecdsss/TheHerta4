@@ -1,13 +1,13 @@
 import os
 
 from ...common.global_config import GlobalConfig
-from ...common.global_properties import GlobalProterties
 from ...common.global_key_count_helper import GlobalKeyCountHelper
+from ...common.global_properties import GlobalProterties
+from ...common.m_ini_builder import M_IniBuilder, M_IniSection, M_SectionType
 from ...common.m_ini_helper import M_IniHelper
 from ...common.m_ini_helper_gui import M_IniHelperGUI
-from ...common.m_ini_builder import M_IniBuilder, M_IniSection, M_SectionType
-from .unity import ExportUnity
 from ...utils.timer_utils import TimerUtils
+from .unity import ExportUnity
 
 
 class ZZMITextureMarkName:
@@ -19,6 +19,16 @@ class ZZMITextureMarkName:
 
 
 class ExportZZMI(ExportUnity):
+    CROSS_IB_METHOD_VB_COPY = "VB_COPY"
+    CROSS_IB_METHOD_VB_COPY_CB1 = "VB_COPY_CB1"
+    CROSS_IB_METHOD_VB_REF_SO0 = "VB_REF_SO0"
+
+    SUPPORTED_CROSS_IB_METHODS = {
+        CROSS_IB_METHOD_VB_COPY,
+        CROSS_IB_METHOD_VB_COPY_CB1,
+        CROSS_IB_METHOD_VB_REF_SO0,
+    }
+
     SLOT_FIX_RESOURCE_NAME_DICT = {
         ZZMITextureMarkName.DiffuseMap: r"Resource\ZZMI\Diffuse",
         ZZMITextureMarkName.NormalMap: r"Resource\ZZMI\NormalMap",
@@ -32,15 +42,244 @@ class ExportZZMI(ExportUnity):
 
         self.cross_ib_info_dict = blueprint_model.cross_ib_info_dict
         self.cross_ib_method_dict = blueprint_model.cross_ib_method_dict
+        self.cross_ib_mapping_method = getattr(blueprint_model, "cross_ib_mapping_method", {})
         self.has_cross_ib = blueprint_model.has_cross_ib
         self.cross_ib_object_names = blueprint_model.cross_ib_object_names
 
         print(f"[CrossIB ZZMI] 初始化: has_cross_ib={self.has_cross_ib}")
-        print(f"[CrossIB ZZMI] cross_ib_info_dict={self.cross_ib_info_dict}")
-        print(f"[CrossIB ZZMI] cross_ib_object_names={self.cross_ib_object_names}")
+        print(f"[CrossIB ZZMI] cross_ib_info_dict={self._format_cross_ib_info_dict(self.cross_ib_info_dict)}")
+        print(f"[CrossIB ZZMI] cross_ib_object_names={self._format_name_set(self.cross_ib_object_names)}")
 
     def _get_submesh_ib_key(self, submesh_model, draw_ib):
         return f"{draw_ib}_{submesh_model.match_first_index}"
+
+    @staticmethod
+    def _format_name_set(names) -> list[str]:
+        return sorted(str(name) for name in (names or []))
+
+    @staticmethod
+    def _format_cross_ib_info_dict(mapping) -> dict[str, list[str]]:
+        ordered = {}
+        for key in sorted((mapping or {}).keys(), key=str):
+            ordered[str(key)] = sorted(str(item) for item in ((mapping or {}).get(key) or []))
+        return ordered
+
+    def _get_mapping_method(self, source_ib_key: str, target_ib_key: str) -> str:
+        return self.cross_ib_mapping_method.get(
+            (source_ib_key, target_ib_key),
+            self.CROSS_IB_METHOD_VB_COPY,
+        )
+
+    def _get_source_methods(self, source_ib_key: str) -> set[str]:
+        methods = {
+            method
+            for (mapped_source_key, _mapped_target_key), method in self.cross_ib_mapping_method.items()
+            if mapped_source_key == source_ib_key
+        }
+        if not methods and source_ib_key in self.cross_ib_info_dict:
+            methods.add(self.CROSS_IB_METHOD_VB_COPY)
+        return methods
+
+    def _get_source_body_vb_resource_name(self, source_hash: str, source_first_index: int) -> str:
+        return f"ResourceBodyVB_{source_hash}_{source_first_index}"
+
+    def _get_source_cb1_capture_resource_name(self, source_hash: str, source_first_index: int) -> str:
+        return f"ResourceCaptureCB1_{source_hash}_{source_first_index}"
+
+    def _get_target_cb1_temp_resource_name(self, target_hash: str, target_first_index: int) -> str:
+        return f"ResourceTempCB1_{target_hash}_{target_first_index}"
+
+    def _get_source_so0_resource_name(self, source_hash: str, source_first_index: int) -> str:
+        return f"ResourceBodyVB0_{source_hash}_{source_first_index}"
+
+    def _append_source_capture_sections(
+        self,
+        section: M_IniSection,
+        source_hash: str,
+        source_first_index: int,
+        source_methods: set[str],
+    ) -> None:
+        if self.CROSS_IB_METHOD_VB_REF_SO0 in source_methods:
+            section.append("[" + self._get_source_so0_resource_name(source_hash, source_first_index) + "]")
+            section.append("type = Buffer")
+            section.append("stride = 40")
+
+        if self.CROSS_IB_METHOD_VB_COPY in source_methods or self.CROSS_IB_METHOD_VB_COPY_CB1 in source_methods:
+            section.append("[" + self._get_source_body_vb_resource_name(source_hash, source_first_index) + "]")
+
+        if self.CROSS_IB_METHOD_VB_COPY_CB1 in source_methods:
+            section.append("[" + self._get_source_cb1_capture_resource_name(source_hash, source_first_index) + "]")
+
+    def _append_source_capture_lines(
+        self,
+        section: M_IniSection,
+        source_hash: str,
+        source_first_index: int,
+        source_methods: set[str],
+    ) -> None:
+        if self.CROSS_IB_METHOD_VB_REF_SO0 in source_methods:
+            section.append(
+                self._get_source_so0_resource_name(source_hash, source_first_index) + " = ref so0"
+            )
+
+        if self.CROSS_IB_METHOD_VB_COPY in source_methods or self.CROSS_IB_METHOD_VB_COPY_CB1 in source_methods:
+            section.append(
+                self._get_source_body_vb_resource_name(source_hash, source_first_index) + " = copy vb0"
+            )
+
+        if self.CROSS_IB_METHOD_VB_COPY_CB1 in source_methods:
+            section.append(
+                self._get_source_cb1_capture_resource_name(source_hash, source_first_index)
+                + " = copy vs-cb1 unless_null"
+            )
+
+    def _append_source_capture_override(
+        self,
+        section: M_IniSection,
+        texture_override_name_suffix: str,
+        source_hash: str,
+        source_first_index: int,
+        source_methods: set[str],
+    ) -> None:
+        section.append("[TextureOverride_" + texture_override_name_suffix + "_copy]")
+        section.append("hash = " + source_hash)
+        section.append("match_first_index = " + str(source_first_index))
+        section.append("match_instance_count = 0")
+        self._append_source_capture_lines(
+            section,
+            source_hash,
+            source_first_index,
+            source_methods,
+        )
+
+    def _append_target_cross_ib_draw(
+        self,
+        section: M_IniSection,
+        method: str,
+        source_hash: str,
+        source_first_index: int,
+        source_ib_resource_name: str,
+        target_hash: str,
+        target_first_index: int,
+    ) -> None:
+        section.append("ib = " + source_ib_resource_name)
+
+        if method == self.CROSS_IB_METHOD_VB_REF_SO0:
+            source_body_vb0_name = self._get_source_so0_resource_name(source_hash, source_first_index)
+            section.append("vb0 = " + source_body_vb0_name)
+            section.append("vb1 = Resource" + source_hash + "Texcoord")
+            section.append("vb2 = Resource" + source_hash + "Blend")
+            section.append("vb3 = " + source_body_vb0_name)
+            return
+
+        source_body_vb_name = self._get_source_body_vb_resource_name(source_hash, source_first_index)
+        section.append("vb0 = " + source_body_vb_name)
+        section.append("vb1 = Resource" + source_hash + "Texcoord")
+
+        if method == self.CROSS_IB_METHOD_VB_COPY_CB1:
+            temp_resource_name = self._get_target_cb1_temp_resource_name(target_hash, target_first_index)
+            section.append(temp_resource_name + " = ref vs-cb1")
+            section.append("vs-cb1 = " + self._get_source_cb1_capture_resource_name(source_hash, source_first_index))
+        else:
+            section.append("vb2 = Resource" + source_hash + "Blend")
+            section.append("vb3 = " + source_body_vb_name)
+
+    def _append_target_cross_ib_cleanup(
+        self,
+        section: M_IniSection,
+        method: str,
+        target_hash: str,
+        target_first_index: int,
+    ) -> None:
+        if method == self.CROSS_IB_METHOD_VB_COPY_CB1:
+            temp_resource_name = self._get_target_cb1_temp_resource_name(target_hash, target_first_index)
+            section.append("vs-cb1 = ref " + temp_resource_name)
+
+    def _find_source_submesh(self, source_ib_key: str):
+        source_parts = source_ib_key.split("_")
+        source_hash = source_parts[0]
+        source_first_index = int(source_parts[1]) if len(source_parts) > 1 else 0
+
+        source_drawib_model = None
+        for dib_model in self.drawib_model_list:
+            if dib_model.draw_ib == source_hash:
+                source_drawib_model = dib_model
+                break
+
+        if source_drawib_model is None:
+            return None, None, source_hash, source_first_index
+
+        for source_submesh in source_drawib_model.submesh_model_list:
+            if str(source_submesh.match_first_index) == str(source_first_index):
+                return source_drawib_model, source_submesh, source_hash, source_first_index
+
+        return source_drawib_model, None, source_hash, source_first_index
+
+    def add_unity_vs_texture_override_vb_sections(self, ini_builder: M_IniBuilder, drawib_model):
+        d3d11_game_type = drawib_model.d3d11GameType
+        draw_ib = drawib_model.draw_ib
+
+        so0_source_resource_names = []
+        for submesh_model in drawib_model.submesh_model_list:
+            source_ib_key = self._get_submesh_ib_key(submesh_model, draw_ib)
+            if self.CROSS_IB_METHOD_VB_REF_SO0 in self._get_source_methods(source_ib_key):
+                so0_source_resource_names.append(
+                    self._get_source_so0_resource_name(draw_ib, submesh_model.match_first_index)
+                )
+
+        texture_override_vb_section = M_IniSection(M_SectionType.TextureOverrideVB)
+        texture_override_vb_section.append("; " + draw_ib)
+        for category_name in d3d11_game_type.OrderedCategoryNameList:
+            category_hash = drawib_model.category_hash_dict.get(category_name, "")
+            texture_override_vb_name_suffix = "VB_" + draw_ib + "_" + drawib_model.draw_ib_alias + "_" + category_name
+            texture_override_vb_section.append("[TextureOverride_" + texture_override_vb_name_suffix + "]")
+            texture_override_vb_section.append("hash = " + category_hash)
+
+            for original_category_name, draw_category_name in d3d11_game_type.CategoryDrawCategoryDict.items():
+                if category_name != draw_category_name:
+                    continue
+                category_original_slot = d3d11_game_type.CategoryExtractSlotDict[original_category_name]
+                texture_override_vb_section.append(category_original_slot + " = Resource" + draw_ib + original_category_name)
+
+            draw_category_name = d3d11_game_type.CategoryDrawCategoryDict.get("Blend", None)
+            if draw_category_name is not None and category_name == draw_category_name:
+                texture_override_vb_section.append("handling = skip")
+                texture_override_vb_section.append("draw = " + str(drawib_model.draw_number) + ", 0")
+                for so0_source_resource_name in so0_source_resource_names:
+                    texture_override_vb_section.append(so0_source_resource_name + " = ref so0")
+
+            if category_name == d3d11_game_type.CategoryDrawCategoryDict["Position"]:
+                if len(self.blueprint_model.keyname_mkey_dict.keys()) != 0:
+                    texture_override_vb_section.append("$active0 = 1")
+                    if GlobalProterties.generate_branch_mod_gui():
+                        texture_override_vb_section.append("$ActiveCharacter = 1")
+
+            texture_override_vb_section.new_line()
+
+        ini_builder.append_section(texture_override_vb_section)
+
+    def add_unity_vs_resource_vb_sections(self, ini_builder: M_IniBuilder, drawib_model):
+        super().add_unity_vs_resource_vb_sections(ini_builder=ini_builder, drawib_model=drawib_model)
+
+        position_stride = drawib_model.d3d11GameType.CategoryStrideDict.get("Position", 40)
+        so0_resource_section = M_IniSection(M_SectionType.ResourceBuffer)
+        appended_resource_names = set()
+        for submesh_model in drawib_model.submesh_model_list:
+            source_ib_key = self._get_submesh_ib_key(submesh_model, drawib_model.draw_ib)
+            if self.CROSS_IB_METHOD_VB_REF_SO0 not in self._get_source_methods(source_ib_key):
+                continue
+
+            resource_name = self._get_source_so0_resource_name(drawib_model.draw_ib, submesh_model.match_first_index)
+            if resource_name in appended_resource_names:
+                continue
+            appended_resource_names.add(resource_name)
+
+            so0_resource_section.append("[" + resource_name + "]")
+            so0_resource_section.append("type = Buffer")
+            so0_resource_section.append("stride = " + str(position_stride))
+            so0_resource_section.new_line()
+
+        ini_builder.append_section(so0_resource_section)
 
     def add_unity_vs_texture_override_ib_sections(self, ini_builder: M_IniBuilder, drawib_model):
         texture_override_ib_section = M_IniSection(M_SectionType.TextureOverrideIB)
@@ -61,7 +300,10 @@ class ExportZZMI(ExportUnity):
             is_cross_ib_source = current_ib_key in self.cross_ib_info_dict
             is_cross_ib_target = any(current_ib_key in targets for targets in self.cross_ib_info_dict.values())
 
-            print(f"[CrossIB ZZMI] submesh={submesh_model.unique_str}, ib_key={current_ib_key}, is_source={is_cross_ib_source}, is_target={is_cross_ib_target}")
+            print(
+                f"[CrossIB ZZMI] submesh={submesh_model.unique_str}, ib_key={current_ib_key}, "
+                f"is_source={is_cross_ib_source}, is_target={is_cross_ib_target}"
+            )
 
             source_ib_list_for_target = []
             if is_cross_ib_target:
@@ -69,15 +311,35 @@ class ExportZZMI(ExportUnity):
                     if current_ib_key in target_ib_list:
                         source_ib_list_for_target.append(source_ib)
 
+            source_methods = self._get_source_methods(current_ib_key) if is_cross_ib_source else set()
             if is_cross_ib_source:
-                texture_override_ib_section.append("[ResourceBodyVB_" + draw_ib + "_" + str(submesh_model.match_first_index) + "]")
+                self._append_source_capture_sections(
+                    texture_override_ib_section,
+                    draw_ib,
+                    submesh_model.match_first_index,
+                    source_methods,
+                )
+            elif self.CROSS_IB_METHOD_VB_COPY_CB1 in {
+                self._get_mapping_method(source_ib_key, current_ib_key)
+                for source_ib_key in source_ib_list_for_target
+            }:
+                texture_override_ib_section.append(
+                    "[" + self._get_target_cb1_temp_resource_name(draw_ib, submesh_model.match_first_index) + "]"
+                )
+
+            if is_cross_ib_source:
+                self._append_source_capture_override(
+                    texture_override_ib_section,
+                    texture_override_name_suffix,
+                    draw_ib,
+                    submesh_model.match_first_index,
+                    source_methods,
+                )
+                texture_override_ib_section.new_line()
 
             texture_override_ib_section.append("[TextureOverride_" + texture_override_name_suffix + "]")
             texture_override_ib_section.append("hash = " + draw_ib)
             texture_override_ib_section.append("match_first_index = " + str(submesh_model.match_first_index))
-
-            if is_cross_ib_source:
-                texture_override_ib_section.append("ResourceBodyVB_" + draw_ib + "_" + str(submesh_model.match_first_index) + " = copy vb0")
 
             ib_buf = drawib_model.submesh_ib_dict.get(submesh_model.unique_str, None)
             if ib_buf is None or len(ib_buf) == 0:
@@ -116,12 +378,11 @@ class ExportZZMI(ExportUnity):
             if is_cross_ib_source:
                 non_cross_ib_drawcalls = []
                 for drawcall_model in submesh_model.drawcall_model_list:
-                    obj_name = drawcall_model.obj_name if hasattr(drawcall_model, 'obj_name') else str(drawcall_model)
+                    obj_name = drawcall_model.obj_name if hasattr(drawcall_model, "obj_name") else str(drawcall_model)
                     if obj_name not in self.cross_ib_object_names:
                         non_cross_ib_drawcalls.append(drawcall_model)
 
                 print(f"[CrossIB ZZMI] 源块绘制非跨IB物体: {len(non_cross_ib_drawcalls)} 个")
-
                 for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
                     non_cross_ib_drawcalls,
                     obj_name_draw_offset_dict=drawib_model.obj_name_draw_offset,
@@ -129,7 +390,6 @@ class ExportZZMI(ExportUnity):
                     texture_override_ib_section.append(drawindexed_str)
             else:
                 print(f"[CrossIB ZZMI] 非源块绘制物体: {len(submesh_model.drawcall_model_list)} 个")
-
                 for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
                     submesh_model.drawcall_model_list,
                     obj_name_draw_offset_dict=drawib_model.obj_name_draw_offset,
@@ -140,50 +400,44 @@ class ExportZZMI(ExportUnity):
                 print(f"[CrossIB ZZMI] 目标块处理: source_ib_list={source_ib_list_for_target}")
 
                 for source_ib_key in source_ib_list_for_target:
-                    source_parts = source_ib_key.split("_")
-                    source_hash = source_parts[0]
-                    source_first_index = int(source_parts[1]) if len(source_parts) > 1 else 0
-
-                    print(f"[CrossIB ZZMI] 查找源块: hash={source_hash}, first_index={source_first_index}")
-
-                    source_drawib_model = None
-                    for dib_model in self.drawib_model_list:
-                        if dib_model.draw_ib == source_hash:
-                            source_drawib_model = dib_model
-                            print(f"[CrossIB ZZMI] 找到源 DrawIBModel: {dib_model.draw_ib}")
-                            break
-
-                    source_submesh = None
-                    if source_drawib_model:
-                        for sm in source_drawib_model.submesh_model_list:
-                            if str(sm.match_first_index) == str(source_first_index):
-                                source_submesh = sm
-                                print(f"[CrossIB ZZMI] 找到源 submesh: {sm.unique_str}")
-                                break
+                    print(f"[CrossIB ZZMI] 查找源块: ib_key={source_ib_key}")
+                    source_drawib_model, source_submesh, source_hash, source_first_index = self._find_source_submesh(
+                        source_ib_key
+                    )
+                    target_method = self._get_mapping_method(source_ib_key, current_ib_key)
 
                     if source_submesh:
                         source_ib_resource_name = source_drawib_model.get_submesh_ib_resource_name(source_submesh)
-                        texture_override_ib_section.append("ib = " + source_ib_resource_name)
-
-                        texture_override_ib_section.append("vb0 = ResourceBodyVB_" + source_hash + "_" + str(source_first_index))
-                        texture_override_ib_section.append("vb1 = Resource" + source_hash + "Texcoord")
-                        texture_override_ib_section.append("vb2 = Resource" + source_hash + "Blend")
-                        texture_override_ib_section.append("vb3 = ResourceBodyVB_" + source_hash + "_" + str(source_first_index))
+                        self._append_target_cross_ib_draw(
+                            texture_override_ib_section,
+                            target_method,
+                            source_hash,
+                            source_first_index,
+                            source_ib_resource_name,
+                            draw_ib,
+                            submesh_model.match_first_index,
+                        )
 
                         cross_ib_drawcalls = []
                         for drawcall_model in source_submesh.drawcall_model_list:
-                            obj_name = drawcall_model.obj_name if hasattr(drawcall_model, 'obj_name') else str(drawcall_model)
+                            obj_name = drawcall_model.obj_name if hasattr(drawcall_model, "obj_name") else str(drawcall_model)
                             if obj_name in self.cross_ib_object_names:
                                 cross_ib_drawcalls.append(drawcall_model)
 
                         print(f"[CrossIB ZZMI] 跨IB物体数量: {len(cross_ib_drawcalls)}")
-
                         if cross_ib_drawcalls:
                             for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
                                 cross_ib_drawcalls,
                                 obj_name_draw_offset_dict=source_drawib_model.obj_name_draw_offset,
                             ):
                                 texture_override_ib_section.append(drawindexed_str)
+
+                        self._append_target_cross_ib_cleanup(
+                            texture_override_ib_section,
+                            target_method,
+                            draw_ib,
+                            submesh_model.match_first_index,
+                        )
                     else:
                         print(f"[CrossIB ZZMI] 警告: 未找到源块 submesh for {source_ib_key}")
 
@@ -196,10 +450,13 @@ class ExportZZMI(ExportUnity):
 
         if self.has_cross_ib:
             for node_name, cross_ib_method in self.cross_ib_method_dict.items():
-                if cross_ib_method and cross_ib_method != 'VB_COPY':
-                    print(f"[CrossIB] ❌ 错误: 节点 '{node_name}' 使用的跨 IB 方式 '{cross_ib_method}' 不适用于 ZZMI 模式")
-                    print(f"[CrossIB] ZZMI 模式只支持 'VB_COPY' (VB 复制) 方式")
-                    print(f"[CrossIB] 请在 Cross IB 节点中将跨 IB 方式改为 'VB_COPY'")
+                if cross_ib_method and cross_ib_method not in self.SUPPORTED_CROSS_IB_METHODS:
+                    print(
+                        f"[CrossIB] 错误: 节点 '{node_name}' 使用的跨 IB 方式 '{cross_ib_method}' 不适用于 ZZMI 模式"
+                    )
+                    print(
+                        f"[CrossIB] ZZMI 模式只支持: {sorted(self.SUPPORTED_CROSS_IB_METHODS)}"
+                    )
                     self.has_cross_ib = False
                     break
 

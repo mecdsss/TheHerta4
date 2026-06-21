@@ -110,7 +110,6 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         return None
 
     def execute(self, context):
-        LOG.start_collecting()
         GlobalConfig.read_from_main_json_ssmt4()
         
         TimerUtils.start_session("Mod导出")
@@ -139,6 +138,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         BlueprintExportHelper.reset_direct_export_runtime_state(clear_postprocess_caches=True)
         TimerUtils.end_stage("蓝图验证")
 
+        LOG.start_collecting()
         BluePrintModel.clear_object_name_mapping()
         GlobalKeyCountHelper.initialize()
 
@@ -159,8 +159,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
             except Exception as e:
                 error_message = f"直出失败: {str(e)}"
                 print(f"❌ 直出过程中发生错误: {e}")
-                import traceback
-                traceback.print_exc()
+                LOG.exception(e)
                 PreProcessHelper.cleanup_copies(silent=True)
 
             LOG.info("")
@@ -328,8 +327,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         except Exception as e:
             error_message = f"导出失败: {str(e)}"
             print(f"❌ 导出过程中发生错误: {e}")
-            import traceback
-            traceback.print_exc()
+            LOG.exception(e)
 
             PreProcessHelper.cleanup_copies(silent=True)
 
@@ -540,8 +538,7 @@ class SSMTQuickExportSelected(bpy.types.Operator):
             return {'FINISHED'}
         except Exception as e:
             print(f"❌ 快速局部导出失败: {e}")
-            import traceback
-            traceback.print_exc()
+            LOG.exception(e)
             self.report({'ERROR'}, f"快速局部导出失败: {e}")
             return {'CANCELLED'}
         finally:

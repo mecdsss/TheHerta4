@@ -1,5 +1,5 @@
-import bpy
 import bmesh
+import bpy
 import math
 from mathutils import Vector
 
@@ -10,6 +10,9 @@ from ..utils.collection_utils import CollectionUtils
 from ..utils.vertexgroup_utils import VertexGroupUtils
 from ..utils.shapekey_utils import ShapeKeyUtils
 from ..utils.algorithm_utils import AlgorithmUtils
+
+
+MERGE_SPLIT_FACE_SOURCE_ATTR = "TH4_MergeSplitFaceSource"
 
 
 def _get_single_selected_mesh():
@@ -24,6 +27,213 @@ def _get_single_selected_mesh():
 def _get_collection_mesh_objects(collection):
     """获取集合中所有网格物体"""
     return [obj for obj in collection.objects if obj.type == 'MESH']
+
+
+def _iter_selected_mesh_objects(context):
+    for obj in getattr(context, "selected_objects", []) or []:
+        if obj is not None and getattr(obj, "type", "") == "MESH":
+            yield obj
+
+
+def _ensure_object_mode():
+    if bpy.context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def _select_only_objects(context, objects, active_obj=None):
+    bpy.ops.object.select_all(action='DESELECT')
+    for obj in objects:
+        obj.select_set(True)
+    context.view_layer.objects.active = active_obj or (objects[0] if objects else None)
+
+
+def _prepare_shape_keys_for_merge(obj):
+    if obj is None or getattr(obj, "type", "") != "MESH":
+        return
+    shape_keys = getattr(getattr(obj, "data", None), "shape_keys", None)
+    key_blocks = getattr(shape_keys, "key_blocks", None)
+    if not key_blocks:
+        return
+    # If the object currently shows a deformed mesh because of shape key values,
+    # bake that current state into Basis before join, otherwise merged Basis drifts.
+    ShapeKeyUtils.bake_current_shape_key_mix_to_mesh(obj, stage_label=f"MergeSplit prepare: {obj.name}")
+
+
+def _sanitize_merge_split_group_name(name):
+    return "".join(char if char.isalnum() or char in "._-" else "_" for char in name).strip("._") or "Object"
+
+
+def _clear_merge_split_item_record(item):
+    item.marker_group_name = ""
+    item.face_start = 0
+    item.face_count = 0
+    item.vertex_count = 0
+
+
+def _parse_merge_split_source_id(marker_group_name):
+    marker = str(marker_group_name or "").strip()
+    if not marker:
+        return None
+    source_id_text = marker.rsplit("_", 1)[-1]
+    if not source_id_text.isdigit():
+        return None
+    return int(source_id_text)
+
+
+def _collect_recorded_split_entries(items):
+    split_items = []
+    seen_source_ids = set()
+    fallback_source_id = 0
+    for item in items:
+        object_name = str(getattr(item, "object_name", "") or "").strip()
+        face_start = int(getattr(item, "face_start", 0) or 0)
+        face_count = int(getattr(item, "face_count", 0) or 0)
+        vertex_count = int(getattr(item, "vertex_count", 0) or 0)
+        marker_group_name = str(getattr(item, "marker_group_name", "") or "").strip()
+        if not object_name or vertex_count <= 0 or face_count <= 0:
+            continue
+
+        parsed_source_id = _parse_merge_split_source_id(marker_group_name)
+        if parsed_source_id is not None:
+            if parsed_source_id in seen_source_ids:
+                continue
+            source_id = parsed_source_id
+            seen_source_ids.add(parsed_source_id)
+        else:
+            source_id = fallback_source_id
+
+        split_items.append((source_id, object_name, face_start, face_count, marker_group_name))
+        fallback_source_id += 1
+    return split_items
+
+
+def _snapshot_merge_split_item_records(items):
+    return [
+        {
+            "item": item,
+            "marker_group_name": str(getattr(item, "marker_group_name", "") or ""),
+            "face_start": int(getattr(item, "face_start", 0) or 0),
+            "face_count": int(getattr(item, "face_count", 0) or 0),
+            "vertex_count": int(getattr(item, "vertex_count", 0) or 0),
+        }
+        for item in items
+    ]
+
+
+def _restore_merge_split_item_records(snapshot):
+    for payload in snapshot or []:
+        item = payload.get("item")
+        if item is None:
+            continue
+        item.marker_group_name = payload.get("marker_group_name", "")
+        item.face_start = payload.get("face_start", 0)
+        item.face_count = payload.get("face_count", 0)
+        item.vertex_count = payload.get("vertex_count", 0)
+
+
+def _ensure_face_source_attribute(mesh):
+    if mesh is None:
+        return None
+    attributes = getattr(mesh, "attributes", None)
+    if attributes is None:
+        return None
+    attribute = attributes.get(MERGE_SPLIT_FACE_SOURCE_ATTR)
+    if attribute is not None:
+        if getattr(attribute, "domain", "") == "FACE" and getattr(attribute, "data_type", "") == "INT":
+            return attribute
+        try:
+            attributes.remove(attribute)
+        except Exception:
+            return None
+    try:
+        return attributes.new(name=MERGE_SPLIT_FACE_SOURCE_ATTR, type="INT", domain="FACE")
+    except Exception:
+        return None
+
+
+def _write_face_source_id(obj, source_id):
+    if obj is None or getattr(obj, "type", "") != "MESH" or getattr(obj, "data", None) is None:
+        return False
+    attribute = _ensure_face_source_attribute(obj.data)
+    if attribute is None:
+        return False
+    try:
+        for item in getattr(attribute, "data", []) or []:
+            item.value = int(source_id)
+        obj.data.update()
+        return True
+    except Exception:
+        return False
+
+
+def _read_face_source_ids(mesh):
+    attribute = getattr(getattr(mesh, "attributes", None), "get", lambda _name: None)(MERGE_SPLIT_FACE_SOURCE_ATTR)
+    if attribute is None:
+        return []
+    return [int(getattr(item, "value", -1)) for item in getattr(attribute, "data", []) or []]
+
+
+def _clear_internal_merge_split_groups(obj):
+    if obj is None or getattr(obj, "type", "") != "MESH":
+        return
+    mesh = getattr(obj, "data", None)
+    attributes = getattr(mesh, "attributes", None)
+    if attributes is None:
+        return
+    attribute = attributes.get(MERGE_SPLIT_FACE_SOURCE_ATTR)
+    if attribute is not None:
+        try:
+            attributes.remove(attribute)
+        except Exception:
+            pass
+
+
+def _select_faces_by_source_id(obj, source_id):
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    face_layer = bm.faces.layers.int.get(MERGE_SPLIT_FACE_SOURCE_ATTR)
+    if face_layer is None:
+        return 0
+    selected_count = 0
+    for face in bm.faces:
+        is_selected = int(face[face_layer]) == int(source_id)
+        face.select_set(is_selected)
+        if is_selected:
+            selected_count += 1
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    return selected_count
+
+
+def _select_face_range(obj, face_start, face_count):
+    if face_count <= 0:
+        return 0
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    end = face_start + face_count
+    selected_count = 0
+    for face in bm.faces:
+        is_selected = face_start <= face.index < end
+        face.select_set(is_selected)
+        if is_selected:
+            selected_count += 1
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    return selected_count
+
+
+def _find_separated_object(context, source_obj, previous_object_names):
+    active_obj = getattr(context.view_layer.objects, "active", None)
+    if active_obj is not None and active_obj != source_obj and getattr(active_obj, "type", "") == "MESH":
+        return active_obj
+
+    for obj in getattr(context, "selected_objects", []) or []:
+        if obj is not None and obj != source_obj and getattr(obj, "type", "") == "MESH":
+            return obj
+
+    for obj_name in set(bpy.data.objects.keys()) - previous_object_names:
+        candidate = bpy.data.objects.get(obj_name)
+        if candidate is not None and candidate.type == 'MESH':
+            return candidate
+    return None
 
 
 def _get_object_vertex_group_name_set(obj):
@@ -262,6 +472,211 @@ class ModelDeleteLoosePoint(bpy.types.Operator):
 
         self.report({'INFO'}, "删除松散点成功!")
         return {'FINISHED'}
+
+
+class BMTP_AddSelectedObjectsToMergeSplitList(bpy.types.Operator):
+    bl_idname = "toolkit.bmtp_merge_split_add_selected"
+    bl_label = "添加选中物体"
+    bl_description = "将当前选中的多个网格物体添加到合并/拆分列表"
+
+    def execute(self, context):
+        props = context.scene.bmtp_props
+        existing_names = {item.object_name for item in props.merge_split_items}
+        added_count = 0
+        for obj in _iter_selected_mesh_objects(context):
+            if obj.name in existing_names:
+                continue
+            item = props.merge_split_items.add()
+            item.object_name = obj.name
+            item.marker_group_name = ""
+            item.face_start = 0
+            item.face_count = 0
+            item.vertex_count = 0
+            existing_names.add(obj.name)
+            added_count += 1
+
+        self.report({'INFO'}, f"已添加 {added_count} 个物体")
+        return {'FINISHED'}
+
+
+class BMTP_RemoveMergeSplitListItem(bpy.types.Operator):
+    bl_idname = "toolkit.bmtp_merge_split_remove_item"
+    bl_label = "移除选中项"
+    bl_description = "从合并/拆分列表中移除当前选中项"
+
+    def execute(self, context):
+        props = context.scene.bmtp_props
+        index = int(getattr(props, "merge_split_index", 0))
+        if 0 <= index < len(props.merge_split_items):
+            props.merge_split_items.remove(index)
+            props.merge_split_index = max(0, min(index, len(props.merge_split_items) - 1))
+        return {'FINISHED'}
+
+
+class BMTP_MergeObjectsByRecordedRanges(bpy.types.Operator):
+    bl_idname = "toolkit.bmtp_merge_objects_by_recorded_ranges"
+    bl_label = "合并列表物体"
+    bl_description = "把列表中的多个网格物体合并成一个原地物体，并记录面级来源标记"
+
+    def execute(self, context):
+        props = context.scene.bmtp_props
+        previous_records = _snapshot_merge_split_item_records(props.merge_split_items)
+
+        targets = []
+        seen = set()
+        for item in props.merge_split_items:
+            obj_name = str(getattr(item, "object_name", "") or "").strip()
+            if not obj_name or obj_name in seen:
+                continue
+            obj = bpy.data.objects.get(obj_name)
+            if obj is None or obj.type != 'MESH':
+                continue
+            targets.append((item, obj_name, obj))
+            seen.add(obj_name)
+
+        if len(targets) < 2:
+            self.report({'ERROR'}, "列表中至少需要 2 个有效网格物体")
+            return {'CANCELLED'}
+
+        for item in props.merge_split_items:
+            _clear_merge_split_item_record(item)
+
+        _ensure_object_mode()
+        current_face_offset = 0
+        for index, (item, obj_name, obj) in enumerate(targets):
+            _prepare_shape_keys_for_merge(obj)
+            _clear_internal_merge_split_groups(obj)
+            source_id = index
+            face_count = len(getattr(obj.data, "polygons", []))
+            vertex_indices = [vertex.index for vertex in getattr(obj.data, "vertices", [])]
+            marker_group_name = f"{MERGE_SPLIT_FACE_SOURCE_ATTR}_{_sanitize_merge_split_group_name(obj_name)}_{source_id}"
+
+            item.face_start = current_face_offset
+            item.face_count = face_count
+            item.vertex_count = len(vertex_indices)
+            item.marker_group_name = marker_group_name
+            current_face_offset += face_count
+
+            if not _write_face_source_id(obj, source_id):
+                _restore_merge_split_item_records(previous_records)
+                self.report({'ERROR'}, f"物体 {obj_name} 无法写入面来源标记，当前 Blender 版本可能不支持该属性")
+                return {'CANCELLED'}
+
+        _base_item, _base_obj_name, base_obj = targets[0]
+        _select_only_objects(context, [obj for _item, _obj_name, obj in targets], active_obj=base_obj)
+        bpy.ops.object.join()
+
+        merged_obj = context.view_layer.objects.active or base_obj
+        merged_obj.name = str(getattr(props, "merge_split_target_name", "") or "").strip() or merged_obj.name
+        if getattr(merged_obj.data, "name", ""):
+            merged_obj.data.name = merged_obj.name
+        props.merge_split_target_name = merged_obj.name
+
+        if getattr(props, "merge_split_weld_vertices", False):
+            _select_only_objects(context, [merged_obj], active_obj=merged_obj)
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.remove_doubles(threshold=0.00001)
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        self.report({'INFO'}, f"已合并为 {merged_obj.name}")
+        return {'FINISHED'}
+
+
+class BMTP_SplitMergedObjectByRecordedRanges(bpy.types.Operator):
+    bl_idname = "toolkit.bmtp_split_merged_object_by_recorded_ranges"
+    bl_label = "按记录拆分"
+    bl_description = "按列表中记录的面级来源标记，把当前合并后的物体拆分回多个原始物体"
+
+    def execute(self, context):
+        props = context.scene.bmtp_props
+        merged_name = str(getattr(props, "merge_split_target_name", "") or "").strip()
+        merged_obj = bpy.data.objects.get(merged_name)
+        if merged_obj is None or merged_obj.type != 'MESH':
+            self.report({'ERROR'}, "未找到要拆分的合并物体")
+            return {'CANCELLED'}
+
+        split_items = _collect_recorded_split_entries(props.merge_split_items)
+
+        if not split_items:
+            self.report({'ERROR'}, "列表中没有可用的来源记录")
+            return {'CANCELLED'}
+
+        _ensure_object_mode()
+        _select_only_objects(context, [merged_obj], active_obj=merged_obj)
+        face_source_ids = _read_face_source_ids(merged_obj.data)
+        has_face_source_attribute = bool(face_source_ids)
+
+        split_entries = list(split_items)
+        if has_face_source_attribute:
+            split_entries.sort(key=lambda item: item[0])
+        else:
+            split_entries.sort(key=lambda item: item[2])
+
+        renamed_count = 0
+        zero_face_marker_names = []
+        failed_capture_marker_names = []
+        remaining_obj = merged_obj
+        first_entry = split_entries[0]
+        tail_entries = list(reversed(split_entries[1:]))
+
+        for source_id, object_name, face_start, face_count, _marker_group_name in tail_entries:
+            _select_only_objects(context, [remaining_obj], active_obj=remaining_obj)
+            before_object_names = {obj.name for obj in bpy.data.objects}
+            bpy.ops.object.mode_set(mode='EDIT')
+            context.tool_settings.mesh_select_mode = (False, False, True)
+            bpy.ops.mesh.select_all(action='DESELECT')
+            if has_face_source_attribute:
+                selected_face_count = _select_faces_by_source_id(remaining_obj, source_id)
+            else:
+                selected_face_count = _select_face_range(remaining_obj, face_start, face_count)
+            if selected_face_count <= 0:
+                bpy.ops.object.mode_set(mode='OBJECT')
+                zero_face_marker_names.append(object_name)
+                continue
+            bpy.ops.mesh.separate(type='SELECTED')
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+            target_obj = _find_separated_object(context, remaining_obj, before_object_names)
+            if target_obj is None:
+                failed_capture_marker_names.append(object_name)
+                continue
+
+            target_obj.name = object_name
+            if getattr(target_obj.data, "name", ""):
+                target_obj.data.name = object_name
+            _clear_internal_merge_split_groups(target_obj)
+            VertexGroupUtils.remove_unused_vertex_groups(target_obj)
+            renamed_count += 1
+
+        remaining_face_count = len(getattr(getattr(remaining_obj, "data", None), "polygons", []) or [])
+        _first_source_id, first_object_name, _first_face_start, first_face_count, _first_marker_group_name = first_entry
+        if remaining_face_count > 0:
+            remaining_obj.name = first_object_name
+            if getattr(remaining_obj.data, "name", ""):
+                remaining_obj.data.name = first_object_name
+            _clear_internal_merge_split_groups(remaining_obj)
+            VertexGroupUtils.remove_unused_vertex_groups(remaining_obj)
+            renamed_count += 1
+
+        expected_tail_count = len(tail_entries)
+        if renamed_count <= 0:
+            if zero_face_marker_names and len(zero_face_marker_names) == expected_tail_count:
+                self.report({'ERROR'}, "拆分失败：未能从面范围记录中选中任何面，原合并物体保持不变。")
+            elif failed_capture_marker_names:
+                self.report({'ERROR'}, "拆分失败：已执行分离，但未能识别分离结果物体，原合并物体保持不变。")
+            else:
+                self.report({'ERROR'}, "拆分失败：没有恢复出任何物体，原合并物体保持不变。")
+            return {'CANCELLED'}
+
+        if remaining_face_count <= 0 and remaining_obj is not None and remaining_obj.name in bpy.data.objects:
+            bpy.data.objects.remove(remaining_obj, do_unlink=True)
+        elif remaining_face_count > 0 and remaining_face_count != first_face_count:
+            self.report({'WARNING'}, f"首个物体 {remaining_obj.name} 剩余 {remaining_face_count} 个面，预期 {first_face_count} 个面。")
+
+        props.merge_split_target_name = ""
+        self.report({'INFO'}, f"已拆分并恢复 {renamed_count} 个物体")
+        return {'FINISHED'}
     
 class ModelClearCustomSplitNormals(bpy.types.Operator):
     bl_idname = "toolkit.clear_custom_split_normals"
@@ -486,6 +901,10 @@ model_operators_list = [
     ModelSplitEachVertexGroup,
     ModelSplitLoosePartClusterByVertexGroup,
     ModelDeleteLoosePoint,
+    BMTP_AddSelectedObjectsToMergeSplitList,
+    BMTP_RemoveMergeSplitListItem,
+    BMTP_MergeObjectsByRecordedRanges,
+    BMTP_SplitMergedObjectByRecordedRanges,
     ModelClearCustomSplitNormals,
     ModelRenameVertexGroupNameWithTheirSuffix,
     AddBoneFromVertexGroupV2,

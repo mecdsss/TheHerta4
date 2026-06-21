@@ -1,5 +1,5 @@
 import bpy
-from bpy.props import IntProperty, StringProperty, CollectionProperty
+from bpy.props import IntProperty, StringProperty, CollectionProperty, EnumProperty
 
 from .anim_driver_base import SSMTNode_AnimDriver_Base
 
@@ -94,8 +94,19 @@ class SSMTNode_AnimDriver_Toggle(SSMTNode_AnimDriver_Base):
 
     key_binding: StringProperty(
         name="快捷键",
-        description="快捷键绑定（如 no_modifiers k）",
+        description="快捷键绑定，支持多个快捷键并用逗号分隔（如 no_modifiers k, no_modifiers l）",
         default="no_modifiers k",
+    )
+
+    switch_type: EnumProperty(
+        name="开关类型",
+        description="开关模式。",
+        items=[
+            ("cycle", "循环切换", "循环切换所有选项"),
+            ("toggle", "开关切换", "在两个选项间切换"),
+            ("hold", "按住生效", "按住时激活"),
+        ],
+        default="cycle",
     )
 
     toggle_values: StringProperty(
@@ -134,6 +145,7 @@ class SSMTNode_AnimDriver_Toggle(SSMTNode_AnimDriver_Base):
         box = layout.box()
         box.label(text=f"索引: {safe_idx}", icon='LINENUMBERS_ON')
         box.prop(self, "key_binding")
+        box.prop(self, "switch_type")
         box.prop(self, "toggle_values")
         box.prop(self, "comment", text="备注")
 
@@ -159,8 +171,12 @@ class SSMTNode_AnimDriver_Toggle(SSMTNode_AnimDriver_Base):
 
     def generate_ini_segment(self, connected_nodes=None) -> str:
         idx = self._read_safe_index()
+        active_flag = self._get_activation_flag()
 
-        key = self.key_binding.strip() or "no_modifiers k"
+        raw_key = self.key_binding.strip()
+        key_parts = [part.strip() for part in raw_key.split(",") if part.strip()]
+        if not key_parts:
+            key_parts = ["no_modifiers k"]
 
         target_vars = []
         for item in self.pause_target_list:
@@ -181,19 +197,23 @@ class SSMTNode_AnimDriver_Toggle(SSMTNode_AnimDriver_Base):
         values = ",".join(raw.replace(",", " ").split())
         toggle_vals = values if values else "0,1"
         comment = self.comment.strip()
+        blocks = []
+        use_indexed_section_names = len(key_parts) > 1
+        for key_index, key_part in enumerate(key_parts, 1):
+            section_name = f"[KeyToggle_Anim{idx}_{key_index}]" if use_indexed_section_names else f"[KeyToggle_Anim{idx}]"
+            lines = [section_name]
+            if comment:
+                lines.append(f"; {comment}")
+            lines.extend([
+                f"condition = {active_flag} == 1",
+                f"key = {key_part}",
+                f"type = {self.switch_type}",
+            ])
+            for var in target_vars:
+                lines.append(f"{var} = {toggle_vals}")
+            blocks.append("\n".join(lines))
 
-        lines = [
-            f"[KeyToggle_Anim{idx}]",
-            "condition = $active0 == 1",
-            f"key = {key}",
-            "type = cycle",
-        ]
-        if comment:
-            lines.insert(1, f"; {comment}")
-        for var in target_vars:
-            lines.append(f"{var} = {toggle_vals}")
-
-        return "\n".join(lines)
+        return "\n\n".join(blocks)
 
 
 _load_handler_registered = False

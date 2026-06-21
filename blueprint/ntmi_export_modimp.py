@@ -525,7 +525,10 @@ def _execute_supported_postprocess_nodes(blueprint_model: BluePrintModel, output
             LOG.warning(f"Skip unsupported postprocess node: {getattr(node, 'name', '')}")
             continue
         try:
-            execute_postprocess(output_dir)
+            if node_type == "SSMTNode_PostProcess_Material":
+                execute_postprocess(output_dir, exporter=exporter)
+            else:
+                execute_postprocess(output_dir)
         except NotImplementedError:
             LOG.warning(f"Skip postprocess node without implementation: {getattr(node, 'name', '')}")
 
@@ -598,6 +601,7 @@ class ExportNTMIModImp:
         self.keep_temp_collection_tree = bool(getattr(node, "keep_temp_collection_tree", False))
         self.export_runtime_shapekeys = bool(getattr(node, "export_runtime_shapekeys", False))
         self.runtime_shapekey_names = str(getattr(node, "runtime_shapekey_names", "") or "").strip()
+        self.extra_ps_t2_diffuse_map = bool(getattr(node, "extra_ps_t2_diffuse_map", False))
 
     def export(self) -> list[dict[str, object]]:
         multifile_nodes = _multifile_node_payloads(self.blueprint_model)

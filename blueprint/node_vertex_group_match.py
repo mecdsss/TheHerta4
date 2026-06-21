@@ -16,6 +16,7 @@ from mathutils import Vector, kdtree
 from typing import Dict, List, Tuple, Optional
 
 from .node_base import SSMTNodeBase
+from ..utils.log_utils import LOG
 
 _keymaps = []
 
@@ -801,7 +802,7 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
                 for weight, vert_indices in weight_dict.items():
                     new_vg.add(vert_indices, weight, 'REPLACE')
         except Exception as e:
-            print(f"[VertexGroupMatch] 排序顶点组失败: {e}")
+            LOG.warning(f"[VertexGroupMatch] 排序顶点组失败: {e}")
 
     def _remove_backup_objects_from_payload(self, backup_payload):
         return
@@ -2241,7 +2242,7 @@ def register_keymaps():
     )
     _keymaps.append((km, kmi_wp))
     
-    print("[VertexGroupMatch] 已注册快捷键: Ctrl+Shift+Z (同步), Alt+W (快速权重)")
+    LOG.info("[VertexGroupMatch] 已注册快捷键: Ctrl+Shift+Z (同步), Alt+W (快速权重)")
 
 
 def unregister_keymaps():
@@ -2253,7 +2254,7 @@ def unregister_keymaps():
             pass
     _keymaps.clear()
     
-    print("[VertexGroupMatch] 已注销快捷键")
+    LOG.info("[VertexGroupMatch] 已注销快捷键")
 
 
 classes = (

@@ -3,6 +3,7 @@ import bpy
 
 from .common import global_properties
 from .common.global_config import GlobalConfig
+from .utils import log_utils as _log_utils
 from .utils import texture_auto_reload
 
 
@@ -76,7 +77,7 @@ bl_info = {
     "name": "TheHerta4",
     "description": "Blender Plugin of SSMT4",
     "blender": (4, 5, 0),
-    "version": (4, 4, 12),
+    "version": (4, 4, 13),
     "location": "View3D",
     "category": "Generic"
 }
@@ -239,10 +240,11 @@ def unregister():
     
     bpy.utils.unregister_class(HERTT_OT_SwitchToToolkit)
     bpy.utils.unregister_class(HERTT_OT_SwitchToMainPanel)
-    
+
     del bpy.types.Scene.herta_show_toolkit
 
     global_properties.unregister()
+    _log_utils.LOG.uninstall_print_hook()
 
 
 

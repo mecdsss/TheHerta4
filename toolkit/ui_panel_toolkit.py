@@ -364,7 +364,15 @@ class BMTP_MeshEditPanel(bpy.types.Panel):
         col.prop(props, "bridge_smooth")
         col.separator()
         col.operator("toolkit.bmtp_dynamic_bridge", icon='PLAY')
-        
+
+        box = layout.box()
+        box.label(text="面拓扑转换", icon='MOD_TRIANGULATE')
+        col = box.column(align=True)
+        col.prop(props, "limit_surface_subdiv_levels")
+        col.operator("toolkit.bmtp_enable_subdivision_limit_surface", text="使用极限表面", icon='MOD_SUBSURF')
+        col.operator("toolkit.bmtp_tris_to_quads_preserve_uv", text="三角面转四边面(按UV孤岛)", icon='MESH_GRID')
+        col.operator("toolkit.bmtp_quads_to_tris", text="四边面转三角面", icon='MOD_TRIANGULATE')
+
         box = layout.box()
         box.label(text="模型分割", icon='MESH_PLANE')
         box.operator("toolkit.split_by_loose_part")
@@ -372,6 +380,48 @@ class BMTP_MeshEditPanel(bpy.types.Panel):
         box.operator("toolkit.split_by_vertex_group")
         box.operator("toolkit.split_each_vertex_group")
         box.operator("toolkit.split_loose_part_cluster_by_vertex_group")
+
+
+class BMTP_MergeSplitPanel(bpy.types.Panel):
+    bl_label = "合并拆分"
+    bl_idname = "VIEW3D_PT_Herta_BMTP_MergeSplit_Panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'TheHerta4'
+    bl_parent_id = 'VIEW3D_PT_Herta_BMTP_ModelControl_Panel'
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 1
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.bmtp_props
+
+        list_box = layout.box()
+        list_box.label(text="物体列表", icon='OUTLINER_OB_MESH')
+        row = list_box.row()
+        row.template_list(
+            "BMTP_UL_MergeSplitList",
+            "",
+            props,
+            "merge_split_items",
+            props,
+            "merge_split_index",
+            rows=6,
+        )
+        col = row.column(align=True)
+        col.operator("toolkit.bmtp_merge_split_add_selected", text="", icon='ADD')
+        col.operator("toolkit.bmtp_merge_split_remove_item", text="", icon='REMOVE')
+
+        settings_box = layout.box()
+        settings_box.label(text="合并设置", icon='SETTINGS')
+        settings_box.prop(props, "merge_split_target_name", text="目标名称")
+        settings_box.prop(props, "merge_split_weld_vertices")
+        settings_box.label(text="默认按面级来源标记恢复，不再依赖顶点组或面范围。", icon='INFO')
+        settings_box.label(text="开启焊点后不保证完美还原原始拓扑。", icon='ERROR')
+
+        action_row = layout.row(align=True)
+        action_row.operator("toolkit.bmtp_merge_objects_by_recorded_ranges", text="合并", icon='AUTOMERGE_ON')
+        action_row.operator("toolkit.bmtp_split_merged_object_by_recorded_ranges", text="拆分", icon='UV_ISLANDSEL')
 
 
 class BMTP_UVToolsPanel(bpy.types.Panel):
@@ -382,7 +432,7 @@ class BMTP_UVToolsPanel(bpy.types.Panel):
     bl_category = 'TheHerta4'
     bl_parent_id = 'VIEW3D_PT_Herta_BMTP_ModelControl_Panel'
     bl_options = {'DEFAULT_CLOSED'}
-    bl_order = 1
+    bl_order = 2
 
     def draw(self, context):
         layout = self.layout
@@ -436,6 +486,7 @@ class BMTP_SceneCleanPanel(bpy.types.Panel):
         
         col.label(text="材质清理:")
         col.operator("toolkit.bmtp_clean_empty_material_slots", text="清理空材质槽")
+        col.operator("toolkit.bmtp_remove_unused_material_slots", text="清理所有未使用槽")
         col.operator("toolkit.bmtp_clean_duplicate_materials", text="清理重复材质")
         
         col.separator()

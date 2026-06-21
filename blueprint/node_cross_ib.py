@@ -93,11 +93,21 @@ class CrossIBMethodEnum:
     VB_COPY_LABEL = 'VB 复制'
     VB_COPY_LOGIC_NAME = 'ZZMI'
 
+    VB_COPY_CB1 = 'VB_COPY_CB1'
+    VB_COPY_CB1_LABEL = 'VB 复制 + CB1'
+    VB_COPY_CB1_LOGIC_NAME = 'ZZMI'
+
+    VB_REF_SO0 = 'VB_REF_SO0'
+    VB_REF_SO0_LABEL = 'VB 引用 SO0'
+    VB_REF_SO0_LOGIC_NAME = 'ZZMI'
+
     @classmethod
     def get_items(cls):
         return [
             (cls.END_FIELD, cls.END_FIELD_LABEL, "终末地跨 IB 方式 (仅 EFMI)"),
             (cls.VB_COPY, cls.VB_COPY_LABEL, "VB 复制方式 (仅 ZZMI)"),
+            (cls.VB_COPY_CB1, cls.VB_COPY_CB1_LABEL, "VB 复制并捕获/恢复 VS-CB1 (仅 ZZMI)"),
+            (cls.VB_REF_SO0, cls.VB_REF_SO0_LABEL, "通过 SO0 引用 Body VB0 的方式 (仅 ZZMI)"),
         ]
 
     @classmethod
@@ -159,6 +169,31 @@ class SSMT_OT_CrossIB_RemoveItem(bpy.types.Operator):
         if node and self.item_index >= 0 and self.item_index < len(node.cross_ib_list):
             node.cross_ib_list.remove(self.item_index)
 
+        return {'FINISHED'}
+
+
+class SSMT_OT_CrossIB_SetMethod(bpy.types.Operator):
+    bl_idname = "ssmt.cross_ib_set_method"
+    bl_label = "设置跨 IB 方式"
+    bl_description = "切换当前 Cross IB 节点的跨 IB 方式"
+
+    node_name: StringProperty()
+    method_id: StringProperty()
+
+    def execute(self, context):
+        tree = getattr(context.space_data, "edit_tree", None) or getattr(context.space_data, "node_tree", None)
+        if not tree:
+            return {'CANCELLED'}
+
+        node = tree.nodes.get(self.node_name)
+        if not node:
+            return {'CANCELLED'}
+
+        node.cross_ib_method = self.method_id
+        try:
+            node._update_cross_ib_method()
+        except Exception:
+            pass
         return {'FINISHED'}
 
 
@@ -294,12 +329,17 @@ class SSMTNode_CrossIB(SSMTNodeBase):
         available_methods = CrossIBMethodEnum.get_available_methods(logic_name)
 
         if available_methods:
-            if len(available_methods) == 1:
-                row = layout.row()
-                row.label(text=f"跨 IB 方式: {CrossIBMethodEnum.__dict__[available_methods[0] + '_LABEL']}", icon='CHECKMARK')
-            else:
-                row = layout.row()
-                row.prop(self, "cross_ib_method", expand=True)
+            method_box = layout.box()
+            method_box.label(text="跨 IB 方式", icon='SETTINGS')
+            for method_id in available_methods:
+                method_label = getattr(CrossIBMethodEnum, method_id + "_LABEL", method_id)
+                op = method_box.operator(
+                    "ssmt.cross_ib_set_method",
+                    text=method_label,
+                    depress=(self.cross_ib_method == method_id),
+                )
+                op.node_name = self.name
+                op.method_id = method_id
         else:
             row = layout.row()
             row.label(text="当前运行模式不支持跨 IB", icon='ERROR')
@@ -719,6 +759,7 @@ classes = (
     CrossIBItem,
     SSMT_OT_CrossIB_AddItem,
     SSMT_OT_CrossIB_RemoveItem,
+    SSMT_OT_CrossIB_SetMethod,
     SSMTNode_CrossIB,
     SSMTNode_PostProcess_CrossIB,
 )

@@ -580,9 +580,19 @@ class SSMT_OT_View_Group_Objects(bpy.types.Operator):
         checked_nodes = set()
         visited_blueprints = set()
         self._collect_group_preview_objects(node, objects_to_show, checked_nodes, visited_blueprints)
+
+        view_layer_object_names = {
+            obj.name
+            for obj in getattr(context.view_layer, "objects", []) or []
+        }
+        objects_to_show = {
+            obj
+            for obj in objects_to_show
+            if obj is not None and getattr(obj, "name", "") in view_layer_object_names
+        }
         
         if not objects_to_show:
-            self.report({'WARNING'}, "No objects found in this group")
+            self.report({'WARNING'}, "No selectable objects found in this group for the current View Layer")
             return {'CANCELLED'}
 
         def deselect_all_safe():

@@ -10,6 +10,7 @@ from .ui_panel_toolkit import (
     BMTP_WeightManagePanel,
     BMTP_ModelControlPanel,
     BMTP_MeshEditPanel,
+    BMTP_MergeSplitPanel,
     BMTP_UVToolsPanel,
     BMTP_SceneCleanPanel,
     BMTP_CollectionLinkerPanel,
@@ -29,7 +30,7 @@ from .vg_backup import vg_backup_operators
 from .vg_create import vg_create_operators
 from .vg_weight_adjust import vg_weight_adjust_operators
 
-from .bmtp_properties import bmtp_properties_list
+from .bmtp_properties import bmtp_properties_list, BMTP_Properties
 from .bmtp_bone_tools import bmtp_bone_tools_list
 from .bmtp_weight_tools import bmtp_weight_tools_list
 from .bmtp_clean_tools import bmtp_clean_tools_list
@@ -85,6 +86,7 @@ __all__ = [
     'BMTP_WeightManagePanel',
     'BMTP_ModelControlPanel',
     'BMTP_MeshEditPanel',
+    'BMTP_MergeSplitPanel',
     'BMTP_UVToolsPanel',
     'BMTP_SceneCleanPanel',
     'BMTP_CollectionLinkerPanel',
@@ -186,7 +188,7 @@ def register():
         except Exception as e:
             print(f"[TheHerta4]   注册BMTP属性失败: {op_class.__name__} - {e}")
     
-    bpy.types.Scene.bmtp_props = bpy.props.PointerProperty(type=bmtp_properties_list[2])
+    bpy.types.Scene.bmtp_props = bpy.props.PointerProperty(type=BMTP_Properties)
     
     for op_class in bmtp_bone_tools_list:
         try:
@@ -324,9 +326,9 @@ def register():
     for op_class in tt_texture_atlas_list:
         try:
             bpy.utils.register_class(op_class)
-            print(f"[TheHerta4]   宸叉敞鍐孴T Texture Atlas: {op_class.__name__}")
+            print(f"[TheHerta4]   已注册TT Texture Atlas: {op_class.__name__}")
         except Exception as e:
-            print(f"[TheHerta4]   娉ㄥ唽TT Texture Atlas 澶辫触: {op_class.__name__} - {e}")
+            print(f"[TheHerta4]   注册TT Texture Atlas 失败: {op_class.__name__} - {e}")
 
     bpy.types.Scene.atp_props = bpy.props.PointerProperty(type=at_properties_list[-1])
     
@@ -402,6 +404,7 @@ def register():
     bpy.utils.register_class(BMTP_WeightManagePanel)
     bpy.utils.register_class(BMTP_ModelControlPanel)
     bpy.utils.register_class(BMTP_MeshEditPanel)
+    bpy.utils.register_class(BMTP_MergeSplitPanel)
     bpy.utils.register_class(BMTP_UVToolsPanel)
     bpy.utils.register_class(BMTP_SceneCleanPanel)
     bpy.utils.register_class(BMTP_CollectionLinkerPanel)
@@ -457,6 +460,7 @@ def unregister():
     bpy.utils.unregister_class(BMTP_SceneCleanPanel)
     bpy.utils.unregister_class(BMTP_UVToolsPanel)
     bpy.utils.unregister_class(BMTP_MeshEditPanel)
+    bpy.utils.unregister_class(BMTP_MergeSplitPanel)
     bpy.utils.unregister_class(BMTP_ModelControlPanel)
     bpy.utils.unregister_class(BMTP_WeightManagePanel)
     bpy.utils.unregister_class(BMTP_WeightOperationPanel)

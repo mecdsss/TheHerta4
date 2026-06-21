@@ -332,6 +332,8 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         default=False
     )
 
+    _ntmi_modimp_extra_ps_t2_diffuse_map = False
+
     def apply_name_mapping(self, mapping):
         global _name_mapping_cache, _reverse_name_mapping_cache
 
@@ -774,6 +776,79 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
     def _workspace_material_resource_name(self, material):
         return f"Resource-{self._material_resource_stem(material)}"
+
+    @staticmethod
+    def _clone_generated_param_lines(lines, source_param, target_param):
+        if not lines:
+            return []
+
+        source_param = str(source_param or "").strip()
+        target_param = str(target_param or "").strip()
+        if not source_param or not target_param or source_param == target_param:
+            return []
+
+        assignment_re = re.compile(
+            rf"^(?P<indent>\s*){re.escape(source_param)}\s*=\s*(?:(?P<ref>ref)\s+)?(?P<resource>.+?)\s*$",
+            re.IGNORECASE,
+        )
+        alias_lines = []
+        target_is_resource_ref = target_param.lower().startswith("resource\\")
+
+        for line in lines:
+            match = assignment_re.match(str(line or ""))
+            if not match:
+                continue
+
+            indent = match.group("indent") or ""
+            resource_name = str(match.group("resource") or "").strip()
+            if target_is_resource_ref:
+                alias_lines.append(f"{indent}{target_param} = ref {resource_name}")
+            else:
+                alias_lines.append(f"{indent}{target_param} = {resource_name}")
+
+        return alias_lines
+
+    @staticmethod
+    def _find_first_slot_by_mark_name(slot_map, mark_name):
+        target_mark_name = str(mark_name or "").strip().lower()
+        if not target_mark_name:
+            return ""
+
+        for param_name, slot_info in (slot_map or {}).items():
+            current_mark_name = str(getattr(slot_info, "get", lambda *_args, **_kwargs: "")("mark_name", "") or "").strip().lower()
+            if current_mark_name == target_mark_name:
+                return str(param_name or "").strip().lower()
+        return ""
+
+    @staticmethod
+    def _ensure_alias_assignment_in_lines(lines, source_param, target_param):
+        source_param = str(source_param or "").strip()
+        target_param = str(target_param or "").strip()
+        if not source_param or not target_param or source_param == target_param:
+            return False
+
+        source_re = re.compile(
+            rf"^(?P<indent>\s*){re.escape(source_param)}\s*=\s*(?:(?P<ref>ref)\s+)?(?P<resource>.+?)\s*$",
+            re.IGNORECASE,
+        )
+        target_re = re.compile(
+            rf"^\s*{re.escape(target_param)}\s*=",
+            re.IGNORECASE,
+        )
+
+        if any(target_re.match(str(line or "")) for line in lines):
+            return False
+
+        for index, line in enumerate(lines):
+            match = source_re.match(str(line or ""))
+            if not match:
+                continue
+            indent = match.group("indent") or ""
+            resource_name = str(match.group("resource") or "").strip()
+            lines.insert(index, f"{indent}{target_param} = {resource_name}")
+            return True
+
+        return False
 
     def _find_workspace_slot_materials(self, obj, slot_info):
         mark_name = str(slot_info.get("mark_name", "") or "").strip()
@@ -1258,10 +1333,15 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             return last_endif_idx + 1
         return draw_idx + 1
 
-    def _strip_generated_material_lines(self, lines):
+    def _strip_generated_material_lines(self, lines, preserved_ps_slots=None):
         cleaned_lines = []
         inside_mesh_block = False
         skipping_material_switch_block = False
+        preserved_ps_slots = {
+            str(slot or "").strip().lower()
+            for slot in (preserved_ps_slots or [])
+            if str(slot or "").strip()
+        }
 
         for line in lines:
             if self.extract_mesh_name(line):
@@ -1281,6 +1361,10 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 continue
 
             if inside_mesh_block and self._is_generated_material_line(stripped):
+                ps_match = re.match(r"^(ps-t\d+)\s*=", stripped, re.IGNORECASE)
+                if ps_match and ps_match.group(1).strip().lower() in preserved_ps_slots:
+                    cleaned_lines.append(line)
+                    continue
                 continue
 
             cleaned_lines.append(line)
@@ -1308,8 +1392,26 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             next_swap_key_num = int(match.group(2)) if match else 0
 
         lines = all_sections[section_name]
+        mesh_line = next((line for line in lines if self.extract_mesh_name(line)), "")
+        section_mesh_name = self.extract_mesh_name(mesh_line) or ""
+        section_obj = self.find_object_by_mesh_name(section_mesh_name) if section_mesh_name else None
+
+        if section_mesh_name and section_obj is None:
+            return next_swap_key_num
+
         ini_mapping = self.build_mapping_for_section(lines)
-        lines[:] = self._strip_generated_material_lines(lines)
+        preserved_ps_slots = set()
+        workspace_slots = OrderedDict()
+        if getattr(self, "_ntmi_modimp_extra_ps_t2_diffuse_map", False):
+            if section_obj is not None:
+                workspace_slots = self._collect_modimp_texture_slots(section_obj)
+        diffuse_workspace_slot = self._find_first_slot_by_mark_name(workspace_slots, "DiffuseMap")
+        if getattr(self, "_ntmi_modimp_extra_ps_t2_diffuse_map", False) and diffuse_workspace_slot and diffuse_workspace_slot != "ps-t2":
+            _self_alias_inserted = self._ensure_alias_assignment_in_lines(lines, diffuse_workspace_slot, "ps-t2")
+            if _self_alias_inserted:
+                ini_mapping["ps-t2"] = ini_mapping.get(diffuse_workspace_slot, "DiffuseMap")
+                preserved_ps_slots.add("ps-t2")
+        lines[:] = self._strip_generated_material_lines(lines, preserved_ps_slots=preserved_ps_slots)
         config_path = os.path.normpath(all_sections.get('_config_path', ''))
         workspace_texture_ini_folder = "Textures"
         workspace_texture_folder = os.path.join(config_path, workspace_texture_ini_folder)
@@ -1332,10 +1434,13 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             generated_ps_slots = set()
 
             workspace_resource_by_slot = OrderedDict()
+            diffuse_workspace_slot = ""
             for param_name, slot_info in self._collect_modimp_texture_slots(obj).items():
                 texture_type = str(slot_info.get("mark_name", "") or "").strip()
                 if not texture_type or texture_type == "FXMap":
                     continue
+                if not diffuse_workspace_slot and texture_type == "DiffuseMap":
+                    diffuse_workspace_slot = str(param_name or "").strip().lower()
                 matching_materials = self._find_workspace_slot_materials(obj, slot_info)
                 if not matching_materials:
                     continue
@@ -1351,6 +1456,22 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                         **dict(slot_info),
                         "resource_name": self._workspace_material_resource_name(matching_materials[0]),
                     }
+
+            if (
+                getattr(self, "_ntmi_modimp_extra_ps_t2_diffuse_map", False)
+                and diffuse_workspace_slot
+                and diffuse_workspace_slot in generated_ps_slots
+                and "ps-t2" not in generated_ps_slots
+            ):
+                diffuse_alias_lines = self._clone_generated_param_lines(
+                    new_lines_for_this_mesh,
+                    diffuse_workspace_slot,
+                    "ps-t2",
+                )
+                if diffuse_alias_lines:
+                    new_lines_for_this_mesh.extend(diffuse_alias_lines)
+                    generated_ps_slots.add("ps-t2")
+                    matched_types.append("DiffuseMap->ps-t2")
 
             is_pst_style = any(k.lower().startswith("ps-t") for k in ini_mapping.keys())
             is_zzmi_style = any(k.lower().startswith("resource\\zzmi\\") for k in ini_mapping.keys())
@@ -1401,6 +1522,21 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     swap_key_prefix, next_swap_key_num, used_swap_keys,
                     resource_name_provider=resource_name_provider)
                 new_lines_for_this_mesh.extend(generated_lines)
+
+            if (
+                getattr(self, "_ntmi_modimp_extra_ps_t2_diffuse_map", False)
+                and diffuse_workspace_slot
+                and "ps-t2" not in generated_ps_slots
+            ):
+                diffuse_alias_lines = self._clone_generated_param_lines(
+                    new_lines_for_this_mesh,
+                    diffuse_workspace_slot,
+                    "ps-t2",
+                )
+                if diffuse_alias_lines:
+                    new_lines_for_this_mesh.extend(diffuse_alias_lines)
+                    generated_ps_slots.add("ps-t2")
+                    matched_types.append("DiffuseMap->ps-t2")
 
             fxmap_lines = []
             for texture_type in ['Glowmap', 'FXMap']:
@@ -1501,8 +1637,12 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     del lines[start_move_idx:end_move_idx]
         return next_swap_key_num
 
-    def execute_postprocess(self, mod_export_path):
+    def execute_postprocess(self, mod_export_path, exporter=None):
         from ..utils.log_utils import LOG as _LOG
+
+        self._ntmi_modimp_extra_ps_t2_diffuse_map = bool(
+            getattr(exporter, "extra_ps_t2_diffuse_map", False)
+        )
 
         ini_files = glob.glob(os.path.join(mod_export_path, "*.ini"))
         if not ini_files:

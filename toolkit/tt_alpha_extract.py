@@ -6,6 +6,13 @@ from collections import defaultdict
 from ..utils.color_attribute_utils import write_color_attribute_data
 
 
+def _alpha_channel_is_effectively_opaque(alpha_channel, *, opaque_threshold: float = 252.0 / 255.0) -> bool:
+    alpha_array = np.asarray(alpha_channel, dtype=np.float32)
+    if alpha_array.size == 0:
+        return True
+    return bool(np.all(alpha_array >= opaque_threshold))
+
+
 class TT_OT_extract_alpha_channel(bpy.types.Operator):
     bl_idname = "toolkit.tt_extract_alpha_channel"
     bl_label = "提取透明通道"
@@ -167,7 +174,7 @@ class TT_OT_extract_alpha_channel(bpy.types.Operator):
                     if not allow_semitransparency:
                         alpha_channel = np.where(alpha_channel > threshold, 1.0, 0.0)
 
-                    if np.all(alpha_channel == 1.0):
+                    if _alpha_channel_is_effectively_opaque(alpha_channel):
                         self.report({'INFO'}, f"纹理 {base_texture.name} 的透明通道为全白，跳过")
                         continue
 

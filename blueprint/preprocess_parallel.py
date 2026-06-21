@@ -601,7 +601,7 @@ def _run_worker(manifest_path: str):
         result["error"] = str(exc)
         traceback.print_exc()
     finally:
-        log_content = LOG.get_log_content()
+        log_content = LOG.get_log_content(strip_ansi=True)
         with open(manifest["log_path"], "w", encoding="utf-8") as file:
             file.write(log_content)
 

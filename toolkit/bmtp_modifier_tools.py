@@ -2,6 +2,24 @@ import bpy
 from . import bmtp_shape_key_utils
 
 
+def _ensure_single_user_mesh_data(obj):
+    if obj is None or getattr(obj, "type", "") != "MESH":
+        return False
+
+    mesh = getattr(obj, "data", None)
+    if mesh is None:
+        return False
+
+    users = int(getattr(mesh, "users", 0) or 0)
+    if users <= 1 or not hasattr(mesh, "copy"):
+        return False
+
+    obj.data = mesh.copy()
+    if getattr(obj.data, "name", ""):
+        obj.data.name = f"{obj.name}_Mesh"
+    return True
+
+
 class BMTP_OT_ArmatureToShapekey(bpy.types.Operator):
     bl_idname = "toolkit.bmtp_armature_to_shapekey"
     bl_label = "骨架修改器 -> 形态键 (批量)"
@@ -32,6 +50,8 @@ class BMTP_OT_ArmatureToShapekey(bpy.types.Operator):
 
             if obj.mode != 'OBJECT':
                 bpy.ops.object.mode_set(mode='OBJECT')
+
+            _ensure_single_user_mesh_data(obj)
 
             if not obj.data.shape_keys:
                 obj.shape_key_add(from_mix=False).name = "Basis"
@@ -87,6 +107,7 @@ class BMTP_OT_ApplyArmatureModifier(bpy.types.Operator):
                 has_shape_keys = obj.data.shape_keys is not None and len(obj.data.shape_keys.key_blocks) > 0
                 
                 context.view_layer.objects.active = obj
+                _ensure_single_user_mesh_data(obj)
                 
                 if has_shape_keys:
                     shapekey_count += 1
@@ -162,6 +183,8 @@ class BMTP_OT_ApplyAllShapeKeys(bpy.types.Operator):
             
             if obj.mode != 'OBJECT':
                 bpy.ops.object.mode_set(mode='OBJECT')
+
+            _ensure_single_user_mesh_data(obj)
             
             try:
                 bpy.ops.object.shape_key_remove(all=True)
@@ -214,6 +237,8 @@ class BMTP_OT_LatticeToShapekey(bpy.types.Operator):
 
             if obj.mode != 'OBJECT':
                 bpy.ops.object.mode_set(mode='OBJECT')
+
+            _ensure_single_user_mesh_data(obj)
 
             if not obj.data.shape_keys:
                 obj.shape_key_add(from_mix=False).name = "Basis"
@@ -315,6 +340,7 @@ class BMTP_OT_ApplyModifiersByName(bpy.types.Operator):
                 matching_mods = [mod for mod in obj.modifiers if mod.name.upper() in names_to_apply]
                 
                 if matching_mods:
+                    _ensure_single_user_mesh_data(obj)
                     has_shape_keys = obj.data.shape_keys is not None and len(obj.data.shape_keys.key_blocks) > 0
                     
                     if has_shape_keys:

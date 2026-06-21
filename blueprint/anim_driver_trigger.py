@@ -128,11 +128,12 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
         self.outputs.new('SSMTSocketAnimDriver', "链输出")
         self.width = 300
         self._assign_next_available_index()
-        self.custom_paused_var = f"$trigger_paused{self.auto_index}"
+        self._ensure_paused_variable_name("trigger_paused")
 
     def copy(self, node):
         self._assign_next_available_index()
-        self.custom_paused_var = f"$trigger_paused{self.auto_index}"
+        self.custom_paused_var = ""
+        self._ensure_paused_variable_name("trigger_paused")
 
     def draw_buttons(self, context, layout):
         safe_idx = self._read_safe_index()
@@ -183,7 +184,7 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
 
-        paused_state = 1 if self.default_paused else 0
+        paused_state = self._resolve_default_play_state(self.default_paused)
         paused_var = self.custom_paused_var.strip()
         if not paused_var:
             paused_var = f"$trigger_paused{idx}"
@@ -206,9 +207,9 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
 
         lines = [
             "[Constants]",
-            f"global $speed_auto{idx} = {playback_rate}",
+            self._format_global_assignment(f"$speed_auto{idx}", playback_rate, persist=True),
             "; 切换速度（由运行时间的播放速率控制）",
-            f"global {paused_var} = {paused_state}",
+            self._format_global_assignment(paused_var, paused_state, persist=True),
             "; 暂停状态",
             "[Present]",
             f"if {paused_var} == 1",
@@ -235,9 +236,10 @@ def _trigger_load_handler(dummy):
         for node in tree.nodes:
             if node.bl_idname == 'SSMTNode_AnimDriver_Trigger':
                 try:
+                    SSMTNode_AnimDriver_Base.migrate_default_play_state_flag(node)
                     SSMTNode_AnimDriver_Base._migrate_controlled_sockets(node)
                     if not node.custom_paused_var:
-                        node.custom_paused_var = f"$trigger_paused{node.auto_index}"
+                        node._ensure_indexed_paused_variable_name("trigger_paused")
                 except Exception:
                     pass
 

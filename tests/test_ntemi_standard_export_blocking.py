@@ -133,6 +133,8 @@ class NtemiStandardExportBlockingTests(unittest.TestCase):
     def test_generate_mod_blocks_ntemi_and_points_to_modimp_output(self):
         tree = _FakeTree(include_ntmi_output=True)
         ui_func_export.BlueprintExportHelper.get_current_blueprint_tree = lambda **_kwargs: tree
+        start_collecting_calls = []
+        ui_func_export.LOG.start_collecting = lambda *_args, **_kwargs: start_collecting_calls.append(True)
 
         operator = ui_func_export.SSMTGenerateModBlueprint()
         operator.reports = []
@@ -143,6 +145,7 @@ class NtemiStandardExportBlockingTests(unittest.TestCase):
         self.assertEqual(result, {'CANCELLED'})
         self.assertTrue(operator.reports)
         self.assertIn("NTMI ModImp Output", operator.reports[-1][1])
+        self.assertEqual(start_collecting_calls, [])
 
     def test_quick_export_blocks_ntemi_before_building_temp_tree(self):
         operator = ui_func_export.SSMTQuickExportSelected()

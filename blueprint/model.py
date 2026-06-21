@@ -408,6 +408,7 @@ class BluePrintModel:
 
         self.cross_ib_info_dict: Dict[str, list] = {}
         self.cross_ib_method_dict: Dict[str, str] = {}
+        self.cross_ib_mapping_method: Dict[tuple, str] = {}
         self.cross_ib_mapping_objects: Dict[tuple, set] = {}
         self.cross_ib_vb_condition_mapping: Dict[tuple, dict] = {}
         self.cross_ib_source_to_target_dict: Dict[str, list] = {}
@@ -1137,6 +1138,7 @@ class BluePrintModel:
 
         self.cross_ib_info_dict.clear()
         self.cross_ib_method_dict.clear()
+        self.cross_ib_mapping_method.clear()
         self.cross_ib_mapping_objects.clear()
         self.cross_ib_vb_condition_mapping.clear()
         self.cross_ib_source_to_target_dict.clear()
@@ -1170,7 +1172,7 @@ class BluePrintModel:
             node_match_mode = getattr(cross_ib_node, 'match_mode', CrossIBMatchMode.INDEX_COUNT)
 
             LOG.info(f"🔗   method={node_method}, match_mode={node_match_mode}")
-            LOG.info(f"🔗   映射内容: {node_ib_mapping}")
+            LOG.info(f"🔗   映射内容: {self._format_cross_ib_mapping(node_ib_mapping)}")
 
             self.cross_ib_method_dict[cross_ib_node.name] = node_method
 
@@ -1192,11 +1194,13 @@ class BluePrintModel:
 
             for cross_ib_node in cross_ib_nodes_in_chain:
                 node_ib_mapping = cross_ib_node.get_ib_mapping_dict()
+                node_method = getattr(cross_ib_node, 'cross_ib_method', '')
                 vb_condition_source = cross_ib_node.get_vb_condition_source()
                 vb_condition_target = cross_ib_node.get_vb_condition_target()
 
                 LOG.info(
-                    f"🔗   链路 '{obj_name}' (导出名 '{export_obj_name}') 在节点 '{cross_ib_node.name}' 上的节点映射: {node_ib_mapping}"
+                    f"🔗   链路 '{obj_name}' (导出名 '{export_obj_name}') 在节点 '{cross_ib_node.name}' 上的节点映射: "
+                    f"{self._format_cross_ib_mapping(node_ib_mapping)}"
                 )
 
                 for source_key, target_keys in node_ib_mapping.items():
@@ -1212,6 +1216,8 @@ class BluePrintModel:
                             self.cross_ib_source_to_target_dict[source_key].append(target_key)
 
                         mapping_key = (source_key, target_key)
+                        if mapping_key not in self.cross_ib_mapping_method:
+                            self.cross_ib_mapping_method[mapping_key] = node_method
                         if mapping_key not in self.cross_ib_vb_condition_mapping:
                             self.cross_ib_vb_condition_mapping[mapping_key] = {
                                 'source': vb_condition_source,
@@ -1225,7 +1231,7 @@ class BluePrintModel:
                             self.cross_ib_target_info[target_key].append(source_key)
 
                 obj_ib_keys = self._get_object_ib_keys(obj_name)
-                LOG.info(f"🔗 物体 '{obj_name}' 的 IB keys: {obj_ib_keys}")
+                LOG.info(f"🔗 物体 '{obj_name}' 的 IB keys: {self._format_sorted_string_list(obj_ib_keys)}")
 
                 matched_source_key = None
                 for key in obj_ib_keys:
@@ -1256,10 +1262,13 @@ class BluePrintModel:
 
         if self.has_cross_ib:
             LOG.info(f"🔗 跨IB处理完成: {len(self.cross_ib_info_dict)} 个源映射, {len(self.cross_ib_object_names)} 个跨IB物体")
-            for source_key, target_keys in self.cross_ib_info_dict.items():
-                LOG.info(f"🔗   源 {source_key} → 目标 {target_keys}")
-            for mapping_key, obj_names in self.cross_ib_mapping_objects.items():
-                LOG.info(f"🔗   映射 {mapping_key}: {obj_names}")
+            for source_key, target_keys in sorted(self.cross_ib_info_dict.items(), key=lambda item: str(item[0])):
+                LOG.info(f"🔗   源 {source_key} -> 目标 {self._format_sorted_string_list(target_keys)}")
+            for mapping_key, obj_names in sorted(
+                self.cross_ib_mapping_objects.items(),
+                key=lambda item: tuple(str(part) for part in item[0]),
+            ):
+                LOG.info(f"🔗   映射 {mapping_key}: {self._format_sorted_string_list(obj_names)}")
         else:
             LOG.info("🔗 跨IB处理完成: 没有有效的跨IB映射")
 
@@ -1298,7 +1307,18 @@ class BluePrintModel:
         except Exception as e:
             LOG.debug(f"🔗 获取物体 '{obj_name}' 的 IB keys 失败: {e}")
 
-        return keys
+        return sorted(dict.fromkeys(keys))
+
+    @staticmethod
+    def _format_sorted_string_list(values) -> list[str]:
+        return sorted(str(value) for value in (values or []))
+
+    @classmethod
+    def _format_cross_ib_mapping(cls, mapping) -> dict[str, list[str]]:
+        ordered = {}
+        for source_key in sorted((mapping or {}).keys(), key=str):
+            ordered[str(source_key)] = cls._format_sorted_string_list((mapping or {}).get(source_key))
+        return ordered
 
     def execute_postprocess_nodes(self, mod_export_path: str):
         if not self.postprocess_nodes:

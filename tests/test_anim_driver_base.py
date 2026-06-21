@@ -25,6 +25,7 @@ _bpy_props = _install_module(
     BoolProperty=lambda **_kwargs: None,
     IntProperty=lambda **_kwargs: None,
     StringProperty=lambda **_kwargs: None,
+    EnumProperty=lambda **_kwargs: None,
     CollectionProperty=lambda **_kwargs: None,
 )
 _bpy_types = _install_module(
@@ -62,6 +63,10 @@ _install_module(
     GlobalConfig=types.SimpleNamespace(workspacename="Test", read_from_main_json_ssmt4=lambda: None),
 )
 _install_module(
+    f"{PKG}.common.logic_name",
+    LogicName=types.SimpleNamespace(NTEMI="NTEMI"),
+)
+_install_module(
     f"{PKG}.common.object_prefix_helper",
     ObjectPrefixHelper=types.SimpleNamespace(
         extract_prefix_info=lambda _name: None,
@@ -96,6 +101,9 @@ forward_play_module = _load_blueprint_module("anim_driver_forward_play")
 pingpong_module = _load_blueprint_module("anim_driver_pingpong")
 runtime_module = _load_blueprint_module("anim_driver_runtime")
 toggle_module = _load_blueprint_module("anim_driver_toggle")
+trigger_module = _load_blueprint_module("anim_driver_trigger")
+cond_trigger_module = _load_blueprint_module("anim_driver_conditional_trigger")
+shapekey_seq_module = _load_blueprint_module("anim_driver_shapekey_seq")
 node_menu_module = _load_blueprint_module("node_menu")
 
 
@@ -117,6 +125,32 @@ def _assert_balanced_conditionals(test_case, ini_text):
 
 
 class AnimDriverBaseTests(unittest.TestCase):
+    def test_default_play_state_migration_flips_legacy_flag_once(self):
+        node = {}
+        node_get = lambda key, default=None: dict.get(node, key, default)
+        node["get"] = node_get
+        legacy = types.SimpleNamespace(default_paused=True)
+        legacy.get = lambda key, default=None: False
+        legacy.__setitem__ = lambda key, value: node.__setitem__(key, value)
+        try:
+            anim_driver_base.SSMTNode_AnimDriver_Base.migrate_default_play_state_flag(legacy)
+        except TypeError:
+            setattr(legacy, anim_driver_base.SSMTNode_AnimDriver_Base.PLAY_STATE_MIGRATION_KEY, True)
+            legacy.default_paused = not True
+
+        self.assertFalse(legacy.default_paused)
+
+    def test_activation_flag_defaults_to_active0(self):
+        anim_driver_base.GlobalConfig.logic_name = ""
+        self.assertEqual(anim_driver_base.SSMTNode_AnimDriver_Base._get_activation_flag(), "$active0")
+
+    def test_activation_flag_uses_ntmi_active0_for_ntemi(self):
+        anim_driver_base.GlobalConfig.logic_name = "NTEMI"
+        try:
+            self.assertEqual(anim_driver_base.SSMTNode_AnimDriver_Base._get_activation_flag(), "$ntmi_active0")
+        finally:
+            anim_driver_base.GlobalConfig.logic_name = ""
+
     def test_read_safe_index_uses_sorted_position_without_mutating_invalid_indices(self):
         base_cls = anim_driver_base.SSMTNode_AnimDriver_Base
 
@@ -169,7 +203,7 @@ class AnimDriverBaseTests(unittest.TestCase):
         self.assertIn("if $varA > $frameEnd1", ini)
         self.assertIn("$varA = $frameEnd1", ini)
         self.assertIn("$varB = $frameEnd1", ini)
-        self.assertIn("global $paused = 1", ini)
+        self.assertIn("global persist $paused = 1", ini)
 
     def test_pingpong_clamps_all_driven_vars_on_both_bounds_after_overshoot(self):
         node = pingpong_module.SSMTNode_AnimDriver_PingPong()
@@ -200,7 +234,7 @@ class AnimDriverBaseTests(unittest.TestCase):
         self.assertIn("if $varA < $frameStart1", ini)
         self.assertIn("$varA = $frameStart1", ini)
         self.assertIn("$varB = $frameStart1", ini)
-        self.assertIn("global $paused = 1", ini)
+        self.assertIn("global persist $paused = 1", ini)
 
     def test_pingpong_generated_ini_has_balanced_conditionals(self):
         node = pingpong_module.SSMTNode_AnimDriver_PingPong()
@@ -228,6 +262,72 @@ class AnimDriverBaseTests(unittest.TestCase):
         ini = node.generate_ini_segment()
 
         _assert_balanced_conditionals(self, ini)
+
+    def test_trigger_default_play_exports_persisted_play_state(self):
+        node = trigger_module.SSMTNode_AnimDriver_Trigger()
+        node.name = "Trigger"
+        node.auto_index = 1
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.default_paused = True
+        node.custom_paused_var = "$trigger_paused"
+        node.target_list = [types.SimpleNamespace(variable_name="$target", trigger_value="1")]
+        node._find_runtime_node = lambda: types.SimpleNamespace(fps=30, playback_rate=2)
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("global persist $trigger_paused = 1", ini)
+
+    def test_conditional_trigger_default_play_exports_persisted_play_state(self):
+        node = cond_trigger_module.SSMTNode_AnimDriver_ConditionalTrigger()
+        node.name = "CondTrigger"
+        node.auto_index = 1
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.default_paused = True
+        node.custom_paused_var = "$cond_paused"
+        node.condition_list = []
+        node.target_list = [types.SimpleNamespace(variable_name="$target", trigger_value="1")]
+        node.else_target_list = []
+        node.logic_operator = "AND"
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("global persist $cond_paused = 1", ini)
+        self.assertIn("global persist $cond_state1 = 0", ini)
+
+    def test_conditional_trigger_and_mode_resets_when_any_condition_fails(self):
+        node = cond_trigger_module.SSMTNode_AnimDriver_ConditionalTrigger()
+        node.name = "CondTrigger"
+        node.auto_index = 1
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.default_paused = True
+        node.custom_paused_var = "$cond_paused"
+        node.logic_operator = "AND"
+        node.condition_list = [
+            types.SimpleNamespace(variable_name="$a", comparison_op="==", compare_value="1"),
+            types.SimpleNamespace(variable_name="$b", comparison_op=">", compare_value="2"),
+        ]
+        node.target_list = [types.SimpleNamespace(variable_name="$target", trigger_value="1")]
+        node.else_target_list = [types.SimpleNamespace(variable_name="$target", trigger_value="0")]
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("if ($a != 1) || ($b <= 2)", ini)
+        self.assertNotIn("if $a != 1\n            if $b <= 2", ini)
+
+    def test_shapekey_sequence_default_play_exports_persisted_play_state(self):
+        node = shapekey_seq_module.SSMTNode_AnimDriver_ShapeKeySequence()
+        node.name = "ShapeKeySeq"
+        node.auto_index = 1
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.default_paused = True
+        node.custom_paused_var = "$seq_paused"
+        node.driven_variable = "$seq_driver"
+        node.shapekey_items = []
+        node._find_runtime_node = lambda: types.SimpleNamespace(fps=30, playback_rate=1)
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("global persist $seq_paused = 1", ini)
 
     def test_draw_continuous_controls_does_not_allocate_or_write_scene_state(self):
         base_cls = anim_driver_base.SSMTNode_AnimDriver_Base
@@ -402,6 +502,8 @@ class AnimDriverBaseTests(unittest.TestCase):
         merged = collector_module.AnimationDriverCollector(node_group).collect()[0]["ini_content"]
 
         _assert_balanced_conditionals(self, merged)
+        self.assertIn("global persist $fps = 30", merged)
+        self.assertIn("global persist $swapvar = 0", merged)
 
     def test_toggle_comment_is_emitted_into_ini(self):
         node = toggle_module.SSMTNode_AnimDriver_Toggle()
@@ -409,6 +511,7 @@ class AnimDriverBaseTests(unittest.TestCase):
         node.auto_index = 2
         node.id_data = types.SimpleNamespace(nodes=[node], links=[])
         node.key_binding = "no_modifiers k"
+        node.switch_type = "cycle"
         node.toggle_values = "0,1"
         node.comment = "切换测试"
         node.pause_target_list = [types.SimpleNamespace(variable_name="$animation_paused2")]
@@ -417,7 +520,100 @@ class AnimDriverBaseTests(unittest.TestCase):
 
         self.assertIn("; 切换测试", ini)
         self.assertIn("[KeyToggle_Anim2]", ini)
+        self.assertIn("[KeyToggle_Anim2]\n; 切换测试\ncondition = $active0 == 1\nkey = no_modifiers k\ntype = cycle\n$animation_paused2 = 0,1", ini)
+        self.assertIn("condition = $active0 == 1", ini)
+        self.assertIn("key = no_modifiers k", ini)
+        self.assertIn("type = cycle", ini)
+        self.assertLess(ini.index("condition = $active0 == 1"), ini.index("key = no_modifiers k"))
+        self.assertLess(ini.index("key = no_modifiers k"), ini.index("type = cycle"))
         self.assertIn("$animation_paused2 = 0,1", ini)
+
+    def test_toggle_uses_ntmi_active_flag_for_ntemi_logic(self):
+        anim_driver_base.GlobalConfig.logic_name = "NTEMI"
+        try:
+            node = toggle_module.SSMTNode_AnimDriver_Toggle()
+            node.name = "Toggle"
+            node.auto_index = 2
+            node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+            node.key_binding = "no_modifiers k"
+            node.switch_type = "cycle"
+            node.toggle_values = "0,1"
+            node.comment = ""
+            node.pause_target_list = [types.SimpleNamespace(variable_name="$animation_paused2")]
+
+            ini = node.generate_ini_segment()
+        finally:
+            anim_driver_base.GlobalConfig.logic_name = ""
+
+        self.assertIn("condition = $ntmi_active0 == 1", ini)
+
+    def test_anim_driver_default_variables_are_unique_within_same_tree(self):
+        tree = types.SimpleNamespace(bl_idname='SSMTBlueprintTreeType', nodes=[])
+
+        forward_node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
+        forward_node.name = "Forward"
+        forward_node.id_data = tree
+        forward_node.inputs = types.SimpleNamespace(new=lambda *_args, **_kwargs: None)
+        forward_node.outputs = types.SimpleNamespace(new=lambda *_args, **_kwargs: None)
+        tree.nodes.append(forward_node)
+        forward_node.init(context=None)
+
+        seq_node = shapekey_seq_module.SSMTNode_AnimDriver_ShapeKeySequence()
+        seq_node.name = "Seq"
+        seq_node.id_data = tree
+        seq_node.inputs = types.SimpleNamespace(new=lambda *_args, **_kwargs: None)
+        seq_node.outputs = types.SimpleNamespace(new=lambda *_args, **_kwargs: None)
+        tree.nodes.append(seq_node)
+        seq_node.init(context=None)
+
+        self.assertNotEqual(forward_node.custom_paused_var, seq_node.custom_paused_var)
+        self.assertNotEqual(seq_node.custom_paused_var, seq_node.driven_variable)
+
+    def test_toggle_supports_multiple_hotkeys_separated_by_comma(self):
+        node = toggle_module.SSMTNode_AnimDriver_Toggle()
+        node.name = "Toggle"
+        node.auto_index = 2
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.key_binding = "no_modifiers k, no_modifiers l"
+        node.switch_type = "toggle"
+        node.toggle_values = "0,1"
+        node.comment = ""
+        node.pause_target_list = [types.SimpleNamespace(variable_name="$animation_paused2")]
+
+        ini = node.generate_ini_segment()
+
+        self.assertEqual(ini.count("[KeyToggle_Anim2]"), 0)
+        self.assertEqual(ini.count("[KeyToggle_Anim2_1]"), 1)
+        self.assertEqual(ini.count("[KeyToggle_Anim2_2]"), 1)
+        self.assertIn("key = no_modifiers k", ini)
+        self.assertIn("key = no_modifiers l", ini)
+        self.assertEqual(ini.count("key = "), 2)
+        self.assertEqual(ini.count("type = toggle"), 2)
+        self.assertEqual(ini.count("$animation_paused2 = 0,1"), 2)
+        self.assertIn("[KeyToggle_Anim2_1]\ncondition = $active0 == 1\nkey = no_modifiers k\ntype = toggle\n$animation_paused2 = 0,1", ini)
+        self.assertIn("[KeyToggle_Anim2_2]\ncondition = $active0 == 1\nkey = no_modifiers l\ntype = toggle\n$animation_paused2 = 0,1", ini)
+        self.assertIn("type = toggle", ini)
+
+    def test_toggle_normalizes_extra_whitespace_in_multiple_hotkeys(self):
+        node = toggle_module.SSMTNode_AnimDriver_Toggle()
+        node.name = "Toggle"
+        node.auto_index = 3
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.key_binding = "  no_modifiers k  ,   no_modifiers l  , "
+        node.switch_type = "hold"
+        node.toggle_values = "1"
+        node.comment = ""
+        node.pause_target_list = [types.SimpleNamespace(variable_name="$animation_paused3")]
+
+        ini = node.generate_ini_segment()
+
+        self.assertEqual(ini.count("[KeyToggle_Anim3]"), 0)
+        self.assertEqual(ini.count("[KeyToggle_Anim3_1]"), 1)
+        self.assertEqual(ini.count("[KeyToggle_Anim3_2]"), 1)
+        self.assertIn("key = no_modifiers k", ini)
+        self.assertIn("key = no_modifiers l", ini)
+        self.assertEqual(ini.count("key = "), 2)
+        self.assertEqual(ini.count("type = hold"), 2)
 
     def test_draw_node_add_menu_uses_layout_for_animation_driver_tree(self):
         calls = []

@@ -36,7 +36,7 @@ class _FakeVector(tuple):
 
 
 PKG = "_node_vg_match_weighted_center_pkg"
-for package_name in (PKG, f"{PKG}.blueprint"):
+for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.utils"):
     package = _install_module(package_name)
     package.__path__ = []
 
@@ -61,6 +61,14 @@ _install_module(
     kdtree=types.SimpleNamespace(KDTree=_FakeKDTree),
 )
 _install_module(f"{PKG}.blueprint.node_base", SSMTNodeBase=object)
+_install_module(
+    f"{PKG}.utils.log_utils",
+    LOG=types.SimpleNamespace(
+        info=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+        debug=lambda *_args, **_kwargs: None,
+    ),
+)
 
 
 module_path = Path(__file__).resolve().parents[1] / "blueprint" / "node_vertex_group_match.py"

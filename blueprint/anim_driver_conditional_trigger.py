@@ -18,6 +18,13 @@ def _invert_comparison_op(op: str) -> str:
     return _INVERTED_COMPARISON_OPS.get(op, '!=')
 
 
+def _combine_conditions_with_or(conditions) -> str:
+    clauses = []
+    for var, op, val in conditions:
+        clauses.append(f"({var} {op} {val})")
+    return " || ".join(clauses)
+
+
 class ConditionItem(bpy.types.PropertyGroup):
     variable_name: StringProperty(
         name="条件变量",
@@ -344,11 +351,12 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
         self.outputs.new('SSMTSocketAnimDriver', "链输出")
         self.width = 350
         self._assign_next_available_index()
-        self.custom_paused_var = f"$cond_trigger_paused{self.auto_index}"
+        self._ensure_paused_variable_name("cond_trigger_paused")
 
     def copy(self, node):
         self._assign_next_available_index()
-        self.custom_paused_var = f"$cond_trigger_paused{self.auto_index}"
+        self.custom_paused_var = ""
+        self._ensure_paused_variable_name("cond_trigger_paused")
 
     def draw_buttons(self, context, layout):
         safe_idx = self._read_safe_index()
@@ -439,7 +447,7 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
     def generate_ini_segment(self, connected_nodes=None) -> str:
         idx = self._read_safe_index()
 
-        paused_state = 1 if self.default_paused else 0
+        paused_state = self._resolve_default_play_state(self.default_paused)
         paused_var = self.custom_paused_var.strip()
         if not paused_var:
             paused_var = f"$cond_trigger_paused{idx}"
@@ -491,16 +499,16 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
 
         lines = [
             "[Constants]",
-            f"global {paused_var} = {paused_state}",
+            self._format_global_assignment(paused_var, paused_state, persist=True),
             "; 暂停状态",
-            f"global {state_var} = 0",
+            self._format_global_assignment(state_var, 0, persist=True),
             "; 条件触发状态（0=未触发，1=已触发）",
         ]
 
         # flag_var 仅在 OR 模式下用于判断"任一条件成立"
         needs_flag = bool(conditions) and self.logic_operator == 'OR'
         if needs_flag:
-            lines.append(f"global {flag_var} = 0")
+            lines.append(self._format_global_assignment(flag_var, 0, persist=True))
             lines.append("; OR 条件临时标志")
 
         # 边沿触发：避免在条件持续满足期间每帧强制覆盖目标变量
@@ -551,17 +559,16 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
             lines.append("[Present]")
             lines.append(f"if {state_var} == 1")
             lines.append(f"    if {paused_var} == 1")
-            indent = "        "
-            for var, op, val in conditions:
-                inv_op = _invert_comparison_op(op)
-                lines.append(f"{indent}if {var} {inv_op} {val}")
-                indent += "    "
+            inverted_or_condition = _combine_conditions_with_or(
+                (var, _invert_comparison_op(op), val)
+                for var, op, val in conditions
+            )
+            lines.append(f"        if {inverted_or_condition}")
+            indent = "            "
             for target, val in else_target_assignments:
                 lines.append(f"{indent}{target} = {val}")
             lines.append(f"{indent}{state_var} = 0")
-            for _ in conditions:
-                indent = indent[:-4]
-                lines.append(f"{indent}endif")
+            lines.append("        endif")
             lines.append("    endif")
             lines.append("endif")
         else:
@@ -615,11 +622,12 @@ def _cond_trigger_load_handler(dummy):
         for node in tree.nodes:
             if node.bl_idname == 'SSMTNode_AnimDriver_ConditionalTrigger':
                 try:
+                    SSMTNode_AnimDriver_Base.migrate_default_play_state_flag(node)
                     required_inputs = ["链输入", "驱动输入"]
                     required_outputs = ["链输出"]
                     SSMTNode_AnimDriver_Base._migrate_node_sockets(node, required_inputs, required_outputs)
                     if not node.custom_paused_var:
-                        node.custom_paused_var = f"$cond_trigger_paused{node.auto_index}"
+                        node._ensure_indexed_paused_variable_name("cond_trigger_paused")
                 except Exception:
                     pass
 

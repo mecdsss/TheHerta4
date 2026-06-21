@@ -11,6 +11,14 @@ class BMTP_UL_VertexGroupItem(bpy.types.PropertyGroup):
     index: bpy.props.IntProperty(name="索引")
 
 
+class BMTP_MergeSplitItem(bpy.types.PropertyGroup):
+    object_name: bpy.props.StringProperty(name="物体名称", default="")
+    marker_group_name: bpy.props.StringProperty(name="来源标记", default="")
+    face_start: bpy.props.IntProperty(name="起始面", default=0, min=0)
+    face_count: bpy.props.IntProperty(name="面数量", default=0, min=0)
+    vertex_count: bpy.props.IntProperty(name="顶点数量", default=0, min=0)
+
+
 class BMTP_Properties(bpy.types.PropertyGroup):
     vc_mode: bpy.props.EnumProperty(
         name="模式",
@@ -57,7 +65,7 @@ class BMTP_Properties(bpy.types.PropertyGroup):
     uv_add_name_template: bpy.props.StringProperty(name="名称模板", default="UVMap_{index}",
                                                    description="新UV贴图名称的模板，{index}将被替换为索引号")
 
-    mod_delete_names: bpy.props.StringProperty(name="名称", default="Subdivision,Mirror,Solidify",
+    mod_delete_names: bpy.props.StringProperty(name="名称", default="Left Eye UV warp,Right Eye UV warp,Normal Smoothing,Outline Modifier",
                                                description="要删除的修改器或约束名称列表，用逗号分隔")
     
     mod_apply_names: bpy.props.StringProperty(name="名称", default="Subdivision,Mirror,Solidify",
@@ -142,6 +150,26 @@ class BMTP_Properties(bpy.types.PropertyGroup):
         min=0.0,
         max=1.0
     )
+    limit_surface_subdiv_levels: bpy.props.IntProperty(
+        name="细分级别",
+        description="临时极限表面求值时使用的细分级别",
+        default=2,
+        min=1,
+        max=6,
+    )
+
+    merge_split_items: bpy.props.CollectionProperty(type=BMTP_MergeSplitItem, name="合并拆分列表")
+    merge_split_index: bpy.props.IntProperty(name="合并拆分索引", default=0, min=0)
+    merge_split_target_name: bpy.props.StringProperty(
+        name="合并物体名称",
+        default="MergedObject",
+        description="执行合并后目标物体使用的名称",
+    )
+    merge_split_weld_vertices: bpy.props.BoolProperty(
+        name="合并后按距离 0.00001 合并顶点",
+        default=False,
+        description="开启后会焊接重合顶点，但不保证后续能完美恢复原始网格",
+    )
 
 
 class BMTP_UL_CollectionLinkList(bpy.types.UIList):
@@ -170,10 +198,24 @@ class BMTP_UL_VertexGroupList(bpy.types.UIList):
             layout.label(text="", icon_value=icon)
 
 
+class BMTP_UL_MergeSplitList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.label(text=item.object_name or "[未设置]", icon='MESH_DATA')
+            row.label(text=f"{max(0, int(item.vertex_count))} verts")
+            row.label(text="已记录来源" if item.marker_group_name else "未记录")
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon='MESH_DATA')
+
+
 bmtp_properties_list = (
     BMTP_UL_ListItem,
     BMTP_UL_VertexGroupItem,
+    BMTP_MergeSplitItem,
     BMTP_Properties,
     BMTP_UL_CollectionLinkList,
     BMTP_UL_VertexGroupList,
+    BMTP_UL_MergeSplitList,
 )

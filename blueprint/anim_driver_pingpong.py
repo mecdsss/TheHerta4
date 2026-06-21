@@ -139,7 +139,7 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         self.outputs.new('SSMTSocketAnimDriver', "时间输出")
         self.width = 300
         self._assign_next_available_index()
-        self.custom_paused_var = f"$animation_paused{self.auto_index}"
+        self._ensure_paused_variable_name("animation_paused")
         self.assigned_continuous_index_variable_name = ""
         self.custom_continuous_index_variable_name = ""
         self.continuous_index_var_initialized = False
@@ -148,7 +148,8 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
 
     def copy(self, node):
         self._assign_next_available_index()
-        self.custom_paused_var = f"$animation_paused{self.auto_index}"
+        self.custom_paused_var = ""
+        self._ensure_paused_variable_name("animation_paused")
         self.assigned_continuous_index_variable_name = ""
         self.custom_continuous_index_variable_name = ""
         self.continuous_index_var_initialized = False
@@ -250,7 +251,7 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
 
-        paused_state = 1 if self.default_paused else 0
+        paused_state = self._resolve_default_play_state(self.default_paused)
         paused_var = self.custom_paused_var.strip()
         if not paused_var:
             paused_var = f"$animation_paused{idx}"
@@ -266,20 +267,20 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
 
         lines = [
             "[Constants]",
-            f"global $speed_auto{idx} = {playback_rate}",
+            self._format_global_assignment(f"$speed_auto{idx}", playback_rate, persist=True),
             "; 切换速度（由运行时间的播放速率控制）",
-            f"global $frameStart{idx} = {self.frame_start}",
+            self._format_global_assignment(f"$frameStart{idx}", self.frame_start, persist=True),
             "; 起始帧",
-            f"global $frameEnd{idx} = {self.frame_end}",
+            self._format_global_assignment(f"$frameEnd{idx}", self.frame_end, persist=True),
             "; 结束帧",
-            f"global $direction{idx} = {init_direction}",
+            self._format_global_assignment(f"$direction{idx}", init_direction, persist=True),
             "; 播放方向（1=正向，-1=反向）",
-            f"global {paused_var} = {paused_state}",
+            self._format_global_assignment(paused_var, paused_state, persist=True),
             "; 暂停状态",
         ]
         if continuous_mode:
             lines.extend([
-                f"global {primary_var} = {self._get_continuous_primary_initial_value()}",
+                self._format_global_assignment(primary_var, self._get_continuous_primary_initial_value(), persist=True),
                 "; 连续形态键索引变量",
             ])
         lines.extend([
@@ -378,9 +379,10 @@ def _pingpong_load_handler(dummy):
         for node in tree.nodes:
             if node.bl_idname == 'SSMTNode_AnimDriver_PingPong':
                 try:
+                    SSMTNode_AnimDriver_Base.migrate_default_play_state_flag(node)
                     SSMTNode_AnimDriver_Base._migrate_play_sockets(node)
                     if not node.custom_paused_var:
-                        node.custom_paused_var = f"$animation_paused{node.auto_index}"
+                        node._ensure_indexed_paused_variable_name("animation_paused")
                     if getattr(node, "use_continuous_shapekey_mode", False):
                         node.continuous_index_var_initialized = False
                         node._ensure_initial_visible_continuous_index_variable_name()

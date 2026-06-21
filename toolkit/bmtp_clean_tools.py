@@ -350,10 +350,68 @@ class BMTP_OT_BatchClearAll(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class BMTP_OT_RemoveUnusedMaterialSlots(bpy.types.Operator):
+    bl_idname = "toolkit.bmtp_remove_unused_material_slots"
+    bl_label = "清理所有未使用槽"
+    bl_description = "删除选中网格物体上未被任何面引用的材质槽"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    def execute(self, context):
+        mesh_objects = [obj for obj in context.selected_objects if obj.type == 'MESH' and getattr(obj, "data", None)]
+        if not mesh_objects:
+            self.report({'INFO'}, "没有选中的网格物体")
+            return {'FINISHED'}
+
+        original_active = context.view_layer.objects.active
+        original_mode = original_active.mode if original_active else 'OBJECT'
+        total_objects = 0
+        total_removed_slots = 0
+
+        for obj in mesh_objects:
+            if obj.mode != 'OBJECT':
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.object.mode_set(mode='OBJECT')
+
+            slot_count = len(getattr(obj, "material_slots", []) or [])
+            if slot_count <= 0:
+                continue
+
+            used_slot_indices = {
+                int(polygon.material_index)
+                for polygon in getattr(obj.data, "polygons", []) or []
+                if 0 <= int(polygon.material_index) < slot_count
+            }
+            unused_slot_indices = [slot_index for slot_index in range(slot_count) if slot_index not in used_slot_indices]
+            if not unused_slot_indices:
+                total_objects += 1
+                continue
+
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+            for slot_index in reversed(unused_slot_indices):
+                obj.active_material_index = slot_index
+                bpy.ops.object.material_slot_remove()
+                total_removed_slots += 1
+            total_objects += 1
+
+        if original_active and original_active.name in bpy.data.objects:
+            bpy.context.view_layer.objects.active = original_active
+            if getattr(original_active, "mode", None) != original_mode:
+                bpy.ops.object.mode_set(mode=original_mode)
+
+        self.report({'INFO'}, f"已从 {total_objects} 个物体中清理 {total_removed_slots} 个未使用材质槽")
+        return {'FINISHED'}
+
+
 bmtp_clean_tools_list = (
     BMTP_OT_ClearVertexCreases,
     BMTP_OT_ClearEdgeCreases,
     BMTP_OT_ClearSharpEdges,
     BMTP_OT_ClearSeams,
     BMTP_OT_BatchClearAll,
+    BMTP_OT_RemoveUnusedMaterialSlots,
 )

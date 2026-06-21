@@ -7,6 +7,8 @@ from bpy.types import NodeSocket, Node
 
 from .node_base import SSMTNodeBase
 from .variable_registry import allocate_continuous_shapekey_index_variable_name, mark_variable_name_used, normalize_variable_name
+from ..common.global_config import GlobalConfig
+from ..common.logic_name import LogicName
 
 
 class DrivenVariableItem(bpy.types.PropertyGroup):
@@ -334,6 +336,7 @@ class SSMTSocketAnimDriver(NodeSocket):
 
 
 class SSMTNode_AnimDriver_Base(SSMTNodeBase):
+    PLAY_STATE_MIGRATION_KEY = "_th4_default_play_state_migrated"
     bl_idname = 'SSMTNode_AnimDriver_Base'
     bl_label = 'AnimDriver Base'
 
@@ -402,6 +405,107 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
 
     def generate_ini_segment(self, connected_nodes=None) -> str:
         raise NotImplementedError("子类必须实现 generate_ini_segment 方法")
+
+    @staticmethod
+    def _resolve_default_play_state(default_play_enabled) -> int:
+        """Animation driver play flags use 1=playing and 0=paused."""
+        return 1 if default_play_enabled else 0
+
+    @classmethod
+    def migrate_default_play_state_flag(cls, node):
+        if node is None:
+            return
+        try:
+            already_migrated = bool(node.get(cls.PLAY_STATE_MIGRATION_KEY, False))
+        except Exception:
+            already_migrated = False
+        if already_migrated:
+            return
+
+        if hasattr(node, "default_paused"):
+            try:
+                node.default_paused = not bool(getattr(node, "default_paused", False))
+            except Exception:
+                pass
+        try:
+            node[cls.PLAY_STATE_MIGRATION_KEY] = True
+        except Exception:
+            setattr(node, cls.PLAY_STATE_MIGRATION_KEY, True)
+
+    @staticmethod
+    def _format_global_assignment(variable_name, value, persist=False) -> str:
+        scope = "global persist" if persist else "global"
+        return f"{scope} {variable_name} = {value}"
+
+    @staticmethod
+    def _get_activation_flag() -> str:
+        if getattr(GlobalConfig, "logic_name", "") == LogicName.NTEMI:
+            return "$ntmi_active0"
+        return "$active0"
+
+    def _iter_anim_driver_nodes(self):
+        tree = getattr(self, "id_data", None)
+        if not tree:
+            return []
+        return [
+            node for node in getattr(tree, "nodes", [])
+            if str(getattr(node, "bl_idname", "") or "").startswith("SSMTNode_AnimDriver_")
+        ]
+
+    def _collect_anim_driver_variable_names(self):
+        used_names = set()
+        for node in self._iter_anim_driver_nodes():
+            for attr_name in (
+                "custom_paused_var",
+                "driven_variable",
+                "assigned_continuous_index_variable_name",
+                "custom_continuous_index_variable_name",
+            ):
+                raw_value = str(getattr(node, attr_name, "") or "").strip()
+                if raw_value:
+                    used_names.add(normalize_variable_name(raw_value))
+            for item in getattr(node, "driven_variable_list", []) or []:
+                raw_value = str(getattr(item, "variable_name", "") or "").strip()
+                if raw_value:
+                    used_names.add(normalize_variable_name(raw_value))
+        return {name for name in used_names if name}
+
+    def _allocate_unique_anim_driver_variable_name(self, prefix: str, *, exclude_current=()) -> str:
+        used_names = self._collect_anim_driver_variable_names()
+        excluded_names = {
+            normalize_variable_name(value)
+            for value in exclude_current
+            if normalize_variable_name(value)
+        }
+        suffix = 1
+        while True:
+            candidate = f"{prefix}{suffix}"
+            if candidate not in used_names or candidate in excluded_names:
+                return candidate
+            suffix += 1
+
+    def _ensure_paused_variable_name(self, prefix: str):
+        current_value = str(getattr(self, "custom_paused_var", "") or "").strip()
+        normalized = normalize_variable_name(current_value)
+        if normalized:
+            return f"${normalized}"
+        allocated = self._allocate_unique_anim_driver_variable_name(prefix)
+        self.custom_paused_var = f"${allocated}"
+        return self.custom_paused_var
+
+    def _ensure_indexed_paused_variable_name(self, prefix: str):
+        current_value = str(getattr(self, "custom_paused_var", "") or "").strip()
+        normalized = normalize_variable_name(current_value)
+        if normalized:
+            return f"${normalized}"
+
+        preferred = f"{prefix}{self._read_safe_index()}"
+        used_names = self._collect_anim_driver_variable_names()
+        if preferred not in used_names:
+            self.custom_paused_var = f"${preferred}"
+            return self.custom_paused_var
+
+        return self._ensure_paused_variable_name(prefix)
 
     @staticmethod
     def _resolve_shapekey_variable(item):

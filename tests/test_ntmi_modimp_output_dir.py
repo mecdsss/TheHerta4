@@ -195,6 +195,50 @@ class NTMIModImpOutputDirTests(unittest.TestCase):
             ],
         )
 
+    def test_execute_supported_postprocess_nodes_passes_exporter_to_material_node_only(self):
+        calls = []
+        exporter = types.SimpleNamespace(extra_ps_t2_diffuse_map=True)
+
+        material_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_Material",
+            name="Material",
+            execute_postprocess=lambda output_dir, exporter=None: calls.append(
+                ("material", output_dir, getattr(exporter, "extra_ps_t2_diffuse_map", None))
+            ),
+        )
+        cleanup_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_BufferCleanup",
+            name="Cleanup",
+            execute_postprocess=lambda output_dir: calls.append(("cleanup", output_dir)),
+        )
+
+        blueprint_model = types.SimpleNamespace(
+            postprocess_nodes=[material_node, cleanup_node],
+            multi_file_export_nodes=[],
+        )
+
+        original_mapping = getattr(ntmi_export_modimp.BluePrintModel, "_object_name_mapping", None)
+        ntmi_export_modimp.BluePrintModel._object_name_mapping = {}
+        try:
+            ntmi_export_modimp._execute_supported_postprocess_nodes(
+                blueprint_model=blueprint_model,
+                output_dir="E:/Out",
+                exporter=exporter,
+            )
+        finally:
+            if original_mapping is None:
+                delattr(ntmi_export_modimp.BluePrintModel, "_object_name_mapping")
+            else:
+                ntmi_export_modimp.BluePrintModel._object_name_mapping = original_mapping
+
+        self.assertEqual(
+            calls,
+            [
+                ("material", "E:/Out", True),
+                ("cleanup", "E:/Out"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

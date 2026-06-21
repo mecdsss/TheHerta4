@@ -6,7 +6,6 @@ from pathlib import Path
 
 
 def _install_module(name, **attrs):
-    """安装 Fake 模块到 sys.modules"""
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -35,17 +34,14 @@ _install_module(
         IntProperty=_prop_stub,
     ),
 )
-_install_module(
-    "bpy.types",
-    Node=object,
-    PropertyGroup=object,
-)
+_install_module("bpy.types", Node=object, PropertyGroup=object)
 _install_module(
     "bpy.props",
     StringProperty=_prop_stub,
     CollectionProperty=lambda **kwargs: [],
     BoolProperty=_prop_stub,
     EnumProperty=_prop_stub,
+    IntProperty=_prop_stub,
 )
 _install_module(
     f"{PKG}.blueprint.node_base",
@@ -70,10 +66,7 @@ class _SocketList(list):
 
 
 class CrossIBNodeTests(unittest.TestCase):
-    """测试 CrossIB 节点的初始化与不支持原因检测"""
-
     def test_update_cross_ib_method_sets_unsupported_reason_without_raising(self):
-        """测试 update_cross_ib_method 能设置不支持原因而不抛出异常"""
         node = object.__new__(node_cross_ib.SSMTNode_CrossIB)
         node.cross_ib_method = node_cross_ib.CrossIBMethodEnum.END_FIELD
         node.match_mode = node_cross_ib.CrossIBMatchMode.INDEX_COUNT
@@ -84,7 +77,6 @@ class CrossIBNodeTests(unittest.TestCase):
         self.assertTrue(node.unsupported_reason)
 
     def test_init_does_not_raise_for_unsupported_logic_name(self):
-        """测试 init 在遇到不支持的逻辑名称时不抛出异常"""
         node = object.__new__(node_cross_ib.SSMTNode_CrossIB)
         node.inputs = _SocketList()
         node.outputs = _SocketList()
@@ -97,6 +89,20 @@ class CrossIBNodeTests(unittest.TestCase):
         self.assertEqual(len(node.inputs), 1)
         self.assertEqual(len(node.outputs), 1)
         self.assertTrue(node.unsupported_reason)
+
+    def test_zzmi_available_methods_include_new_cross_ib_options(self):
+        methods = node_cross_ib.CrossIBMethodEnum.get_available_methods("ZZMI")
+        self.assertEqual(
+            methods,
+            [
+                node_cross_ib.CrossIBMethodEnum.VB_COPY,
+                node_cross_ib.CrossIBMethodEnum.VB_COPY_CB1,
+                node_cross_ib.CrossIBMethodEnum.VB_REF_SO0,
+            ],
+        )
+
+    def test_cross_ib_set_method_operator_is_registered_in_module_classes(self):
+        self.assertIn(node_cross_ib.SSMT_OT_CrossIB_SetMethod, node_cross_ib.classes)
 
 
 if __name__ == "__main__":

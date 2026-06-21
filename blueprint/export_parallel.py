@@ -485,7 +485,7 @@ def _run_worker(manifest_path: str):
         PreProcessCache.clear_override_cache_dir()
         
         with open(manifest["log_path"], "w", encoding="utf-8") as file:
-            file.write(LOG.get_log_content())
+            file.write(LOG.get_log_content(strip_ansi=True))
 
         with open(manifest["result_path"], "w", encoding="utf-8") as file:
             json.dump(result, file, ensure_ascii=False, indent=2)

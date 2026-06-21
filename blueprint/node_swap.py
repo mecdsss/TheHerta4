@@ -12,6 +12,7 @@ from .variable_registry import ensure_object_swap_variable_name, mark_variable_n
 
 _swap_preview_hidden_state = None
 _swap_preview_session_owner = None
+_is_button_context_menu_hooked = False
 
 
 @dataclass
@@ -845,19 +846,151 @@ class ObjectSwapDebugger:
         return lines
 
 
+def _iter_blueprint_swap_nodes():
+    for tree in getattr(bpy.data, "node_groups", []) or []:
+        if getattr(tree, "bl_idname", "") != "SSMTBlueprintTreeType":
+            continue
+        nodes = getattr(tree, "nodes", []) or []
+        if isinstance(nodes, dict):
+            node_iterable = nodes.values()
+        else:
+            node_iterable = nodes
+        for node in node_iterable:
+            if getattr(node, "bl_idname", "") == "SSMTNode_ObjectSwap":
+                yield node
+
+
+def _get_blueprint_tree_by_name(tree_name: str):
+    clean_name = str(tree_name or "").strip()
+    if not clean_name:
+        return None
+
+    node_groups = getattr(bpy.data, "node_groups", None)
+    if node_groups is None:
+        return None
+
+    getter = getattr(node_groups, "get", None)
+    if callable(getter):
+        return getter(clean_name)
+
+    for tree in node_groups:
+        if getattr(tree, "name", "") == clean_name:
+            return tree
+    return None
+
+
+def _resolve_button_context_swap_property(context):
+    pointer = getattr(context, "button_pointer", None)
+    button_prop = getattr(context, "button_prop", None)
+    if pointer is None or button_prop is None:
+        return None, None
+    if getattr(pointer, "bl_idname", "") != "SSMTNode_ObjectSwap":
+        return None, None
+
+    property_name = str(getattr(button_prop, "identifier", "") or "").strip()
+    allowed_properties = {
+        "comment",
+        "custom_var_name",
+        "hotkey",
+        "swap_type",
+        "input_slot_count",
+        "condition_operator",
+    }
+    if property_name not in allowed_properties:
+        return None, None
+    return pointer, property_name
+
+
+class SSMT_OT_CopySwapPropertyToSameHotkeyNodes(bpy.types.Operator):
+    bl_idname = "ssmt.copy_swap_property_to_same_hotkey_nodes"
+    bl_label = "将内容复制到相同快捷键的节点"
+    bl_description = "在所有蓝图中查找填写了相同快捷键的物体切换节点，并同步当前输入框内容"
+    bl_options = {"REGISTER", "UNDO"}
+
+    source_tree_name: bpy.props.StringProperty(options={"SKIP_SAVE"})  # type: ignore
+    source_node_name: bpy.props.StringProperty(options={"SKIP_SAVE"})  # type: ignore
+    property_name: bpy.props.StringProperty(options={"SKIP_SAVE"})  # type: ignore
+
+    def execute(self, context):
+        tree = _get_blueprint_tree_by_name(str(getattr(self, "source_tree_name", "") or "").strip())
+        source_node = tree.nodes.get(self.source_node_name) if tree else None
+        property_name = str(getattr(self, "property_name", "") or "").strip()
+        if source_node is None or getattr(source_node, "bl_idname", "") != "SSMTNode_ObjectSwap" or not property_name:
+            self.report({"WARNING"}, "未找到源物体切换节点")
+            return {"CANCELLED"}
+
+        source_hotkey = str(getattr(source_node, "hotkey", "") or "").strip()
+        if not source_hotkey:
+            self.report({"WARNING"}, "当前物体切换节点未填写快捷键")
+            return {"CANCELLED"}
+
+        value = getattr(source_node, property_name)
+        updated_count = 0
+        for node in _iter_blueprint_swap_nodes():
+            if node == source_node:
+                continue
+            if str(getattr(node, "hotkey", "") or "").strip() != source_hotkey:
+                continue
+            try:
+                setattr(node, property_name, value)
+                if property_name == "input_slot_count":
+                    update_fn = getattr(node, "update_input_slot_count", None)
+                    if callable(update_fn):
+                        update_fn(context)
+                else:
+                    update_fn = getattr(node, "update_all_properties", None)
+                    if callable(update_fn):
+                        update_fn(context)
+                updated_count += 1
+            except Exception:
+                continue
+
+        self.report({"INFO"}, f"已同步 {updated_count} 个相同快捷键节点")
+        return {"FINISHED"}
+
+
+def draw_swap_button_context_menu(self, context):
+    node, property_name = _resolve_button_context_swap_property(context)
+    if node is None or not property_name:
+        return
+
+    layout = self.layout
+    layout.separator()
+    op = layout.operator(
+        "ssmt.copy_swap_property_to_same_hotkey_nodes",
+        text="将内容复制到相同快捷键的节点",
+        icon="PASTEDOWN",
+    )
+    op.source_tree_name = node.id_data.name if getattr(node, "id_data", None) else ""
+    op.source_node_name = node.name
+    op.property_name = property_name
+
+
 classes = (
     SSMTNode_ObjectSwap,
     SSMT_OT_AddSwapOption,
     SSMT_OT_RemoveSwapOption,
     SSMT_OT_CycleSwapPreview,
+    SSMT_OT_CopySwapPropertyToSameHotkeyNodes,
 )
 
 
 def register():
+    global _is_button_context_menu_hooked
     for cls in classes:
         bpy.utils.register_class(cls)
+    if not _is_button_context_menu_hooked:
+        bpy.types.UI_MT_button_context_menu.append(draw_swap_button_context_menu)
+        _is_button_context_menu_hooked = True
 
 
 def unregister():
+    global _is_button_context_menu_hooked
+    if _is_button_context_menu_hooked:
+        try:
+            bpy.types.UI_MT_button_context_menu.remove(draw_swap_button_context_menu)
+        except Exception:
+            pass
+        _is_button_context_menu_hooked = False
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
