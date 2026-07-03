@@ -101,6 +101,10 @@ class CrossIBNodeTests(unittest.TestCase):
             ],
         )
 
+    def test_zzmidx12_has_no_available_cross_ib_methods(self):
+        methods = node_cross_ib.CrossIBMethodEnum.get_available_methods("ZZMIDX12")
+        self.assertEqual(methods, [])
+
     def test_cross_ib_set_method_operator_is_registered_in_module_classes(self):
         self.assertIn(node_cross_ib.SSMT_OT_CrossIB_SetMethod, node_cross_ib.classes)
 

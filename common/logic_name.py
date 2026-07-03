@@ -18,6 +18,7 @@ class LogicName:
     HIMI = "HIMI"
     SRMI = "SRMI"
     ZZMI = "ZZMI"
+    ZZMIDX12 = "ZZMIDX12"  # 绝区零DX12模式，方便测试DX12模型导入
     WWMI = "WWMI"
     EFMI = "EFMI"
     HTMI = "HTMI"
@@ -40,3 +41,8 @@ class LogicName:
     # 预留位置
     APMI = "APMI" # 还在内测的蓝色星原，已在测试服中测试过，完美支持3Dmigoto，预计发布就会被XXMI收录
     NEMI = "NEMI" # 还在内测的异环，已在测试服中测试过，完美支持3Dmigoto，预计发布就会被XXMI收录
+
+    @classmethod
+    def is_zzmi_family(cls, logic_name: str) -> bool:
+        """判断是否属于 ZZMI 家族（ZZMI / ZZMIDX12 共用同一套导出逻辑）"""
+        return logic_name in {cls.ZZMI, cls.ZZMIDX12}

@@ -72,6 +72,7 @@ class M_IniBuilder:
     def clear(self):
         self.line_list.clear()
         self.ini_section_list.clear()
+        self.ini_section_name_set.clear()
 
     def __append_section_line(self,ini_section_type:M_SectionType):
         '''

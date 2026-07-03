@@ -66,6 +66,52 @@ class DDSConversionTests(unittest.TestCase):
         self.assertEqual(dds_format, "bc7_unorm_srgb")
         self.assertIn("--srgb-in", dds_conversion._texconv_colorspace_flags(texture_type))
 
+    def test_custom_rules_use_first_recognized_marker_as_texture_type(self):
+        """测试命中自定义规则时，texture_type 仍按文件名中最先出现的已知段落识别"""
+        props = types.SimpleNamespace(
+            dds_use_custom_rules=True,
+            dds_rules=[
+                types.SimpleNamespace(
+                    enabled=True,
+                    pattern=r"(?i)(?:^|[_\-. ])DiffuseMap_high(?:[_\-. ]|$)",
+                    format="bc7_unorm_srgb",
+                ),
+                types.SimpleNamespace(
+                    enabled=True,
+                    pattern=r"(?i)(?:^|[_\-. ])DiffuseMap(?:[_\-. ]|$)",
+                    format="bc7_unorm_srgb",
+                ),
+                types.SimpleNamespace(
+                    enabled=True,
+                    pattern=r"(?i)(?:^|[_\-. ])NormalMap(?:[_\-. ]|$)",
+                    format="r8g8b8a8_unorm",
+                ),
+            ],
+        )
+        texture_type, dds_format, matched_by = dds_conversion.resolve_dds_target(
+            "NormalMap_DiffuseMap_high.png", props
+        )
+        self.assertEqual(texture_type, "NormalMap")
+        self.assertEqual(dds_format, "bc7_unorm_srgb")
+        self.assertEqual(matched_by, r"(?i)(?:^|[_\-. ])DiffuseMap_high(?:[_\-. ]|$)")
+        self.assertIn("--ignore-srgb", dds_conversion._texconv_colorspace_flags(texture_type))
+
+    def test_default_rules_pick_first_matching_keyword(self):
+        """测试文件名同时包含 NormalMap 和 DiffuseMap 时，取最先出现的匹配规则"""
+        props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
+        texture_type, dds_format, _matched_by = dds_conversion.resolve_dds_target(
+            "NormalMap_DiffuseMap_high_丝袜.png", props
+        )
+        self.assertEqual(texture_type, "NormalMap")
+        self.assertEqual(dds_format, "r8g8b8a8_unorm")
+
+    def test_default_rules_single_keyword_normalmap(self):
+        """测试仅包含 NormalMap 时正常匹配"""
+        props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
+        texture_type, dds_format, _matched_by = dds_conversion.resolve_dds_target("cloth_NormalMap.png", props)
+        self.assertEqual(texture_type, "NormalMap")
+        self.assertEqual(dds_format, "r8g8b8a8_unorm")
+
 
 if __name__ == "__main__":
     unittest.main()

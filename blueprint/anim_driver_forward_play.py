@@ -80,6 +80,12 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
         default=True,
     )
 
+    hold_end_value: BoolProperty(
+        name="保持结束值",
+        description="播放完成后保持当前值不变，不重置回起始值（仅在未启用循环时生效）",
+        default=False,
+    )
+
     use_continuous_shapekey_mode: BoolProperty(
         name="连续形态键",
         description="开启后，驱动变量改为按目标物体上的连续形态键顺序自动映射到预分配变量",
@@ -228,6 +234,11 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
         else:
             row.prop(self, "loop_playback", text="循环", icon='FILE_REFRESH')
 
+        if not self.loop_playback:
+            box.prop(self, "hold_end_value", text="保持结束值", icon='KEYFRAME')
+        else:
+            box.label(text="保持结束值（禁用）", icon='KEYFRAME')
+
         box.separator()
         box.label(text="输入说明:", icon='INFO')
         if self.inputs.get("时间输入") and self.inputs["时间输入"].is_linked:
@@ -247,6 +258,7 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
         primary_var = driven_vars[0]
         continuous_mode = getattr(self, "use_continuous_shapekey_mode", False)
         continuous_entries = self._get_continuous_shape_key_entries() if continuous_mode else []
+        hold_end_value = bool(getattr(self, "hold_end_value", False))
 
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
@@ -324,12 +336,14 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
                 "endif",
             ])
         elif has_next_in_chain:
-            next_paused = self._get_next_paused_var()
-            if next_paused:
+            next_paused_vars = self._get_all_next_paused_vars()
+            if next_paused_vars:
                 lines.append(f"            {paused_var} = 0")
-                lines.append(f"            {next_paused} = 1")
-                for var in driven_vars:
-                    lines.append(f"            {var} = {reset_target}")
+                for next_paused in next_paused_vars:
+                    lines.append(f"            {next_paused} = 1")
+                if not hold_end_value:
+                    for var in driven_vars:
+                        lines.append(f"            {var} = {reset_target}")
                 if continuous_mode and continuous_entries:
                     self._append_continuous_shape_key_mapping_lines(lines, primary_var, indent="            ")
                 lines.extend([
@@ -339,8 +353,9 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
                 ])
             else:
                 lines.append(f"            {paused_var} = 0")
-                for var in driven_vars:
-                    lines.append(f"            {var} = {reset_target}")
+                if not hold_end_value:
+                    for var in driven_vars:
+                        lines.append(f"            {var} = {reset_target}")
                 if continuous_mode and continuous_entries:
                     self._append_continuous_shape_key_mapping_lines(lines, primary_var, indent="            ")
                 lines.extend([
@@ -350,8 +365,9 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
                 ])
         else:
             lines.append(f"            {paused_var} = 0")
-            for var in driven_vars:
-                lines.append(f"            {var} = {reset_target}")
+            if not hold_end_value:
+                for var in driven_vars:
+                    lines.append(f"            {var} = {reset_target}")
             if continuous_mode and continuous_entries:
                 self._append_continuous_shape_key_mapping_lines(lines, primary_var, indent="            ")
             lines.extend([

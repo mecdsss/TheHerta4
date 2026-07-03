@@ -5,6 +5,11 @@ import math
 from ..utils.color_attribute_utils import read_color_attribute_data, write_color_attribute_data
 from ..utils.vertex_color_utils import build_vertex_color_payload, ensure_color_attribute
 
+try:
+    from bpy.props import FloatProperty
+except Exception:
+    FloatProperty = getattr(getattr(bpy, "props", None), "FloatProperty", lambda **_kwargs: None)
+
 
 def _iter_face_convert_target_objects(context):
     if getattr(context, "mode", "") == 'EDIT_MESH':
@@ -609,19 +614,30 @@ class BMTP_OT_SyncDataNames(bpy.types.Operator):
 
 
 class BMTP_OT_CleanUselessShapeKeys(bpy.types.Operator):
-    """清理选中物体中没有效果的形态键（所有顶点与基础键相同）"""
+    """清理选中物体中没有效果的形态键（所有顶点与基础键相同），并删除内容完全相同的重复形态键（只保留第一个）"""
     bl_idname = "toolkit.bmtp_clean_useless_shape_keys"
     bl_label = "清理选中物体的无效形态键"
-    bl_description = "清理选中物体中没有效果的形态键（所有顶点位置与基础形态键相同的形态键）"
+    bl_description = "清理选中物体中没有效果的形态键（顶点位置与基础形态键几乎一致）；对于顶点位置几乎相同的多个形态键，只保留第一个"
     bl_options = {'REGISTER', 'UNDO'}
-    
+
+    threshold: FloatProperty(
+        name="判定阈值",
+        description="顶点坐标差值的最大允许值，超过该值才视为有效变形。值越大，判定越宽松，更多看似没动的形态键会被清理",
+        default=1e-4,
+        min=0.0,
+        soft_max=1.0,
+        precision=6,
+    )
+
     @classmethod
     def poll(cls, context):
         return True
-    
+
     def execute(self, context):
         total_removed = 0
+        total_duplicates_removed = 0
         processed_objects = 0
+        threshold = float(self.threshold)
         
         for obj in context.selected_objects:
             if obj.type != 'MESH':
@@ -635,36 +651,65 @@ class BMTP_OT_CleanUselessShapeKeys(bpy.types.Operator):
                 continue
                 
             basis_key = shape_keys[0]
-            keys_to_remove = []
+            vertex_count = len(basis_key.data)
+            if vertex_count == 0:
+                continue
+            
+            basis_coords = np.empty(vertex_count * 3, dtype=np.float32)
+            basis_key.data.foreach_get("co", basis_coords)
+            
+            keys_to_remove = []  # (shape_key, kind) kind in {"useless", "duplicate"}
+            kept_signatures = []  # list of np.ndarray, 已保留的非 basis 形态键坐标
             
             for i, shape_key in enumerate(shape_keys):
                 if i == 0:
                     continue
-                    
-                has_effect = False
-                threshold = 1e-6
                 
-                for j in range(len(shape_key.data)):
-                    if (shape_key.data[j].co - basis_key.data[j].co).length > threshold:
-                        has_effect = True
+                coords = np.empty(vertex_count * 3, dtype=np.float32)
+                shape_key.data.foreach_get("co", coords)
+                
+                # 与基础键完全相同 → 无效形态键
+                if np.max(np.abs(coords - basis_coords)) <= threshold:
+                    keys_to_remove.append((shape_key, "useless"))
+                    continue
+                
+                # 与已保留的某个形态键完全相同 → 重复形态键，跳过
+                is_duplicate = False
+                for kept_coords in kept_signatures:
+                    if np.max(np.abs(coords - kept_coords)) <= threshold:
+                        is_duplicate = True
                         break
                 
-                if not has_effect:
-                    keys_to_remove.append(shape_key)
-            
-            for shape_key in keys_to_remove:
-                obj.shape_key_remove(shape_key)
-                total_removed += 1
+                if is_duplicate:
+                    keys_to_remove.append((shape_key, "duplicate"))
+                    continue
                 
+                kept_signatures.append(coords)
+            
+            removed_useless = 0
+            removed_duplicates = 0
+            for shape_key, kind in keys_to_remove:
+                obj.shape_key_remove(shape_key)
+                if kind == "useless":
+                    removed_useless += 1
+                else:
+                    removed_duplicates += 1
+            
+            total_removed += removed_useless
+            total_duplicates_removed += removed_duplicates
+            
             if keys_to_remove:
                 processed_objects += 1
         
         bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
         
-        if total_removed > 0:
-            self.report({'INFO'}, f"已从 {processed_objects} 个选中物体中删除了 {total_removed} 个无效的形态键")
+        if total_removed > 0 or total_duplicates_removed > 0:
+            self.report(
+                {'INFO'},
+                f"已从 {processed_objects} 个选中物体中删除 {total_removed} 个无效形态键、{total_duplicates_removed} 个重复形态键"
+            )
         else:
-            self.report({'INFO'}, "选中的物体中未找到无效的形态键")
+            self.report({'INFO'}, "选中的物体中未找到无效或重复的形态键")
         return {'FINISHED'}
 
 

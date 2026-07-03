@@ -46,7 +46,7 @@ def _allocate_shape_key_temp_name(existing_names, base_name):
         index += 1
 
 
-def _build_shape_key_rename_plan(key_blocks, old_text, new_text):
+def _build_shape_key_rename_plan(key_blocks, old_text, new_text, exact_match=False):
     rename_candidates = []
     existing_names = {
         str(getattr(key_block, "name", "") or "")
@@ -55,10 +55,15 @@ def _build_shape_key_rename_plan(key_blocks, old_text, new_text):
 
     for key_block in key_blocks:
         current_name = str(getattr(key_block, "name", "") or "")
-        if old_text not in current_name:
-            continue
+        if exact_match:
+            if current_name != old_text:
+                continue
+            replaced_name = new_text
+        else:
+            if old_text not in current_name:
+                continue
+            replaced_name = current_name.replace(old_text, new_text)
 
-        replaced_name = current_name.replace(old_text, new_text)
         rename_candidates.append((key_block, current_name, replaced_name))
 
     if not rename_candidates:
@@ -282,6 +287,7 @@ class ATP_OT_BatchRenameShapeKey(bpy.types.Operator):
         props = context.scene.atp_props
         old_name = props.sk_rename_old_name
         new_name = props.sk_rename_new_name
+        exact_match = bool(getattr(props, "sk_rename_exact_match", False))
         selected_objects = context.selected_objects
         
         if not old_name or not new_name:
@@ -303,6 +309,7 @@ class ATP_OT_BatchRenameShapeKey(bpy.types.Operator):
                     obj.data.shape_keys.key_blocks,
                     old_name,
                     new_name,
+                    exact_match=exact_match,
                 )
                 if not rename_plan:
                     no_match_object_count += 1

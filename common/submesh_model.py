@@ -434,7 +434,7 @@ class SubMeshModel:
 
             for candidate_name in cache_key_to_candidate_names.get(cache_key, set()):
                 if candidate_name:
-                    object_export_context_map[candidate_name] = context
+                    object_export_context_map.setdefault(candidate_name, context)
 
         return object_export_context_map
 

@@ -557,7 +557,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         if match:
             base_name = match.group(1)
             transparency_value = match.group(2)
-            shader_name = f"CustomShaderTransparencyCloth{base_name.replace('-', '_').replace('.', '_')}"
+            shader_name = f"CustomShaderTransparencyCloth{base_name.replace('-', '_').replace('.', '_')}_透明{transparency_value}"
             return shader_name, transparency_value
         return None, None
 

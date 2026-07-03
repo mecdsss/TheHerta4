@@ -79,6 +79,11 @@ class ATP_Properties(bpy.types.PropertyGroup):
     sk_set_active_name: bpy.props.StringProperty(name="活动形态键名称", default="", description="要设置为活动项的形态键名称")
     sk_rename_old_name: bpy.props.StringProperty(name="旧名称片段", default="", description="要在形态键名称中查找并替换的文本片段")
     sk_rename_new_name: bpy.props.StringProperty(name="新名称片段", default="", description="用于替换旧名称片段的新文本")
+    sk_rename_exact_match: bpy.props.BoolProperty(
+        name="全名匹配",
+        default=False,
+        description="启用后仅当形态键名称与旧片段完全相同时才会被替换，避免 Motion_Key_1 匹配到 Motion_Key_17 等情况",
+    )
     sk_rebase_remove_source: bpy.props.BoolProperty(
         name="删除源形态键",
         default=True,
@@ -189,6 +194,22 @@ class ATP_Properties(bpy.types.PropertyGroup):
         name="将形态键复制回原物体",
         default=True,
         description="启用后，处理完成时会将形态键重新复制回原始物体\n关闭后，形态键仅保留在中间_Base物体上"
+    )
+    vertex_mapping_mode: bpy.props.EnumProperty(
+        name="顶点匹配模式",
+        items=[
+            ('AUTO', "自动", "优先使用稳定ID属性匹配；找不到时自动降级为位置最近邻；都失败则按index对齐"),
+            ('STABLE_ID', "稳定ID (优先)", "优先使用稳定ID属性匹配；找不到属性或匹配失败时降级为位置最近邻"),
+            ('POSITION', "位置最近邻", "始终使用KDTree按起始帧顶点位置最近邻匹配（适合GN改变顶点顺序但顶点分布稀疏的情况）"),
+            ('INDEX', "按index对齐", "保持旧版本行为，直接按顶点index一一对应（GN未改变顶点顺序时可用）"),
+        ],
+        default='AUTO',
+        description="当几何节点改变顶点顺序时，控制起始帧与目标帧之间如何建立顶点对应关系"
+    )
+    stable_id_attribute: bpy.props.StringProperty(
+        name="稳定ID属性名",
+        default="stable_id",
+        description="几何节点中通过 Store Named Attribute 写入的顶点稳定ID属性名。\n建议在GN开头用 Store Named Attribute 把 Index 存为 INT 类型的 stable_id\n多个名字可用英文逗号分隔，工具会按顺序尝试"
     )
     show_processing_status: bpy.props.BoolProperty(
         name="显示处理状态",

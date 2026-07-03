@@ -766,14 +766,34 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
         _, downstream = self._get_chain_links()
         return downstream[0] if downstream else None
 
+    def _get_all_next_nodes_in_chain(self):
+        """获取链输出连接的所有下游节点（支持分支）"""
+        _, downstream = self._get_chain_links()
+        return downstream
+
     def _get_next_paused_var(self):
         next_node = self._get_next_node_in_chain()
-        if next_node and hasattr(next_node, 'custom_paused_var'):
-            var = next_node.custom_paused_var.strip()
-            if var:
-                if not var.startswith('$'):
-                    var = f"${var}"
-                return var
+        return self._resolve_node_paused_var(next_node)
+
+    def _get_all_next_paused_vars(self):
+        """获取所有下游节点的暂停变量名（支持分支）"""
+        return [
+            var for n in self._get_all_next_nodes_in_chain()
+            if (var := self._resolve_node_paused_var(n))
+        ]
+
+    @staticmethod
+    def _resolve_node_paused_var(node):
+        """获取节点的暂停变量名，兼容自定义和自动分配两种方式"""
+        if node is None:
+            return None
+        if not hasattr(node, 'custom_paused_var'):
+            return None
+        var = node.custom_paused_var.strip()
+        if var:
+            if not var.startswith('$'):
+                var = f"${var}"
+            return var
         return None
 
     def _is_play_node(self, node):

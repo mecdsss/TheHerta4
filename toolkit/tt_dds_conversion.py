@@ -134,13 +134,17 @@ def _texture_type_expects_srgb(texture_type: str) -> bool | None:
 
 def _infer_texture_type_from_rule_pattern(pattern: str, filename: str) -> str:
     candidates = [rule["texture_type"] for rule in DDS_DEFAULT_RULES]
-    haystacks = [str(pattern or ""), *(_get_match_targets(filename))]
+    haystacks = _get_match_targets(filename)
+    best_type = "custom"
+    best_start = float("inf")
     for candidate in candidates:
         needle = candidate.lower()
         for haystack in haystacks:
-            if needle in str(haystack or "").lower():
-                return candidate
-    return "custom"
+            idx = str(haystack or "").lower().find(needle)
+            if idx != -1 and idx < best_start:
+                best_start = idx
+                best_type = candidate
+    return best_type
 
 
 def _texconv_colorspace_flags(texture_type: str) -> list[str]:
@@ -179,13 +183,24 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
             except re.error:
                 continue
 
+    targets = _get_match_targets(filename)
+    best_rule = None
+    best_start = float("inf")
     for rule in DDS_DEFAULT_RULES:
         try:
-            if _pattern_matches(rule["pattern"], filename):
-                texture_type = rule["texture_type"]
-                return texture_type, rule["format"], texture_type
+            pattern = rule["pattern"]
+            for target in targets:
+                match = re.search(pattern, target)
+                if match:
+                    if match.start() < best_start:
+                        best_start = match.start()
+                        best_rule = rule
+                    break
         except re.error:
             continue
+
+    if best_rule is not None:
+        return best_rule["texture_type"], best_rule["format"], best_rule["texture_type"]
 
     return "default", "bc7_unorm", "Default"
 

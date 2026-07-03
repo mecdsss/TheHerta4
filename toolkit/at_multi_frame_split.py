@@ -13,6 +13,232 @@ except ImportError:
     from utils.shapekey_rebase_utils import rebase_shape_key_coordinates
 
 
+# 用作 mesh 中保存稳定ID的自定义属性键，方便后续帧从快照中读出
+_STABLE_ID_STORAGE_KEY = "atp_stable_id_attr"
+
+
+def _candidate_stable_id_names(props):
+    """读取 props.stable_id_attribute（逗号分隔）并去除空白"""
+    raw = ""
+    if props is not None:
+        raw = getattr(props, "stable_id_attribute", "") or ""
+    names = [token.strip() for token in raw.split(",") if token.strip()]
+    if not names:
+        names = ["stable_id"]
+    return names
+
+
+def _read_stable_ids_from_mesh(mesh, candidate_names):
+    """从 mesh 的顶点域属性中读取稳定 ID。
+    返回 (numpy int64 array, attr_name) 或 (None, None)。
+    """
+    if mesh is None or not candidate_names:
+        return None, None
+    attributes = getattr(mesh, "attributes", None)
+    if attributes is None:
+        return None, None
+    vtx_count = len(mesh.vertices)
+    for name in candidate_names:
+        attr = attributes.get(name) if hasattr(attributes, "get") else None
+        if attr is None:
+            continue
+        if getattr(attr, "domain", None) != 'POINT':
+            continue
+        data_type = getattr(attr, "data_type", None)
+        try:
+            if data_type in {'INT', 'INT32'}:
+                buf = np.zeros(vtx_count, dtype=np.int32)
+                attr.data.foreach_get("value", buf)
+                return buf.astype(np.int64, copy=False), name
+            if data_type == 'FLOAT':
+                buf = np.zeros(vtx_count, dtype=np.float32)
+                attr.data.foreach_get("value", buf)
+                return np.rint(buf).astype(np.int64), name
+        except Exception:
+            continue
+    return None, None
+
+
+def _snapshot_stable_ids_to_mesh(mesh, ids, attr_name):
+    """把读到的稳定 ID 缓存到 mesh.id_properties，避免后续帧因 GN 重排丢失"""
+    if mesh is None or ids is None:
+        return
+    try:
+        mesh[_STABLE_ID_STORAGE_KEY] = list(int(v) for v in ids)
+        mesh[_STABLE_ID_STORAGE_KEY + "_name"] = str(attr_name or "")
+    except Exception:
+        pass
+
+
+def _read_cached_stable_ids(mesh):
+    """从 mesh.id_properties 读出已缓存的稳定 ID 数组"""
+    if mesh is None:
+        return None, None
+    try:
+        cached = mesh.get(_STABLE_ID_STORAGE_KEY)
+    except Exception:
+        cached = None
+    if cached is None:
+        return None, None
+    try:
+        ids = np.fromiter((int(v) for v in cached), dtype=np.int64)
+    except Exception:
+        return None, None
+    name = mesh.get(_STABLE_ID_STORAGE_KEY + "_name", "")
+    return ids, str(name) if name else ""
+
+
+def _resolve_stable_ids_for_object(obj, candidate_names):
+    """优先读取 mesh 上已缓存的稳定 ID，回退到当前属性"""
+    if obj is None or obj.type != 'MESH':
+        return None, None
+    mesh = obj.data
+    ids, name = _read_cached_stable_ids(mesh)
+    if ids is not None and len(ids) == len(mesh.vertices):
+        return ids, name or None
+    return _read_stable_ids_from_mesh(mesh, candidate_names)
+
+
+def _build_position_nearest_mapping(base_coords, target_coords):
+    """使用纯 numpy 的最近邻贪心匹配构建 target -> base 的顶点映射。"""
+    base_coords = np.asarray(base_coords, dtype=np.float32)
+    target_coords = np.asarray(target_coords, dtype=np.float32)
+
+    base_count = len(base_coords)
+    target_count = len(target_coords)
+    mapping = np.empty(target_count, dtype=np.int64)
+    used = np.zeros(base_count, dtype=bool)
+    collisions = 0
+
+    for t_idx, target_co in enumerate(target_coords):
+        distances = np.linalg.norm(base_coords - target_co, axis=1)
+        candidate_indices = np.argsort(distances)
+
+        chosen_idx = -1
+        for candidate_idx in candidate_indices.tolist():
+            if not used[candidate_idx]:
+                chosen_idx = int(candidate_idx)
+                break
+
+        if chosen_idx < 0:
+            chosen_idx = int(candidate_indices[0])
+            collisions += 1
+
+        used[chosen_idx] = True
+        mapping[t_idx] = chosen_idx
+
+    return mapping, collisions
+
+
+def _build_target_to_base_mapping(base_obj, target_obj, props):
+    """构建 target 顶点 index → base 顶点 index 的映射数组。
+
+    返回 (mapping numpy int64 array, mode_used_str, message)
+    若返回 (None, mode_used_str, message) 表示无法构建。
+    AUTO 与 STABLE_ID 模式在稳定ID缺失/匹配失败时会自动降级为 KDTree 位置匹配，
+    再失败时回退到顶点index对齐（仅在用户显式选择INDEX时静默）。
+    """
+    base_mesh = base_obj.data
+    target_mesh = target_obj.data
+    base_count = len(base_mesh.vertices)
+    target_count = len(target_mesh.vertices)
+    if base_count != target_count:
+        return None, "NONE", f"顶点数不一致 ({base_count} vs {target_count})"
+
+    mode = getattr(props, "vertex_mapping_mode", "AUTO") if props else "AUTO"
+    if mode not in {"AUTO", "STABLE_ID", "POSITION", "INDEX"}:
+        mode = "AUTO"
+    candidates = _candidate_stable_id_names(props)
+
+    stable_id_diag = ""
+
+    if mode in {"AUTO", "STABLE_ID"}:
+        base_ids, base_attr = _resolve_stable_ids_for_object(base_obj, candidates)
+        target_ids, target_attr = _resolve_stable_ids_for_object(target_obj, candidates)
+        if base_ids is not None and target_ids is not None and len(base_ids) == base_count and len(target_ids) == target_count:
+            base_lookup = {}
+            for idx, value in enumerate(base_ids):
+                base_lookup.setdefault(int(value), idx)
+            mapping = np.empty(target_count, dtype=np.int64)
+            missing = 0
+            for t_idx, value in enumerate(target_ids):
+                base_idx = base_lookup.get(int(value))
+                if base_idx is None:
+                    missing += 1
+                    mapping[t_idx] = -1
+                else:
+                    mapping[t_idx] = base_idx
+            if missing == 0:
+                attr_label = base_attr or target_attr or "stable_id"
+                return mapping, "STABLE_ID", f"基于稳定ID属性 '{attr_label}' 建立顶点映射"
+            stable_id_diag = f"稳定ID属性匹配失败：{missing}/{target_count} 个目标顶点未找到对应ID"
+        else:
+            tried = ",".join(candidates) if candidates else "stable_id"
+            stable_id_diag = (
+                f"未找到稳定ID属性 (尝试: {tried})。"
+                f"建议在GN开头用 Store Named Attribute(Point域, INT) 把 Index 存为 '{candidates[0] if candidates else 'stable_id'}'"
+            )
+
+    # 进入位置最近邻分支（AUTO/STABLE_ID 失败时降级，或显式选择 POSITION）
+    if mode in {"AUTO", "STABLE_ID", "POSITION"}:
+        base_coords = np.zeros(base_count * 3, dtype=np.float32)
+        base_mesh.vertices.foreach_get("co", base_coords)
+        base_coords = base_coords.reshape(-1, 3)
+        target_coords = np.zeros(target_count * 3, dtype=np.float32)
+        target_mesh.vertices.foreach_get("co", target_coords)
+        target_coords = target_coords.reshape(-1, 3)
+
+        try:
+            import mathutils  # noqa: WPS433
+            kd = mathutils.kdtree.KDTree(base_count)
+            for idx, co in enumerate(base_coords):
+                kd.insert((float(co[0]), float(co[1]), float(co[2])), idx)
+            kd.balance()
+
+            mapping = np.empty(target_count, dtype=np.int64)
+            used = np.zeros(base_count, dtype=bool)
+            collisions = 0
+            for t_idx, co in enumerate(target_coords):
+                found_idx = -1
+                for _co_found, idx_found, _dist in kd.find_n((float(co[0]), float(co[1]), float(co[2])), 4):
+                    if not used[idx_found]:
+                        found_idx = idx_found
+                        break
+                if found_idx < 0:
+                    _co_found, idx_found, _dist = kd.find((float(co[0]), float(co[1]), float(co[2])))
+                    found_idx = idx_found
+                    collisions += 1
+                used[found_idx] = True
+                mapping[t_idx] = found_idx
+            message = "基于位置最近邻(KDTree)建立顶点映射"
+            if stable_id_diag:
+                message = f"已降级为位置最近邻: {stable_id_diag}"
+            if collisions:
+                message += f"（{collisions} 处一对多冲突已就近回退）"
+            return mapping, "POSITION", message
+        except Exception as exc:
+            try:
+                mapping, collisions = _build_position_nearest_mapping(base_coords, target_coords)
+                message = "基于位置最近邻(numpy)建立顶点映射"
+                if stable_id_diag:
+                    message = f"已降级为位置最近邻: {stable_id_diag}"
+                if collisions:
+                    message += f"（{collisions} 处一对多冲突已就近回退）"
+                message += f"；KDTree不可用: {exc}"
+                return mapping, "POSITION", message
+            except Exception as fallback_exc:
+                if mode == "POSITION":
+                    return None, "POSITION", f"位置最近邻匹配失败: {fallback_exc}"
+                stable_id_diag = (stable_id_diag + "；" if stable_id_diag else "") + f"KDTree匹配失败: {exc}；numpy回退失败: {fallback_exc}"
+
+    mapping = np.arange(target_count, dtype=np.int64)
+    final_message = "按顶点index一一对应（GN若改变顺序将得到错误结果）"
+    if stable_id_diag:
+        final_message = f"{stable_id_diag}；最终回退为按index对齐"
+    return mapping, "INDEX", final_message
+
+
+
 def is_matrix_close(matrix1, matrix2, tolerance=1e-6):
     """检查两个矩阵是否在容差范围内相等"""
     if matrix1 is None or matrix2 is None:
@@ -82,6 +308,65 @@ def _rebase_target_shape_keys_to_baked_basis(target_keys, baked_basis_coords):
         remove_new_basis_key=True,
     )
     _restore_shape_key_coordinates(target_keys.key_blocks, rebased_coordinates)
+
+
+def _ensure_stable_id_on_original_mesh(obj, candidate_names):
+    """在原始 mesh 上写入一个 INT 顶点属性作为稳定 ID。
+
+    使用 candidate_names 中第一个名字（默认 'stable_id'）。
+    如果同名属性已存在且类型正确，则直接复用；否则创建/重建。
+    返回 (attr_name, was_created) 元组。
+    """
+    if obj is None or obj.type != 'MESH' or obj.data is None:
+        return None, False
+    if not candidate_names:
+        candidate_names = ["stable_id"]
+    name = candidate_names[0]
+    mesh = obj.data
+    attributes = getattr(mesh, "attributes", None)
+    if attributes is None:
+        return None, False
+
+    vtx_count = len(mesh.vertices)
+    existing = attributes.get(name) if hasattr(attributes, "get") else None
+
+    needs_rebuild = True
+    if existing is not None:
+        if (
+            getattr(existing, "domain", None) == 'POINT'
+            and getattr(existing, "data_type", None) in {'INT', 'INT32'}
+            and len(existing.data) == vtx_count
+        ):
+            # 校验内容是否还是 0..N-1（GN 中途若没做改动则一定是），否则保留原值。
+            try:
+                buf = np.zeros(vtx_count, dtype=np.int32)
+                existing.data.foreach_get("value", buf)
+                if buf.size == vtx_count:
+                    needs_rebuild = False
+            except Exception:
+                needs_rebuild = True
+        if needs_rebuild:
+            try:
+                attributes.remove(existing)
+            except Exception:
+                # 移除失败就别再尝试创建，避免命名冲突
+                return name, False
+
+    if needs_rebuild:
+        try:
+            attr = attributes.new(name=name, type='INT', domain='POINT')
+        except Exception:
+            return None, False
+        ids = np.arange(vtx_count, dtype=np.int32)
+        try:
+            attr.data.foreach_set("value", ids)
+        except Exception:
+            return name, False
+        mesh.update()
+        return name, True
+
+    return name, False
+
 
 
 class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
@@ -265,6 +550,13 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         self._processing_status = f"准备处理物体: {current_obj.name}"
         props.current_processing_status = self._processing_status
         
+        # 在原始 mesh 上注入稳定ID属性，确保经过几何节点重排后仍能反查回原顶点
+        if getattr(props, "vertex_mapping_mode", "AUTO") in {"AUTO", "STABLE_ID"}:
+            candidate_names = _candidate_stable_id_names(props)
+            attr_name, was_created = _ensure_stable_id_on_original_mesh(current_obj, candidate_names)
+            if was_created and attr_name:
+                self.report({'INFO'}, f"已在 '{current_obj.name}' 上注入稳定ID属性 '{attr_name}'")
+        
         self._temp_start_obj = None
         self._temp_end_obj = None
         self._temp_collection = None
@@ -373,6 +665,11 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         mesh_data = bpy.data.meshes.new_from_object(eval_obj)
         matrix = eval_obj.matrix_world.copy()
         mesh_data.transform(matrix)
+        
+        candidate_names = _candidate_stable_id_names(props)
+        ids, attr_name = _read_stable_ids_from_mesh(mesh_data, candidate_names)
+        if ids is not None:
+            _snapshot_stable_ids_to_mesh(mesh_data, ids, attr_name)
         
         obj_name = f"{current_obj.name}_{frame:03d}"
         
@@ -1132,6 +1429,18 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
             self.report({'ERROR'}, "两个物体的顶点数不同，无法创建形态键")
             return False
         
+        props = context.scene.atp_props if hasattr(context, "scene") else None
+        mapping, mode_used, mapping_msg = _build_target_to_base_mapping(base_obj, target_obj, props)
+        if mapping is None:
+            self.report({'ERROR'}, f"无法建立顶点映射: {mapping_msg}")
+            return False
+        if mode_used == "STABLE_ID":
+            self.report({'INFO'}, f"[{base_obj.name}→{target_obj.name}] {mapping_msg}")
+        elif mode_used == "POSITION":
+            self.report({'WARNING'}, f"[{base_obj.name}→{target_obj.name}] 未找到稳定ID属性，已降级为位置最近邻匹配。{mapping_msg}")
+        elif mode_used == "INDEX":
+            self.report({'WARNING'}, f"[{base_obj.name}→{target_obj.name}] {mapping_msg}")
+        
         if not base_obj.data.shape_keys:
             base_obj.shape_key_add(name="Basis")
         
@@ -1154,15 +1463,27 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         target_obj.data.vertices.foreach_get('co', target_coords)
         target_coords = target_coords.reshape(-1, 3)
         
+        # 将目标帧的顶点按映射重排到 base 顶点顺序
+        remapped_target_coords = np.empty_like(basis_coords)
+        remapped_target_coords[mapping] = target_coords
+        
         if continuous_base_obj:
             continuous_base_coords = np.zeros(vtx_count * 3, dtype=np.float32)
             continuous_base_obj.data.vertices.foreach_get('co', continuous_base_coords)
             continuous_base_coords = continuous_base_coords.reshape(-1, 3)
             
-            delta = target_coords - continuous_base_coords
+            # 同样把 continuous_base 重排到 base 顶点顺序（若 continuous_base 自带稳定ID）
+            cb_mapping, _cb_mode, _cb_msg = _build_target_to_base_mapping(base_obj, continuous_base_obj, props)
+            if cb_mapping is not None:
+                remapped_cb_coords = np.empty_like(basis_coords)
+                remapped_cb_coords[cb_mapping] = continuous_base_coords
+            else:
+                remapped_cb_coords = continuous_base_coords
+            
+            delta = remapped_target_coords - remapped_cb_coords
             shape_key_coords = basis_coords + delta
         else:
-            shape_key_coords = target_coords
+            shape_key_coords = remapped_target_coords
         
         shape_key.data.foreach_set('co', shape_key_coords.reshape(-1))
         

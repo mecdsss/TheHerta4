@@ -162,7 +162,7 @@ class DrawIBModel:
                 global_context = dict(local_context)
                 global_context["export_indices"] = (local_export_indices + vertex_base).astype(numpy.int32)
                 global_context["vertex_base"] = vertex_base
-                object_export_context_map[candidate_name] = global_context
+                object_export_context_map.setdefault(candidate_name, global_context)
 
         return object_export_context_map
 

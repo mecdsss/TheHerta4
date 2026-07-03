@@ -1,0 +1,321 @@
+"""测试多帧拆分到形态键时，基于稳定ID/位置最近邻的顶点映射逻辑"""
+import importlib.util
+import sys
+import types
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+
+def _install_module(name, **attrs):
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    sys.modules[name] = module
+    return module
+
+
+class _FakeMatrix:
+    @staticmethod
+    def Identity(_size):
+        return _FakeMatrix(((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
+
+    def __init__(self, rows=None):
+        self.rows = rows or ()
+
+
+class _FakeKDPoint:
+    def __init__(self, co, idx, dist):
+        self.co = co
+        self.idx = idx
+        self.dist = dist
+
+    def __iter__(self):
+        yield self.co
+        yield self.idx
+        yield self.dist
+
+
+class _FakeKDTree:
+    def __init__(self, size):
+        self._items = []
+
+    def insert(self, co, idx):
+        self._items.append((tuple(co), idx))
+
+    def balance(self):
+        pass
+
+    def find(self, co):
+        co_arr = np.asarray(co, dtype=np.float64)
+        best = None
+        best_dist = float('inf')
+        for item_co, item_idx in self._items:
+            d = float(np.linalg.norm(np.asarray(item_co) - co_arr))
+            if d < best_dist:
+                best_dist = d
+                best = (item_co, item_idx, d)
+        return best
+
+    def find_n(self, co, n):
+        co_arr = np.asarray(co, dtype=np.float64)
+        scored = []
+        for item_co, item_idx in self._items:
+            d = float(np.linalg.norm(np.asarray(item_co) - co_arr))
+            scored.append((item_co, item_idx, d))
+        scored.sort(key=lambda x: x[2])
+        return scored[:n]
+
+
+_install_module(
+    "bpy",
+    types=types.SimpleNamespace(Operator=object),
+    data=types.SimpleNamespace(objects={}, collections={}),
+)
+_install_module(
+    "mathutils",
+    Matrix=_FakeMatrix,
+    Vector=tuple,
+    kdtree=types.SimpleNamespace(KDTree=_FakeKDTree),
+)
+
+
+PKG = "_at_multi_frame_split_vmap_test_pkg"
+module_path = Path(__file__).resolve().parents[1] / "toolkit" / "at_multi_frame_split.py"
+spec = importlib.util.spec_from_file_location(f"{PKG}.toolkit.at_multi_frame_split", module_path)
+split_module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = split_module
+spec.loader.exec_module(split_module)
+
+
+class _FakeAttr:
+    def __init__(self, name, domain, data_type, values):
+        self.name = name
+        self.domain = domain
+        self.data_type = data_type
+        self._values = np.asarray(values)
+
+        class _Data:
+            def __init__(inner_self, arr_ref):
+                inner_self._owner = arr_ref
+
+            def foreach_get(inner_self, _attr, output):
+                output[:] = inner_self._owner._values.reshape(-1)
+
+            def foreach_set(inner_self, _attr, values):
+                inner_self._owner._values = np.asarray(values)
+
+            def __len__(inner_self):
+                return int(inner_self._owner._values.size)
+
+        self.data = _Data(self)
+
+
+class _FakeAttrCollection:
+    def __init__(self, attrs):
+        self._attrs = {attr.name: attr for attr in attrs}
+
+    def get(self, name):
+        return self._attrs.get(name)
+
+    def new(self, name, type, domain):
+        # 创建一个新的属性，初始数据全为0；测试代码会再 foreach_set
+        size = 0
+        attr = _FakeAttr(name, domain, type, np.zeros(size, dtype=np.int32))
+        # 替换为接受任意长度 foreach_set 的实现：通过先放置一个足够大的占位
+        self._attrs[name] = attr
+        return attr
+
+    def remove(self, attr):
+        self._attrs.pop(attr.name, None)
+
+
+class _FakeVertices:
+    def __init__(self, coords):
+        self._coords = np.asarray(coords, dtype=np.float32)
+
+    def foreach_get(self, _attr, output):
+        output[:] = self._coords.reshape(-1)
+
+    def __len__(self):
+        return len(self._coords)
+
+
+class _FakeMesh:
+    def __init__(self, coords, attrs=None, props=None):
+        self.vertices = _FakeVertices(coords)
+        self.attributes = _FakeAttrCollection(attrs or [])
+        self._props = props or {}
+
+    def update(self):
+        pass
+
+    def get(self, key, default=None):
+        return self._props.get(key, default)
+
+    def __getitem__(self, key):
+        return self._props[key]
+
+    def __setitem__(self, key, value):
+        self._props[key] = value
+
+
+class _FakeObject:
+    def __init__(self, name, mesh):
+        self.name = name
+        self.type = "MESH"
+        self.data = mesh
+
+
+class _FakeProps:
+    def __init__(self, vertex_mapping_mode="AUTO", stable_id_attribute="stable_id"):
+        self.vertex_mapping_mode = vertex_mapping_mode
+        self.stable_id_attribute = stable_id_attribute
+
+
+class StableIdMappingTests(unittest.TestCase):
+    def test_stable_id_mapping_resolves_reordered_vertices(self):
+        # base: ids [10, 20, 30], coords arbitrary
+        base_coords = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=np.float32)
+        base_ids = [10, 20, 30]
+        base_mesh = _FakeMesh(
+            base_coords,
+            attrs=[_FakeAttr("stable_id", "POINT", "INT", np.asarray(base_ids, dtype=np.int32))],
+        )
+        # target: same ids but reordered [30, 10, 20], coords moved
+        target_coords = np.array([[2, 1, 0], [0, 1, 0], [1, 1, 0]], dtype=np.float32)
+        target_ids = [30, 10, 20]
+        target_mesh = _FakeMesh(
+            target_coords,
+            attrs=[_FakeAttr("stable_id", "POINT", "INT", np.asarray(target_ids, dtype=np.int32))],
+        )
+
+        base_obj = _FakeObject("Base", base_mesh)
+        target_obj = _FakeObject("Target", target_mesh)
+        props = _FakeProps()
+
+        mapping, mode, msg = split_module._build_target_to_base_mapping(base_obj, target_obj, props)
+        self.assertEqual(mode, "STABLE_ID")
+        self.assertIsNotNone(mapping)
+
+        # Verify remapping yields target coords aligned to base ID order:
+        # base index 0 = id 10 -> target index 1 (id 10) -> coord [0, 1, 0]
+        # base index 1 = id 20 -> target index 2 (id 20) -> coord [1, 1, 0]
+        # base index 2 = id 30 -> target index 0 (id 30) -> coord [2, 1, 0]
+        remapped = np.empty_like(base_coords)
+        remapped[mapping] = target_coords
+        np.testing.assert_allclose(
+            remapped,
+            np.array([[0, 1, 0], [1, 1, 0], [2, 1, 0]], dtype=np.float32),
+        )
+
+    def test_position_fallback_when_no_stable_id(self):
+        base_coords = np.array([[0, 0, 0], [10, 0, 0], [20, 0, 0]], dtype=np.float32)
+        # target reordered, slight position shift
+        target_coords = np.array([[20.01, 0, 0], [0.01, 0, 0], [10.01, 0, 0]], dtype=np.float32)
+        base_mesh = _FakeMesh(base_coords, attrs=[])
+        target_mesh = _FakeMesh(target_coords, attrs=[])
+
+        base_obj = _FakeObject("Base", base_mesh)
+        target_obj = _FakeObject("Target", target_mesh)
+        props = _FakeProps(vertex_mapping_mode="AUTO")
+
+        mapping, mode, _msg = split_module._build_target_to_base_mapping(base_obj, target_obj, props)
+        self.assertEqual(mode, "POSITION")
+        # target[0] is near base[2]; target[1] near base[0]; target[2] near base[1]
+        self.assertEqual(list(mapping), [2, 0, 1])
+
+    def test_strict_stable_id_mode_falls_back_to_position_when_attribute_missing(self):
+        # 严格模式下缺失稳定ID属性时，自动降级为KDTree位置最近邻匹配。
+        base_coords = np.array([[0, 0, 0], [10, 0, 0]], dtype=np.float32)
+        target_coords = np.array([[10.01, 0, 0], [0.01, 0, 0]], dtype=np.float32)
+        base_mesh = _FakeMesh(base_coords, attrs=[])
+        target_mesh = _FakeMesh(target_coords, attrs=[])
+
+        base_obj = _FakeObject("Base", base_mesh)
+        target_obj = _FakeObject("Target", target_mesh)
+        props = _FakeProps(vertex_mapping_mode="STABLE_ID")
+
+        mapping, mode, msg = split_module._build_target_to_base_mapping(base_obj, target_obj, props)
+        self.assertEqual(mode, "POSITION")
+        self.assertEqual(list(mapping), [1, 0])
+        self.assertIn("降级", msg)
+
+    def test_index_mode_returns_identity_mapping(self):
+        base_coords = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=np.float32)
+        target_coords = np.array([[0, 1, 0], [1, 1, 0], [2, 1, 0]], dtype=np.float32)
+        base_mesh = _FakeMesh(base_coords, attrs=[])
+        target_mesh = _FakeMesh(target_coords, attrs=[])
+
+        base_obj = _FakeObject("Base", base_mesh)
+        target_obj = _FakeObject("Target", target_mesh)
+        props = _FakeProps(vertex_mapping_mode="INDEX")
+
+        mapping, mode, _msg = split_module._build_target_to_base_mapping(base_obj, target_obj, props)
+        self.assertEqual(mode, "INDEX")
+        self.assertEqual(list(mapping), [0, 1, 2])
+
+
+class CachedStableIdTests(unittest.TestCase):
+    def test_cached_ids_are_used_when_attributes_are_lost(self):
+        base_coords = np.array([[0, 0, 0], [1, 0, 0]], dtype=np.float32)
+        # base mesh no longer has the attribute, but cached ids are present in id_properties
+        base_mesh = _FakeMesh(
+            base_coords,
+            attrs=[],
+            props={
+                split_module._STABLE_ID_STORAGE_KEY: [10, 20],
+                split_module._STABLE_ID_STORAGE_KEY + "_name": "stable_id",
+            },
+        )
+        target_mesh = _FakeMesh(
+            np.array([[5, 0, 0], [6, 0, 0]], dtype=np.float32),
+            attrs=[],
+            props={
+                split_module._STABLE_ID_STORAGE_KEY: [20, 10],
+                split_module._STABLE_ID_STORAGE_KEY + "_name": "stable_id",
+            },
+        )
+
+        base_obj = _FakeObject("Base", base_mesh)
+        target_obj = _FakeObject("Target", target_mesh)
+        props = _FakeProps()
+
+        mapping, mode, _msg = split_module._build_target_to_base_mapping(base_obj, target_obj, props)
+        self.assertEqual(mode, "STABLE_ID")
+        # target[0].id=20 -> base index 1; target[1].id=10 -> base index 0
+        self.assertEqual(list(mapping), [1, 0])
+
+
+class EnsureStableIdOnOriginalMeshTests(unittest.TestCase):
+    def test_injects_attribute_when_missing(self):
+        mesh = _FakeMesh(np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=np.float32), attrs=[])
+        obj = _FakeObject("Source", mesh)
+        attr_name, was_created = split_module._ensure_stable_id_on_original_mesh(obj, ["stable_id"])
+        self.assertEqual(attr_name, "stable_id")
+        self.assertTrue(was_created)
+        stored = mesh.attributes.get("stable_id")
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.domain, "POINT")
+        self.assertIn(stored.data_type, {"INT", "INT32"})
+        buf = np.zeros(3, dtype=np.int32)
+        stored.data.foreach_get("value", buf)
+        # 验证写入的是 0..N-1
+        self.assertEqual(list(buf), [0, 1, 2])
+
+    def test_reuses_existing_valid_attribute(self):
+        existing = _FakeAttr("stable_id", "POINT", "INT", np.array([7, 8, 9], dtype=np.int32))
+        mesh = _FakeMesh(np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=np.float32), attrs=[existing])
+        obj = _FakeObject("Source", mesh)
+        attr_name, was_created = split_module._ensure_stable_id_on_original_mesh(obj, ["stable_id"])
+        self.assertEqual(attr_name, "stable_id")
+        self.assertFalse(was_created)
+        buf = np.zeros(3, dtype=np.int32)
+        mesh.attributes.get("stable_id").data.foreach_get("value", buf)
+        # 已存在的值未被覆盖
+        self.assertEqual(list(buf), [7, 8, 9])
+
+
+if __name__ == "__main__":
+    unittest.main()

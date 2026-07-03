@@ -153,6 +153,9 @@ def _build_exporter(blueprint_model):
         return ExportIdentityV(blueprint_model=blueprint_model)
     if GlobalConfig.logic_name == "SRMI":
         return ExportSRMI(blueprint_model=blueprint_model)
+    if GlobalConfig.logic_name == "ZZMIDX12":
+        from ..ui.universal.zzmidx12 import ExportZZMIDX12
+        return ExportZZMIDX12(blueprint_model=blueprint_model)
     if GlobalConfig.logic_name == "ZZMI":
         return ExportZZMI(blueprint_model=blueprint_model)
     if GlobalConfig.logic_name == "WWMI":

@@ -553,6 +553,10 @@ class M_IniHelper:
         if len(shapekeyname_mkey_dict.keys()) == 0:
             return
 
+        # 生成形态键 INI 时需要确保 Shapes.hlsl 等资源已复制到 res/ 目录
+        from .m_ini_helper_gui import M_IniHelperGUI
+        M_IniHelperGUI.copy_res_to_mod_folder()
+
         # [Constants]
         constants_section = M_IniSection(M_SectionType.Constants)
         constants_section.append("[Constants]")

@@ -156,10 +156,37 @@ def _log_reload_summary(reloaded_names: list[str]):
 def _reload_image(image: bpy.types.Image) -> bool:
     try:
         image.reload()
-        return True
     except Exception as exc:
         LOG.warning(f"[TextureAutoReload] Failed to reload '{image.name}': {exc}")
         return False
+
+    _ensure_srgb_colorspace(image)
+    return True
+
+
+def _ensure_srgb_colorspace(image: bpy.types.Image) -> None:
+    """重载贴图后，确保对应的纹理节点色彩空间为 sRGB。
+
+    Blender 中 ShaderNodeTexImage 在 UI 上显示的"Color Space"实际上读写的是
+    `image.colorspace_settings.name`，因此修改 image 即可影响所有引用该贴图的纹理节点。
+    """
+    colorspace_settings = getattr(image, "colorspace_settings", None)
+    if colorspace_settings is None:
+        return
+
+    current_name = str(getattr(colorspace_settings, "name", "") or "")
+    if current_name == "sRGB":
+        return
+
+    try:
+        colorspace_settings.name = "sRGB"
+        LOG.info(
+            f"[TextureAutoReload] Forced colorspace 'sRGB' on '{image.name}' (was '{current_name}')"
+        )
+    except Exception as exc:
+        LOG.warning(
+            f"[TextureAutoReload] Failed to set sRGB colorspace on '{image.name}': {exc}"
+        )
 
 
 def _check_and_reload_changed_images():

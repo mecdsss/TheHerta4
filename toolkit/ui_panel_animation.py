@@ -100,6 +100,7 @@ class ATP_PT_ShapeKeyOperations(bpy.types.Panel):
         row = col.row(align=True)
         col.prop(props, "sk_rename_old_name", text="旧片段")
         col.prop(props, "sk_rename_new_name", text="新片段")
+        col.prop(props, "sk_rename_exact_match")
         row = col.row(align=True)
         row.operator(at_shape_key_operations.ATP_OT_BatchRenameShapeKey.bl_idname, text="重命名", icon='OUTLINER_OB_GROUP_INSTANCE')
 
@@ -215,6 +216,13 @@ class ATP_PT_ShapeKeyCreation(bpy.types.Panel):
         row.prop(props, "use_precise_frame_mode", text="高精度模式")
         row.prop(props, "use_continuous_mode", text="连续模式")
         col.prop(props, "copy_shape_keys_back", text="将形态键复制回原物体")
+        
+        box_gn = col.box()
+        box_gn.label(text="几何节点顶点映射", icon='GEOMETRY_NODES' if 'GEOMETRY_NODES' in dir(bpy.types.UILayout) else 'NODETREE')
+        box_gn.prop(props, "vertex_mapping_mode", text="模式")
+        if props.vertex_mapping_mode in {'AUTO', 'STABLE_ID'}:
+            box_gn.prop(props, "stable_id_attribute", text="稳定ID属性")
+            box_gn.label(text="提示: 在GN开头用 Store Named Attribute 把 Index 写入该属性 (INT)", icon='INFO')
         
         if props.show_processing_status:
             col.prop(props, "show_processing_status", text="显示处理状态", icon='HIDE_OFF')

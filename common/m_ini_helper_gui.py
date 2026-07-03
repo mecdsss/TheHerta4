@@ -32,6 +32,20 @@ class M_IniHelperGUI:
                 print(f"复制文件: {src_file} -> {dst_file}")
                 
     @classmethod
+    def copy_res_to_mod_folder(cls):
+        """将插件 resources/ 目录下的所有文件复制到生成 Mod 的 res/ 目录下。"""
+        res_path = os.path.join(GlobalConfig.path_generate_mod_folder(), "res")
+        if not os.path.exists(res_path):
+            os.makedirs(res_path)
+
+        script_path = os.path.abspath(__file__)
+        plugin_directory = os.path.dirname(script_path)
+        addon_root_directory = os.path.dirname(plugin_directory)
+        res_source_path = os.path.join(addon_root_directory, "resources")
+
+        cls.copy_files(res_source_path, res_path)
+
+    @classmethod
     def add_branch_mod_gui_section(cls,ini_builder:M_IniBuilder,key_name_mkey_dict:dict[str,M_Key]):
         '''
         声明模板化GUI面板
@@ -48,21 +62,7 @@ class M_IniHelperGUI:
         if not GlobalProterties.generate_branch_mod_gui():
             return
         else:
-            # 在这里把所有的res下面的东西，复制到当前生成的Mod文件夹的res目录下
-            res_path = os.path.join(GlobalConfig.path_generate_mod_folder(), "res")
-            if not os.path.exists(res_path):
-                os.makedirs(res_path)
-
-            script_path = os.path.abspath(__file__)
-
-            # 获取当前插件的工作目录
-            plugin_directory = os.path.dirname(script_path)
-            addon_root_directory = os.path.dirname(plugin_directory)
-
-            # 构建保存文件的路径
-            res_source_path = os.path.join(addon_root_directory, "resources")
-
-            cls.copy_files(res_source_path,res_path)
+            cls.copy_res_to_mod_folder()
 
         if len(key_name_mkey_dict.keys()) == 0:
             return

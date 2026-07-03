@@ -1,4 +1,4 @@
-﻿import bpy
+import bpy
 import os
 import time
 from bpy.types import NodeTree, Node, NodeSocket
@@ -425,7 +425,7 @@ class SSMTNode_Result_Output(SSMTNodeBase):
             layout.prop(context.scene.global_properties,
                         "recalculate_color",text="算术平均归一化法线存入COLOR(全局)")
 
-        if GlobalConfig.logic_name == LogicName.ZZMI:
+        if LogicName.is_zzmi_family(GlobalConfig.logic_name):
             layout.prop(context.scene.global_properties, "zzz_use_slot_fix")
 
         if GlobalConfig.logic_name == LogicName.GIMI:

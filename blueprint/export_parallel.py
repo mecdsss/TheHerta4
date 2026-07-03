@@ -138,7 +138,10 @@ class ExportRoundExecutor:
             ExportIdentityV(blueprint_model=blueprint_model).export()
         elif GlobalConfig.logic_name == LogicName.SRMI:
             ExportSRMI(blueprint_model=blueprint_model).export()
-        elif GlobalConfig.logic_name == LogicName.ZZMI:
+        elif GlobalConfig.logic_name == LogicName.ZZMIDX12:
+            from ..ui.universal.zzmidx12 import ExportZZMIDX12
+            ExportZZMIDX12(blueprint_model=blueprint_model).export()
+        elif LogicName.is_zzmi_family(GlobalConfig.logic_name):
             ExportZZMI(blueprint_model=blueprint_model).export()
         elif GlobalConfig.logic_name == LogicName.WWMI:
             ExportWWMI(blueprint_model=blueprint_model).export()
@@ -163,7 +166,7 @@ class ExportRoundExecutor:
             ExportIdentityV(blueprint_model=blueprint_model).export_buffers_only()
         elif GlobalConfig.logic_name == LogicName.SRMI:
             ExportSRMI(blueprint_model=blueprint_model).export_buffers_only()
-        elif GlobalConfig.logic_name == LogicName.ZZMI:
+        elif LogicName.is_zzmi_family(GlobalConfig.logic_name):
             ExportZZMI(blueprint_model=blueprint_model).export_buffers_only()
         elif GlobalConfig.logic_name == LogicName.WWMI:
             ExportWWMI(blueprint_model=blueprint_model).export_buffers_only()
