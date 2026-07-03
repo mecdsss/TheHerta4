@@ -83,6 +83,8 @@ class SubmeshMetadata:
     d3d11_game_type: D3D11GameType = field(init=False, repr=False)
     work_game_type: str = field(init=False, default="")
     vertex_limit_hash: str = field(init=False, default="")
+    match_cs: str = field(init=False, default="")
+    match_uav_bytes: int = field(init=False, default=0)
     category_hash_dict: dict = field(init=False, default_factory=dict)
     texture_markup_info_list: list = field(init=False, default_factory=list)
     part_name: str = field(init=False, default="")
@@ -99,6 +101,8 @@ class SubmeshMetadata:
         self.submesh_json_dict = self.submesh_json.JsonDict
         self.work_game_type = self.submesh_json.WorkGameType
         self.vertex_limit_hash = self.submesh_json.VertexLimitVB
+        self.match_cs = self.submesh_json.MatchCS
+        self.match_uav_bytes = self.submesh_json.MatchUAVBytes
         self.category_hash_dict = dict(self.submesh_json.CategoryHash)
         self.texture_markup_info_list = list(self.submesh_json.TextureMarkUpInfoList)
         self.part_name = str(

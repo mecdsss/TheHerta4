@@ -36,21 +36,13 @@ class BufferExportHelper:
 
     @staticmethod
     def write_buf_shapekey_offsets(shapekey_offsets,filename:str):
-        with open(GlobalConfig.path_generatemod_buffer_folder() + filename, 'wb') as file:
-            for number in shapekey_offsets:
-                # 假设数字是32位整数，使用'i'格式符
-                # 根据实际需要调整数字格式和相应的格式符
-                data = struct.pack('i', number)
-                file.write(data)
+        out_path = os.path.join(GlobalConfig.path_generatemod_buffer_folder(), filename)
+        numpy.asarray(shapekey_offsets, dtype=numpy.uint32).tofile(out_path)
 
     @staticmethod
     def write_buf_shapekey_vertex_ids(shapekey_vertex_ids,filename:str):
-        with open(GlobalConfig.path_generatemod_buffer_folder() + filename, 'wb') as file:
-            for number in shapekey_vertex_ids:
-                # 假设数字是32位整数，使用'i'格式符
-                # 根据实际需要调整数字格式和相应的格式符
-                data = struct.pack('i', number)
-                file.write(data)
+        out_path = os.path.join(GlobalConfig.path_generatemod_buffer_folder(), filename)
+        numpy.asarray(shapekey_vertex_ids, dtype=numpy.uint32).tofile(out_path)
                 
     @staticmethod
     def write_buf_shapekey_vertex_offsets(shapekey_vertex_offsets,filename:str):

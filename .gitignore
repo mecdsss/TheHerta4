@@ -9,3 +9,6 @@ docs/
 reports/
 # Codex benchmark output directory
 .codex_benchmarks/
+dist/
+DIST/
+test_result.txt

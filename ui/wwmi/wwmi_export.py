@@ -116,6 +116,9 @@ class ExportWWMI:
         constants_section.append("global $object_guid = " + str(draw_ib_model.extracted_object.index_count))
         constants_section.append("global $mesh_vertex_count = " + str(draw_ib_model.mesh_vertex_count))
         constants_section.append("global $shapekey_vertex_count = " + str(len(draw_ib_model.obj_buffer_model_wwmi.shapekey_vertex_ids)))
+        for batch_id, batch in enumerate(self.get_wwmi_shapekey_batches(draw_ib_model)):
+            constants_section.append("global $shapekey_vertex_offset_batch" + str(batch_id) + " = " + str(batch["custom_vertex_offset"]))
+            constants_section.append("global $shapekey_vertex_count_batch" + str(batch_id) + " = " + str(batch["custom_vertex_count"]))
         constants_section.append("global $mod_id = -1000")
 
         if GlobalProterties.import_merged_vgmap():
@@ -125,6 +128,41 @@ class ExportWWMI:
         constants_section.append("global $object_detected = 0")
         constants_section.new_line()
         ini_builder.append_section(constants_section)
+
+    @staticmethod
+    def get_wwmi_shapekey_batches(draw_ib_model: DrawIBModelWWMI) -> list[dict]:
+        shapekey_offsets = draw_ib_model.obj_buffer_model_wwmi.shapekey_offsets
+        if not shapekey_offsets:
+            return []
+
+        batch_count = len(shapekey_offsets) // 128
+        metadata_batches = list(getattr(draw_ib_model.extracted_object.shapekeys, "batches", []) or [])
+        if not metadata_batches and getattr(draw_ib_model.extracted_object.shapekeys, "checksum", 0):
+            metadata_batches = [{
+                "vertex_offset": 0,
+                "dispatch_y": draw_ib_model.extracted_object.shapekeys.dispatch_y,
+                "checksum": draw_ib_model.extracted_object.shapekeys.checksum,
+            }]
+        if len(metadata_batches) < batch_count:
+            return []
+
+        batches = []
+        custom_vertex_offset = 0
+        for batch_id in range(batch_count):
+            batch_offsets = shapekey_offsets[batch_id * 128:(batch_id + 1) * 128]
+            custom_vertex_count = batch_offsets[-1] if batch_offsets else 0
+            metadata = metadata_batches[batch_id]
+            if int(metadata.get("checksum", 0)) == 0:
+                return []
+            batches.append({
+                "checksum": int(metadata.get("checksum", 0)),
+                "original_vertex_offset": int(metadata.get("vertex_offset", 0)),
+                "dispatch_y": int(metadata.get("dispatch_y", 0)),
+                "custom_vertex_offset": custom_vertex_offset,
+                "custom_vertex_count": custom_vertex_count,
+            })
+            custom_vertex_offset += custom_vertex_count
+        return batches
 
     def add_present_section(self, ini_builder: M_IniBuilder, draw_ib_model: DrawIBModelWWMI):
         present_section = M_IniSection(M_SectionType.Present)
@@ -460,6 +498,10 @@ class ExportWWMI:
         if BlueprintExportHelper.should_suppress_shapekey_resource_export():
             return
 
+        shapekey_batches = self.get_wwmi_shapekey_batches(draw_ib_model)
+        if not shapekey_batches:
+            return
+
         texture_override_shapekeys_section = M_IniSection(M_SectionType.TextureOverrideShapeKeys)
 
         shapekey_offsets_hash = draw_ib_model.extracted_object.shapekeys.offsets_hash
@@ -480,20 +522,25 @@ class ExportWWMI:
             texture_override_shapekeys_section.append("override_vertex_count = $mesh_vertex_count")
             texture_override_shapekeys_section.new_line()
 
-        texture_override_shapekeys_section.append("[CommandListSetupShapeKeys]")
-        texture_override_shapekeys_section.append("$\\WWMIv1\\shapekey_checksum = " + str(draw_ib_model.extracted_object.shapekeys.checksum))
+        texture_override_shapekeys_section.append("[CommandListSetupShapeKeysBatch]")
+        for batch_id, batch in enumerate(shapekey_batches):
+            texture_override_shapekeys_section.append("$\\WWMIv1\\shapekey_checksum_batch" + str(batch_id) + " = " + str(batch["checksum"]))
+            texture_override_shapekeys_section.append("$\\WWMIv1\\shapekey_vertex_offset_original_batch" + str(batch_id) + " = " + str(batch["original_vertex_offset"]))
+            texture_override_shapekeys_section.append("$\\WWMIv1\\shapekey_vertex_offset_custom_batch" + str(batch_id) + " = $shapekey_vertex_offset_batch" + str(batch_id))
         texture_override_shapekeys_section.append("cs-t33 = ResourceShapeKeyOffsetBuffer")
         texture_override_shapekeys_section.append("cs-u5 = ResourceCustomShapeKeyValuesRW")
         texture_override_shapekeys_section.append("cs-u6 = ResourceShapeKeyCBRW")
-        texture_override_shapekeys_section.append("run = CustomShader\\WWMIv1\\ShapeKeyOverrider")
+        texture_override_shapekeys_section.append("run = CustomShader\\WWMIv1\\ShapeKeyBatchOverrider")
         texture_override_shapekeys_section.new_line()
 
-        texture_override_shapekeys_section.append("[CommandListLoadShapeKeys]")
-        texture_override_shapekeys_section.append("$\\WWMIv1\\shapekey_vertex_count = $shapekey_vertex_count")
+        texture_override_shapekeys_section.append("[CommandListLoadShapeKeysBatch]")
+        for batch_id, batch in enumerate(shapekey_batches):
+            texture_override_shapekeys_section.append("$\\WWMIv1\\shapekey_dispatch_size_y_original_batch" + str(batch_id) + " = " + str(batch["dispatch_y"]))
+            texture_override_shapekeys_section.append("$\\WWMIv1\\shapekey_vertex_count_batch" + str(batch_id) + " = $shapekey_vertex_count_batch" + str(batch_id))
         texture_override_shapekeys_section.append("cs-t0 = ResourceShapeKeyVertexIdBuffer")
         texture_override_shapekeys_section.append("cs-t1 = ResourceShapeKeyVertexOffsetBuffer")
         texture_override_shapekeys_section.append("cs-u6 = ResourceShapeKeyCBRW")
-        texture_override_shapekeys_section.append("run = CustomShader\\WWMIv1\\ShapeKeyLoader")
+        texture_override_shapekeys_section.append("run = CommandList\\WWMIv1\\LoadShapeKeysBatch")
         texture_override_shapekeys_section.new_line()
 
         if shapekey_offsets_hash != "":
@@ -506,8 +553,8 @@ class ExportWWMI:
             else:
                 texture_override_shapekeys_section.append("  if cs == 3381.3333")
             texture_override_shapekeys_section.append("    handling = skip")
-            texture_override_shapekeys_section.append("    run = CommandListSetupShapeKeys")
-            texture_override_shapekeys_section.append("    run = CommandListLoadShapeKeys")
+            texture_override_shapekeys_section.append("    run = CommandListSetupShapeKeysBatch")
+            texture_override_shapekeys_section.append("    run = CommandListLoadShapeKeysBatch")
             texture_override_shapekeys_section.append("  endif")
             texture_override_shapekeys_section.append("endif")
             texture_override_shapekeys_section.new_line()
@@ -539,6 +586,10 @@ class ExportWWMI:
         if BlueprintExportHelper.should_suppress_shapekey_resource_export():
             return
 
+        shapekey_batches = self.get_wwmi_shapekey_batches(draw_ib_model)
+        if not shapekey_batches:
+            return
+
         resource_shapekeys_section = M_IniSection(M_SectionType.ResourceShapeKeysOverride)
         resource_shapekeys_section.append("; Resources: Shape Keys Override -------------------------")
         resource_shapekeys_section.append("[ResourceShapeKeyCBRW]")
@@ -548,7 +599,7 @@ class ExportWWMI:
         resource_shapekeys_section.append("[ResourceCustomShapeKeyValuesRW]")
         resource_shapekeys_section.append("type = RWBuffer")
         resource_shapekeys_section.append("format = R32G32B32A32_FLOAT")
-        resource_shapekeys_section.append("array = 32")
+        resource_shapekeys_section.append("array = " + str(32 * len(shapekey_batches)))
         ini_builder.append_section(resource_shapekeys_section)
 
     def add_resource_merged_skeleton(self, ini_builder: M_IniBuilder, draw_ib_model: DrawIBModelWWMI):

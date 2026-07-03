@@ -36,6 +36,8 @@ class SubMeshModel:
     match_draw_ib:str = field(init=False, default="")
     match_first_index:int = field(init=False, default=-1)
     match_index_count:int = field(init=False, default=-1)
+    match_cs:str = field(init=False, default="")
+    match_uav_bytes:int = field(init=False, default=0)
     unique_str:str = field(init=False, default="")
     workspace_unique_str:str = field(init=False, default="")
 
@@ -71,6 +73,8 @@ class SubMeshModel:
 
         submesh_metadata = SubmeshMetadataResolver.resolve(folder_name)
         self.d3d11_game_type = submesh_metadata.d3d11_game_type
+        self.match_cs = getattr(submesh_metadata, "match_cs", "") or ""
+        self.match_uav_bytes = int(getattr(submesh_metadata, "match_uav_bytes", 0) or 0)
 
         TimerUtils.start_stage("数据哈希预计算")
         object_hashes, source_obj_list = self._precompute_object_hashes()

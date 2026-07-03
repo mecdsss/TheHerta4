@@ -4,6 +4,7 @@ import bpy
 import time
 import numpy
 import re
+import math
 from contextlib import contextmanager
 from mathutils import Matrix
 
@@ -649,29 +650,37 @@ class ShapeKeyUtils:
     @classmethod
     def extract_shapekey_data(cls,merged_obj,index_vertex_id_dict):
         '''
-        传入一个Obj，提取出其形态键数据为特定格式
+        Build WWMI native shape key buffers.
+
+        WWMI stores shape keys in batches of 127 keys. Each batch has 128
+        uint offsets: a leading 0, one offset after every key, and the final
+        value acts as the sentinel used by ShapeKeyLoader.
         '''
         shapekey_cache = cls.get_shapekey_cache(merged_obj,index_vertex_id_dict)
+        if not shapekey_cache:
+            return [], [], []
 
         shapekey_offsets = []
         shapekey_vertex_ids = []
         shapekey_vertex_offsets = []
 
-        # 从0到128去获取ShapeKey的Index，有就直接加到
-        shapekey_verts_count = 0
-        for group_id in range(128):
-            shapekey = shapekey_cache.get(group_id, None)
+        max_shapekey_id = max(shapekey_cache.keys())
+        batch_count = max(1, math.ceil((max_shapekey_id + 1) / 127))
 
-            if shapekey is None or len(shapekey_cache[group_id]) == 0:
-                shapekey_offsets.extend([shapekey_verts_count if shapekey_verts_count != 0 else 0])
-                continue
+        for batch_id in range(batch_count):
+            shapekey_verts_count = 0
+            shapekey_offsets.append(0)
+            shapekey_id_offset = batch_id * 127
 
-            shapekey_offsets.extend([shapekey_verts_count])
+            for group_id in range(shapekey_id_offset, shapekey_id_offset + 127):
+                shapekey = shapekey_cache.get(group_id, None)
+                if shapekey is not None and len(shapekey) != 0:
+                    for draw_index, vertex_offsets in shapekey.items():
+                        shapekey_vertex_ids.append(draw_index)
+                        shapekey_vertex_offsets.extend(vertex_offsets + [0, 0, 0])
+                        shapekey_verts_count += 1
 
-            for draw_index, vertex_offsets in shapekey.items():
-                shapekey_vertex_ids.extend([draw_index])
-                shapekey_vertex_offsets.extend(vertex_offsets + [0, 0, 0])
-                shapekey_verts_count += 1
+                shapekey_offsets.append(shapekey_verts_count)
 
         return shapekey_offsets,shapekey_vertex_ids,shapekey_vertex_offsets
     
@@ -719,8 +728,6 @@ class ShapeKeyUtils:
                 
             shapekey_idx = int(match[0])
             # print("process: " + str(shapekey_idx))
-            if shapekey_idx >= 128:
-                break  # 按原逻辑遇到>=128的索引直接停止处理
 
             # 获取形态键坐标数据
             sk_coords = numpy.empty((len(mesh.vertices), 3), dtype=numpy.float32)

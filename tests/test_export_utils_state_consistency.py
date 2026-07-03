@@ -177,6 +177,21 @@ class ExportUtilsStateConsistencyTests(unittest.TestCase):
 
         self.assertEqual(result, ([1], [2], [3], True))
 
+    def test_build_wwmi_shapekey_payload_supports_batch_layout(self):
+        """测试 WWMI ShapeKey 载荷支持 batch 化 offsets 布局"""
+        obj = _FakeObject()
+        original_extract = export_utils.ShapeKeyUtils.extract_shapekey_data
+        try:
+            export_utils.ShapeKeyUtils.extract_shapekey_data = lambda *_args, **_kwargs: ([0] * 128 + [0] * 128, [2], [3])
+            result = export_utils.ExportUtils.build_wwmi_shapekey_payload(
+                obj=obj,
+                index_vertex_id_dict={},
+            )
+        finally:
+            export_utils.ShapeKeyUtils.extract_shapekey_data = original_extract
+
+        self.assertEqual(result, ([0] * 128 + [0] * 128, [2], [3], True))
+
 
 if __name__ == "__main__":
     unittest.main()

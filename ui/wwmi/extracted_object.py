@@ -41,6 +41,11 @@ class ExtractedObjectShapeKeys:
     vertex_count: int = 0
     dispatch_y: int = 0
     checksum: int = 0
+    batches: list = None
+
+    def __post_init__(self):
+        if self.batches is None:
+            self.batches = []
 
 
 @dataclass
@@ -116,7 +121,15 @@ class ExtractedObjectHelper:
             vertex_count=int(shapekeys_info.get("vertex_count", 0)),
             dispatch_y=int(shapekeys_info.get("dispatch_y", 0)),
             checksum=int(shapekeys_info.get("checksum", 0)),
+            batches=list(shapekeys_info.get("batches", [])),
         )
+        if not shapekeys.batches and shapekeys.checksum > 0:
+            shapekeys.batches = [{
+                "vertex_offset": 0,
+                "vertex_count": shapekeys.vertex_count,
+                "dispatch_y": shapekeys.dispatch_y,
+                "checksum": shapekeys.checksum,
+            }]
 
         return ExtractedObject(
             vb0_hash=first_json.VertexLimitVB,
