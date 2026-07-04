@@ -6,6 +6,9 @@ from collections import OrderedDict
 _RESOURCE_POSITION_PATTERN = re.compile(
     r"^\[(Resource_?[A-Za-z0-9.]+(?:_[A-Za-z0-9.]+)*_?Position)(\d*)\]$"
 )
+_TEXTURE_OVERRIDE_POSITION_ALIAS_PATTERN = re.compile(
+    r"^\[TextureOverride[^\]]*Position_1\]$"
+)
 
 
 def iter_hash_buffer_candidates(folder_path: str, hash_filter: str, file_suffix: str) -> list[dict]:
@@ -135,6 +138,77 @@ def ensure_resource_alias_section(sections, resource_name: str, alias_suffix: st
     return alias_section_name
 
 
+def find_base_position_resource_name(
+    sections,
+    hash_filter: str,
+    base_name: str = "",
+    preferred_names=None,
+    fallback_name: str = "",
+) -> str:
+    matched_resource_names = []
+    match_tokens = _build_resource_match_tokens(hash_filter, base_name, *(preferred_names or []))
+
+    for section_name in sections.keys():
+        match = _RESOURCE_POSITION_PATTERN.match(str(section_name or "").strip())
+        if not match:
+            continue
+
+        resource_name, numeric_suffix = match.groups()
+        if numeric_suffix:
+            continue
+        if _resource_name_matches_tokens(resource_name, match_tokens):
+            matched_resource_names.append(resource_name)
+
+    for preferred_name in list(preferred_names or []):
+        clean_preferred_name = section_to_resource_name(preferred_name)
+        if clean_preferred_name in matched_resource_names:
+            return clean_preferred_name
+
+    if matched_resource_names:
+        return matched_resource_names[0]
+
+    for preferred_name in list(preferred_names or []):
+        clean_preferred_name = section_to_resource_name(preferred_name)
+        if clean_preferred_name:
+            return clean_preferred_name
+
+    return section_to_resource_name(fallback_name)
+
+
+def is_stale_texture_override_position_alias_section(section_name: str, hash_filter: str = "") -> bool:
+    clean_section_name = str(section_name or "").strip()
+    if not _TEXTURE_OVERRIDE_POSITION_ALIAS_PATTERN.match(clean_section_name):
+        return False
+    return _text_matches_hash_filter(clean_section_name, hash_filter)
+
+
+def is_stale_texture_override_position_copy_desc_line(line: str, hash_filter: str = "") -> bool:
+    clean_line = str(line or "").strip()
+    if not clean_line.startswith("post TextureOverride"):
+        return False
+    marker = " = copy_desc "
+    if marker not in clean_line:
+        return False
+    left_name, right_name = clean_line[len("post ") :].split(marker, 1)
+    if not left_name.startswith("TextureOverride") or not right_name.startswith("TextureOverride"):
+        return False
+    if "Position" not in left_name:
+        return False
+    return is_stale_texture_override_position_alias_section(
+        resource_name_to_section(right_name),
+        hash_filter,
+    )
+
+
+def collect_stale_texture_override_position_alias_names(lines, hash_filter: str = "") -> list[str]:
+    alias_names = []
+    for line in list(lines or []):
+        alias_name = _extract_stale_texture_override_position_copy_desc_alias(line, hash_filter)
+        if alias_name and alias_name not in alias_names:
+            alias_names.append(alias_name)
+    return alias_names
+
+
 def resource_name_to_section(resource_name: str) -> str:
     clean_name = str(resource_name or "").strip()
     if clean_name.startswith("[") and clean_name.endswith("]"):
@@ -206,6 +280,46 @@ def _normalize_hash_prefix(value: str) -> str:
     if normalized_value.upper().startswith("LOD") and "." in normalized_value:
         normalized_value = normalized_value.split(".", 1)[1]
     return normalized_value.split("-", 1)[0]
+
+
+def _build_resource_match_tokens(*values) -> set[str]:
+    tokens = set()
+    for value in values:
+        clean_value = section_to_resource_name(value)
+        for candidate in (clean_value, _normalize_hash_prefix(clean_value)):
+            normalized_candidate = _normalize_resource_match_text(candidate)
+            if normalized_candidate:
+                tokens.add(normalized_candidate)
+    return tokens
+
+
+def _resource_name_matches_tokens(resource_name: str, match_tokens: set[str]) -> bool:
+    if not match_tokens:
+        return False
+    resource_key = _normalize_resource_match_text(resource_name)
+    return any(token and token in resource_key for token in match_tokens)
+
+
+def _text_matches_hash_filter(text: str, hash_filter: str) -> bool:
+    match_tokens = _build_resource_match_tokens(hash_filter)
+    if not match_tokens:
+        return True
+    text_key = _normalize_resource_match_text(text)
+    return any(token and token in text_key for token in match_tokens)
+
+
+def _extract_stale_texture_override_position_copy_desc_alias(line: str, hash_filter: str = "") -> str:
+    if not is_stale_texture_override_position_copy_desc_line(line, hash_filter):
+        return ""
+    rhs = str(line or "").strip().split(" = copy_desc ", 1)[1].strip()
+    section_name = resource_name_to_section(rhs)
+    if not is_stale_texture_override_position_alias_section(section_name, hash_filter):
+        return ""
+    return rhs
+
+
+def _normalize_resource_match_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
 def _stem_matches_filter(stem: str, stem_prefix: str, raw_filter: str, filter_prefix: str) -> bool:

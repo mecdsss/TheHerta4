@@ -8,8 +8,10 @@ import bpy
 import numpy as np
 
 from ..common.global_config import GlobalConfig
+from ..common.mod_path_compat import collect_stale_texture_override_position_alias_names
 from ..common.mod_path_compat import ensure_resource_alias_section
-from ..common.mod_path_compat import section_to_resource_name
+from ..common.mod_path_compat import find_base_position_resource_name
+from ..common.mod_path_compat import is_stale_texture_override_position_copy_desc_line
 from ..common.mod_path_compat import resolve_position_buffer_candidate
 from ..utils.export_utils import ExportUtils
 from .direct_export_runtime_utils import (
@@ -612,18 +614,15 @@ class DirectMultiFileGenerator:
             return canonical_name
 
         sections, _ = self.config_node._read_ini_to_ordered_dict(ini_files[0])
-        for section_name in sections.keys():
-            if "Position" not in str(section_name or ""):
-                continue
-            full_name = section_to_resource_name(section_name)
-            lowered_name = full_name.lower().replace("_", ".")
-            actual_candidates = {
-                str(actual_hash or "").lower(),
-                str(actual_hash or "").lower().replace("-", "."),
-            }
-            if any(candidate and candidate in lowered_name for candidate in actual_candidates):
-                return full_name
-        return canonical_name
+        return find_base_position_resource_name(
+            sections,
+            actual_hash,
+            preferred_names=[
+                canonical_name,
+                self._build_legacy_resource_name(actual_hash),
+            ],
+            fallback_name=canonical_name,
+        )
 
     def _find_existing_base_resource_section_name(self, sections, actual_hash: str, base_resource_name: str) -> str | None:
         legacy_base_resource_name = self._build_legacy_resource_name(actual_hash)
@@ -676,16 +675,22 @@ class DirectMultiFileGenerator:
                 runtime_info["actual_hash"],
                 base_resource_name,
             )
+            source_resource_candidates = [
+                original_section_name[1:-1] if original_section_name else "",
+                f"{base_resource_name}_0",
+                f"{legacy_base_resource_name}_0",
+                legacy_base_resource_name,
+            ]
+            if not any(f"[{candidate}]" in sections for candidate in source_resource_candidates if candidate):
+                raise MultiFileDirectExportError(
+                    f"未在 INI 中找到基础 Position Resource: [{base_resource_name}]。"
+                    f"哈希值: {actual_hash}。请确认多文件配置节点的哈希值与导出的 Position.buf/INI Resource 匹配。"
+                )
             base_section_name = ensure_resource_alias_section(
                 sections,
                 base_resource_name,
                 "_1",
-                source_candidates=[
-                    original_section_name[1:-1] if original_section_name else "",
-                    f"{base_resource_name}_0",
-                    f"{legacy_base_resource_name}_0",
-                    legacy_base_resource_name,
-                ],
+                source_candidates=source_resource_candidates,
             )
             base_resource_alias_name = base_section_name[1:-1]
 
@@ -727,20 +732,51 @@ class DirectMultiFileGenerator:
             shader_lines.append(f"    cs-u5 = copy {base_resource_alias_name}")
             shader_lines.append(f"    {base_resource_name} = ref cs-u5")
             vertex_count = runtime_info["vertex_count"] or 100000
-            shader_lines.append(f"    Dispatch = {vertex_count}, 1, 1")
+            dispatch_count = self.config_node._compute_dispatch_group_count(vertex_count, threads_per_group=16)
+            shader_lines.append(f"    Dispatch = {dispatch_count}, 1, 1")
             shader_lines.append("    cs-u5 = null")
             shader_lines.append("    cs-t51 = null")
             shader_lines.append("    cs-t75 = null")
             sections[shader_section] = shader_lines
 
             legacy_post_copy_line = f"post {legacy_base_resource_name} = copy_desc {legacy_base_resource_name}_1"
-            constants_lines = [line for line in constants_lines if line != legacy_post_copy_line]
             post_copy_line = f"post {base_resource_name} = copy_desc {base_resource_alias_name}"
             post_run_line = f"post run = CustomShader_{actual_hash}_1Anim"
-            if post_copy_line not in constants_lines:
-                constants_lines.append(post_copy_line)
-            if post_run_line not in constants_lines:
-                constants_lines.append(post_run_line)
+            stale_alias_names = []
+            stale_hash_filters = [
+                runtime_info["hash_filter"],
+                actual_hash,
+                resource_prefix,
+            ]
+            for stale_hash_filter in stale_hash_filters:
+                for stale_alias_name in collect_stale_texture_override_position_alias_names(
+                    constants_lines,
+                    stale_hash_filter,
+                ):
+                    if stale_alias_name not in stale_alias_names:
+                        stale_alias_names.append(stale_alias_name)
+            for stale_alias_name in stale_alias_names:
+                stale_section_name = f"[{stale_alias_name}]"
+                if stale_section_name in sections:
+                    del sections[stale_section_name]
+                print(
+                    "[MultiFile][WARNING] 检测到旧版本错误生成的 TextureOverride Position copy_desc，"
+                    f"已移除别名 section: {stale_alias_name}；"
+                    f"当前基础 Position 资源: {base_resource_name}。"
+                )
+            constants_lines = [
+                line
+                for line in constants_lines
+                if line != legacy_post_copy_line
+                and line != post_copy_line
+                and line != post_run_line
+                and not any(
+                    is_stale_texture_override_position_copy_desc_line(line, stale_hash_filter)
+                    for stale_hash_filter in stale_hash_filters
+                )
+            ]
+            constants_lines.append(post_copy_line)
+            constants_lines.append(post_run_line)
 
             run_line = f"    run = CustomShader_{actual_hash}_1Anim"
             if run_line not in run_lines_to_add:

@@ -12,8 +12,11 @@ except ImportError:
     NUMPY_AVAILABLE = False
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
+from ..common.mod_path_compat import collect_stale_texture_override_position_alias_names
 from ..common.mod_path_compat import ensure_resource_alias_section
+from ..common.mod_path_compat import find_base_position_resource_name
 from ..common.mod_path_compat import iter_position_buffer_candidates
+from ..common.mod_path_compat import is_stale_texture_override_position_copy_desc_line
 from ..common.object_prefix_helper import ObjectPrefixHelper
 
 
@@ -62,34 +65,16 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
     def _find_existing_base_resource_name(self, sections, hash_filter: str, base_name: str) -> str:
         normalized_base_name = str(base_name or "").strip()
         normalized_hash_filter = str(hash_filter or "").strip()
-        resource_names = []
-        for section_name in sections.keys():
-            stripped_name = str(section_name or "").strip()
-            if not stripped_name.startswith("[") or not stripped_name.endswith("]"):
-                continue
-            resource_name = stripped_name[1:-1]
-            if "Position" not in resource_name:
-                continue
-            if resource_name.endswith("_0") or resource_name.endswith("_1"):
-                continue
-            lowered = resource_name.lower()
-            variants = {
-                normalized_base_name.lower().replace(".", "_").replace("-", "_"),
-                normalized_hash_filter.lower().replace(".", "_").replace("-", "_"),
-            }
-            if any(variant and variant in lowered for variant in variants):
-                resource_names.append(resource_name)
 
         preferred_canonical_name = self._resource_name_from_prefix(self._hash_to_resource_prefix(normalized_base_name))
-        if preferred_canonical_name in resource_names:
-            return preferred_canonical_name
         legacy_name = f"Resource{self._hash_to_resource_prefix(normalized_hash_filter)}Position"
-        if legacy_name in resource_names:
-            return legacy_name
-        if resource_names:
-            resource_names.sort(key=str.casefold)
-            return resource_names[0]
-        return preferred_canonical_name
+        return find_base_position_resource_name(
+            sections,
+            normalized_hash_filter,
+            base_name=normalized_base_name,
+            preferred_names=[preferred_canonical_name, legacy_name],
+            fallback_name=preferred_canonical_name,
+        )
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "hash_values")
@@ -187,6 +172,12 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                 _, num_floats, _ = parsed
                 return num_floats
         return 10
+
+    @staticmethod
+    def _compute_dispatch_group_count(vertex_count, threads_per_group=16):
+        vertex_count = int(vertex_count or 0)
+        threads_per_group = max(1, int(threads_per_group or 1))
+        return max(1, (vertex_count + threads_per_group - 1) // threads_per_group)
 
     def _update_shader_file(self, shader_path):
         try:
@@ -347,275 +338,6 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                 f.write(preserved_tail_content)
 
     def execute_postprocess(self, mod_export_path):
-        print(f"多文件配置后处理节点开始执行，Mod导出路径: {mod_export_path}")
-
-        if not NUMPY_AVAILABLE:
-            print("需要安装numpy库以使用紧凑缓冲区和增量存储功能")
-            return
-
-        hash_values = self._parse_hash_values(self.hash_values)
-        if not hash_values:
-            print("请至少输入一个有效的哈希值")
-            return
-
-        try:
-            original_cwd = os.getcwd()
-            os.chdir(mod_export_path)
-
-            ini_files = glob.glob("*.ini")
-            if not ini_files:
-                print("在路径中未找到任何.ini文件")
-                os.chdir(original_cwd)
-                return
-
-            for ini_file in ini_files:
-                ini_file_path = os.path.join(mod_export_path, ini_file)
-                self._create_cumulative_backup(ini_file_path, mod_export_path)
-                sections, preserved_tail_content = self._read_ini_to_ordered_dict(ini_file_path)
-                if not sections:
-                    continue
-
-                Meshes_folders = []
-                for i in range(1, 1000):
-                    Meshes_folder = os.path.join(mod_export_path, f"Meshes{i:02d}")
-                    if os.path.exists(Meshes_folder):
-                        Meshes_folders.append(f"Meshes{i:02d}")
-                    else:
-                        break
-
-                if len(Meshes_folders) < 2:
-                    print(f"至少需要 Meshes01 和 Meshes02 两个文件夹才能进行多文件配置")
-                    continue
-
-                for section_name in list(sections.keys()):
-                    if section_name.startswith('[Resource') and section_name.endswith(']'):
-                        resource_name = section_name[1:-1]
-
-                        original_lines = sections[section_name].copy()
-                        new_lines = []
-                        for line in original_lines:
-                            modified_line = line
-                            for buf_folder in Meshes_folders[1:]:
-                                old_path = f"filename = {buf_folder}/"
-                                if old_path in line:
-                                    modified_line = line.replace(old_path, "filename = Meshes01/")
-                                    break
-                            new_lines.append(modified_line)
-
-                        if 'Position' in resource_name:
-                            sections[section_name] = new_lines
-                            ensure_resource_alias_section(
-                                sections,
-                                resource_name,
-                                "_1",
-                                source_candidates=[resource_name],
-                            )
-                        else:
-                            sections[section_name] = new_lines
-
-                processed_base_names = []
-
-                for hash_value in hash_values:
-                    Meshes01_path = os.path.join(mod_export_path, "Meshes01")
-                    if not os.path.exists(Meshes01_path):
-                        print(f"Meshes01 文件夹不存在: {Meshes01_path}")
-                        continue
-
-                    position_files = []
-                    try:
-                        for filename in os.listdir(Meshes01_path):
-                            if filename.startswith(hash_value) and filename.endswith("-Position.buf"):
-                                position_files.append(filename)
-                    except Exception as e:
-                        print(f"读取 Meshes01 文件夹失败: {e}")
-                        continue
-
-                    if not position_files:
-                        print(f"在 Meshes01 中未找到以 {hash_value} 开头的 Position 文件")
-                        print(f"查找路径: {Meshes01_path}")
-                        print(f"查找模式: {hash_value}*-Position.buf")
-                        continue
-
-                    base_position_file = position_files[0]
-                    print(f"找到 {len(position_files)} 个匹配的 Position 文件，使用: {base_position_file}")
-
-                    base_name = base_position_file.replace("-Position.buf", "")
-                    hash_prefix = self._hash_to_resource_prefix(base_name)
-                    print(f"使用基础名称: {base_name}，资源前缀: {hash_prefix}")
-
-                    processed_base_names.append((base_name, hash_prefix))
-
-                    base_Meshes_path = os.path.join("Meshes01", base_position_file)
-                    base_Meshes_full_path = os.path.join(mod_export_path, base_Meshes_path)
-
-                    base_Meshes = self._read_Meshes_file(base_Meshes_full_path)
-                    if base_Meshes is None:
-                        continue
-
-                    processed_frames = []
-                    for Meshes_folder in Meshes_folders[1:]:
-                        Meshes_folder_path = os.path.join(mod_export_path, Meshes_folder)
-                        if not os.path.exists(Meshes_folder_path):
-                            continue
-
-                        target_position_files = []
-                        try:
-                            for filename in os.listdir(Meshes_folder_path):
-                                if filename.startswith(hash_value) and filename.endswith("-Position.buf"):
-                                    target_position_files.append(filename)
-                        except Exception as e:
-                            print(f"读取 {Meshes_folder} 文件夹失败: {e}")
-                            continue
-
-                        if not target_position_files:
-                            continue
-
-                        target_position_file = target_position_files[0]
-                        target_filename = os.path.join(Meshes_folder, target_position_file)
-                        target_Meshes_full_path = os.path.join(mod_export_path, target_filename)
-
-                        if os.path.exists(target_Meshes_full_path):
-                            target_Meshes = self._read_Meshes_file(target_Meshes_full_path)
-                            if target_Meshes is None:
-                                continue
-
-                            map_array, pos_deltas_array = self._create_packed_Meshess(
-                                base_Meshes, target_Meshes, True
-                            )
-
-                            pos_output_path = os.path.join(mod_export_path, Meshes_folder, f"{base_name}-Position_packed_pos_delta.buf")
-                            self._write_Meshes_file(pos_deltas_array, pos_output_path)
-
-                            map_output_path = os.path.join(mod_export_path, Meshes_folder, f"{base_name}-Position_map.buf")
-                            self._write_Meshes_file(map_array, map_output_path)
-
-                            folder_num = int(Meshes_folder.replace("Meshes", ""))
-                            pos_resource_section = f'[Resource_{hash_prefix}_Position{folder_num:02d}_packed_pos_delta]'
-                            stride = 12
-
-                            sections[pos_resource_section] = [
-                                'type = Buffer',
-                                f'stride = {stride}',
-                                f'filename = {Meshes_folder}/{base_name}-Position_packed_pos_delta.buf'
-                            ]
-
-                            map_resource_section = f'[Resource_{hash_prefix}_Position{folder_num:02d}_Map]'
-                            sections[map_resource_section] = [
-                                'type = Buffer',
-                                'stride = 4',
-                                f'filename = {Meshes_folder}/{base_name}-Position_map.buf'
-                            ]
-
-                            processed_frames.append((folder_num, Meshes_folder))
-
-                    if not processed_frames:
-                        print(f"没有找到有效的目标帧文件，跳过哈希值: {hash_value}")
-                        continue
-
-                    shader_section = f'[CustomShader_{base_name}_1Anim]'
-                    shader_lines = []
-
-                    if self.comment:
-                        shader_lines.append("; " + self.comment)
-                        shader_lines.append("")
-
-                    for state_index, (folder_num, Meshes_folder) in enumerate(processed_frames, 1):
-                        shader_lines.append(f"if {self.animation_swapkey} == {state_index}")
-                        shader_lines.append(f"      cs-t51 = copy Resource_{hash_prefix}_Position{folder_num:02d}_packed_pos_delta")
-                        shader_lines.append(f"endif")
-
-                    shader_lines.append("")
-
-                    for state_index, (folder_num, Meshes_folder) in enumerate(processed_frames, 1):
-                        shader_lines.append(f"if {self.animation_swapkey} == {state_index}")
-                        shader_lines.append(f"      cs-t75 = copy Resource_{hash_prefix}_Position{folder_num:02d}_Map")
-                        shader_lines.append(f"endif")
-
-                    shader_lines.append("")
-                    shader_lines.append("    cs = ./res/merge_anim_packed_delta.hlsl")
-                    base_resource_name = self._resource_name_from_prefix(hash_prefix)
-                    shader_lines.append(f"    cs-u5 = copy {base_resource_name}_1")
-                    shader_lines.append(f"    {base_resource_name} = ref cs-u5")
-
-                    shader_source_path = self._get_shader_source_path()
-                    if shader_source_path and os.path.exists(shader_source_path):
-                        dest_res_dir = os.path.join(mod_export_path, "res")
-                        os.makedirs(dest_res_dir, exist_ok=True)
-                        shader_dest_path = os.path.join(dest_res_dir, "merge_anim_packed_delta.hlsl")
-                        shutil.copy2(shader_source_path, shader_dest_path)
-                        self._update_shader_file(shader_dest_path)
-                        print(f"已复制并更新着色器文件: merge_anim_packed_delta.hlsl")
-
-                    vertex_count = self._get_vertex_count(sections, hash_value)
-                    if not vertex_count:
-                        try:
-                            file_size = os.path.getsize(base_Meshes_full_path)
-                            vertex_size_bytes = self._get_vertex_size() * 4
-                            vertex_count = file_size // vertex_size_bytes
-                            print(f"  [DEBUG] 从文件大小推断顶点数: file={os.path.basename(base_Meshes_full_path)}, size={file_size}, vertex_size={vertex_size_bytes}, count={vertex_count}")
-                        except Exception as e:
-                            print(f"  [WARNING] 无法推断顶点数: {e}")
-                            vertex_count = 100000
-                    if vertex_count == 0:
-                        vertex_count = 100000
-                    shader_lines.append(f"    Dispatch = {vertex_count}, 1, 1")
-
-                    shader_lines.append("    cs-u5 = null")
-                    shader_lines.append("    cs-t51 = null")
-                    shader_lines.append("    cs-t75 = null")
-
-                    sections[shader_section] = shader_lines
-
-                constants_section = '[Constants]'
-                constants_lines = sections.get(constants_section, [])
-
-                animation_swapkey_defined = False
-
-                for line in constants_lines:
-                    if self.animation_swapkey in line:
-                        animation_swapkey_defined = True
-
-                if not animation_swapkey_defined:
-                    constants_lines.append(f"global persist {self.animation_swapkey} = 0")
-
-                for base_name, hash_prefix in processed_base_names:
-                    base_resource_name = self._resource_name_from_prefix(hash_prefix)
-                    legacy_base_resource_name = f"Resource{hash_prefix}Position"
-                    legacy_post_copy_line = f"post {legacy_base_resource_name} = copy_desc {legacy_base_resource_name}_1"
-                    constants_lines = [line for line in constants_lines if line != legacy_post_copy_line]
-                    post_copy_line = f"post {base_resource_name} = copy_desc {base_resource_name}_1"
-                    post_run_line = f"post run = CustomShader_{base_name}_1Anim"
-
-                    if post_copy_line not in constants_lines:
-                        constants_lines.append(post_copy_line)
-                    if post_run_line not in constants_lines:
-                        constants_lines.append(post_run_line)
-
-                sections[constants_section] = constants_lines
-
-                present_section = '[Present]'
-                present_lines = sections.get(present_section, [])
-
-                for base_name, hash_prefix in processed_base_names:
-                    run_line = f"    run = CustomShader_{base_name}_1Anim"
-                    if run_line not in present_lines:
-                        present_lines.append(run_line)
-
-                sections[present_section] = present_lines
-
-                self._write_ordered_dict_to_ini(sections, ini_file, preserved_tail_content)
-
-            os.chdir(original_cwd)
-            print("多文件配置生成完成！")
-
-        except Exception as e:
-            if 'original_cwd' in locals() and os.path.exists(original_cwd):
-                os.chdir(original_cwd)
-            print(f"多文件配置生成过程中出错: {str(e)}")
-            import traceback
-            traceback.print_exc()
-
-    def execute_postprocess(self, mod_export_path):
         print(f"MultiFile postprocess start, output: {mod_export_path}")
 
         if not NUMPY_AVAILABLE:
@@ -762,6 +484,13 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                         "_1",
                         source_candidates=[base_resource_name, f"{base_resource_name}_0"],
                     )[1:-1]
+                    if f"[{base_resource_alias}]" not in sections:
+                        print(
+                            "[MultiFile][ERROR] 未在 INI 中找到基础 Position Resource，"
+                            f"无法创建 copy_desc 别名: [{base_resource_name}]；"
+                            f"哈希值: {hash_value}；基础文件: {base_position_file}。"
+                        )
+                        continue
 
                     shader_section = f"[CustomShader_{base_name}_1Anim]"
                     shader_lines = []
@@ -795,7 +524,8 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                     if vertex_count == 0:
                         vertex_count = 100000
 
-                    shader_lines.append(f"    Dispatch = {vertex_count}, 1, 1")
+                    dispatch_count = self._compute_dispatch_group_count(vertex_count, threads_per_group=16)
+                    shader_lines.append(f"    Dispatch = {dispatch_count}, 1, 1")
                     shader_lines.append("    cs-u5 = null")
                     shader_lines.append("    cs-t51 = null")
                     shader_lines.append("    cs-t75 = null")
@@ -805,6 +535,7 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                         {
                             "base_name": base_name,
                             "hash_prefix": hash_prefix,
+                            "hash_value": hash_value,
                             "base_resource_name": base_resource_name,
                             "base_resource_alias": base_resource_alias,
                         }
@@ -820,14 +551,43 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                 for entry in processed_entries:
                     legacy_base_resource_name = f"Resource{entry['hash_prefix']}Position"
                     legacy_post_copy_line = f"post {legacy_base_resource_name} = copy_desc {legacy_base_resource_name}_1"
-                    constants_lines = [line for line in constants_lines if line != legacy_post_copy_line]
-
                     post_copy_line = f"post {entry['base_resource_name']} = copy_desc {entry['base_resource_alias']}"
                     post_run_line = f"post run = CustomShader_{entry['base_name']}_1Anim"
-                    if post_copy_line not in constants_lines:
-                        constants_lines.append(post_copy_line)
-                    if post_run_line not in constants_lines:
-                        constants_lines.append(post_run_line)
+                    stale_alias_names = []
+                    stale_hash_filters = [
+                        entry["hash_value"],
+                        entry["base_name"],
+                        entry["hash_prefix"],
+                    ]
+                    for stale_hash_filter in stale_hash_filters:
+                        for stale_alias_name in collect_stale_texture_override_position_alias_names(
+                            constants_lines,
+                            stale_hash_filter,
+                        ):
+                            if stale_alias_name not in stale_alias_names:
+                                stale_alias_names.append(stale_alias_name)
+                    for stale_alias_name in stale_alias_names:
+                        stale_section_name = f"[{stale_alias_name}]"
+                        if stale_section_name in sections:
+                            del sections[stale_section_name]
+                        print(
+                            "[MultiFile][WARNING] 检测到旧版本错误生成的 TextureOverride Position copy_desc，"
+                            f"已移除别名 section: {stale_alias_name}；"
+                            f"当前基础 Position 资源: {entry['base_resource_name']}。"
+                        )
+                    constants_lines = [
+                        line
+                        for line in constants_lines
+                        if line != legacy_post_copy_line
+                        and line != post_copy_line
+                        and line != post_run_line
+                        and not any(
+                            is_stale_texture_override_position_copy_desc_line(line, stale_hash_filter)
+                            for stale_hash_filter in stale_hash_filters
+                        )
+                    ]
+                    constants_lines.append(post_copy_line)
+                    constants_lines.append(post_run_line)
                 sections[constants_section] = constants_lines
 
                 present_section = "[Present]"

@@ -3,8 +3,12 @@ from collections import OrderedDict
 
 from common.mod_path_compat import (
     collect_base_position_resource_map,
+    collect_stale_texture_override_position_alias_names,
     ensure_resource_alias_section,
+    find_base_position_resource_name,
     iter_position_buffer_candidates,
+    is_stale_texture_override_position_alias_section,
+    is_stale_texture_override_position_copy_desc_line,
 )
 
 
@@ -57,6 +61,68 @@ class ModPathCompatTests(unittest.TestCase):
         self.assertEqual(
             sections[alias_name],
             sections["[Resource_LOD0_c8197c5b_53472_0_Position]"],
+        )
+
+    def test_find_base_position_resource_name_ignores_texture_override_sections(self):
+        sections = OrderedDict(
+            [
+                ("[TextureOverride_VB_bcc7e369_bcc7e369_Position]", ["hash = 80f2a2aa"]),
+                ("[TextureOverride_VB_bcc7e369_bcc7e369_Position_1]", ["hash = 80f2a2aa"]),
+                ("[Resourcebcc7e369Position]", [
+                    "type = Buffer",
+                    "stride = 40",
+                    "filename = Meshes0000/bcc7e369-Position.buf",
+                ]),
+            ]
+        )
+
+        resource_name = find_base_position_resource_name(
+            sections,
+            "LOD0.bcc7e369-13680-0",
+            base_name="bcc7e369",
+            preferred_names=["Resource_bcc7e369_Position", "Resourcebcc7e369Position"],
+            fallback_name="Resource_bcc7e369_Position",
+        )
+
+        self.assertEqual(resource_name, "Resourcebcc7e369Position")
+
+    def test_stale_texture_override_multifile_output_is_detected(self):
+        self.assertTrue(
+            is_stale_texture_override_position_alias_section(
+                "[TextureOverride_VB_bcc7e369_bcc7e369_Position_1]",
+                "LOD0.bcc7e369-13680-0",
+            )
+        )
+        self.assertTrue(
+            is_stale_texture_override_position_copy_desc_line(
+                "post TextureOverride_VB_bcc7e369_bcc7e369_Position = copy_desc TextureOverride_VB_bcc7e369_bcc7e369_Position_1",
+                "LOD0.bcc7e369-13680-0",
+            )
+        )
+        self.assertFalse(
+            is_stale_texture_override_position_copy_desc_line(
+                "post Resourcebcc7e369Position = copy_desc Resourcebcc7e369Position_1",
+                "LOD0.bcc7e369-13680-0",
+            )
+        )
+
+    def test_collect_stale_texture_override_alias_names_uses_copy_desc_references(self):
+        constants_lines = [
+            "post TextureOverride_VB_bcc7e369_bcc7e369_Position = copy_desc TextureOverride_VB_bcc7e369_bcc7e369_Position_1",
+            "post TextureOverride_VB_bcc7e369_bcc7e369_Position = copy_desc TextureOverride_VB_bcc7e369_bcc7e369_Position_1",
+            "post TextureOverride_VB_deadbeef_deadbeef_Position = copy_desc TextureOverride_VB_deadbeef_deadbeef_Position_1",
+            "post TextureOverride_VB_bcc7e369_bcc7e369_Position = copy_desc TextureOverride_VB_bcc7e369_bcc7e369_Index_1",
+            "post Resourcebcc7e369Position = copy_desc Resourcebcc7e369Position_1",
+        ]
+
+        alias_names = collect_stale_texture_override_position_alias_names(
+            constants_lines,
+            "LOD0.bcc7e369-13680-0",
+        )
+
+        self.assertEqual(
+            alias_names,
+            ["TextureOverride_VB_bcc7e369_bcc7e369_Position_1"],
         )
 
     def test_iter_position_buffer_candidates_accepts_lod_prefixed_stem(self):

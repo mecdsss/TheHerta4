@@ -25,6 +25,11 @@ StructuredBuffer<int> delta_map : register(t75);
 void main(uint3 threadID : SV_DispatchThreadID)
 {
     uint i = threadID.x;
+    uint vertex_count = rw_buffer.Length;
+    if (i >= vertex_count)
+    {
+        return;
+    }
     
     // Find the index into the packed delta buffer.
     // If there's no change for this vertex, the index will be -1.
