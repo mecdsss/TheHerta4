@@ -717,6 +717,27 @@ class ModelRenameVertexGroupNameWithTheirSuffix(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class ModelRenameNumericVertexGroupsToRandomEnglish(bpy.types.Operator):
+    bl_idname = "toolkit.rename_numeric_vertex_groups_to_random_english"
+    bl_label = "数字顶点组改随机英文"
+    bl_description = "将纯数字顶点组使用两段重命名方式改成随机英文，支持多选多个网格物体"
+
+    def execute(self, context):
+        selected_mesh_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not selected_mesh_objects:
+            self.report({'ERROR'}, "没有选中的网格对象！")
+            return {'CANCELLED'}
+
+        processed_objects, renamed_count = VertexGroupUtils.rename_numeric_vertex_groups_to_random_english(
+            selected_mesh_objects
+        )
+        self.report(
+            {'INFO'},
+            f"操作完成！处理了 {processed_objects} 个物体，重命名了 {renamed_count} 个数字顶点组。"
+        )
+        return {'FINISHED'}
+
+
 class AddBoneFromVertexGroupV2(bpy.types.Operator):
     bl_idname = "toolkit.add_bone_from_vertex_group_v2"
     bl_label = "根据顶点组生成基础骨骼"
@@ -907,6 +928,7 @@ model_operators_list = [
     BMTP_SplitMergedObjectByRecordedRanges,
     ModelClearCustomSplitNormals,
     ModelRenameVertexGroupNameWithTheirSuffix,
+    ModelRenameNumericVertexGroupsToRandomEnglish,
     AddBoneFromVertexGroupV2,
     SplitMeshByCommonVertexGroup,
     SmoothNormalSaveToUV,

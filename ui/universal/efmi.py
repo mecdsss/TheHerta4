@@ -46,6 +46,11 @@ class ExportEFMI:
         self.cross_ib_match_mode = self.blueprint_model.cross_ib_match_mode
         self.cross_ib_object_names = self.blueprint_model.cross_ib_object_names
 
+        self.shader_replace_info_list = getattr(self.blueprint_model, "shader_replace_info_list", [])
+        self.shader_replace_object_names = getattr(self.blueprint_model, "shader_replace_object_names", set())
+        self.shader_replace_object_info_map = getattr(self.blueprint_model, "shader_replace_object_info_map", {})
+        self.has_shader_replace = getattr(self.blueprint_model, "has_shader_replace", False)
+
         print(f"[CrossIB EFMI] 初始化: has_cross_ib={self.has_cross_ib}")
         print(f"[CrossIB EFMI] cross_ib_info_dict={self.cross_ib_info_dict}")
         print(f"[CrossIB EFMI] cross_ib_object_names={self.cross_ib_object_names}")
@@ -73,6 +78,54 @@ class ExportEFMI:
             return f"indexcount_{submesh_model.match_index_count}"
         else:
             return f"{submesh_model.match_draw_ib}_{submesh_model.match_first_index}"
+
+    def _append_drawindexed_instanced_with_shader_replace(self, section, drawcall_list, draw_offset_dict):
+        """将 drawcall 列表写入 section，对着色器替换物体使用 run 逻辑替代 instanced 绘制。"""
+        if not self.has_shader_replace:
+            for drawindexed_str in M_IniHelper.get_drawindexed_instanced_str_list(
+                drawcall_list, obj_name_draw_offset_dict=draw_offset_dict,
+            ):
+                section.append(drawindexed_str)
+            return
+
+        normal_drawcalls = [d for d in drawcall_list if d.obj_name not in self.shader_replace_object_names]
+        sr_drawcalls = [d for d in drawcall_list if d.obj_name in self.shader_replace_object_names]
+
+        for drawindexed_str in M_IniHelper.get_drawindexed_instanced_str_list(
+            normal_drawcalls, obj_name_draw_offset_dict=draw_offset_dict,
+        ):
+            section.append(drawindexed_str)
+
+        for dc in sr_drawcalls:
+            draw_offset = dc.index_offset
+            if draw_offset_dict:
+                draw_offset = draw_offset_dict.get(dc.obj_name, dc.index_offset)
+
+            display_name = str(getattr(dc, 'obj_name', '') or '')
+            section.append(f"; [mesh:{display_name}] [vertex_count:{dc.vertex_count}]")
+
+            obj_infos = self.shader_replace_object_info_map.get(dc.obj_name, [])
+            if not obj_infos:
+                obj_infos = self.shader_replace_info_list
+
+            for info in obj_infos:
+                condition_str = dc.get_condition_str()
+                indent = "  " if condition_str else ""
+                if condition_str:
+                    section.append(f"if {condition_str}")
+                run_lines = M_IniHelper.get_shader_replace_run_logic(
+                    info,
+                    dc.match_draw_ib or "0",
+                    dc.match_first_index if dc.match_first_index else "0",
+                    info.get('component_index', 0),
+                    dc.index_count,
+                    draw_offset,
+                )
+                for line in run_lines:
+                    section.append(f"{indent}{line}")
+                if condition_str:
+                    section.append("endif")
+            section.append("")
 
     def _get_all_cross_ib_identifiers(self):
         all_identifiers = set()
@@ -199,20 +252,36 @@ class ExportEFMI:
             lines.append(f"    vs-cb1 = ResourceFakeCB1_{source_identifier}")
             lines.append(";所有需要跨 Ib 的物体引用")
 
-            drawindexed_str_list = M_IniHelper.get_drawindexed_instanced_str_list(objects)
-            for drawindexed_str in drawindexed_str_list:
-                if drawindexed_str.strip():
-                    lines.append(drawindexed_str)
+            class _ListSectionAdapter:
+                def __init__(self, target_lines):
+                    self._target_lines = target_lines
+
+                def append(self, line):
+                    self._target_lines.append(line)
+
+            self._append_drawindexed_instanced_with_shader_replace(
+                _ListSectionAdapter(lines),
+                objects,
+                None,
+            )
 
             lines.append("endif")
 
         lines.append(";不需要跨 Ib 的物体引用")
 
         if non_cross_ib_drawcalls:
-            drawindexed_str_list = M_IniHelper.get_drawindexed_instanced_str_list(non_cross_ib_drawcalls)
-            for drawindexed_str in drawindexed_str_list:
-                if drawindexed_str.strip():
-                    lines.append(drawindexed_str)
+            class _ListSectionAdapter:
+                def __init__(self, target_lines):
+                    self._target_lines = target_lines
+
+                def append(self, line):
+                    self._target_lines.append(line)
+
+            self._append_drawindexed_instanced_with_shader_replace(
+                _ListSectionAdapter(lines),
+                non_cross_ib_drawcalls,
+                None,
+            )
 
         lines.append("")
         lines.append(f"post vs-cb1 = null")
@@ -560,20 +629,22 @@ class ExportEFMI:
                     texture_override_ib_section.append(f"    vs-cb1 = ResourceFakeCB1_{current_identifier}")
                     texture_override_ib_section.append(";所有需要跨 Ib 的物体引用")
 
-                    drawindexed_str_list = M_IniHelper.get_drawindexed_instanced_str_list(objects)
-                    for drawindexed_str in drawindexed_str_list:
-                        if drawindexed_str.strip():
-                            texture_override_ib_section.append(drawindexed_str)
+                    self._append_drawindexed_instanced_with_shader_replace(
+                        texture_override_ib_section,
+                        objects,
+                        None,
+                    )
 
                     texture_override_ib_section.append("endif")
 
                 texture_override_ib_section.append(";不需要跨 Ib 的物体引用")
 
                 if non_cross_ib_drawcalls:
-                    drawindexed_str_list = M_IniHelper.get_drawindexed_instanced_str_list(non_cross_ib_drawcalls)
-                    for drawindexed_str in drawindexed_str_list:
-                        if drawindexed_str.strip():
-                            texture_override_ib_section.append(drawindexed_str)
+                    self._append_drawindexed_instanced_with_shader_replace(
+                        texture_override_ib_section,
+                        non_cross_ib_drawcalls,
+                        None,
+                    )
 
                 if is_target_ib and source_ib_list_for_target:
                     self._append_target_cross_ib_blocks(
@@ -598,10 +669,11 @@ class ExportEFMI:
             elif is_target_ib and self.has_cross_ib and source_ib_list_for_target:
                 all_target_drawcalls = submesh_model.drawcall_model_list
                 if all_target_drawcalls:
-                    drawindexed_str_list = M_IniHelper.get_drawindexed_instanced_str_list(all_target_drawcalls)
-                    for drawindexed_str in drawindexed_str_list:
-                        if drawindexed_str.strip():
-                            texture_override_ib_section.append(drawindexed_str)
+                    self._append_drawindexed_instanced_with_shader_replace(
+                        texture_override_ib_section,
+                        all_target_drawcalls,
+                        None,
+                    )
 
                 self._append_target_cross_ib_blocks(
                     texture_override_ib_section, source_ib_list_for_target, current_ib_key
@@ -613,8 +685,11 @@ class ExportEFMI:
                 texture_override_ib_section.append("post cs-t2 = null")
 
             else:
-                for draw_line in M_IniHelper.get_drawindexed_instanced_str_list(submesh_model.drawcall_model_list):
-                    texture_override_ib_section.append(draw_line)
+                self._append_drawindexed_instanced_with_shader_replace(
+                    texture_override_ib_section,
+                    submesh_model.drawcall_model_list,
+                    None,
+                )
 
             if len(self.blueprint_model.keyname_mkey_dict.keys()) != 0:
                 texture_override_ib_section.append("$active" + str(active_index) + " = 1")
@@ -677,6 +752,16 @@ class ExportEFMI:
             key_name_mkey_dict=self.blueprint_model.keyname_mkey_dict,
         )
 
+        if self.has_shader_replace:
+            M_IniHelper.add_shader_replace_sections(
+                ini_builder=ini_builder,
+                shader_replace_info_list=self.shader_replace_info_list,
+                shader_replace_object_names=self.shader_replace_object_names,
+                draw_call_models=self.blueprint_model.ordered_draw_obj_data_model_list,
+                mod_export_path=GlobalConfig.path_generate_mod_folder(),
+                use_instanced_draw=True,
+            )
+
         ini_filepath = os.path.join(GlobalConfig.path_generate_mod_folder(), GlobalConfig.get_workspace_name() + ".ini")
         ini_builder.save_to_file(ini_filepath)
 
@@ -737,10 +822,11 @@ class ExportEFMI:
 
                 section.append(";所有需要跨 Ib 的物体引用")
 
-                drawindexed_str_list = M_IniHelper.get_drawindexed_instanced_str_list(objects)
-                for drawindexed_str in drawindexed_str_list:
-                    if drawindexed_str.strip():
-                        section.append(drawindexed_str)
+                self._append_drawindexed_instanced_with_shader_replace(
+                    section,
+                    objects,
+                    getattr(source_drawib_model, "obj_name_draw_offset", None),
+                )
 
                 section.append("endif")
 

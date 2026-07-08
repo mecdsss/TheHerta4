@@ -116,6 +116,8 @@ class SSMTNodeBase(Node):
             return _NODE_COLOR_SHAPEKEY
         if bl_idname in {'SSMTNode_Blueprint_Nest', 'SSMTNode_ModPanel'}:
             return _NODE_COLOR_BLUEPRINT
+        if bl_idname == 'SSMTNode_ShaderReplace':
+            return _NODE_COLOR_SPECIALIZED
         if bl_idname in {'SSMTNode_Result_Output', 'SSMTNode_Result_Output_NTMIModImp'}:
             return _NODE_COLOR_OUTPUT
         if bl_idname.startswith('SSMTNode_PostProcess_'):

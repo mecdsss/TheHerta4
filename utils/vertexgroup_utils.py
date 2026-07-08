@@ -1,6 +1,8 @@
 import bpy
 import numpy
 import math
+import random
+import string
 
 from mathutils import Vector
 
@@ -8,6 +10,45 @@ from .format_utils import Fatal
 
 
 class VertexGroupUtils:
+    RANDOM_RENAME_TOKEN_LENGTH = 6
+
+    @classmethod
+    def _generate_unique_random_vg_token(cls, used_names):
+        alphabet = string.ascii_letters
+        while True:
+            token = "".join(random.choice(alphabet) for _ in range(cls.RANDOM_RENAME_TOKEN_LENGTH))
+            if token not in used_names:
+                used_names.add(token)
+                return token
+
+    @classmethod
+    def rename_numeric_vertex_groups_to_random_english(cls, objects):
+        """将纯数字顶点组使用两段重命名方式改成随机英文，避免重名冲突。"""
+        renamed_count = 0
+        processed_objects = 0
+
+        for obj in objects or []:
+            if obj is None or getattr(obj, "type", "") != "MESH":
+                continue
+
+            numeric_groups = [vg for vg in getattr(obj, "vertex_groups", []) if str(getattr(vg, "name", "")).isdigit()]
+            if not numeric_groups:
+                continue
+
+            processed_objects += 1
+            used_names = {vg.name for vg in obj.vertex_groups}
+
+            for vg in numeric_groups:
+                temp_name = f"__TH4_TMP_{cls._generate_unique_random_vg_token(used_names)}__"
+                vg.name = temp_name
+
+            for vg in numeric_groups:
+                final_name = cls._generate_unique_random_vg_token(used_names)
+                vg.name = final_name
+                renamed_count += 1
+
+        return processed_objects, renamed_count
+
     @classmethod
     def get_nonzero_vertex_group_indices(cls, obj, weight_threshold=1e-6):
         """

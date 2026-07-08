@@ -46,6 +46,7 @@ class VGToolsPanel(bpy.types.Panel):
         box = layout.box()
         box.label(text="顶点组重命名与骨骼", icon='BONE_DATA')
         box.operator("toolkit.rename_vertex_group_name_with_their_suffix")
+        box.operator("toolkit.rename_numeric_vertex_groups_to_random_english")
         box.operator("toolkit.add_bone_from_vertex_group_v2")
 
     def _draw_vertex_group_create(self, layout, context):

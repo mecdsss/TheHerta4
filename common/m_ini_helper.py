@@ -798,3 +798,219 @@ class M_IniHelper:
                 ini_builder.append_section(key_section)
 
                 key_number = key_number + 1
+
+    # ------------------------------------------------------------------
+    # 着色器替换相关
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _build_custom_shader_section_name(cls, prefix, ib_hash, first_index, component, index_count, index_offset, base_vertex, variant):
+        """构建 CustomShader 段名。
+
+        格式: CustomShader_{prefix}_{ib_hash}_{first_index}_{component}_{index_count}_{index_offset}_{base_vertex}_{variant}
+        """
+        return f"CustomShader_{prefix}_{ib_hash}_{first_index}_{component}_{index_count}_{index_offset}_{base_vertex}_{variant}"
+
+    @classmethod
+    def add_shader_replace_sections(
+        cls,
+        ini_builder,
+        shader_replace_info_list,
+        shader_replace_object_names,
+        draw_call_models,
+        mod_export_path,
+        use_instanced_draw: bool = False,
+    ):
+        """生成着色器替换相关的 INI 段。
+
+        生成内容:
+        - CustomShader 段（World / NonWorld / Normal 变体）
+        - KeyToggle 段（开关循环）
+        - ShaderOverride 段（基于哈希的自动判定）
+
+        Args:
+            ini_builder: M_IniBuilder 实例
+            shader_replace_info_list: 着色器替换配置列表
+            shader_replace_object_names: 关联物体名集合
+            draw_call_models: DrawCallModel 列表
+            mod_export_path: 导出路径（用于复制着色器文件）
+            use_instanced_draw: 是否生成 drawindexedinstanced 绘制命令
+        """
+        if not shader_replace_info_list:
+            return
+
+        # 复制着色器文件到导出目录
+        shaders_dir = os.path.join(mod_export_path, "Shaders")
+        os.makedirs(shaders_dir, exist_ok=True)
+        for info in shader_replace_info_list:
+            for shader in info['shaders']:
+                src = shader.get('shader_file_path', '')
+                if src and os.path.exists(src):
+                    dst = os.path.join(shaders_dir, os.path.basename(src))
+                    try:
+                        if not os.path.exists(dst) or os.path.getmtime(src) > os.path.getmtime(dst):
+                            shutil.copy2(src, dst)
+                    except Exception:
+                        pass
+
+        # --- 在 [Constants] 中声明变量 ---
+        constants_section = None
+        for section in ini_builder.ini_section_list:
+            if section.SectionType == M_SectionType.Constants:
+                constants_section = section
+                break
+
+        is_new_constants = constants_section is None
+        if is_new_constants:
+            constants_section = M_IniSection(M_SectionType.Constants)
+            constants_section.SectionName = "Constants"
+
+        for info in shader_replace_info_list:
+            prefix = info['name_prefix']
+            ps_replace_var = f"${prefix}_ps_replace"
+            env_a_var = f"${prefix}_env_a"
+            ps_line = f"global persist {ps_replace_var} = 0"
+            env_line = f"global persist {env_a_var} = 0"
+            if not any(ps_line in line for line in constants_section.SectionLineList):
+                constants_section.append(ps_line)
+            if not any(env_line in line for line in constants_section.SectionLineList):
+                constants_section.append(env_line)
+        constants_section.new_line()
+
+        # 新建的 Constants 段在填充内容后再注册到 ini_builder
+        if is_new_constants:
+            ini_builder.append_section(constants_section)
+
+        # 筛选属于着色器替换物体的 DrawCallModel
+        sr_draw_models = [d for d in draw_call_models if d.obj_name in shader_replace_object_names]
+
+        for info in shader_replace_info_list:
+            prefix = info['name_prefix']
+            toggle_key = info.get('toggle_key', '')
+            component = info.get('component_index', 0)
+            shaders = info['shaders']
+            ps_replace_var = f"${prefix}_ps_replace"
+            env_a_var = f"${prefix}_env_a"
+
+            # --- KeyToggle 段（在最上面） ---
+            keytoggle_section = M_IniSection(M_SectionType.ShaderReplace)
+            keytoggle_section.SectionName = f"KeyToggle_{prefix}"
+            keytoggle_section.append(f"key = {toggle_key}")
+            keytoggle_section.append("type = cycle")
+            keytoggle_section.append(f"{ps_replace_var} = 0,1,")
+            keytoggle_section.new_line()
+            ini_builder.append_section(keytoggle_section)
+
+            # --- ShaderOverride 段（每个着色器哈希一个） ---
+            for shader in shaders:
+                shader_hash = shader.get('shader_hash', '')
+                variant = shader.get('variant_name', '')
+                env_value = shader.get('env_value', 1)
+                if not shader_hash:
+                    continue
+
+                so_section = M_IniSection(M_SectionType.ShaderReplace)
+                so_section.SectionName = f"ShaderOverride_{prefix}EnvA_{variant}"
+                so_section.append(f"hash = {shader_hash}")
+                so_section.append("allow_duplicate_hash = overrule")
+                so_section.append(f"if {ps_replace_var} == 1")
+                so_section.append(f"    {env_a_var} = {env_value}")
+                so_section.append("endif")
+                so_section.new_line()
+                ini_builder.append_section(so_section)
+
+            # --- CustomShader 段（放在最下面） ---
+            for dm in sr_draw_models:
+                ib_hash = dm.match_draw_ib or "0"
+                first_index = dm.match_first_index if dm.match_first_index else "0"
+                index_count = dm.index_count or 0
+                index_offset = dm.index_offset or 0
+                base_vertex = 0
+                if use_instanced_draw:
+                    drawindexed_str = (
+                        f"drawindexedinstanced = {index_count},INSTANCE_COUNT,"
+                        f"{index_offset},{base_vertex},FIRST_INSTANCE"
+                    )
+                else:
+                    drawindexed_str = f"drawindexed = {index_count},{index_offset},{base_vertex}"
+
+                # 为每个变体生成 CustomShader 段
+                for shader in shaders:
+                    variant = shader.get('variant_name', '')
+                    src = shader.get('shader_file_path', '')
+                    section_name = cls._build_custom_shader_section_name(
+                        prefix, ib_hash, first_index, component,
+                        index_count, index_offset, base_vertex, variant
+                    )
+                    cs_section = M_IniSection(M_SectionType.ShaderReplace)
+                    cs_section.SectionName = section_name
+                    if src:
+                        filename = os.path.basename(src)
+                        cs_section.append(f"ps = ./Shaders/{filename}")
+                    cs_section.append("handling = skip")
+                    cs_section.append(drawindexed_str)
+                    cs_section.new_line()
+                    ini_builder.append_section(cs_section)
+
+                # Normal 变体（无着色器文件）
+                normal_name = cls._build_custom_shader_section_name(
+                    prefix, ib_hash, first_index, component,
+                    index_count, index_offset, base_vertex, "Normal"
+                )
+                normal_section = M_IniSection(M_SectionType.ShaderReplace)
+                normal_section.SectionName = normal_name
+                normal_section.append("handling = skip")
+                normal_section.append(drawindexed_str)
+                normal_section.new_line()
+                ini_builder.append_section(normal_section)
+
+    @classmethod
+    def get_shader_replace_run_logic(cls, info, ib_hash, first_index, component, index_count, index_offset, base_vertex=0):
+        """生成替换 drawindexed 的条件运行逻辑行列表。
+
+        返回 None 表示无需替换。
+        """
+        prefix = info['name_prefix']
+        shaders = info['shaders']
+        ps_replace_var = f"${prefix}_ps_replace"
+        env_a_var = f"${prefix}_env_a"
+
+        lines = []
+        lines.append(f"if {ps_replace_var} == 1")
+
+        if shaders:
+            for i, shader in enumerate(shaders):
+                variant = shader.get('variant_name', '')
+                section_name = cls._build_custom_shader_section_name(
+                    prefix, ib_hash, first_index, component,
+                    index_count, index_offset, base_vertex, variant
+                )
+                if i == 0:
+                    lines.append(f"    if {env_a_var} == {shader.get('env_value', i + 1)}")
+                else:
+                    lines.append(f"    else if {env_a_var} == {shader.get('env_value', i + 1)}")
+                lines.append(f"        run = {section_name}")
+
+            normal_name = cls._build_custom_shader_section_name(
+                prefix, ib_hash, first_index, component,
+                index_count, index_offset, base_vertex, "Normal"
+            )
+            lines.append("    else")
+            lines.append(f"        run = {normal_name}")
+            lines.append("    endif")
+        else:
+            normal_name = cls._build_custom_shader_section_name(
+                prefix, ib_hash, first_index, component,
+                index_count, index_offset, base_vertex, "Normal"
+            )
+            lines.append(f"    run = {normal_name}")
+
+        normal_name = cls._build_custom_shader_section_name(
+            prefix, ib_hash, first_index, component,
+            index_count, index_offset, base_vertex, "Normal"
+        )
+        lines.append("else")
+        lines.append(f"    run = {normal_name}")
+        lines.append("endif")
+
+        return lines

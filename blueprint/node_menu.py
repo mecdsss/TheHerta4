@@ -1082,6 +1082,7 @@ class SSMT_MT_NodeMenu_Blueprint(bpy.types.Menu):
         _add_node_entry(layout, "蓝图嵌套", 'NODETREE', "SSMTNode_Blueprint_Nest")
         _add_node_entry(layout, "Mod面板", 'MENU_PANEL', "SSMTNode_ModPanel")
         _add_node_entry(layout, "跨IB节点", 'ARROW_LEFTRIGHT', "SSMTNode_CrossIB")
+        _add_node_entry(layout, "着色器替换节点", 'SHADERFX', "SSMTNode_ShaderReplace")
         _add_node_entry(layout, "多文件导出", 'FILE', "SSMTNode_MultiFile_Export")
 
 

@@ -46,12 +46,67 @@ class ExportZZMI(ExportUnity):
         self.has_cross_ib = blueprint_model.has_cross_ib
         self.cross_ib_object_names = blueprint_model.cross_ib_object_names
 
+        self.shader_replace_info_list = getattr(blueprint_model, "shader_replace_info_list", [])
+        self.shader_replace_object_names = getattr(blueprint_model, "shader_replace_object_names", set())
+        self.shader_replace_object_info_map = getattr(blueprint_model, "shader_replace_object_info_map", {})
+        self.has_shader_replace = getattr(blueprint_model, "has_shader_replace", False)
+
         print(f"[CrossIB ZZMI] 初始化: has_cross_ib={self.has_cross_ib}")
         print(f"[CrossIB ZZMI] cross_ib_info_dict={self._format_cross_ib_info_dict(self.cross_ib_info_dict)}")
         print(f"[CrossIB ZZMI] cross_ib_object_names={self._format_name_set(self.cross_ib_object_names)}")
 
     def _get_submesh_ib_key(self, submesh_model, draw_ib):
         return f"{draw_ib}_{submesh_model.match_first_index}"
+
+    def _append_drawindexed_with_shader_replace(self, section, drawcall_list, draw_offset_dict):
+        """将 drawcall 列表写入 section，对着色器替换物体使用条件运行逻辑替代 drawindexed。"""
+        if not self.has_shader_replace:
+            for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
+                drawcall_list, obj_name_draw_offset_dict=draw_offset_dict,
+            ):
+                section.append(drawindexed_str)
+            return
+
+        normal_drawcalls = [d for d in drawcall_list if d.obj_name not in self.shader_replace_object_names]
+        sr_drawcalls = [d for d in drawcall_list if d.obj_name in self.shader_replace_object_names]
+
+        for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
+            normal_drawcalls, obj_name_draw_offset_dict=draw_offset_dict,
+        ):
+            section.append(drawindexed_str)
+
+        for dc in sr_drawcalls:
+            draw_offset = dc.index_offset
+            if draw_offset_dict:
+                draw_offset = draw_offset_dict.get(dc.obj_name, dc.index_offset)
+
+            # 输出物体标识注释（与 get_drawindexed_str_list 格式一致）
+            display_name = str(getattr(dc, 'obj_name', '') or '')
+            section.append(f"; [mesh:{display_name}] [vertex_count:{dc.vertex_count}]")
+
+            # 仅输出该物体关联的着色器替换节点信息
+            obj_infos = self.shader_replace_object_info_map.get(dc.obj_name, [])
+            if not obj_infos:
+                obj_infos = self.shader_replace_info_list
+
+            for info in obj_infos:
+                condition_str = dc.get_condition_str()
+                indent = "  " if condition_str else ""
+                if condition_str:
+                    section.append(f"if {condition_str}")
+                run_lines = M_IniHelper.get_shader_replace_run_logic(
+                    info,
+                    dc.match_draw_ib or "0",
+                    dc.match_first_index if dc.match_first_index else "0",
+                    info.get('component_index', 0),
+                    dc.index_count,
+                    draw_offset,
+                )
+                for line in run_lines:
+                    section.append(f"{indent}{line}")
+                if condition_str:
+                    section.append("endif")
+            section.append("")
 
     @staticmethod
     def _format_name_set(names) -> list[str]:
@@ -383,18 +438,18 @@ class ExportZZMI(ExportUnity):
                         non_cross_ib_drawcalls.append(drawcall_model)
 
                 print(f"[CrossIB ZZMI] 源块绘制非跨IB物体: {len(non_cross_ib_drawcalls)} 个")
-                for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
+                self._append_drawindexed_with_shader_replace(
+                    texture_override_ib_section,
                     non_cross_ib_drawcalls,
-                    obj_name_draw_offset_dict=drawib_model.obj_name_draw_offset,
-                ):
-                    texture_override_ib_section.append(drawindexed_str)
+                    drawib_model.obj_name_draw_offset,
+                )
             else:
                 print(f"[CrossIB ZZMI] 非源块绘制物体: {len(submesh_model.drawcall_model_list)} 个")
-                for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
+                self._append_drawindexed_with_shader_replace(
+                    texture_override_ib_section,
                     submesh_model.drawcall_model_list,
-                    obj_name_draw_offset_dict=drawib_model.obj_name_draw_offset,
-                ):
-                    texture_override_ib_section.append(drawindexed_str)
+                    drawib_model.obj_name_draw_offset,
+                )
 
             if is_cross_ib_target and source_ib_list_for_target:
                 print(f"[CrossIB ZZMI] 目标块处理: source_ib_list={source_ib_list_for_target}")
@@ -481,6 +536,16 @@ class ExportZZMI(ExportUnity):
         M_IniHelper.add_branch_key_sections(ini_builder=ini_builder, key_name_mkey_dict=self.blueprint_model.keyname_mkey_dict)
         M_IniHelper.add_shapekey_ini_sections(ini_builder=ini_builder, drawib_drawibmodel_dict=drawib_drawibmodel_dict)
         M_IniHelperGUI.add_branch_mod_gui_section(ini_builder=ini_builder, key_name_mkey_dict=self.blueprint_model.keyname_mkey_dict)
+
+        if self.has_shader_replace:
+            M_IniHelper.add_shader_replace_sections(
+                ini_builder=ini_builder,
+                shader_replace_info_list=self.shader_replace_info_list,
+                shader_replace_object_names=self.shader_replace_object_names,
+                draw_call_models=self.blueprint_model.ordered_draw_obj_data_model_list,
+                mod_export_path=GlobalConfig.path_generate_mod_folder(),
+            )
+
         ini_builder.save_to_file(os.path.join(GlobalConfig.path_generate_mod_folder(), GlobalConfig.get_workspace_name() + ".ini"))
         TimerUtils.end_stage("INI配置生成")
 

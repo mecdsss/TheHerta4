@@ -34,6 +34,9 @@ class M_SectionType:
     CrossIBShaderOverride = "CrossIBShaderOverride"
     CrossIBTextureOverride = "CrossIBTextureOverride"
 
+    # 着色器替换相关Section类型
+    ShaderReplace = "ShaderReplace"
+
 
 class M_IniSection:
     def __init__(self,section_type:M_SectionType) -> None:
@@ -188,6 +191,8 @@ class M_IniBuilder:
         self.__append_section_line(M_SectionType.VertexShaderCheck)
         
         self.__append_section_line(M_SectionType.CreditInfo)
+
+        self.__append_section_line(M_SectionType.ShaderReplace)
 
 
         # Add tools credit.

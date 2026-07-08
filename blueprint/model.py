@@ -25,6 +25,7 @@ _NODE_TYPE_VERTEX_GROUP_MATCH = 'SSMTNode_VertexGroupMatch'
 _NODE_TYPE_VERTEX_GROUP_MAPPING_INPUT = 'SSMTNode_VertexGroupMappingInput'
 _NODE_TYPE_BLUEPRINT_NEST = 'SSMTNode_Blueprint_Nest'
 _NODE_TYPE_CROSS_IB = 'SSMTNode_CrossIB'
+_NODE_TYPE_SHADER_REPLACE = 'SSMTNode_ShaderReplace'
 _NODE_TYPE_MULTI_FILE_EXPORT = 'SSMTNode_MultiFile_Export'
 
 _KNOWN_NODE_TYPES = {
@@ -42,6 +43,7 @@ _KNOWN_NODE_TYPES = {
     _NODE_TYPE_VERTEX_GROUP_MAPPING_INPUT,
     _NODE_TYPE_BLUEPRINT_NEST,
     _NODE_TYPE_CROSS_IB,
+    _NODE_TYPE_SHADER_REPLACE,
     _NODE_TYPE_MULTI_FILE_EXPORT,
 }
 
@@ -185,6 +187,15 @@ class ProcessingChain:
             if cross_ib_method:
                 params.append(f"method={cross_ib_method}")
             return f"CrossIB[{','.join(params)}]" if params else "CrossIB[]"
+
+        elif node_type == 'ShaderReplace':
+            params = []
+            name_prefix = getattr(node, 'name_prefix', '')
+            if name_prefix:
+                params.append(f"prefix={name_prefix}")
+            shader_count = len(getattr(node, 'shader_list', []))
+            params.append(f"shaders={shader_count}")
+            return f"ShaderReplace[{','.join(params)}]"
 
         elif node_type == 'MultiFile_Export':
             params = []
@@ -418,6 +429,13 @@ class BluePrintModel:
         self.cross_ib_object_names: Set[str] = set()
         self.has_cross_ib: bool = False
 
+        # 着色器替换节点数据
+        self.shader_replace_nodes: List[bpy.types.Node] = []
+        self.shader_replace_info_list: List[dict] = []
+        self.shader_replace_object_names: Set[str] = set()
+        self.shader_replace_object_info_map: Dict[str, list] = {}
+        self.has_shader_replace: bool = False
+
         tree = tree or BlueprintExportHelper.get_current_blueprint_tree(context=context)
         if not tree:
             raise ValueError("未找到当前蓝图树，请先打开正确的蓝图编辑器")
@@ -515,6 +533,7 @@ class BluePrintModel:
         self.multi_file_export_nodes = []
         self.nested_blueprint_trees = []
         self.cross_ib_nodes = []
+        self.shader_replace_nodes = []
 
         output_node = BlueprintExportHelper.get_node_from_bl_idname(tree, _NODE_TYPE_RESULT_OUTPUT)
 
@@ -541,6 +560,11 @@ class BluePrintModel:
                     self.cross_ib_nodes.append(node)
                     LOG.debug(f"   🔧 发现跨IB节点: {node.name}")
 
+            elif node.bl_idname == _NODE_TYPE_SHADER_REPLACE:
+                if output_node and BlueprintExportHelper._is_node_connected_to_output(tree, node):
+                    self.shader_replace_nodes.append(node)
+                    LOG.debug(f"   🔧 发现着色器替换节点: {node.name}")
+
         self._collect_special_nodes_from_nested_trees()
 
         if self.vertex_group_process_nodes:
@@ -551,11 +575,14 @@ class BluePrintModel:
             LOG.info(f"   🔧 收集到 {len(self.nested_blueprint_trees)} 个嵌套蓝图")
         if self.cross_ib_nodes:
             LOG.info(f"   🔧 收集到 {len(self.cross_ib_nodes)} 个跨IB节点")
+        if self.shader_replace_nodes:
+            LOG.info(f"   🔧 收集到 {len(self.shader_replace_nodes)} 个着色器替换节点")
 
     def _collect_special_nodes_from_nested_trees(self):
         existing_vg_keys = {_get_node_unique_key(n) for n in self.vertex_group_process_nodes}
         existing_mf_keys = {_get_node_unique_key(n) for n in self.multi_file_export_nodes}
         existing_cross_keys = {_get_node_unique_key(n) for n in self.cross_ib_nodes}
+        existing_sr_keys = {_get_node_unique_key(n) for n in self.shader_replace_nodes}
 
         for nested_tree in self.nested_blueprint_trees:
             nested_output = BlueprintExportHelper.get_node_from_bl_idname(nested_tree, _NODE_TYPE_RESULT_OUTPUT)
@@ -586,6 +613,12 @@ class BluePrintModel:
                         self.cross_ib_nodes.append(node)
                         existing_cross_keys.add(node_key)
                         LOG.debug(f"   🔧 发现嵌套蓝图跨IB节点: {node.name} (蓝图: {nested_tree.name})")
+
+                elif node.bl_idname == _NODE_TYPE_SHADER_REPLACE:
+                    if node_key not in existing_sr_keys:
+                        self.shader_replace_nodes.append(node)
+                        existing_sr_keys.add(node_key)
+                        LOG.debug(f"   🔧 发现嵌套蓝图着色器替换节点: {node.name} (蓝图: {nested_tree.name})")
 
     def _resolve_nested_blueprint_collect(self, nest_node: bpy.types.Node, visited: Optional[Set[str]] = None):
         if visited is None:
@@ -642,6 +675,8 @@ class BluePrintModel:
         self._detect_and_apply_cross_ib_rename_mapping()
 
         self._process_cross_ib_nodes()
+
+        self._process_shader_replace_nodes()
 
         self._build_draw_call_models_from_chains()
 
@@ -1275,6 +1310,54 @@ class BluePrintModel:
         for cross_ib_node in self.cross_ib_nodes:
             if getattr(cross_ib_node, 'original_cross_ib_data', ''):
                 cross_ib_node.restore_original_params()
+
+    def _process_shader_replace_nodes(self):
+        """处理着色器替换节点：收集配置和关联物体。"""
+        LOG.info(f"🎨 开始处理着色器替换节点，共 {len(self.shader_replace_nodes)} 个节点")
+
+        self.shader_replace_info_list.clear()
+        self.shader_replace_object_names.clear()
+        self.shader_replace_object_info_map.clear()
+        self.has_shader_replace = False
+
+        if not self.shader_replace_nodes:
+            LOG.info("🎨 没有找到着色器替换节点，跳过处理")
+            return
+
+        # 节点名 → info 的映射，便于按物体关联查找
+        node_info_map = {}
+        for sr_node in self.shader_replace_nodes:
+            info = sr_node.get_shader_replace_info()
+            self.shader_replace_info_list.append(info)
+            node_info_map[sr_node.name] = info
+            LOG.info(f"🎨 着色器替换节点 '{sr_node.name}': prefix={info['name_prefix']}, shaders={len(info['shaders'])}")
+
+        valid_chains = [c for c in self.processing_chains if c.is_valid and c.reached_output]
+
+        sr_chain_count = 0
+        for chain in valid_chains:
+            sr_nodes_in_chain = [n for n in chain.node_path if n.bl_idname == _NODE_TYPE_SHADER_REPLACE]
+            if not sr_nodes_in_chain:
+                continue
+
+            sr_chain_count += 1
+            obj_name = chain.object_name
+            export_obj_name = chain.get_export_object_name()
+
+            self.shader_replace_object_names.add(export_obj_name)
+            # 只取链路中最近的一个着色器替换节点（最靠近输出端的）
+            nearest_sr_node = sr_nodes_in_chain[-1]
+            info = node_info_map.get(nearest_sr_node.name)
+            if info:
+                self.shader_replace_object_info_map[export_obj_name] = [info]
+            LOG.info(f"🎨   物体 '{obj_name}' (导出名 '{export_obj_name}') 关联着色器替换节点 '{nearest_sr_node.name}'")
+
+        self.has_shader_replace = len(self.shader_replace_info_list) > 0
+
+        if self.has_shader_replace:
+            LOG.info(f"🎨 着色器替换处理完成: {len(self.shader_replace_info_list)} 个节点, {len(self.shader_replace_object_names)} 个关联物体")
+        else:
+            LOG.info("🎨 着色器替换处理完成: 没有有效的配置")
 
     def _get_object_ib_key(self, obj_name: str, match_mode: str) -> Optional[str]:
         try:
