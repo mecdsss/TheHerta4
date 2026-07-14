@@ -1,5 +1,7 @@
 import bpy
+import hashlib
 import os
+import tempfile
 from bpy.types import Node, PropertyGroup
 from bpy.props import StringProperty, CollectionProperty, BoolProperty, IntProperty
 
@@ -24,33 +26,119 @@ def parse_shader_hash_from_filename(filepath):
     return name_without_ext
 
 
+def _get_shader_item_index(node, item):
+    """按对象身份查找条目索引，兼容 Blender PropertyGroup 包装对象。"""
+    item_pointer = getattr(item, "as_pointer", None)
+    item_pointer = item_pointer() if callable(item_pointer) else None
+    for index, candidate in enumerate(node.shader_list):
+        if candidate is item:
+            return index
+        candidate_pointer = getattr(candidate, "as_pointer", None)
+        candidate_pointer = candidate_pointer() if callable(candidate_pointer) else None
+        if item_pointer is not None and candidate_pointer == item_pointer:
+            return index
+    return -1
+
+
 def _get_text_block_name(node, item):
     """获取着色器在 bpy.data.texts 中对应的文本块名称。"""
-    return f"ShaderReplace_{node.name}_{item.variant_name}"
+    stored_name = str(getattr(item, "preview_text_block_name", "") or "").strip()
+    if stored_name:
+        return stored_name
+
+    tree_name = str(getattr(getattr(node, "id_data", None), "name", "") or "").strip()
+    item_index = _get_shader_item_index(node, item)
+    item_key = (str(item_index) if item_index >= 0 else "unknown")[-8:]
+    variant_name = str(getattr(item, "variant_name", "") or "Variant")
+    variant_key = "".join(
+        char if char.isascii() and (char.isalnum() or char in "_-") else "_"
+        for char in variant_name
+    ).strip("_")[:20] or "Variant"
+    identity = f"{tree_name}\0{getattr(node, 'name', '')}\0{item_key}\0{variant_name}"
+    identity_hash = hashlib.blake2s(identity.encode("utf-8"), digest_size=8).hexdigest()
+    text_name = f"ShaderReplace_{item_key}_{variant_key}_{identity_hash}"
+    try:
+        item.preview_text_block_name = text_name
+    except Exception:
+        pass
+    return text_name
+
+
+def _resolve_shader_file_path(filepath):
+    filepath = str(filepath or "").strip()
+    if not filepath:
+        return ""
+    try:
+        filepath = bpy.path.abspath(filepath)
+    except Exception:
+        pass
+    return os.path.abspath(filepath)
+
+
+def _canonical_shader_path(filepath):
+    resolved_path = _resolve_shader_file_path(filepath)
+    if not resolved_path:
+        return ""
+    return os.path.normcase(os.path.realpath(resolved_path))
+
+
+def _find_preview_path_conflict(node):
+    own_paths = set()
+    for item in node.shader_list:
+        canonical_path = _canonical_shader_path(item.shader_file_path)
+        if not canonical_path:
+            continue
+        if canonical_path in own_paths:
+            return item.shader_file_path
+        own_paths.add(canonical_path)
+
+    if not own_paths:
+        return ""
+    for tree in bpy.data.node_groups:
+        if getattr(tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
+            continue
+        for other_node in tree.nodes:
+            if other_node == node or getattr(other_node, "bl_idname", "") != 'SSMTNode_ShaderReplace':
+                continue
+            if not getattr(other_node, "preview_enabled", False):
+                continue
+            for item in other_node.shader_list:
+                if _canonical_shader_path(item.shader_file_path) in own_paths:
+                    return item.shader_file_path
+    return ""
 
 
 def _load_shader_into_text_block(node):
     """将当前活动着色器文件内容加载到 bpy.data.texts 文本块中。"""
     if node.active_shader_index < 0 or node.active_shader_index >= len(node.shader_list):
-        return
+        return False
     item = node.shader_list[node.active_shader_index]
     if not item.shader_file_path:
-        return
+        return False
+    shader_path = _resolve_shader_file_path(item.shader_file_path)
+    cache_key = _canonical_shader_path(shader_path)
 
     text_name = _get_text_block_name(node, item)
-    content = ""
     try:
-        with open(item.shader_file_path, 'r', encoding='utf-8') as f:
+        with open(shader_path, 'r', encoding='utf-8') as f:
             content = f.read()
+        current_stat = os.stat(shader_path)
+        current_sig = (int(current_stat.st_mtime_ns), current_stat.st_size)
     except Exception:
-        content = ""
+        return False
 
-    if text_name in bpy.data.texts:
-        text_block = bpy.data.texts[text_name]
-        text_block.clear()
-    else:
-        text_block = bpy.data.texts.new(text_name)
-    text_block.write(content)
+    try:
+        if text_name in bpy.data.texts:
+            text_block = bpy.data.texts[text_name]
+            text_block.clear()
+        else:
+            text_block = bpy.data.texts.new(text_name)
+        text_block.write(content)
+    except Exception:
+        return False
+
+    _file_signature_cache[cache_key] = current_sig
+    return True
 
 
 def _clear_text_blocks(node):
@@ -59,32 +147,90 @@ def _clear_text_blocks(node):
         text_name = _get_text_block_name(node, item)
         if text_name in bpy.data.texts:
             bpy.data.texts.remove(bpy.data.texts[text_name])
+        try:
+            item.preview_text_block_name = ""
+        except Exception:
+            pass
 
 
-def _flush_text_block_to_file(node):
-    """在关闭预览前强制写回当前文本块内容，避免未落盘编辑丢失。"""
-    if node.active_shader_index < 0 or node.active_shader_index >= len(node.shader_list):
-        return
-    item = node.shader_list[node.active_shader_index]
-    if not item.shader_file_path:
-        return
-
-    text_name = _get_text_block_name(node, item)
-    text_block = bpy.data.texts.get(text_name)
-    if text_block is None:
-        return
-
+def _write_shader_text_block_to_file(item, text_block):
+    temp_path = None
+    file_descriptor = None
     try:
         text_content = text_block.as_string()
-        with open(item.shader_file_path, 'w', encoding='utf-8') as f:
+        target_path = _canonical_shader_path(item.shader_file_path)
+        if not target_path:
+            return False
+        target_stat = os.stat(target_path)
+        target_dir = os.path.dirname(target_path)
+        target_name = os.path.basename(target_path)
+        file_descriptor, temp_path = tempfile.mkstemp(
+            dir=target_dir,
+            prefix=f".{target_name}.",
+            suffix=".tmp",
+        )
+        file_object = os.fdopen(file_descriptor, 'w', encoding='utf-8', newline='\n')
+        file_descriptor = None
+        with file_object as f:
             f.write(text_content)
-        new_stat = os.stat(item.shader_file_path)
-        _file_signature_cache[item.shader_file_path] = (
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_path, target_stat.st_mode)
+        os.replace(temp_path, target_path)
+        temp_path = None
+        new_stat = os.stat(target_path)
+        _file_signature_cache[target_path] = (
             int(new_stat.st_mtime_ns),
             new_stat.st_size,
         )
+        return True
     except Exception:
-        pass
+        return False
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        if temp_path is not None:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def _flush_text_block_to_file(node):
+    """在关闭预览前写回该节点的全部文本块，避免切换变体后丢失编辑。"""
+    success = True
+    for item in node.shader_list:
+        if not item.shader_file_path:
+            continue
+        text_block = bpy.data.texts.get(_get_text_block_name(node, item))
+        if text_block is None:
+            continue
+        if not _write_shader_text_block_to_file(item, text_block):
+            success = False
+    return success
+
+
+def _shutdown_preview_sessions():
+    """Flush active preview sessions before timer/class unregistration."""
+    success = True
+    for tree in bpy.data.node_groups:
+        if getattr(tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
+            continue
+        for node in tree.nodes:
+            if (
+                getattr(node, "bl_idname", "") != 'SSMTNode_ShaderReplace'
+                or not getattr(node, "preview_enabled", False)
+            ):
+                continue
+            if not _flush_text_block_to_file(node):
+                success = False
+                continue
+            _clear_text_blocks(node)
+            node.preview_enabled = False
+    return success
 
 
 # ---------------------------------------------------------------------------
@@ -108,62 +254,44 @@ def _shader_replace_timer_callback():
                     continue
                 if not node.preview_enabled:
                     continue
-                if node.active_shader_index < 0 or node.active_shader_index >= len(node.shader_list):
+                active_shader_index = node.active_shader_index
+                if active_shader_index < 0 or active_shader_index >= len(node.shader_list):
                     continue
-                item = node.shader_list[node.active_shader_index]
-                if not item.shader_file_path or not os.path.exists(item.shader_file_path):
-                    continue
+                for item_index, item in enumerate(node.shader_list):
+                    shader_path = _resolve_shader_file_path(item.shader_file_path)
+                    cache_key = _canonical_shader_path(shader_path)
+                    if not shader_path or not os.path.exists(shader_path):
+                        continue
 
-                text_name = _get_text_block_name(node, item)
-                text_block = bpy.data.texts.get(text_name)
-                if text_block is None:
-                    _load_shader_into_text_block(node)
-                    continue
+                    text_name = _get_text_block_name(node, item)
+                    text_block = bpy.data.texts.get(text_name)
+                    if text_block is None:
+                        if item_index == active_shader_index and not _load_shader_into_text_block(node):
+                            node.preview_enabled = False
+                        continue
 
-                text_content = text_block.as_string()
+                    text_content = text_block.as_string()
 
-                # 读取文件内容
-                try:
-                    with open(item.shader_file_path, 'r', encoding='utf-8') as f:
-                        file_content = f.read()
-                except Exception:
-                    file_content = None
+                    try:
+                        with open(shader_path, 'r', encoding='utf-8') as f:
+                            file_content = f.read()
+                        current_stat = os.stat(shader_path)
+                        current_sig = (int(current_stat.st_mtime_ns), current_stat.st_size)
+                    except Exception:
+                        continue
 
-                if file_content is not None:
-                    if file_content != text_content:
-                        # 内容不一致，判断是文件被外部修改还是文本块被用户编辑
-                        try:
-                            current_stat = os.stat(item.shader_file_path)
-                            current_sig = (int(current_stat.st_mtime_ns), current_stat.st_size)
-                        except Exception:
-                            current_sig = None
+                    if file_content == text_content:
+                        _file_signature_cache[cache_key] = current_sig
+                        continue
 
-                        cached_sig = _file_signature_cache.get(item.shader_file_path)
-                        if cached_sig != current_sig:
-                            # 文件被外部修改 → 重新加载到文本块
-                            text_block.clear()
-                            text_block.write(file_content)
-                            _file_signature_cache[item.shader_file_path] = current_sig
-                        else:
-                            # 文本块被用户编辑 → 保存到文件
-                            try:
-                                with open(item.shader_file_path, 'w', encoding='utf-8') as f:
-                                    f.write(text_content)
-                                new_stat = os.stat(item.shader_file_path)
-                                _file_signature_cache[item.shader_file_path] = (
-                                    int(new_stat.st_mtime_ns), new_stat.st_size
-                                )
-                            except Exception:
-                                pass
+                    cached_sig = _file_signature_cache.get(cache_key)
+                    if cached_sig != current_sig:
+                        # 磁盘文件变更优先，重新加载所有已打开的对应文本块。
+                        text_block.clear()
+                        text_block.write(file_content)
+                        _file_signature_cache[cache_key] = current_sig
                     else:
-                        # 内容一致，仅更新缓存
-                        try:
-                            current_stat = os.stat(item.shader_file_path)
-                            _file_signature_cache[item.shader_file_path] = (
-                                int(current_stat.st_mtime_ns), current_stat.st_size
-                            )
-                        except Exception:
-                            pass
+                        _write_shader_text_block_to_file(item, text_block)
     except Exception:
         pass
 
@@ -190,6 +318,12 @@ class ShaderReplaceItem(PropertyGroup):
         description="着色器哈希值，可从文件名自动解析",
         default=""
     )
+    preview_text_block_name: StringProperty(
+        name="预览文本块",
+        description="预览会话绑定的文本块名称",
+        default="",
+        options={'HIDDEN'},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -208,15 +342,16 @@ class SSMT_OT_ShaderReplace_AddItem(bpy.types.Operator):
         if not tree:
             return {'CANCELLED'}
         node = tree.nodes.get(self.node_name)
-        if node:
-            new_item = node.shader_list.add()
-            variant_count = len(node.shader_list)
-            if variant_count == 1:
-                new_item.variant_name = "World"
-            elif variant_count == 2:
-                new_item.variant_name = "NonWorld"
-            else:
-                new_item.variant_name = f"Variant{variant_count}"
+        if not node or node.preview_enabled:
+            return {'CANCELLED'}
+        new_item = node.shader_list.add()
+        variant_count = len(node.shader_list)
+        if variant_count == 1:
+            new_item.variant_name = "World"
+        elif variant_count == 2:
+            new_item.variant_name = "NonWorld"
+        else:
+            new_item.variant_name = f"Variant{variant_count}"
         return {'FINISHED'}
 
 
@@ -233,10 +368,15 @@ class SSMT_OT_ShaderReplace_RemoveItem(bpy.types.Operator):
         if not tree:
             return {'CANCELLED'}
         node = tree.nodes.get(self.node_name)
-        if node and 0 <= self.item_index < len(node.shader_list):
-            node.shader_list.remove(self.item_index)
-            if node.active_shader_index >= len(node.shader_list):
-                node.active_shader_index = max(0, len(node.shader_list) - 1)
+        if (
+            not node
+            or node.preview_enabled
+            or not 0 <= self.item_index < len(node.shader_list)
+        ):
+            return {'CANCELLED'}
+        node.shader_list.remove(self.item_index)
+        if node.active_shader_index >= len(node.shader_list):
+            node.active_shader_index = max(0, len(node.shader_list) - 1)
         return {'FINISHED'}
 
 
@@ -255,7 +395,11 @@ class SSMT_OT_ShaderReplace_SelectFile(bpy.types.Operator):
         if not tree:
             return {'CANCELLED'}
         node = tree.nodes.get(self.node_name)
-        if not node or self.item_index >= len(node.shader_list):
+        if (
+            not node
+            or node.preview_enabled
+            or not 0 <= self.item_index < len(node.shader_list)
+        ):
             return {'CANCELLED'}
         item = node.shader_list[self.item_index]
         item.shader_file_path = bpy.path.abspath(self.filepath)
@@ -265,6 +409,10 @@ class SSMT_OT_ShaderReplace_SelectFile(bpy.types.Operator):
         return {'FINISHED'}
 
     def invoke(self, context, event):
+        tree = getattr(context.space_data, "edit_tree", None) or getattr(context.space_data, "node_tree", None)
+        node = tree.nodes.get(self.node_name) if tree else None
+        if not node or node.preview_enabled:
+            return {'CANCELLED'}
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -282,7 +430,11 @@ class SSMT_OT_ShaderReplace_ParseHash(bpy.types.Operator):
         if not tree:
             return {'CANCELLED'}
         node = tree.nodes.get(self.node_name)
-        if not node or self.item_index >= len(node.shader_list):
+        if (
+            not node
+            or node.preview_enabled
+            or not 0 <= self.item_index < len(node.shader_list)
+        ):
             return {'CANCELLED'}
         item = node.shader_list[self.item_index]
         parsed_hash = parse_shader_hash_from_filename(item.shader_file_path)
@@ -308,11 +460,26 @@ class SSMT_OT_ShaderReplace_TogglePreview(bpy.types.Operator):
         node = tree.nodes.get(self.node_name)
         if not node:
             return {'CANCELLED'}
-        node.preview_enabled = not node.preview_enabled
-        if node.preview_enabled:
-            _load_shader_into_text_block(node)
+        if not node.preview_enabled:
+            conflict_path = _find_preview_path_conflict(node)
+            if conflict_path:
+                self.report(
+                    {'ERROR'},
+                    f"着色器文件已被当前或其他预览条目占用: {conflict_path}",
+                )
+                return {'CANCELLED'}
+            node.preview_enabled = True
+            if not _load_shader_into_text_block(node):
+                node.preview_enabled = False
+                _clear_text_blocks(node)
+                self.report({'ERROR'}, "读取着色器文件失败，未启用预览模式")
+                return {'CANCELLED'}
         else:
-            _flush_text_block_to_file(node)
+            node.preview_enabled = False
+            if not _flush_text_block_to_file(node):
+                node.preview_enabled = True
+                self.report({'ERROR'}, "写入着色器文件失败，预览模式保持开启")
+                return {'CANCELLED'}
             _clear_text_blocks(node)
         return {'FINISHED'}
 
@@ -404,6 +571,12 @@ class SSMTNode_ShaderReplace(SSMTNodeBase):
         nonworld_item = self.shader_list.add()
         nonworld_item.variant_name = "NonWorld"
 
+    def copy(self, node):
+        # A copied node must not share an active preview session with its source.
+        self.preview_enabled = False
+        for item in self.shader_list:
+            item.preview_text_block_name = ""
+
     def draw_buttons(self, context, layout):
         # 基本配置
         box = layout.box()
@@ -418,6 +591,7 @@ class SSMTNode_ShaderReplace(SSMTNodeBase):
 
         for i, item in enumerate(self.shader_list):
             sub = box.box()
+            sub.enabled = not self.preview_enabled
             row = sub.row(align=True)
             row.prop(item, "variant_name", text="变体")
 
@@ -437,14 +611,23 @@ class SSMTNode_ShaderReplace(SSMTNodeBase):
             op.node_name = self.name
             op.item_index = i
 
-        op = box.operator("ssmt.shader_replace_add_item", text="添加着色器", icon='ADD')
+        add_row = box.row()
+        add_row.enabled = not self.preview_enabled
+        op = add_row.operator("ssmt.shader_replace_add_item", text="添加着色器", icon='ADD')
         op.node_name = self.name
 
         # 预览/编辑
         box = layout.box()
         row = box.row()
-        row.prop(self, "preview_enabled", text="预览/编辑模式")
-        op = row.operator("ssmt.shader_replace_toggle_preview", text="切换", icon='RESTRICT_VIEW_OFF')
+        row.label(
+            text="预览模式已开启" if self.preview_enabled else "预览模式已关闭",
+            icon='HIDE_OFF' if self.preview_enabled else 'HIDE_ON',
+        )
+        op = row.operator(
+            "ssmt.shader_replace_toggle_preview",
+            text="关闭预览" if self.preview_enabled else "开启预览",
+            icon='RESTRICT_VIEW_OFF',
+        )
         op.node_name = self.name
 
         if self.preview_enabled:
@@ -475,7 +658,7 @@ class SSMTNode_ShaderReplace(SSMTNodeBase):
         for i, item in enumerate(self.shader_list):
             shaders.append({
                 'variant_name': item.variant_name,
-                'shader_file_path': item.shader_file_path,
+                'shader_file_path': _resolve_shader_file_path(item.shader_file_path),
                 'shader_hash': item.shader_hash,
                 'env_value': i + 1,
             })
@@ -522,6 +705,7 @@ def register():
 
 def unregister():
     global _shader_replace_timer_handle
+    _shutdown_preview_sessions()
     if _shader_replace_timer_handle is not None:
         try:
             bpy.app.timers.unregister(_shader_replace_timer_callback)

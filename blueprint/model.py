@@ -90,6 +90,7 @@ class ProcessingChain:
 
     vertex_group_process_nodes: List[bpy.types.Node] = field(default_factory=list)
     vertex_group_mapping_nodes: List[bpy.types.Node] = field(default_factory=list)
+    shader_replace_info_list: List[dict] = field(default_factory=list)
     export_object_name_override: str = ""
 
     reached_output: bool = False
@@ -320,6 +321,7 @@ class ProcessingChain:
         new_chain.multi_file_option_count = self.multi_file_option_count
         new_chain.vertex_group_process_nodes = list(self.vertex_group_process_nodes)
         new_chain.vertex_group_mapping_nodes = list(self.vertex_group_mapping_nodes)
+        new_chain.shader_replace_info_list = list(self.shader_replace_info_list)
         new_chain.export_object_name_override = self.export_object_name_override
         new_chain.reached_output = self.reached_output
         new_chain.is_valid = self.is_valid
@@ -341,6 +343,8 @@ class ProcessingChain:
                 obj_model.source_obj_name = self.original_object_name
 
         obj_model.work_key_list = copy.deepcopy(self.shapekey_params)
+        obj_model.shader_replace_info_list = list(self.shader_replace_info_list)
+        obj_model.shader_replace_info_resolved = True
 
         return obj_model
 
@@ -483,6 +487,8 @@ class BluePrintModel:
             if not nested_output:
                 continue
 
+            previous_postprocess_count = len(self.postprocess_nodes)
+
             for output_socket in nested_output.outputs:
                 if output_socket.bl_idname == 'SSMTSocketPostProcess' and output_socket.is_linked:
                     for link in output_socket.links:
@@ -497,7 +503,7 @@ class BluePrintModel:
                         if _is_postprocess_node(source.bl_idname):
                             self._traverse_postprocess_chain(source, existing_keys=existing_pp_keys)
 
-            nested_in_tree = sum(1 for n in self.postprocess_nodes if _get_node_unique_key(n) not in existing_pp_keys)
+            nested_in_tree = len(self.postprocess_nodes) - previous_postprocess_count
             existing_pp_keys.update(_get_node_unique_key(n) for n in self.postprocess_nodes)
             nested_pp_count += nested_in_tree
 
@@ -1324,16 +1330,13 @@ class BluePrintModel:
             LOG.info("🎨 没有找到着色器替换节点，跳过处理")
             return
 
-        # 节点名 → info 的映射，便于按物体关联查找
-        node_info_map = {}
-        for sr_node in self.shader_replace_nodes:
-            info = sr_node.get_shader_replace_info()
-            self.shader_replace_info_list.append(info)
-            node_info_map[sr_node.name] = info
-            LOG.info(f"🎨 着色器替换节点 '{sr_node.name}': prefix={info['name_prefix']}, shaders={len(info['shaders'])}")
-
         valid_chains = [c for c in self.processing_chains if c.is_valid and c.reached_output]
+        for chain in self.processing_chains:
+            chain.shader_replace_info_list = []
 
+        # 仅解析实际被有效链选中的最近节点。仅连接到输出但没有对象输入的节点，
+        # 以及同一链上被最近节点遮蔽的配置，都不应参与文件复制和全局前缀校验。
+        node_info_map = {}
         sr_chain_count = 0
         for chain in valid_chains:
             sr_nodes_in_chain = [n for n in chain.node_path if n.bl_idname == _NODE_TYPE_SHADER_REPLACE]
@@ -1345,11 +1348,23 @@ class BluePrintModel:
             export_obj_name = chain.get_export_object_name()
 
             self.shader_replace_object_names.add(export_obj_name)
-            # 只取链路中最近的一个着色器替换节点（最靠近输出端的）
-            nearest_sr_node = sr_nodes_in_chain[-1]
-            info = node_info_map.get(nearest_sr_node.name)
+            # 只取链路中最近的一个着色器替换节点（最靠近物体端的）
+            nearest_sr_node = sr_nodes_in_chain[0]
+            node_key = _get_node_unique_key(nearest_sr_node)
+            info = node_info_map.get(node_key)
+            if info is None:
+                info = nearest_sr_node.get_shader_replace_info()
+                node_info_map[node_key] = info
+                self.shader_replace_info_list.append(info)
+                LOG.info(
+                    f"🎨 着色器替换节点 '{nearest_sr_node.name}': "
+                    f"prefix={info['name_prefix']}, shaders={len(info['shaders'])}"
+                )
             if info:
-                self.shader_replace_object_info_map[export_obj_name] = [info]
+                chain.shader_replace_info_list = [info]
+                object_infos = self.shader_replace_object_info_map.setdefault(export_obj_name, [])
+                if info not in object_infos:
+                    object_infos.append(info)
             LOG.info(f"🎨   物体 '{obj_name}' (导出名 '{export_obj_name}') 关联着色器替换节点 '{nearest_sr_node.name}'")
 
         self.has_shader_replace = len(self.shader_replace_info_list) > 0

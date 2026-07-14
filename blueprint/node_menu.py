@@ -77,24 +77,31 @@ def _get_active_blueprint_tree(context):
 
 
 def _sort_objects_by_trailing_number(objects):
-    """根据物体名称末尾的数字排序
-    
-    例如：_001, _002, _003 这样的顺序
-    
+    """根据物体名称中的数字进行排序
+
+    优先按末尾 _数字 排序（如 _001, _002），
+    若不匹配则提取名称中所有数字段作为元组排序，
+    以支持 LOD0.xxx-55002-0.身体.004_010_透明0.75 这类复杂名称。
+
     Args:
         objects: bpy.types.Object 列表
-    
+
     Returns:
         排序后的物体列表
     """
-    def get_trailing_number(obj):
-        # 查找物体名称末尾的数字
-        match = re.search(r'_([0-9]+)$', obj.name)
+    def get_sort_key(obj):
+        name = obj.name
+        # 优先匹配末尾 _数字
+        match = re.search(r'_([0-9]+)$', name)
         if match:
-            return int(match.group(1))
-        return 0
-    
-    return sorted(objects, key=get_trailing_number)
+            return (0, (int(match.group(1)),))
+        # 提取所有数字段作为元组排序
+        numbers = re.findall(r'[0-9]+', name)
+        if numbers:
+            return (1, tuple(int(n) for n in numbers))
+        return (2, (0,))
+
+    return sorted(objects, key=get_sort_key)
 
 
 def _add_node_entry(layout, text, icon, node_type):
@@ -249,6 +256,124 @@ def _copy_scalar_and_collection_properties(source_node, target_node):
                             continue
         except Exception:
             continue
+
+
+def _copy_custom_id_properties(source_node, target_node):
+    try:
+        property_keys = list(source_node.keys())
+    except Exception:
+        return
+
+    for prop_name in property_keys:
+        if prop_name == "_RNA_UI":
+            continue
+        try:
+            target_node[prop_name] = source_node[prop_name]
+        except Exception:
+            continue
+
+
+def _copy_node_location(location):
+    copy_method = getattr(location, "copy", None)
+    if callable(copy_method):
+        try:
+            return copy_method()
+        except Exception:
+            pass
+    return location
+
+
+def _copy_named_collection_items(source_collection, target_collection, field_names):
+    if source_collection is None or target_collection is None:
+        return
+
+    try:
+        while len(target_collection) > 0:
+            target_collection.remove(len(target_collection) - 1)
+    except Exception:
+        pass
+
+    for source_item in list(source_collection):
+        try:
+            target_item = target_collection.add()
+        except Exception:
+            break
+        for field_name in field_names:
+            if not hasattr(source_item, field_name) or not hasattr(target_item, field_name):
+                continue
+            try:
+                setattr(target_item, field_name, getattr(source_item, field_name))
+            except Exception:
+                continue
+
+
+def _sync_anim_driver_conversion_state(source_node, target_node):
+    scalar_fields = (
+        "auto_index",
+        "frame_start",
+        "frame_end",
+        "play_total_duration",
+        "default_paused",
+        "custom_paused_var",
+        "reverse_playback",
+        "loop_playback",
+        "hold_end_value",
+        "use_float_interval",
+        "use_continuous_shapekey_mode",
+        "continuous_target_object",
+        "continuous_shape_key_prefix_filter",
+        "driven_variable",
+        "driven_variable_list_active",
+        "continuous_shape_key_items_active",
+        "assigned_continuous_index_variable_name",
+        "custom_continuous_index_variable_name",
+        "continuous_index_var_initialized",
+    )
+
+    for field_name in scalar_fields:
+        if not hasattr(source_node, field_name) or not hasattr(target_node, field_name):
+            continue
+        try:
+            setattr(target_node, field_name, getattr(source_node, field_name))
+        except Exception:
+            continue
+
+    _copy_named_collection_items(
+        getattr(source_node, "driven_variable_list", None),
+        getattr(target_node, "driven_variable_list", None),
+        ("variable_name",),
+    )
+    _copy_named_collection_items(
+        getattr(source_node, "continuous_shape_key_items", None),
+        getattr(target_node, "continuous_shape_key_items", None),
+        ("shape_key_name", "variable_name"),
+    )
+
+
+def _resolve_converted_node_label(source_node):
+    source_label = str(getattr(source_node, "label", "") or "")
+    source_default_label = str(getattr(source_node, "bl_label", "") or "")
+    if not source_label:
+        return ""
+    if source_label == source_default_label:
+        return ""
+    return source_label
+
+
+def _rename_converted_anim_driver_node(target_node):
+    target_title = str(getattr(target_node, "bl_label", "") or "").strip()
+    if not target_title:
+        return
+
+    try:
+        target_node.name = target_title
+    except Exception:
+        pass
+
+    try:
+        target_node.label = target_title
+    except Exception:
+        pass
 
 
 def _ensure_input_count(node, required_inputs: int):
@@ -1017,6 +1142,152 @@ class SSMT_OT_ViewChain(bpy.types.Operator):
         self.report({'INFO'}, "已恢复链路高亮")
 
 
+def _get_selected_anim_driver_convertible_node(node_tree):
+    """获取选中的可转换动画驱动节点（索引播放或往返播放）"""
+    active_node = getattr(getattr(node_tree, "nodes", None), "active", None)
+    if active_node and getattr(active_node, "select", False) and getattr(active_node, "bl_idname", "") in {
+        'SSMTNode_AnimDriver_ForwardPlay',
+        'SSMTNode_AnimDriver_PingPong',
+    }:
+        return active_node
+
+    selected = [n for n in node_tree.nodes if n.select]
+    if len(selected) != 1:
+        return None
+    node = selected[0]
+    if node.bl_idname in {'SSMTNode_AnimDriver_ForwardPlay', 'SSMTNode_AnimDriver_PingPong'}:
+        return node
+    return None
+
+
+class SSMT_OT_ConvertAnimDriverNode(bpy.types.Operator):
+    """在索引播放和往返播放节点之间互相转换，保留所有参数和连接"""
+    bl_idname = "ssmt.convert_anim_driver_node"
+    bl_label = "转换动画驱动节点"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, 'space_data', None)
+        if not space or space.type != 'NODE_EDITOR':
+            return False
+        tree = getattr(space, "edit_tree", None) or getattr(space, "node_tree", None)
+        if not tree or tree.bl_idname != 'SSMTBlueprintTreeType':
+            return False
+        return _get_selected_anim_driver_convertible_node(tree) is not None
+
+    def execute(self, context):
+        space = context.space_data
+        tree = getattr(space, "edit_tree", None) or getattr(space, "node_tree", None)
+        if not tree:
+            return {'CANCELLED'}
+
+        source_node = _get_selected_anim_driver_convertible_node(tree)
+        if source_node is None:
+            return {'CANCELLED'}
+
+        if source_node.bl_idname == 'SSMTNode_AnimDriver_ForwardPlay':
+            target_type = 'SSMTNode_AnimDriver_PingPong'
+        else:
+            target_type = 'SSMTNode_AnimDriver_ForwardPlay'
+
+        # 保存连接端点，按插槽位置迁移；源节点保留到全部新连接建立成功。
+        input_links = []
+        original_links = []
+        for socket_index, sock in enumerate(source_node.inputs):
+            if sock.is_linked:
+                for link in list(sock.links):
+                    input_links.append((socket_index, link.from_socket))
+                    if link not in original_links:
+                        original_links.append(link)
+
+        output_links = []
+        for socket_index, sock in enumerate(source_node.outputs):
+            if sock.is_linked:
+                for link in list(sock.links):
+                    output_links.append((socket_index, link.to_socket))
+                    if link not in original_links:
+                        original_links.append(link)
+
+        new_node = None
+        try:
+            new_node = tree.nodes.new(type=target_type)
+            new_node.parent = getattr(source_node, "parent", None)
+            new_node.location = _copy_node_location(source_node.location)
+            new_node.width = source_node.width
+            new_node.label = _resolve_converted_node_label(source_node)
+            _copy_scalar_and_collection_properties(source_node, new_node)
+            _sync_anim_driver_conversion_state(source_node, new_node)
+            _copy_custom_id_properties(source_node, new_node)
+        except Exception as exc:
+            if new_node is not None:
+                try:
+                    tree.nodes.remove(new_node)
+                except Exception:
+                    pass
+            self.report({'ERROR'}, f"创建目标动画驱动节点失败: {exc}")
+            return {'CANCELLED'}
+
+        missing_input = next((index for index, _socket in input_links if index >= len(new_node.inputs)), None)
+        missing_output = next((index for index, _socket in output_links if index >= len(new_node.outputs)), None)
+        if missing_input is not None or missing_output is not None:
+            tree.nodes.remove(new_node)
+            self.report({'ERROR'}, "目标节点插槽结构不兼容，转换已取消")
+            return {'CANCELLED'}
+
+        original_endpoints = [(link.from_socket, link.to_socket) for link in original_links]
+        removed_original_endpoints = []
+        created_links = []
+        try:
+            for link, endpoints in zip(original_links, original_endpoints):
+                tree.links.remove(link)
+                removed_original_endpoints.append(endpoints)
+
+            for socket_index, from_sock in input_links:
+                created_links.append(tree.links.new(from_sock, new_node.inputs[socket_index]))
+            for socket_index, to_sock in output_links:
+                created_links.append(tree.links.new(new_node.outputs[socket_index], to_sock))
+
+            tree.nodes.remove(source_node)
+        except Exception as exc:
+            for link in reversed(created_links):
+                try:
+                    tree.links.remove(link)
+                except Exception:
+                    pass
+            restore_failures = []
+            for from_sock, to_sock in removed_original_endpoints:
+                try:
+                    tree.links.new(from_sock, to_sock)
+                except Exception as restore_exc:
+                    restore_failures.append(str(restore_exc))
+            try:
+                tree.nodes.remove(new_node)
+            except Exception:
+                pass
+            detail = f"动画驱动节点连接迁移失败，已回滚: {exc}"
+            if restore_failures:
+                detail += f"；恢复连接失败: {'; '.join(restore_failures)}"
+            self.report({'ERROR'}, detail)
+            return {'CANCELLED'}
+
+        # 选中新节点
+        for n in tree.nodes:
+            n.select = False
+        new_node.select = True
+        tree.nodes.active = new_node
+
+        try:
+            new_node.update()
+        except Exception:
+            pass
+
+        _rename_converted_anim_driver_node(new_node)
+
+        self.report({'INFO'}, f"已转换为 {new_node.bl_label}")
+        return {'FINISHED'}
+
+
 def draw_objects_context_menu_add(self, context):
     layout = self.layout
     layout.separator()
@@ -1484,6 +1755,17 @@ def draw_node_add_menu(self, context):
     layout.separator()
 
 
+def _add_anim_driver_conversion_menu(layout, node_tree):
+    """当选中索引播放或往返播放节点时，添加互相转换的菜单项"""
+    node = _get_selected_anim_driver_convertible_node(node_tree)
+    if node is None:
+        return
+    if node.bl_idname == 'SSMTNode_AnimDriver_ForwardPlay':
+        layout.operator("ssmt.convert_anim_driver_node", text="转换为往返播放", icon='ARROW_LEFTRIGHT')
+    else:
+        layout.operator("ssmt.convert_anim_driver_node", text="转换为索引播放", icon='ARROW_LEFTRIGHT')
+
+
 def draw_node_context_menu(self, context):
     if not isinstance(context.space_data, bpy.types.SpaceNodeEditor):
         return
@@ -1501,6 +1783,8 @@ def draw_node_context_menu(self, context):
         layout.operator("node.add_node", text="条件触发", icon='ORIENTATION_CURSOR').type = "SSMTNode_AnimDriver_ConditionalTrigger"
         layout.operator("node.add_node", text="动画驱动开关", icon='KEYFRAME').type = "SSMTNode_AnimDriver_Toggle"
         layout.operator("node.add_node", text="形态键动画序列", icon='SHAPEKEY_DATA').type = "SSMTNode_AnimDriver_ShapeKeySequence"
+        layout.separator()
+        _add_anim_driver_conversion_menu(layout, node_tree)
         layout.separator()
         return
 
@@ -1525,6 +1809,8 @@ def draw_node_context_menu(self, context):
     layout.operator_context = 'EXEC_DEFAULT'
     layout.separator()
     layout.operator("ssmt.update_all_node_references", text="更新所有节点引用", icon='FILE_REFRESH')
+    layout.separator()
+    _add_anim_driver_conversion_menu(layout, node_tree)
     layout.separator()
     layout.operator("ssmt.view_chain", text="查看链路", icon='HIDE_OFF')
 
@@ -1578,6 +1864,7 @@ def register():
     bpy.utils.register_class(SSMT_OT_GroupNodesToNestedBlueprint)
     bpy.utils.register_class(SSMT_OT_UngroupNestedBlueprint)
     bpy.utils.register_class(SSMT_OT_ViewChain)
+    bpy.utils.register_class(SSMT_OT_ConvertAnimDriverNode)
     bpy.utils.register_class(SSMT_OT_AlignNodes)
     bpy.utils.register_class(SSMT_OT_BatchConnectNodes)
     bpy.utils.register_class(SSMT_MT_ObjectContextMenuSub)
@@ -1634,6 +1921,7 @@ def unregister():
     bpy.utils.unregister_class(SSMT_OT_GroupNodesToNestedBlueprint)
     bpy.utils.unregister_class(SSMT_OT_UngroupNestedBlueprint)
     bpy.utils.unregister_class(SSMT_OT_ViewChain)
+    bpy.utils.unregister_class(SSMT_OT_ConvertAnimDriverNode)
     bpy.utils.unregister_class(SSMT_OT_QuickAddVertexGroupMatch)
     bpy.utils.unregister_class(SSMT_OT_QuickAddRenameRule)
     bpy.utils.unregister_class(SSMT_OT_CreateInternalSwitch)

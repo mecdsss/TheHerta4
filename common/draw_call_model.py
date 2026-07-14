@@ -20,6 +20,8 @@ class DrawCallModel:
     comment_alias_name: str = field(init=False, repr=False, default="")
 
     work_key_list: list[M_Key] = field(init=False, repr=False, default_factory=list)
+    shader_replace_info_list: list[dict] = field(init=False, repr=False, default_factory=list)
+    shader_replace_info_resolved: bool = field(init=False, repr=False, default=False)
 
     index_count: int = field(init=False, repr=False, default=0)
     vertex_count: int = field(init=False, repr=False, default=0)

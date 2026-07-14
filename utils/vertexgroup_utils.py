@@ -93,8 +93,137 @@ class VertexGroupUtils:
         移除给定 obj 的所有顶点组
         '''
         if obj.type == "MESH":
-            for x in obj.vertex_groups:
+            for x in reversed(list(obj.vertex_groups)):
                 obj.vertex_groups.remove(x)
+
+    @staticmethod
+    def _snapshot_vertex_groups(obj):
+        snapshots = [
+            {
+                "name": group.name,
+                "lock_weight": bool(getattr(group, "lock_weight", False)),
+                "weights": {},
+            }
+            for group in obj.vertex_groups
+        ]
+        snapshot_by_index = {
+            group.index: snapshot
+            for group, snapshot in zip(obj.vertex_groups, snapshots)
+        }
+        for vertex in obj.data.vertices:
+            for assignment in vertex.groups:
+                snapshot = snapshot_by_index.get(assignment.group)
+                if snapshot is not None:
+                    snapshot["weights"][vertex.index] = float(assignment.weight)
+        return {
+            "groups": snapshots,
+            "active_index": int(getattr(obj.vertex_groups, "active_index", 0)),
+        }
+
+    @staticmethod
+    def _restore_vertex_groups(obj, snapshot):
+        for group in reversed(list(obj.vertex_groups)):
+            obj.vertex_groups.remove(group)
+
+        for group_snapshot in snapshot["groups"]:
+            group = obj.vertex_groups.new(name=group_snapshot["name"])
+            for vertex_index, weight in group_snapshot["weights"].items():
+                group.add([vertex_index], weight, 'REPLACE')
+            if hasattr(group, "lock_weight"):
+                group.lock_weight = group_snapshot["lock_weight"]
+
+        if obj.vertex_groups:
+            obj.vertex_groups.active_index = min(
+                snapshot["active_index"],
+                len(obj.vertex_groups) - 1,
+            )
+
+    @classmethod
+    def merge_vertex_groups(cls, obj, source_group_names, target_group_name=None):
+        """Merge multiple vertex groups on a mesh object into one target group."""
+        if obj is None or getattr(obj, "type", "") != "MESH":
+            raise Fatal("Please select a mesh object")
+        if getattr(obj, "mode", "OBJECT") != "OBJECT":
+            raise Fatal("Vertex groups can only be merged in Object Mode")
+
+        unique_names = []
+        seen_names = set()
+        for group_name in source_group_names or []:
+            normalized_name = str(group_name).strip()
+            if normalized_name and normalized_name not in seen_names:
+                seen_names.add(normalized_name)
+                unique_names.append(normalized_name)
+
+        if len(unique_names) < 2:
+            raise Fatal("At least two vertex groups are required for merging")
+
+        missing_names = [name for name in unique_names if obj.vertex_groups.get(name) is None]
+        if missing_names:
+            raise Fatal("Vertex group not found: " + ", ".join(missing_names))
+
+        resolved_target_name = str(target_group_name or "").strip() or unique_names[0]
+        existing_target = obj.vertex_groups.get(resolved_target_name)
+        if existing_target is not None and resolved_target_name not in seen_names:
+            raise Fatal(
+                f"Target vertex group '{resolved_target_name}' already exists. "
+                "Select it in the merge list or use a new name."
+            )
+
+        state_snapshot = cls._snapshot_vertex_groups(obj)
+        try:
+            target_group = existing_target
+            if target_group is None:
+                target_group = obj.vertex_groups.new(name=resolved_target_name)
+                resolved_target_name = target_group.name
+
+            source_group_indices = {
+                obj.vertex_groups[group_name].index
+                for group_name in unique_names
+            }
+
+            merged_weights = {}
+            for vertex in obj.data.vertices:
+                total_weight = 0.0
+                for group in vertex.groups:
+                    if group.group in source_group_indices and group.weight > 0.0:
+                        total_weight += group.weight
+                if total_weight > 0.0:
+                    merged_weights[vertex.index] = min(1.0, total_weight)
+
+            all_vertex_indices = list(range(len(obj.data.vertices)))
+            if all_vertex_indices:
+                target_group.remove(all_vertex_indices)
+
+            for vertex_index, weight in merged_weights.items():
+                target_group.add([vertex_index], weight, 'REPLACE')
+
+            removed_groups = 0
+            for group_name in unique_names:
+                if group_name == resolved_target_name:
+                    continue
+                group = obj.vertex_groups.get(group_name)
+                if group is not None:
+                    obj.vertex_groups.remove(group)
+                    removed_groups += 1
+
+            final_target_group = obj.vertex_groups.get(resolved_target_name)
+            if final_target_group is None:
+                raise RuntimeError(f"Merged target vertex group '{resolved_target_name}' was not created")
+            obj.vertex_groups.active_index = final_target_group.index
+        except Exception as exc:
+            try:
+                cls._restore_vertex_groups(obj, state_snapshot)
+            except Exception as rollback_exc:
+                raise Fatal(
+                    f"Vertex group merge failed and rollback also failed: {exc}; {rollback_exc}"
+                ) from exc
+            raise Fatal(f"Vertex group merge failed and was rolled back: {exc}") from exc
+
+        return {
+            "target_name": resolved_target_name,
+            "removed_groups": removed_groups,
+            "merged_vertices": len(merged_weights),
+        }
 
     # @classmethod
     # def merge_vertex_groups_with_same_number(cls):

@@ -1077,16 +1077,37 @@ class PreProcessHelper:
 
     @classmethod
     def _apply_modifiers(cls, object_names: List[str], fail_on_error: bool = False):
+        scene = bpy.context.scene
+        saved_use_simplify = scene.render.use_simplify
+        try:
+            # Simplify can disable modifiers and make modifier_apply fail.
+            scene.render.use_simplify = False
+            return cls._apply_modifiers_with_simplify_disabled(
+                object_names,
+                fail_on_error=fail_on_error,
+            )
+        finally:
+            scene.render.use_simplify = saved_use_simplify
+
+    @classmethod
+    def _apply_modifiers_with_simplify_disabled(
+        cls,
+        object_names: List[str],
+        fail_on_error: bool = False,
+    ):
         applied_count = 0
         removed_disabled_count = 0
         failed_count = 0
         shapekey_count = 0
         no_modifier_count = 0
         failure_messages = []
-        
+
         for obj_name in object_names:
             obj = bpy.data.objects.get(obj_name)
             if not obj:
+                failure_message = f"{obj_name}: object not found"
+                LOG.warning(f"   ❌ {failure_message}")
+                failure_messages.append(failure_message)
                 failed_count += 1
                 continue
             
@@ -1097,20 +1118,34 @@ class PreProcessHelper:
             modifier_count = len(obj.modifiers)
             has_shape_keys = obj.data.shape_keys and len(obj.data.shape_keys.key_blocks) > 0
             shape_key_count_before = len(obj.data.shape_keys.key_blocks) if has_shape_keys else 0
-            modifier_names = [m.name for m in obj.modifiers if m.show_viewport]
+
+            # 检测失效的修改器（已开启但缺少必要参数）
+            invalid_modifier_names = []
+            valid_modifier_names = []
+            for m in obj.modifiers:
+                if not m.show_viewport:
+                    continue
+                if cls._is_invalid_modifier(m):
+                    invalid_modifier_names.append(m.name)
+                else:
+                    valid_modifier_names.append(m.name)
+
+            modifier_names = valid_modifier_names
             disabled_modifier_names = [m.name for m in obj.modifiers if not m.show_viewport]
-            
+
             if modifier_count == 0:
                 no_modifier_count += 1
                 LOG.info(f"   {obj_name}: 无修改器 (形态键: {shape_key_count_before})")
                 continue
 
-            if not modifier_names and not disabled_modifier_names:
+            if not modifier_names and not disabled_modifier_names and not invalid_modifier_names:
                 no_modifier_count += 1
                 LOG.info(f"   {obj_name}: 修改器均不可用，跳过 (形态键: {shape_key_count_before})")
                 continue
-            
+
             LOG.info(f"   {obj_name}: {modifier_count} 个修改器, {shape_key_count_before} 个形态键")
+            if invalid_modifier_names:
+                LOG.info(f"   ⚠️ {obj_name}: 检测到 {len(invalid_modifier_names)} 个失效修改器: {invalid_modifier_names}")
             
             with ShapeKeyUtils.operator_context(obj):
                 if has_shape_keys:
@@ -1143,17 +1178,36 @@ class PreProcessHelper:
                             failure_messages.append(failure_message)
                             failed_count += 1
             
+            removed_for_object = 0
             for mod_name in reversed(disabled_modifier_names):
                 try:
                     mod = obj.modifiers.get(mod_name)
                     if mod is not None:
                         obj.modifiers.remove(mod)
                         removed_disabled_count += 1
+                        removed_for_object += 1
                 except Exception as e:
-                    LOG.warning(f"   ⚠️ {obj_name}: 删除禁用修改器 {mod_name} 失败 - {e}")
-            
-            if disabled_modifier_names:
-                LOG.info(f"   🗑️ {obj_name}: 已删除 {len(disabled_modifier_names)} 个禁用修改器")
+                    failure_message = f"{obj_name}.{mod_name}: disabled modifier removal failed - {e}"
+                    LOG.warning(f"   ❌ {failure_message}")
+                    failure_messages.append(failure_message)
+                    failed_count += 1
+
+            # 删除失效的修改器
+            for mod_name in reversed(invalid_modifier_names):
+                try:
+                    mod = obj.modifiers.get(mod_name)
+                    if mod is not None:
+                        obj.modifiers.remove(mod)
+                        removed_disabled_count += 1
+                        removed_for_object += 1
+                except Exception as e:
+                    failure_message = f"{obj_name}.{mod_name}: invalid modifier removal failed - {e}"
+                    LOG.warning(f"   ❌ {failure_message}")
+                    failure_messages.append(failure_message)
+                    failed_count += 1
+
+            if disabled_modifier_names or invalid_modifier_names:
+                LOG.info(f"   🗑️ {obj_name}: 已删除 {removed_for_object} 个无效/禁用修改器")
             
         if removed_disabled_count > 0:
             LOG.info(f"   ✅ 应用修改器: {applied_count} 个, 删除禁用修改器: {removed_disabled_count} 个")
@@ -1169,6 +1223,29 @@ class PreProcessHelper:
             if len(failure_messages) > 10:
                 details += f"\n... and {len(failure_messages) - 10} more"
             raise RuntimeError(f"Preprocess modifier application failed:\n{details}")
+
+    @staticmethod
+    def _is_invalid_modifier(mod) -> bool:
+        """仅识别缺少 Blender 明确必需外部引用的修改器。"""
+        mod_type = getattr(mod, "type", "")
+        if mod_type in {'ARMATURE', 'LATTICE', 'HOOK', 'DATA_TRANSFER', 'MESH_DEFORM'}:
+            return getattr(mod, "object", None) is None
+        if mod_type in {'SURFACE_DEFORM', 'SHRINKWRAP', 'VERTEX_WEIGHT_PROXIMITY'}:
+            return getattr(mod, "target", None) is None
+        if mod_type == 'CURVE':
+            return getattr(mod, "object", None) is None
+        if mod_type == 'NODES':
+            return getattr(mod, "node_group", None) is None
+        if mod_type == 'BOOLEAN':
+            operand_type = getattr(mod, "operand_type", 'OBJECT')
+            if operand_type == 'COLLECTION':
+                return getattr(mod, "collection", None) is None
+            return getattr(mod, "object", None) is None
+
+        # UV Project can use the active UV layer, UV Warp uses object_from/object_to,
+        # and Vertex Weight Edit/Mix do not require an external object. Treating
+        # those as invalid would either delete valid modifiers or access missing RNA.
+        return False
 
     @classmethod
     def _triangulate_objects(cls, object_names: List[str]):

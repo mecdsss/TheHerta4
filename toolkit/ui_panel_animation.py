@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 
 import bpy
 
@@ -15,7 +15,7 @@ class ATP_PT_MainPanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="版本: 4.4.17")
+        layout.label(text="版本: 4.4.18")
 
 
 class ATP_PT_ShapeKeyTools(bpy.types.Panel):

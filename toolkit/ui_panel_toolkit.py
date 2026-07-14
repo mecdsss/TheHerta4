@@ -232,6 +232,34 @@ class BMTP_WeightOperationPanel(bpy.types.Panel):
         col.operator("toolkit.bmtp_spread_weights", icon='PLAY')
 
 
+        box = layout.box()
+        box.label(text="顶点组合并 (作用于当前活动物体)", icon='AUTOMERGE_ON')
+
+        active_obj = context.active_object
+        if active_obj and active_obj.type == 'MESH':
+            box.label(text=f"当前物体: {active_obj.name}", icon='MESH_DATA')
+
+            row = box.row(align=True)
+            row.operator("toolkit.bmtp_refresh_merge_vertex_groups", icon='FILE_REFRESH')
+            row.operator("toolkit.bmtp_select_merge_vertex_groups", text="全选").select = True
+            row.operator("toolkit.bmtp_select_merge_vertex_groups", text="全不选").select = False
+
+            box.template_list(
+                "BMTP_UL_VertexGroupList",
+                "merge",
+                props,
+                "wt_merge_vertex_groups",
+                props,
+                "wt_merge_vertex_groups_index",
+                rows=5,
+            )
+            box.prop(props, "wt_merge_target_name")
+            box.label(text="留空则合并到第一个选中的顶点组", icon='INFO')
+            box.operator("toolkit.bmtp_merge_vertex_groups", icon='PLAY')
+        else:
+            box.label(text="请先激活一个网格物体", icon='ERROR')
+
+
 class BMTP_WeightManagePanel(bpy.types.Panel):
     bl_label = "权重管理"
     bl_idname = "VIEW3D_PT_Herta_BMTP_WeightManage_Panel"
@@ -480,6 +508,7 @@ class BMTP_SceneCleanPanel(bpy.types.Panel):
         col.operator("toolkit.bmtp_clear_materials")
         col.operator("toolkit.bmtp_sync_data_names")
         col.operator("toolkit.bmtp_clean_useless_shape_keys")
+        col.prop(context.scene.bmtp_props, "shapekey_cleanup_threshold", text="判定阈值")
         
         box = layout.box()
         box.label(text="独立清理项目")

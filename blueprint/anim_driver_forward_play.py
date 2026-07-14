@@ -179,6 +179,7 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
     def draw_buttons(self, context, layout):
         safe_idx = self._read_safe_index()
         box = layout.box()
+        box.label(text="当前模式: 索引播放", icon='PLAY')
         row = box.row(align=True)
         row.label(text=f"索引: {safe_idx}", icon='LINENUMBERS_ON')
         row.prop(self, "use_float_interval", text="浮点", icon='IPO_BEZIER')

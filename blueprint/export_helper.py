@@ -1353,7 +1353,12 @@ class BlueprintExportHelper:
         BlueprintExportHelper.shapekey_objects = []
         resolved_count = 0
         for candidate_name in BlueprintExportHelper.collect_connected_object_names(tree):
-            resolved_name = BlueprintExportHelper._resolve_shapekey_source_object_name(candidate_name)
+            resolved_object = BlueprintExportHelper._resolve_shapekey_object_in_scene(candidate_name)
+            resolved_name = (
+                resolved_object.name
+                if resolved_object is not None
+                else BlueprintExportHelper._resolve_shapekey_source_object_name(candidate_name)
+            )
             if not resolved_name or resolved_name in BlueprintExportHelper.shapekey_objects:
                 continue
             BlueprintExportHelper.shapekey_objects.append(resolved_name)
@@ -1363,49 +1368,6 @@ class BlueprintExportHelper:
             f"[ShapeKeyExport] collected {len(BlueprintExportHelper.shapekey_objects)} shape key source objects"
             f" (resolved {resolved_count} virtual/export names)"
         )
-        return BlueprintExportHelper.shapekey_objects
-
-        BlueprintExportHelper.shapekey_objects = []
-        if not tree:
-            return []
-
-        visited_trees = set()
-
-        def collect_from_tree(current_tree):
-            if current_tree.name in visited_trees:
-                return
-            visited_trees.add(current_tree.name)
-
-            output_node = BlueprintExportHelper.get_result_output_node(current_tree)
-
-            for node in current_tree.nodes:
-                if node.bl_idname == 'SSMTNode_Object_Info' and not node.mute:
-                    if output_node and not BlueprintExportHelper._is_node_connected_to_output(current_tree, node):
-                        continue
-                    obj_name = getattr(node, 'object_name', '')
-                    if obj_name and obj_name not in BlueprintExportHelper.shapekey_objects:
-                        BlueprintExportHelper.shapekey_objects.append(obj_name)
-
-                elif node.bl_idname == 'SSMTNode_MultiFile_Export' and not node.mute:
-                    if output_node and not BlueprintExportHelper._is_node_connected_to_output(current_tree, node):
-                        continue
-                    obj_list = getattr(node, 'object_list', [])
-                    if obj_list:
-                        item = obj_list[0]
-                        obj_name = getattr(item, 'object_name', '')
-                        if obj_name and obj_name not in BlueprintExportHelper.shapekey_objects:
-                            BlueprintExportHelper.shapekey_objects.append(obj_name)
-
-                elif node.bl_idname == 'SSMTNode_Blueprint_Nest' and not node.mute:
-                    nested_tree_name = getattr(node, 'blueprint_name', '')
-                    if nested_tree_name and nested_tree_name != 'NONE':
-                        nested_tree = bpy.data.node_groups.get(nested_tree_name)
-                        if nested_tree:
-                            collect_from_tree(nested_tree)
-
-        collect_from_tree(tree)
-
-        print(f"[ShapeKeyExport] 收集到 {len(BlueprintExportHelper.shapekey_objects)} 个物体")
         return BlueprintExportHelper.shapekey_objects
 
     @staticmethod
@@ -1485,6 +1447,37 @@ class BlueprintExportHelper:
         return effective_slot_count
 
     @staticmethod
+    def _resolve_shapekey_object_in_scene(obj_name: str):
+        """在场景中查找形态键物体，支持带 _copy/_chainN/_dupN 后缀的反查。"""
+        if not obj_name:
+            return None
+        obj = bpy.data.objects.get(obj_name)
+        if obj:
+            return obj
+        resolved = BlueprintExportHelper._resolve_shapekey_source_object_name(obj_name)
+        if resolved and resolved != obj_name:
+            obj = bpy.data.objects.get(resolved)
+            if obj:
+                return obj
+        import re as _re
+        for initial_name in dict.fromkeys((obj_name, resolved)):
+            current = initial_name
+            for _ in range(20):
+                changed = False
+                for pattern in (r'_copy$', r'_chain\d+$', r'_dup\d+$'):
+                    new_name = _re.sub(pattern, '', current)
+                    if new_name != current:
+                        obj = bpy.data.objects.get(new_name)
+                        if obj:
+                            return obj
+                        current = new_name
+                        changed = True
+                        break
+                if not changed:
+                    break
+        return None
+
+    @staticmethod
     def set_all_shapekey_values(value: int, slot_index: int = None):
         total_objects = len(BlueprintExportHelper.shapekey_objects)
         objects_with_keys = 0
@@ -1492,9 +1485,9 @@ class BlueprintExportHelper:
         objects_without_keys = 0
         changed_keys = 0
         failed_keys = 0
-        
+
         for obj_name in BlueprintExportHelper.shapekey_objects:
-            obj = bpy.data.objects.get(obj_name)
+            obj = BlueprintExportHelper._resolve_shapekey_object_in_scene(obj_name)
             if not obj or not obj.data:
                 missing_objects += 1
                 continue

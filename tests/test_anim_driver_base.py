@@ -455,6 +455,683 @@ class AnimDriverBaseTests(unittest.TestCase):
         self.assertEqual(node.custom_continuous_index_variable_name, "continuous_shapekey_frame2")
         self.assertTrue(node.continuous_index_var_initialized)
 
+    def test_convert_anim_driver_node_preserves_properties_custom_state_and_links(self):
+        class _FakeSocket:
+            def __init__(self, node, name, identifier):
+                self.node = node
+                self.name = name
+                self.identifier = identifier
+                self.links = []
+
+            @property
+            def is_linked(self):
+                return bool(self.links)
+
+        class _FakeLink:
+            def __init__(self, from_socket, to_socket):
+                self.from_node = from_socket.node
+                self.from_socket = from_socket
+                self.to_node = to_socket.node
+                self.to_socket = to_socket
+
+        class _FakeLinks(list):
+            def new(self, from_socket, to_socket):
+                if getattr(to_socket, "links", None):
+                    raise RuntimeError("target socket already linked")
+                link = _FakeLink(from_socket, to_socket)
+                self.append(link)
+                from_socket.links.append(link)
+                to_socket.links.append(link)
+                return link
+
+            def remove(self, link):
+                if link in link.from_socket.links:
+                    link.from_socket.links.remove(link)
+                if link in link.to_socket.links:
+                    link.to_socket.links.remove(link)
+                super().remove(link)
+
+            def remove_node(self, node):
+                remaining = []
+                for link in list(self):
+                    if link.from_node == node or link.to_node == node:
+                        if link in link.from_socket.links:
+                            link.from_socket.links.remove(link)
+                        if link in link.to_socket.links:
+                            link.to_socket.links.remove(link)
+                        continue
+                    remaining.append(link)
+                self[:] = remaining
+
+        class _FakeNodeCollection(list):
+            def __init__(self, tree):
+                super().__init__()
+                self._tree = tree
+                self.active = None
+
+            def new(self, type):
+                node = self._tree._new_node_factory(type)
+                node.id_data = self._tree
+                self.append(node)
+                return node
+
+            def remove(self, node):
+                self._tree.links.remove_node(node)
+                super().remove(node)
+
+        class _FakeLocation:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+            def copy(self):
+                return _FakeLocation(self.x, self.y)
+
+        class _FakeAnimNode:
+            def __init__(self, bl_idname, bl_label, name, input_defs, output_defs):
+                self.bl_idname = bl_idname
+                self.bl_label = bl_label
+                self.name = name
+                self.label = f"Label:{name}"
+                self.location = _FakeLocation(12, 34)
+                self.width = 320
+                self.select = False
+                self.inputs = [_FakeSocket(self, socket_name, identifier) for socket_name, identifier in input_defs]
+                self.outputs = [_FakeSocket(self, socket_name, identifier) for socket_name, identifier in output_defs]
+                self._idprops = {}
+                self.update_count = 0
+
+            def keys(self):
+                return self._idprops.keys()
+
+            def __getitem__(self, key):
+                return self._idprops[key]
+
+            def __setitem__(self, key, value):
+                self._idprops[key] = value
+
+            def update(self):
+                self.update_count += 1
+
+        def _copy_anim_driver_fields(source_node, target_node):
+            scalar_fields = [
+                "auto_index",
+                "frame_start",
+                "frame_end",
+                "play_total_duration",
+                "default_paused",
+                "custom_paused_var",
+                "reverse_playback",
+                "loop_playback",
+                "hold_end_value",
+                "use_float_interval",
+                "use_continuous_shapekey_mode",
+                "continuous_target_object",
+                "continuous_shape_key_prefix_filter",
+                "driven_variable",
+                "driven_variable_list_active",
+                "continuous_shape_key_items_active",
+                "assigned_continuous_index_variable_name",
+                "custom_continuous_index_variable_name",
+                "continuous_index_var_initialized",
+            ]
+            for field_name in scalar_fields:
+                setattr(target_node, field_name, getattr(source_node, field_name))
+
+            target_node.driven_variable_list = [
+                types.SimpleNamespace(variable_name=item.variable_name)
+                for item in getattr(source_node, "driven_variable_list", [])
+            ]
+            target_node.continuous_shape_key_items = [
+                types.SimpleNamespace(
+                    shape_key_name=item.shape_key_name,
+                    variable_name=item.variable_name,
+                )
+                for item in getattr(source_node, "continuous_shape_key_items", [])
+            ]
+
+        upstream_a = _FakeAnimNode("Upstream", "Upstream", "UpstreamA", [], [("链输出", "up_out_0")])
+        upstream_b = _FakeAnimNode("Upstream", "Upstream", "UpstreamB", [], [("驱动输出", "up_out_1")])
+        downstream_a = _FakeAnimNode("Downstream", "Downstream", "DownstreamA", [("链输入", "down_in_0")], [])
+        downstream_b = _FakeAnimNode("Downstream", "Downstream", "DownstreamB", [("时间输入", "down_in_1")], [])
+
+        source_node = _FakeAnimNode(
+            "SSMTNode_AnimDriver_ForwardPlay",
+            "索引播放",
+            "ForwardNode",
+            [("链输入", "src_in_0"), ("时间输入", "src_in_1"), ("驱动输入", "src_in_2")],
+            [("链输出", "src_out_0"), ("时间输出", "src_out_1")],
+        )
+        source_frame = object()
+        source_node.parent = source_frame
+        source_node.select = True
+        source_node.auto_index = 7
+        source_node.frame_start = 1.5
+        source_node.frame_end = 9.5
+        source_node.play_total_duration = 2.75
+        source_node.default_paused = False
+        source_node.custom_paused_var = "$pause_custom"
+        source_node.reverse_playback = True
+        source_node.loop_playback = True
+        source_node.hold_end_value = True
+        source_node.use_float_interval = False
+        source_node.use_continuous_shapekey_mode = True
+        source_node.continuous_target_object = "Body"
+        source_node.continuous_shape_key_prefix_filter = "Talk_"
+        source_node.driven_variable = "$legacy_var"
+        source_node.driven_variable_list = [
+            types.SimpleNamespace(variable_name="$var_a"),
+            types.SimpleNamespace(variable_name="$var_b"),
+        ]
+        source_node.driven_variable_list_active = 1
+        source_node.continuous_shape_key_items = [
+            types.SimpleNamespace(shape_key_name="Talk_001", variable_name="$Freq_Talk_001"),
+            types.SimpleNamespace(shape_key_name="Talk_002", variable_name="$Freq_Talk_002"),
+        ]
+        source_node.continuous_shape_key_items_active = 1
+        source_node.assigned_continuous_index_variable_name = "continuous_shapekey_frame7"
+        source_node.custom_continuous_index_variable_name = "custom_continuous_frame7"
+        source_node.continuous_index_var_initialized = True
+        source_node[anim_driver_base.SSMTNode_AnimDriver_Base.PLAY_STATE_MIGRATION_KEY] = True
+
+        converted_node = _FakeAnimNode(
+            "SSMTNode_AnimDriver_PingPong",
+            "往返播放",
+            "ConvertedNode",
+            [("链输入", "dst_in_a"), ("时间输入", "dst_in_b"), ("驱动输入", "dst_in_c")],
+            [("链输出", "dst_out_a"), ("时间输出", "dst_out_b")],
+        )
+        converted_node.driven_variable_list = []
+        converted_node.continuous_shape_key_items = []
+
+        class _FakeTree:
+            def __init__(self):
+                self.bl_idname = "SSMTBlueprintTreeType"
+                self.links = _FakeLinks()
+                self.nodes = _FakeNodeCollection(self)
+
+            def _new_node_factory(self, type_name):
+                self.last_new_type = type_name
+                return converted_node
+
+        tree = _FakeTree()
+        for node in (upstream_a, upstream_b, source_node, downstream_a, downstream_b):
+            node.id_data = tree
+            tree.nodes.append(node)
+
+        tree.links.new(upstream_a.outputs[0], source_node.inputs[0])
+        tree.links.new(upstream_b.outputs[0], source_node.inputs[2])
+        tree.links.new(source_node.outputs[0], downstream_a.inputs[0])
+        tree.links.new(source_node.outputs[1], downstream_b.inputs[0])
+
+        original_selector = node_menu_module._get_selected_anim_driver_convertible_node
+        original_copy = node_menu_module._copy_scalar_and_collection_properties
+        node_menu_module._get_selected_anim_driver_convertible_node = lambda _tree: source_node
+        node_menu_module._copy_scalar_and_collection_properties = _copy_anim_driver_fields
+
+        try:
+            operator = node_menu_module.SSMT_OT_ConvertAnimDriverNode()
+            operator.report = lambda *_args, **_kwargs: None
+            context = types.SimpleNamespace(
+                space_data=types.SimpleNamespace(
+                    edit_tree=tree,
+                    node_tree=None,
+                )
+            )
+
+            result = operator.execute(context)
+        finally:
+            node_menu_module._get_selected_anim_driver_convertible_node = original_selector
+            node_menu_module._copy_scalar_and_collection_properties = original_copy
+
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(tree.last_new_type, "SSMTNode_AnimDriver_PingPong")
+        self.assertNotIn(source_node, tree.nodes)
+        self.assertIn(converted_node, tree.nodes)
+        self.assertEqual(converted_node.name, "往返播放")
+        self.assertEqual(converted_node.label, "往返播放")
+        self.assertIs(converted_node.parent, source_frame)
+        self.assertTrue(converted_node.select)
+        self.assertIs(tree.nodes.active, converted_node)
+        self.assertEqual(converted_node.update_count, 1)
+
+        self.assertEqual(converted_node.auto_index, 7)
+        self.assertEqual(converted_node.frame_start, 1.5)
+        self.assertEqual(converted_node.frame_end, 9.5)
+        self.assertEqual(converted_node.play_total_duration, 2.75)
+        self.assertFalse(converted_node.default_paused)
+        self.assertEqual(converted_node.custom_paused_var, "$pause_custom")
+        self.assertTrue(converted_node.reverse_playback)
+        self.assertTrue(converted_node.loop_playback)
+        self.assertTrue(converted_node.hold_end_value)
+        self.assertFalse(converted_node.use_float_interval)
+        self.assertTrue(converted_node.use_continuous_shapekey_mode)
+        self.assertEqual(converted_node.continuous_target_object, "Body")
+        self.assertEqual(converted_node.continuous_shape_key_prefix_filter, "Talk_")
+        self.assertEqual(converted_node.driven_variable, "$legacy_var")
+        self.assertEqual([item.variable_name for item in converted_node.driven_variable_list], ["$var_a", "$var_b"])
+        self.assertEqual(converted_node.driven_variable_list_active, 1)
+        self.assertEqual(
+            [(item.shape_key_name, item.variable_name) for item in converted_node.continuous_shape_key_items],
+            [("Talk_001", "$Freq_Talk_001"), ("Talk_002", "$Freq_Talk_002")],
+        )
+        self.assertEqual(converted_node.continuous_shape_key_items_active, 1)
+        self.assertEqual(converted_node.assigned_continuous_index_variable_name, "continuous_shapekey_frame7")
+        self.assertEqual(converted_node.custom_continuous_index_variable_name, "custom_continuous_frame7")
+        self.assertTrue(converted_node.continuous_index_var_initialized)
+        self.assertTrue(
+            converted_node[anim_driver_base.SSMTNode_AnimDriver_Base.PLAY_STATE_MIGRATION_KEY]
+        )
+
+        self.assertEqual(len(tree.links), 4)
+        self.assertIs(converted_node.inputs[0].links[0].from_socket, upstream_a.outputs[0])
+        self.assertIs(converted_node.inputs[2].links[0].from_socket, upstream_b.outputs[0])
+        self.assertIs(downstream_a.inputs[0].links[0].from_socket, converted_node.outputs[0])
+        self.assertIs(downstream_b.inputs[0].links[0].from_socket, converted_node.outputs[1])
+
+    def test_convert_anim_driver_node_rolls_back_when_link_migration_fails(self):
+        class _FakeSocket:
+            def __init__(self, node):
+                self.node = node
+                self.links = []
+
+            @property
+            def is_linked(self):
+                return bool(self.links)
+
+        class _FakeLink:
+            def __init__(self, from_socket, to_socket):
+                self.from_node = from_socket.node
+                self.from_socket = from_socket
+                self.to_node = to_socket.node
+                self.to_socket = to_socket
+
+        class _FakeLinks(list):
+            def __init__(self, converted_node):
+                super().__init__()
+                self.converted_node = converted_node
+                self.fail_migration = False
+
+            def new(self, from_socket, to_socket):
+                if self.fail_migration and (
+                    from_socket.node is self.converted_node
+                    or to_socket.node is self.converted_node
+                ):
+                    self.fail_migration = False
+                    raise RuntimeError("injected link failure")
+                link = _FakeLink(from_socket, to_socket)
+                self.append(link)
+                from_socket.links.append(link)
+                to_socket.links.append(link)
+                return link
+
+            def remove(self, link):
+                link.from_socket.links.remove(link)
+                link.to_socket.links.remove(link)
+                super().remove(link)
+
+            def remove_node(self, node):
+                for link in list(self):
+                    if link.from_node is node or link.to_node is node:
+                        self.remove(link)
+
+        class _FakeNode:
+            def __init__(self, bl_idname):
+                self.bl_idname = bl_idname
+                self.bl_label = bl_idname
+                self.name = bl_idname
+                self.label = ""
+                self.location = (0, 0)
+                self.width = 240
+                self.select = False
+                self.inputs = [_FakeSocket(self)]
+                self.outputs = [_FakeSocket(self)]
+
+            def keys(self):
+                return []
+
+        source_node = _FakeNode("SSMTNode_AnimDriver_ForwardPlay")
+        converted_node = _FakeNode("SSMTNode_AnimDriver_PingPong")
+        upstream_node = _FakeNode("Upstream")
+        downstream_node = _FakeNode("Downstream")
+
+        class _FakeNodes(list):
+            def __init__(self, tree):
+                super().__init__()
+                self.tree = tree
+                self.active = source_node
+
+            def new(self, type):
+                self.append(converted_node)
+                return converted_node
+
+            def remove(self, node):
+                self.tree.links.remove_node(node)
+                super().remove(node)
+
+        tree = types.SimpleNamespace(bl_idname="SSMTBlueprintTreeType")
+        tree.links = _FakeLinks(converted_node)
+        tree.nodes = _FakeNodes(tree)
+        tree.nodes.extend([upstream_node, source_node, downstream_node])
+        tree.links.new(upstream_node.outputs[0], source_node.inputs[0])
+        tree.links.new(source_node.outputs[0], downstream_node.inputs[0])
+        tree.links.fail_migration = True
+
+        original_selector = node_menu_module._get_selected_anim_driver_convertible_node
+        original_copy = node_menu_module._copy_scalar_and_collection_properties
+        original_sync = node_menu_module._sync_anim_driver_conversion_state
+        node_menu_module._get_selected_anim_driver_convertible_node = lambda _tree: source_node
+        node_menu_module._copy_scalar_and_collection_properties = lambda *_args: None
+        node_menu_module._sync_anim_driver_conversion_state = lambda *_args: None
+
+        try:
+            operator = node_menu_module.SSMT_OT_ConvertAnimDriverNode()
+            reports = []
+            operator.report = lambda kinds, message: reports.append((kinds, message))
+            context = types.SimpleNamespace(
+                space_data=types.SimpleNamespace(edit_tree=tree, node_tree=None)
+            )
+
+            result = operator.execute(context)
+        finally:
+            node_menu_module._get_selected_anim_driver_convertible_node = original_selector
+            node_menu_module._copy_scalar_and_collection_properties = original_copy
+            node_menu_module._sync_anim_driver_conversion_state = original_sync
+
+        self.assertEqual(result, {'CANCELLED'})
+        self.assertIn(source_node, tree.nodes)
+        self.assertNotIn(converted_node, tree.nodes)
+        self.assertEqual(len(tree.links), 2)
+        self.assertIs(source_node.inputs[0].links[0].from_socket, upstream_node.outputs[0])
+        self.assertIs(downstream_node.inputs[0].links[0].from_socket, source_node.outputs[0])
+        self.assertTrue(any("已回滚" in message for _kinds, message in reports))
+
+    def test_convert_anim_driver_node_pingpong_to_forward_preserves_driven_variables(self):
+        class _FakeSocket:
+            def __init__(self, node, name, identifier):
+                self.node = node
+                self.name = name
+                self.identifier = identifier
+                self.links = []
+
+            @property
+            def is_linked(self):
+                return bool(self.links)
+
+        class _FakeLink:
+            def __init__(self, from_socket, to_socket):
+                self.from_node = from_socket.node
+                self.from_socket = from_socket
+                self.to_node = to_socket.node
+                self.to_socket = to_socket
+
+        class _FakeLinks(list):
+            def new(self, from_socket, to_socket):
+                if getattr(to_socket, "links", None):
+                    raise RuntimeError("target socket already linked")
+                link = _FakeLink(from_socket, to_socket)
+                self.append(link)
+                from_socket.links.append(link)
+                to_socket.links.append(link)
+                return link
+
+            def remove(self, link):
+                if link in link.from_socket.links:
+                    link.from_socket.links.remove(link)
+                if link in link.to_socket.links:
+                    link.to_socket.links.remove(link)
+                super().remove(link)
+
+            def remove_node(self, node):
+                remaining = []
+                for link in list(self):
+                    if link.from_node == node or link.to_node == node:
+                        if link in link.from_socket.links:
+                            link.from_socket.links.remove(link)
+                        if link in link.to_socket.links:
+                            link.to_socket.links.remove(link)
+                        continue
+                    remaining.append(link)
+                self[:] = remaining
+
+        class _FakeNodeCollection(list):
+            def __init__(self, tree):
+                super().__init__()
+                self._tree = tree
+                self.active = None
+
+            def new(self, type):
+                node = self._tree._new_node_factory(type)
+                node.id_data = self._tree
+                self.append(node)
+                return node
+
+            def remove(self, node):
+                self._tree.links.remove_node(node)
+                super().remove(node)
+
+        class _FakeLocation:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+            def copy(self):
+                return _FakeLocation(self.x, self.y)
+
+        class _FakeAnimNode:
+            def __init__(self, bl_idname, bl_label, name, input_defs, output_defs):
+                self.bl_idname = bl_idname
+                self.bl_label = bl_label
+                self.name = name
+                self.label = f"Label:{name}"
+                self.location = _FakeLocation(40, 80)
+                self.width = 300
+                self.select = False
+                self.inputs = [_FakeSocket(self, socket_name, identifier) for socket_name, identifier in input_defs]
+                self.outputs = [_FakeSocket(self, socket_name, identifier) for socket_name, identifier in output_defs]
+                self._idprops = {}
+                self.update_count = 0
+
+            def keys(self):
+                return self._idprops.keys()
+
+            def __getitem__(self, key):
+                return self._idprops[key]
+
+            def __setitem__(self, key, value):
+                self._idprops[key] = value
+
+            def update(self):
+                self.update_count += 1
+
+        def _copy_anim_driver_fields(source_node, target_node):
+            scalar_fields = [
+                "auto_index",
+                "frame_start",
+                "frame_end",
+                "play_total_duration",
+                "default_paused",
+                "custom_paused_var",
+                "reverse_playback",
+                "loop_playback",
+                "hold_end_value",
+                "use_float_interval",
+                "use_continuous_shapekey_mode",
+                "continuous_target_object",
+                "continuous_shape_key_prefix_filter",
+                "driven_variable",
+                "driven_variable_list_active",
+                "continuous_shape_key_items_active",
+                "assigned_continuous_index_variable_name",
+                "custom_continuous_index_variable_name",
+                "continuous_index_var_initialized",
+            ]
+            for field_name in scalar_fields:
+                setattr(target_node, field_name, getattr(source_node, field_name))
+
+            target_node.driven_variable_list = [
+                types.SimpleNamespace(variable_name=item.variable_name)
+                for item in getattr(source_node, "driven_variable_list", [])
+            ]
+            target_node.continuous_shape_key_items = [
+                types.SimpleNamespace(
+                    shape_key_name=item.shape_key_name,
+                    variable_name=item.variable_name,
+                )
+                for item in getattr(source_node, "continuous_shape_key_items", [])
+            ]
+
+        source_node = _FakeAnimNode(
+            "SSMTNode_AnimDriver_PingPong",
+            "往返播放",
+            "PingPongNode",
+            [("链输入", "src_in_0"), ("时间输入", "src_in_1"), ("驱动输入", "src_in_2")],
+            [("链输出", "src_out_0"), ("时间输出", "src_out_1")],
+        )
+        source_node.select = True
+        source_node.auto_index = 3
+        source_node.frame_start = 0.0
+        source_node.frame_end = 12.0
+        source_node.play_total_duration = 1.25
+        source_node.default_paused = True
+        source_node.custom_paused_var = "$paused_pp"
+        source_node.reverse_playback = False
+        source_node.loop_playback = False
+        source_node.hold_end_value = True
+        source_node.use_float_interval = True
+        source_node.use_continuous_shapekey_mode = False
+        source_node.continuous_target_object = ""
+        source_node.continuous_shape_key_prefix_filter = ""
+        source_node.driven_variable = "$legacy_pingpong"
+        source_node.driven_variable_list = [
+            types.SimpleNamespace(variable_name="$driver_1"),
+            types.SimpleNamespace(variable_name="$driver_2"),
+            types.SimpleNamespace(variable_name="$driver_3"),
+        ]
+        source_node.driven_variable_list_active = 2
+        source_node.continuous_shape_key_items = []
+        source_node.continuous_shape_key_items_active = 0
+        source_node.assigned_continuous_index_variable_name = "continuous_shapekey_frame3"
+        source_node.custom_continuous_index_variable_name = "continuous_shapekey_frame3"
+        source_node.continuous_index_var_initialized = True
+
+        converted_node = _FakeAnimNode(
+            "SSMTNode_AnimDriver_ForwardPlay",
+            "索引播放",
+            "ConvertedForward",
+            [("链输入", "dst_in_0"), ("时间输入", "dst_in_1"), ("驱动输入", "dst_in_2")],
+            [("链输出", "dst_out_0"), ("时间输出", "dst_out_1")],
+        )
+        converted_node.driven_variable_list = []
+        converted_node.continuous_shape_key_items = []
+
+        class _FakeTree:
+            def __init__(self):
+                self.bl_idname = "SSMTBlueprintTreeType"
+                self.links = _FakeLinks()
+                self.nodes = _FakeNodeCollection(self)
+
+            def _new_node_factory(self, type_name):
+                self.last_new_type = type_name
+                return converted_node
+
+        tree = _FakeTree()
+        source_node.id_data = tree
+        tree.nodes.append(source_node)
+
+        original_selector = node_menu_module._get_selected_anim_driver_convertible_node
+        original_copy = node_menu_module._copy_scalar_and_collection_properties
+        node_menu_module._get_selected_anim_driver_convertible_node = lambda _tree: source_node
+        node_menu_module._copy_scalar_and_collection_properties = _copy_anim_driver_fields
+
+        try:
+            operator = node_menu_module.SSMT_OT_ConvertAnimDriverNode()
+            operator.report = lambda *_args, **_kwargs: None
+            context = types.SimpleNamespace(
+                space_data=types.SimpleNamespace(
+                    edit_tree=tree,
+                    node_tree=None,
+                )
+            )
+
+            result = operator.execute(context)
+        finally:
+            node_menu_module._get_selected_anim_driver_convertible_node = original_selector
+            node_menu_module._copy_scalar_and_collection_properties = original_copy
+
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(tree.last_new_type, "SSMTNode_AnimDriver_ForwardPlay")
+        self.assertEqual(converted_node.name, "索引播放")
+        self.assertEqual(converted_node.label, "索引播放")
+        self.assertEqual(converted_node.bl_idname, "SSMTNode_AnimDriver_ForwardPlay")
+        self.assertEqual(converted_node.driven_variable, "$legacy_pingpong")
+        self.assertEqual(
+            [item.variable_name for item in converted_node.driven_variable_list],
+            ["$driver_1", "$driver_2", "$driver_3"],
+        )
+        self.assertEqual(converted_node.driven_variable_list_active, 2)
+        self.assertEqual(converted_node.frame_start, 0.0)
+        self.assertEqual(converted_node.frame_end, 12.0)
+        self.assertEqual(converted_node.play_total_duration, 1.25)
+        self.assertTrue(converted_node.default_paused)
+        self.assertEqual(converted_node.custom_paused_var, "$paused_pp")
+        self.assertFalse(converted_node.loop_playback)
+        self.assertTrue(converted_node.hold_end_value)
+        self.assertEqual(converted_node.update_count, 1)
+
+    def test_convertible_node_selection_prefers_active_node(self):
+        active_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_PingPong",
+            select=True,
+        )
+        other_selected_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ForwardPlay",
+            select=True,
+        )
+        node_tree = types.SimpleNamespace(
+            nodes=types.SimpleNamespace(
+                active=active_node,
+                __iter__=lambda self: iter([active_node, other_selected_node]),
+            )
+        )
+
+        class _IterableNodes:
+            def __init__(self, active, nodes):
+                self.active = active
+                self._nodes = nodes
+
+            def __iter__(self):
+                return iter(self._nodes)
+
+        node_tree.nodes = _IterableNodes(active_node, [active_node, other_selected_node])
+
+        result = node_menu_module._get_selected_anim_driver_convertible_node(node_tree)
+
+        self.assertIs(result, active_node)
+
+    def test_convertible_node_selection_ignores_deselected_active_node(self):
+        stale_active_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_PingPong",
+            select=False,
+        )
+        selected_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ForwardPlay",
+            select=True,
+        )
+
+        class _IterableNodes:
+            def __init__(self):
+                self.active = stale_active_node
+
+            def __iter__(self):
+                return iter([stale_active_node, selected_node])
+
+        node_tree = types.SimpleNamespace(nodes=_IterableNodes())
+
+        result = node_menu_module._get_selected_anim_driver_convertible_node(node_tree)
+
+        self.assertIs(result, selected_node)
+
     def test_runtime_and_pingpong_segments_merge_with_balanced_conditionals(self):
         runtime_node = runtime_module.SSMTNode_AnimDriver_Runtime()
         runtime_node.name = "Runtime"

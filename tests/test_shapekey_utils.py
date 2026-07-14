@@ -177,6 +177,10 @@ class _FakeMatrix3:
 
 
 class _FakeMatrix:
+    def __iter__(self):
+        import numpy as _np
+        return iter(_np.eye(4).tolist())
+
     def copy(self):
         return self
 
@@ -191,9 +195,10 @@ class _FakeMatrix:
     def decompose(self):
         return ((0.0, 0.0, 0.0), _FakeQuaternion(), _FakeVector())
 
-    def __array__(self, dtype=None):
+    def __array__(self, dtype=None, copy=None):
         import numpy as _np
-        return _np.eye(4, dtype=dtype if dtype is not None else float)
+        matrix = _np.eye(4, dtype=dtype if dtype is not None else float)
+        return matrix.copy() if copy is True else matrix
 
 
 class ShapeKeyUtilsTests(unittest.TestCase):

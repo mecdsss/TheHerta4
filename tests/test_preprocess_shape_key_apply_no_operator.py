@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -135,10 +136,15 @@ class _FakeObjectWithoutShapeKeyRemove(_FakeObject):
 
 
 _fake_view_layer = types.SimpleNamespace(objects=types.SimpleNamespace(active=None), update=lambda: None)
+_fake_scene = types.SimpleNamespace(render=types.SimpleNamespace(use_simplify=True))
 _fake_bpy_data_objects = {}
 _install_module(
     "bpy",
-    context=types.SimpleNamespace(view_layer=_fake_view_layer, evaluated_depsgraph_get=lambda: object()),
+    context=types.SimpleNamespace(
+        view_layer=_fake_view_layer,
+        scene=_fake_scene,
+        evaluated_depsgraph_get=lambda: object(),
+    ),
     data=types.SimpleNamespace(objects=_fake_bpy_data_objects),
     ops=types.SimpleNamespace(object=_FakeOpsObject()),
     path=types.SimpleNamespace(abspath=lambda value: value),
@@ -223,6 +229,54 @@ spec.loader.exec_module(preprocess)
 class PreprocessShapeKeyApplyNoOperatorTests(unittest.TestCase):
     def setUp(self):
         _fake_bpy_data_objects.clear()
+        _fake_scene.render.use_simplify = True
+
+    def test_modifier_validation_uses_type_specific_blender_properties(self):
+        self.assertFalse(preprocess.PreProcessHelper._is_invalid_modifier(
+            types.SimpleNamespace(type="UV_WARP", uv_layer=""),
+        ))
+        self.assertFalse(preprocess.PreProcessHelper._is_invalid_modifier(
+            types.SimpleNamespace(type="VERTEX_WEIGHT_EDIT"),
+        ))
+        self.assertFalse(preprocess.PreProcessHelper._is_invalid_modifier(
+            types.SimpleNamespace(type="VERTEX_WEIGHT_MIX"),
+        ))
+        self.assertTrue(preprocess.PreProcessHelper._is_invalid_modifier(
+            types.SimpleNamespace(type="VERTEX_WEIGHT_PROXIMITY", target=None),
+        ))
+        self.assertFalse(preprocess.PreProcessHelper._is_invalid_modifier(
+            types.SimpleNamespace(type="VERTEX_WEIGHT_PROXIMITY", target=object()),
+        ))
+        self.assertTrue(preprocess.PreProcessHelper._is_invalid_modifier(
+            types.SimpleNamespace(type="NODES", node_group=None),
+        ))
+        self.assertTrue(preprocess.PreProcessHelper._is_invalid_modifier(
+            types.SimpleNamespace(type="CURVE", object=None),
+        ))
+        self.assertTrue(preprocess.PreProcessHelper._is_invalid_modifier(
+            types.SimpleNamespace(type="BOOLEAN", operand_type="OBJECT", object=None),
+        ))
+        self.assertFalse(preprocess.PreProcessHelper._is_invalid_modifier(
+            types.SimpleNamespace(type="BOOLEAN", operand_type="COLLECTION", collection=object()),
+        ))
+
+    def test_apply_modifiers_restores_simplify_after_unexpected_failure(self):
+        with mock.patch.object(
+            preprocess.PreProcessHelper,
+            "_apply_modifiers_with_simplify_disabled",
+            side_effect=RuntimeError("boom"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                preprocess.PreProcessHelper._apply_modifiers(["Mesh"])
+
+        self.assertTrue(_fake_scene.render.use_simplify)
+
+    def test_apply_modifiers_strict_mode_reports_missing_objects(self):
+        with self.assertRaisesRegex(RuntimeError, "MissingMesh: object not found"):
+            preprocess.PreProcessHelper._apply_modifiers_with_simplify_disabled(
+                ["MissingMesh"],
+                fail_on_error=True,
+            )
 
     def test_apply_shape_keys_uses_object_api_without_bpy_operator(self):
         basis_coords = [(0.0, 0.0, 0.0), (1.0, 1.0, 1.0)]

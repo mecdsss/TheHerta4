@@ -119,6 +119,13 @@ class VertexGroupCleanupTests(unittest.TestCase):
         self.assertEqual(removed_count, 1)
         self.assertEqual([group.name for group in obj.vertex_groups], ["A", "C"])
 
+    def test_remove_all_vertex_groups_does_not_skip_live_collection_items(self):
+        obj = _FakeObject(["A", "B", "C", "D"], [])
+
+        VertexGroupUtils.remove_all_vertex_groups(obj)
+
+        self.assertEqual(list(obj.vertex_groups), [])
+
     def test_clean_vertex_groups_with_zero_cleanup_uses_single_lookup_per_object(self):
         obj = _FakeObject(
             ["Keep", "ZeroWeight", "RemoveByName"],

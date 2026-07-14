@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -49,7 +50,18 @@ _fake_bpy = types.SimpleNamespace(
     utils=types.SimpleNamespace(register_class=lambda _cls: None, unregister_class=lambda _cls: None),
 )
 _install_module("bpy", **_fake_bpy.__dict__)
-_install_module(f"{PKG}.blueprint.node_postprocess_base", SSMTNode_PostProcess_Base=object)
+_install_module(
+    f"{PKG}.blueprint.node_postprocess_base",
+    SSMTNode_PostProcess_Base=type(
+        "_FakePostProcessBase",
+        (object,),
+        {
+            "split_auto_appended_tail_content": staticmethod(
+                lambda content: (content, "")
+            ),
+        },
+    ),
+)
 _install_module(f"{PKG}.blueprint.direct_export", sync_shapekey_direct_mode=lambda *_args, **_kwargs: None)
 _install_module(
     f"{PKG}.blueprint.variable_registry",
@@ -90,6 +102,7 @@ _install_module(
     BlueprintExportHelper=types.SimpleNamespace(
         collect_connected_start_nodes=lambda tree: _helper_state["collect_connected_start_nodes"](tree),
         get_current_blueprint_model=lambda: _helper_state["blueprint_model"],
+        _resolve_shapekey_object_in_scene=lambda name: _fake_bpy.data.objects.get(name),
     ),
 )
 
@@ -214,6 +227,151 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
         self.assertEqual(node._compute_dispatch_group_count(16, threads_per_group=16), 1)
         self.assertEqual(node._compute_dispatch_group_count(17, threads_per_group=16), 2)
         self.assertEqual(node._compute_dispatch_group_count(128, threads_per_group=64), 2)
+
+    def test_parse_ini_for_draw_info_follows_run_block_for_draw_and_outer_ib(self):
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        base_path = str(Path("E:/mod"))
+        sections = {
+            "[Resource_DrawIB]": [
+                "filename = Meshes0000/body.ib",
+            ],
+            "[CustomShader_Test]": [
+                "handling = skip",
+                "drawindexed = 36,12,0",
+            ],
+            "[TextureOverride_Test]": [
+                "ib = ref Resource_DrawIB",
+                "; [mesh:Body]",
+                "if $Body_ps_replace == 1",
+                "    run = CustomShader_Test",
+                "else",
+                "    run = CustomShader_Test",
+                "endif",
+            ],
+        }
+
+        draw_info = node._parse_ini_for_draw_info(sections, base_path)
+
+        self.assertIn("Body", draw_info)
+        self.assertEqual(draw_info["Body"][0]["draw_params"], (36, 12, 0))
+        self.assertEqual(
+            draw_info["Body"][0]["ib_path"],
+            str(Path(base_path) / "Meshes0000" / "body.ib"),
+        )
+
+    def test_parse_ini_for_draw_info_follows_nested_run_path_for_ib_lookup(self):
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        base_path = str(Path("E:/mod"))
+        sections = {
+            "[Resource_DrawIB]": [
+                "filename = Meshes0000/body_nested.ib",
+            ],
+            "[CommandList_IB]": [
+                "ib = ref Resource_DrawIB",
+            ],
+            "[CustomShader_Final]": [
+                "handling = skip",
+                "drawindexed = 48,24,0",
+            ],
+            "[CommandList_DrawWrapper]": [
+                "run = CommandList_IB",
+                "run = CustomShader_Final",
+            ],
+            "[TextureOverride_Test]": [
+                "; [mesh:BodyNested]",
+                "run = CommandList_DrawWrapper",
+            ],
+        }
+
+        draw_info = node._parse_ini_for_draw_info(sections, base_path)
+
+        self.assertIn("BodyNested", draw_info)
+        self.assertEqual(draw_info["BodyNested"][0]["draw_params"], (48, 24, 0))
+        self.assertEqual(
+            draw_info["BodyNested"][0]["ib_path"],
+            str(Path(base_path) / "Meshes0000" / "body_nested.ib"),
+        )
+
+    def test_parse_ini_for_draw_info_reads_ib_from_same_run_section_as_draw(self):
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        base_path = str(Path("E:/mod"))
+        sections = {
+            "[Resource_DrawIB]": [
+                "filename = Meshes0000/body_same_run.ib",
+            ],
+            "[CommandList_Draw]": [
+                "ib = ref Resource_DrawIB",
+                "drawindexed = 60,30,0",
+            ],
+            "[TextureOverride_Test]": [
+                "; [mesh:BodySameRun]",
+                "run = CommandList_Draw",
+            ],
+        }
+
+        draw_info = node._parse_ini_for_draw_info(sections, base_path)
+
+        self.assertIn("BodySameRun", draw_info)
+        self.assertEqual(draw_info["BodySameRun"][0]["draw_params"], (60, 30, 0))
+        self.assertEqual(
+            draw_info["BodySameRun"][0]["ib_path"],
+            str(Path(base_path) / "Meshes0000" / "body_same_run.ib"),
+        )
+
+    def test_parse_ini_for_draw_info_resolves_case_insensitive_compact_assignments(self):
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        base_path = str(Path("E:/mod"))
+        sections = {
+            "[RESOURCE_DRAWIB]": [
+                "FILENAME=Meshes0000/body_case.ib",
+            ],
+            "[customshader_draw]": [
+                "DRAWINDEXED=72,36,0",
+            ],
+            "[TextureOverride_Test]": [
+                "IB=ref resource_drawib",
+                "; [mesh:BodyCase]",
+                "RUN=CUSTOMSHADER_DRAW",
+            ],
+        }
+
+        draw_info = node._parse_ini_for_draw_info(sections, base_path)
+
+        self.assertEqual(draw_info["BodyCase"][0]["draw_params"], (72, 36, 0))
+        self.assertEqual(
+            draw_info["BodyCase"][0]["ib_path"],
+            str(Path(base_path) / "Meshes0000" / "body_case.ib"),
+        )
+
+    def test_parse_draw_command_rejects_non_numeric_geometry_parameters(self):
+        node = module.SSMTNode_PostProcess_ShapeKey()
+
+        self.assertIsNone(node._parse_draw_command_line("drawindexed = $count,12,0"))
+        self.assertIsNone(
+            node._parse_draw_command_line(
+                "drawindexedinstanced = 36,INSTANCE_COUNT,$offset,0,FIRST_INSTANCE"
+            )
+        )
+
+    def test_ini_read_write_preserves_namespace_preamble_with_lf(self):
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ini_path = Path(tmpdir) / "test.ini"
+            ini_path.write_bytes(
+                b"namespace = Example\\Mod\n; header\n\n[Constants]\nglobal $x = 1\n"
+            )
+
+            sections, tail = node._read_ini_to_ordered_dict(str(ini_path))
+            node._write_ordered_dict_to_ini(sections, str(ini_path), tail)
+
+            first_output = ini_path.read_bytes()
+            sections, tail = node._read_ini_to_ordered_dict(str(ini_path))
+            node._write_ordered_dict_to_ini(sections, str(ini_path), tail)
+
+            output = ini_path.read_bytes()
+            self.assertEqual(output, first_output)
+            self.assertIn(b"namespace = Example\\Mod\n; header\n\n[Constants]", output)
+            self.assertNotIn(b"\r", output)
 
     def test_update_shader_file_optimized_mode_skips_vertex_range_definitions(self):
         node = module.SSMTNode_PostProcess_ShapeKey()

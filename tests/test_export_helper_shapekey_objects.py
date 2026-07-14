@@ -156,6 +156,33 @@ class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
 
         self.assertEqual(result, ["Body"])
 
+    def test_resolve_shapekey_object_strips_suffixes_after_virtual_name_resolution(self):
+        body = types.SimpleNamespace(name="Body")
+        _fake_bpy.data.objects["Body"] = body
+        export_helper.ObjectPrefixHelper.resolve_source_object_name = (
+            lambda name: "Body_chain1_copy" if name == "Hash.Body_chain1_copy" else name
+        )
+
+        result = export_helper.BlueprintExportHelper._resolve_shapekey_object_in_scene(
+            "Hash.Body_chain1_copy"
+        )
+
+        self.assertIs(result, body)
+
+    def test_collect_shapekey_objects_uses_combined_suffix_resolution(self):
+        body = types.SimpleNamespace(name="Body")
+        _fake_bpy.data.objects["Body"] = body
+        export_helper.ObjectPrefixHelper.resolve_source_object_name = (
+            lambda name: "Body_chain1_copy" if name == "Hash.Body_chain1_copy" else name
+        )
+        export_helper.BlueprintExportHelper.collect_connected_object_names = staticmethod(
+            lambda _tree: ["Hash.Body_chain1_copy"]
+        )
+
+        result = export_helper.BlueprintExportHelper.collect_shapekey_objects(object())
+
+        self.assertEqual(result, ["Body"])
+
     def test_ntmi_result_output_enables_shapekey_postprocess_scan(self):
         """测试 NTMI 结果输出节点启用形态键后处理扫描"""
         shapekey_node = _FakeNode("ShapeKeyPP", "SSMTNode_PostProcess_ShapeKey")

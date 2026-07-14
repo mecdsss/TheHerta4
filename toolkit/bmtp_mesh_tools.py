@@ -620,15 +620,6 @@ class BMTP_OT_CleanUselessShapeKeys(bpy.types.Operator):
     bl_description = "清理选中物体中没有效果的形态键（顶点位置与基础形态键几乎一致）；对于顶点位置几乎相同的多个形态键，只保留第一个"
     bl_options = {'REGISTER', 'UNDO'}
 
-    threshold: FloatProperty(
-        name="判定阈值",
-        description="顶点坐标差值的最大允许值，超过该值才视为有效变形。值越大，判定越宽松，更多看似没动的形态键会被清理",
-        default=1e-4,
-        min=0.0,
-        soft_max=1.0,
-        precision=6,
-    )
-
     @classmethod
     def poll(cls, context):
         return True
@@ -637,7 +628,7 @@ class BMTP_OT_CleanUselessShapeKeys(bpy.types.Operator):
         total_removed = 0
         total_duplicates_removed = 0
         processed_objects = 0
-        threshold = float(self.threshold)
+        threshold = float(context.scene.bmtp_props.shapekey_cleanup_threshold)
         
         for obj in context.selected_objects:
             if obj.type != 'MESH':

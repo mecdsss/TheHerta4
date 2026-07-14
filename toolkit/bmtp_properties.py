@@ -83,6 +83,24 @@ class BMTP_Properties(bpy.types.PropertyGroup):
     wt_use_armature_positions: bpy.props.BoolProperty(name="使用骨骼位置", default=False,
                                                        description="在传递权重时使用骨骼修改器变形后的位置（需要模型有骨骼修改器）")
                                        
+    wt_merge_vertex_groups: bpy.props.CollectionProperty(type=BMTP_UL_VertexGroupItem, name="合并顶点组列表")
+    wt_merge_vertex_groups_index: bpy.props.IntProperty(name="合并顶点组列表索引", default=0)
+    wt_merge_source_object: bpy.props.PointerProperty(
+        name="合并列表所属物体",
+        type=bpy.types.Object,
+        options={'HIDDEN'},
+    )
+    wt_merge_source_object_name: bpy.props.StringProperty(
+        name="合并列表所属物体",
+        default="",
+        options={'HIDDEN'},
+    )
+    wt_merge_target_name: bpy.props.StringProperty(
+        name="合并后顶点组名",
+        default="",
+        description="留空时使用列表中第一个选中的顶点组作为目标组"
+    )
+
     wt_smooth_factor: bpy.props.FloatProperty(
         name="平滑系数",
         description="平滑操作的强度",
@@ -169,6 +187,15 @@ class BMTP_Properties(bpy.types.PropertyGroup):
         name="合并后按距离 0.00001 合并顶点",
         default=False,
         description="开启后会焊接重合顶点，但不保证后续能完美恢复原始网格",
+    )
+
+    shapekey_cleanup_threshold: bpy.props.FloatProperty(
+        name="形态键清理阈值",
+        description="顶点坐标差值的最大允许值，超过该值才视为有效变形。值越大，判定越宽松，更多看似没动的形态键会被清理",
+        default=1e-4,
+        min=0.0,
+        soft_max=1.0,
+        precision=6,
     )
 
 

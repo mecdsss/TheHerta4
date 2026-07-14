@@ -42,7 +42,19 @@ _fake_bpy = types.SimpleNamespace(
     utils=types.SimpleNamespace(register_class=lambda _cls: None, unregister_class=lambda _cls: None),
 )
 _install_module("bpy", **_fake_bpy.__dict__)
-_install_module(f"{PKG}.blueprint.node_postprocess_base", SSMTNode_PostProcess_Base=object)
+_install_module(
+    f"{PKG}.blueprint.node_postprocess_base",
+    SSMTNode_PostProcess_Base=type(
+        "_FakePostProcessBase",
+        (object,),
+        {
+            "AUTO_APPENDED_SECTION_MARKERS": (
+                "; --- AUTO-APPENDED SLIDER CONTROL PANEL ---",
+                "; --- AUTO-APPENDED HEALTH DETECTION MODULE ---",
+            ),
+        },
+    ),
+)
 _install_module(
     f"{PKG}.utils.log_utils",
     LOG=types.SimpleNamespace(
@@ -636,6 +648,167 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.process_texture_override_section("[TextureOverride_Test]", sections, ...)
             override_lines = sections["[TextureOverride_Test]"]
             self.assertIn("ps-t2 = ResourceTexture_14076dfb_4893_310857_T7", override_lines)
+
+    def test_transparency_moves_complete_shader_replace_conditional_block(self):
+        obj = _FakeObject("Body_透明0.5", {}, ["ImportedObject_Material"])
+        _fake_bpy.data.objects[obj.name] = obj
+        sections = OrderedDict([
+            ("[TextureOverride_Test]", [
+                f"[mesh:{obj.name}]",
+                "if $Rain_ps_replace == 1",
+                "    run = CustomShader_Rain_World",
+                "else",
+                "    run = CustomShader_Rain_Normal",
+                "endif",
+            ]),
+            ("_config_path", ""),
+        ])
+        transparency_sections = OrderedDict()
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        node.name = "MaterialNode"
+        node.material_to_resource_override = False
+        node.material_switch_var = "$swapkey150"
+
+        node.process_texture_override_section(
+            "[TextureOverride_Test]",
+            sections,
+            material_group_to_swapkey={},
+            swap_key_prefix="$swapkey",
+            next_swap_key_num=150,
+            used_swap_keys=set(),
+            transparency_sections_to_add=transparency_sections,
+        )
+
+        override_lines = sections["[TextureOverride_Test]"]
+        self.assertEqual(len(override_lines), 2)
+        self.assertTrue(override_lines[1].startswith("run = CustomShaderTransparencyCloth"))
+        moved_lines = next(iter(transparency_sections.values()))
+        self.assertEqual(moved_lines[-1], "endif")
+        self.assertEqual(
+            sum(line.strip().startswith("if ") for line in moved_lines),
+            sum(line.strip() == "endif" for line in moved_lines),
+        )
+
+    def test_transparency_keeps_distinct_blocks_for_duplicate_mesh_names(self):
+        obj = _FakeObject("Body_透明0.5", {}, ["ImportedObject_Material"])
+        _fake_bpy.data.objects[obj.name] = obj
+        sections = OrderedDict([
+            ("[TextureOverride_Test]", [
+                f"[mesh:{obj.name}]",
+                "drawindexed = 3,0,0",
+                f"[mesh:{obj.name}]",
+                "drawindexed = 6,3,0",
+            ]),
+            ("_config_path", ""),
+        ])
+        transparency_sections = OrderedDict()
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        node.name = "MaterialNode"
+        node.material_to_resource_override = False
+        node.material_switch_var = "$swapkey150"
+
+        node.process_texture_override_section(
+            "[TextureOverride_Test]",
+            sections,
+            material_group_to_swapkey={},
+            swap_key_prefix="$swapkey",
+            next_swap_key_num=150,
+            used_swap_keys=set(),
+            transparency_sections_to_add=transparency_sections,
+        )
+
+        self.assertEqual(len(transparency_sections), 2)
+        moved_lines = [line for block in transparency_sections.values() for line in block]
+        self.assertIn("drawindexed = 3,0,0", moved_lines)
+        self.assertIn("drawindexed = 6,3,0", moved_lines)
+        run_targets = [
+            line.split("=", 1)[1].strip()
+            for line in sections["[TextureOverride_Test]"]
+            if line.startswith("run = CustomShaderTransparencyCloth")
+        ]
+        self.assertEqual(len(run_targets), 2)
+        self.assertEqual(len(set(run_targets)), 2)
+
+    def test_transparency_avoids_existing_custom_shader_section_name(self):
+        obj = _FakeObject("Body_透明0.5", {}, ["ImportedObject_Material"])
+        _fake_bpy.data.objects[obj.name] = obj
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        base_name, _value = node.extract_transparency_info_from_mesh_name(obj.name)
+        sections = OrderedDict([
+            ("[TextureOverride_Test]", [
+                f"[mesh:{obj.name}]",
+                "drawindexed = 3,0,0",
+            ]),
+            (f"[{base_name}]", ["handling = skip"]),
+            ("_config_path", ""),
+        ])
+        transparency_sections = OrderedDict()
+        node.name = "MaterialNode"
+        node.material_to_resource_override = False
+        node.material_switch_var = "$swapkey150"
+
+        node.process_texture_override_section(
+            "[TextureOverride_Test]",
+            sections,
+            material_group_to_swapkey={},
+            swap_key_prefix="$swapkey",
+            next_swap_key_num=150,
+            used_swap_keys=set(),
+            transparency_sections_to_add=transparency_sections,
+        )
+
+        self.assertEqual(list(transparency_sections), [f"{base_name}_2"])
+        self.assertIn(f"run = {base_name}_2", sections["[TextureOverride_Test]"])
+
+    def test_previous_transparency_tail_is_replaced_without_losing_auto_appended_tail(self):
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        auto_marker = node.AUTO_APPENDED_SECTION_MARKERS[0]
+        transparency_name = "CustomShaderTransparencyClothBody_透明0.5"
+        content = (
+            "[TextureOverride_Test]\n"
+            "hash = abc\n"
+            "[mesh:Body_透明0.5]\n"
+            f"run = {transparency_name}\n\n"
+            f"{node.TRANSPARENCY_SECTION_MARKER}\n"
+            f"[{transparency_name}]\n"
+            "blend = ADD BLEND_FACTOR INV_BLEND_FACTOR\n"
+            "handling = skip\n"
+            "; --- Start of Overridden Mesh Content ---\n"
+            "drawindexed = 3,0,0\n\n"
+            f"{auto_marker}\n"
+            "[CommandListTail]\n"
+            "run = CommandListTail\n"
+        )
+
+        stripped = node._strip_previous_transparency_sections(content)
+
+        self.assertNotIn(f"run = {transparency_name}", stripped)
+        self.assertNotIn(f"[{transparency_name}]", stripped)
+        self.assertIn("drawindexed = 3,0,0", stripped)
+        self.assertIn(auto_marker, stripped)
+        self.assertIn("[CommandListTail]", stripped)
+
+    def test_ini_parser_preserves_namespace_preamble(self):
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+
+        preamble, sections = node._parse_ini_content(
+            "namespace = Example\\Mod\n; header\n\n[Constants]\nglobal $x = 1\n"
+        )
+
+        self.assertEqual(preamble, ["namespace = Example\\Mod", "; header", ""])
+        self.assertEqual(sections["[Constants]"], ["global $x = 1"])
+
+    def test_ini_serialization_is_idempotent_with_namespace_preamble(self):
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        content = "namespace = Example\\Mod\n; header\n\n[Constants]\nglobal $x = 1\n"
+
+        preamble, sections = node._parse_ini_content(content)
+        first_output = node._serialize_ini_content(preamble, sections)
+        preamble, sections = node._parse_ini_content(first_output)
+        second_output = node._serialize_ini_content(preamble, sections)
+
+        self.assertEqual(second_output, first_output)
+        self.assertIn("namespace = Example\\Mod\n; header\n\n[Constants]", second_output)
 
 
 if __name__ == "__main__":

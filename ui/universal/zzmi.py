@@ -67,15 +67,27 @@ class ExportZZMI(ExportUnity):
                 section.append(drawindexed_str)
             return
 
-        normal_drawcalls = [d for d in drawcall_list if d.obj_name not in self.shader_replace_object_names]
-        sr_drawcalls = [d for d in drawcall_list if d.obj_name in self.shader_replace_object_names]
+        resolved_drawcalls = [
+            (
+                drawcall,
+                M_IniHelper.get_draw_call_shader_replace_info_list(
+                    drawcall,
+                    shader_replace_object_names=self.shader_replace_object_names,
+                    shader_replace_object_info_map=self.shader_replace_object_info_map,
+                    shader_replace_info_list=self.shader_replace_info_list,
+                ),
+            )
+            for drawcall in drawcall_list
+        ]
+        for dc, obj_infos in resolved_drawcalls:
+            if not obj_infos:
+                for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
+                    [dc],
+                    obj_name_draw_offset_dict=draw_offset_dict,
+                ):
+                    section.append(drawindexed_str)
+                continue
 
-        for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
-            normal_drawcalls, obj_name_draw_offset_dict=draw_offset_dict,
-        ):
-            section.append(drawindexed_str)
-
-        for dc in sr_drawcalls:
             draw_offset = dc.index_offset
             if draw_offset_dict:
                 draw_offset = draw_offset_dict.get(dc.obj_name, dc.index_offset)
@@ -83,11 +95,6 @@ class ExportZZMI(ExportUnity):
             # 输出物体标识注释（与 get_drawindexed_str_list 格式一致）
             display_name = str(getattr(dc, 'obj_name', '') or '')
             section.append(f"; [mesh:{display_name}] [vertex_count:{dc.vertex_count}]")
-
-            # 仅输出该物体关联的着色器替换节点信息
-            obj_infos = self.shader_replace_object_info_map.get(dc.obj_name, [])
-            if not obj_infos:
-                obj_infos = self.shader_replace_info_list
 
             for info in obj_infos:
                 condition_str = dc.get_condition_str()
@@ -481,11 +488,11 @@ class ExportZZMI(ExportUnity):
 
                         print(f"[CrossIB ZZMI] 跨IB物体数量: {len(cross_ib_drawcalls)}")
                         if cross_ib_drawcalls:
-                            for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
+                            self._append_drawindexed_with_shader_replace(
+                                texture_override_ib_section,
                                 cross_ib_drawcalls,
-                                obj_name_draw_offset_dict=source_drawib_model.obj_name_draw_offset,
-                            ):
-                                texture_override_ib_section.append(drawindexed_str)
+                                source_drawib_model.obj_name_draw_offset,
+                            )
 
                         self._append_target_cross_ib_cleanup(
                             texture_override_ib_section,
@@ -544,6 +551,8 @@ class ExportZZMI(ExportUnity):
                 shader_replace_object_names=self.shader_replace_object_names,
                 draw_call_models=self.blueprint_model.ordered_draw_obj_data_model_list,
                 mod_export_path=GlobalConfig.path_generate_mod_folder(),
+                shader_replace_object_info_map=self.shader_replace_object_info_map,
+                draw_call_offset_map=M_IniHelper.build_draw_call_offset_map(self.drawib_model_list),
             )
 
         ini_builder.save_to_file(os.path.join(GlobalConfig.path_generate_mod_folder(), GlobalConfig.get_workspace_name() + ".ini"))

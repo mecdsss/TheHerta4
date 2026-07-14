@@ -88,25 +88,33 @@ class ExportEFMI:
                 section.append(drawindexed_str)
             return
 
-        normal_drawcalls = [d for d in drawcall_list if d.obj_name not in self.shader_replace_object_names]
-        sr_drawcalls = [d for d in drawcall_list if d.obj_name in self.shader_replace_object_names]
+        resolved_drawcalls = [
+            (
+                drawcall,
+                M_IniHelper.get_draw_call_shader_replace_info_list(
+                    drawcall,
+                    shader_replace_object_names=self.shader_replace_object_names,
+                    shader_replace_object_info_map=self.shader_replace_object_info_map,
+                    shader_replace_info_list=self.shader_replace_info_list,
+                ),
+            )
+            for drawcall in drawcall_list
+        ]
+        for dc, obj_infos in resolved_drawcalls:
+            if not obj_infos:
+                for drawindexed_str in M_IniHelper.get_drawindexed_instanced_str_list(
+                    [dc],
+                    obj_name_draw_offset_dict=draw_offset_dict,
+                ):
+                    section.append(drawindexed_str)
+                continue
 
-        for drawindexed_str in M_IniHelper.get_drawindexed_instanced_str_list(
-            normal_drawcalls, obj_name_draw_offset_dict=draw_offset_dict,
-        ):
-            section.append(drawindexed_str)
-
-        for dc in sr_drawcalls:
             draw_offset = dc.index_offset
             if draw_offset_dict:
                 draw_offset = draw_offset_dict.get(dc.obj_name, dc.index_offset)
 
             display_name = str(getattr(dc, 'obj_name', '') or '')
             section.append(f"; [mesh:{display_name}] [vertex_count:{dc.vertex_count}]")
-
-            obj_infos = self.shader_replace_object_info_map.get(dc.obj_name, [])
-            if not obj_infos:
-                obj_infos = self.shader_replace_info_list
 
             for info in obj_infos:
                 condition_str = dc.get_condition_str()
@@ -232,7 +240,7 @@ class ExportEFMI:
             source_ib_key=source_ib_key
         )
 
-        target_ib_keys = self.cross_ib_source_to_target_dict.get(source_ib_key, [])
+        target_ib_keys = list(self.cross_ib_source_to_target_dict.get(source_ib_key, []) or [])
         if target_ib_key and target_ib_key not in target_ib_keys:
             target_ib_keys.append(target_ib_key)
 
@@ -760,6 +768,8 @@ class ExportEFMI:
                 draw_call_models=self.blueprint_model.ordered_draw_obj_data_model_list,
                 mod_export_path=GlobalConfig.path_generate_mod_folder(),
                 use_instanced_draw=True,
+                shader_replace_object_info_map=self.shader_replace_object_info_map,
+                draw_call_offset_map=M_IniHelper.build_draw_call_offset_map(self.drawib_model_list),
             )
 
         ini_filepath = os.path.join(GlobalConfig.path_generate_mod_folder(), GlobalConfig.get_workspace_name() + ".ini")

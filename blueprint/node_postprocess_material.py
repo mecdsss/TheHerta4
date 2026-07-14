@@ -307,6 +307,116 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
     bl_label = '材质转资源'
     bl_description = '根据场景物体的材质和纹理创建资源引用'
 
+    TRANSPARENCY_SECTION_MARKER = ";MARK:CustomShaderTransparency----------------------------------------------------------"
+
+    @staticmethod
+    def _parse_ini_content(content):
+        preamble_lines = []
+        sections = OrderedDict()
+        current_section = None
+        for line in str(content or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith('[') and stripped.endswith(']'):
+                current_section = stripped
+                sections.setdefault(current_section, [])
+            elif current_section is None:
+                preamble_lines.append(line)
+            elif stripped:
+                sections[current_section].append(line)
+        return preamble_lines, sections
+
+    @classmethod
+    def _serialize_ini_content(
+        cls,
+        preamble_lines,
+        sections,
+        transparency_sections=None,
+        preserved_tail_content="",
+    ):
+        new_content = list(preamble_lines or [])
+        if new_content and sections and new_content[-1].strip():
+            new_content.append('')
+
+        for section_name, lines in sections.items():
+            new_content.append(section_name)
+            new_content.extend(lines)
+            new_content.append('')
+
+        if transparency_sections:
+            new_content.append(f'\n{cls.TRANSPARENCY_SECTION_MARKER}')
+            for shader_name, lines in transparency_sections.items():
+                new_content.append(f"[{shader_name}]")
+                new_content.extend(lines)
+                new_content.append('')
+
+        if preserved_tail_content:
+            new_content.append('')
+            new_content.append(preserved_tail_content)
+
+        return "\n".join(new_content)
+
+    @classmethod
+    def _strip_previous_transparency_sections(cls, content):
+        content = str(content or "")
+        marker_index = content.find(cls.TRANSPARENCY_SECTION_MARKER)
+        if marker_index < 0:
+            return content
+
+        preserved_tail_index = None
+        for marker in cls.AUTO_APPENDED_SECTION_MARKERS:
+            candidate_index = content.find(marker, marker_index + len(cls.TRANSPARENCY_SECTION_MARKER))
+            if candidate_index < 0:
+                continue
+            if preserved_tail_index is None or candidate_index < preserved_tail_index:
+                preserved_tail_index = candidate_index
+
+        generated_tail_end = preserved_tail_index if preserved_tail_index is not None else len(content)
+        generated_tail = content[
+            marker_index + len(cls.TRANSPARENCY_SECTION_MARKER):generated_tail_end
+        ]
+        transparency_bodies = {}
+        current_section_name = ""
+        current_section_lines = []
+
+        def store_current_section():
+            if not current_section_name.startswith("CustomShaderTransparencyCloth"):
+                return
+            body_start = next(
+                (
+                    index + 1
+                    for index, line in enumerate(current_section_lines)
+                    if line.strip() == "; --- Start of Overridden Mesh Content ---"
+                ),
+                None,
+            )
+            if body_start is not None:
+                transparency_bodies[current_section_name.casefold()] = current_section_lines[body_start:]
+
+        for line in generated_tail.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('[') and stripped.endswith(']'):
+                store_current_section()
+                current_section_name = stripped[1:-1].strip()
+                current_section_lines = []
+            elif current_section_name:
+                current_section_lines.append(line)
+        store_current_section()
+
+        restored_prefix_lines = []
+        for line in content[:marker_index].rstrip().splitlines():
+            run_match = re.match(r'^\s*run\s*=\s*([^;]+?)\s*$', line, re.IGNORECASE)
+            run_target = run_match.group(1).strip().casefold() if run_match else ""
+            body_lines = transparency_bodies.get(run_target)
+            if body_lines is None:
+                restored_prefix_lines.append(line)
+            else:
+                restored_prefix_lines.extend(body_lines)
+
+        prefix = "\n".join(restored_prefix_lines).rstrip()
+        if preserved_tail_index is None:
+            return prefix
+        return prefix + "\n\n" + content[preserved_tail_index:]
+
     @staticmethod
     def clear_cache():
         clear_name_mapping_cache()
@@ -1315,8 +1425,18 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             if 'drawindexed' in lines[i]:
                 draw_idx = i
                 break
+
+        # 着色器替换模式下 drawindexed 被移到了 run = 引用的段里，
+        # 此时用 run = 行作为锚点来确定插入位置。
         if draw_idx == -1:
-            return -1
+            run_idx = -1
+            for i in range(mesh_start_index + 1, search_end_idx):
+                stripped = lines[i].strip()
+                if stripped.startswith("run = ") or stripped.startswith("run="):
+                    run_idx = i
+            if run_idx == -1:
+                return -1
+            draw_idx = run_idx
 
         block_depth = 0
         last_endif_idx = -1
@@ -1598,26 +1718,39 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         for mesh_index, mesh_name in reversed(mesh_lines_info_phase2):
             transparency_shader_name, transparency_value = self.extract_transparency_info_from_mesh_name(mesh_name)
             if transparency_shader_name:
-                is_new_section = transparency_shader_name not in transparency_sections_to_add
-                if is_new_section:
-                    transparency_sections_to_add[transparency_shader_name] = [
-                        "blend = ADD BLEND_FACTOR INV_BLEND_FACTOR",
-                        f"blend_factor[0] = {transparency_value}", f"blend_factor[1] = {transparency_value}",
-                        f"blend_factor[2] = {transparency_value}", "blend_factor[3] = 1",
-                        "handling = skip",
-                        "; --- Start of Overridden Mesh Content ---"
-                    ]
+                base_shader_name = transparency_shader_name
+                suffix = 2
+                existing_section_names = {
+                    str(existing_name or "").strip().strip('[]').casefold()
+                    for existing_name in all_sections
+                }
+                generated_section_names = {
+                    str(existing_name or "").casefold()
+                    for existing_name in transparency_sections_to_add
+                }
+                while (
+                    transparency_shader_name.casefold() in generated_section_names
+                    or transparency_shader_name.casefold() in existing_section_names
+                ):
+                    transparency_shader_name = f"{base_shader_name}_{suffix}"
+                    suffix += 1
+                transparency_sections_to_add[transparency_shader_name] = [
+                    "blend = ADD BLEND_FACTOR INV_BLEND_FACTOR",
+                    f"blend_factor[0] = {transparency_value}", f"blend_factor[1] = {transparency_value}",
+                    f"blend_factor[2] = {transparency_value}", "blend_factor[3] = 1",
+                    "handling = skip",
+                    "; --- Start of Overridden Mesh Content ---"
+                ]
                 lines.insert(mesh_index + 1, f"run = {transparency_shader_name}")
                 start_move_idx = mesh_index + 2
-                end_move_idx = -1
+                end_move_idx = len(lines)
                 for i in range(start_move_idx, len(lines)):
-                    if 'drawindexed' in lines[i]:
-                        end_move_idx = i + 1
-                        break
-                    if '[mesh:' in lines[i] or (lines[i].strip().startswith('[') and not lines[i].strip().startswith('[mesh:')):
+                    stripped = lines[i].strip()
+                    if self.extract_mesh_name(lines[i]) or (
+                        stripped.startswith('[') and not stripped.startswith('[mesh:')
+                    ):
                         end_move_idx = i
                         break
-                if end_move_idx == -1: end_move_idx = len(lines)
                 if start_move_idx < end_move_idx:
                     block_to_move = lines[start_move_idx:end_move_idx]
                     filtered_block_to_move = [
@@ -1632,8 +1765,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                                 final_block.append(line)
                         else:
                             final_block.append(line)
-                    if is_new_section:
-                        transparency_sections_to_add[transparency_shader_name].extend(final_block)
+                    transparency_sections_to_add[transparency_shader_name].extend(final_block)
                     del lines[start_move_idx:end_move_idx]
         return next_swap_key_num
 
@@ -1659,20 +1791,11 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             with open(ini_file, 'r', encoding='utf-8') as f:
                 content = f.read()
 
+            content = self._strip_previous_transparency_sections(content)
             preserved_tail_content = ""
             content, preserved_tail_content = self.split_auto_appended_tail_content(content)
 
-            sections = OrderedDict()
-            current_section = None
-            for line in content.splitlines():
-                stripped = line.strip()
-                if stripped.startswith('[') and stripped.endswith(']'):
-                    current_section = stripped
-                    sections[current_section] = []
-                elif not stripped:
-                    continue
-                elif current_section:
-                    sections[current_section].append(line)
+            preamble_lines, sections = self._parse_ini_content(content)
 
             sections['_config_path'] = mod_export_path
 
@@ -1696,25 +1819,15 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
             self.define_swapkeys_in_sections(sections, used_swap_keys)
 
-            new_content = []
-            for section_name, lines in sections.items():
-                new_content.append(section_name)
-                new_content.extend(lines)
-                new_content.append('')
+            new_content = self._serialize_ini_content(
+                preamble_lines,
+                sections,
+                transparency_sections=transparency_sections_to_add,
+                preserved_tail_content=preserved_tail_content,
+            )
 
-            if transparency_sections_to_add:
-                new_content.append('\n;MARK:CustomShaderTransparency----------------------------------------------------------')
-                for shader_name, lines in transparency_sections_to_add.items():
-                    new_content.append(f"[{shader_name}]")
-                    new_content.extend(lines)
-                    new_content.append('')
-
-            if preserved_tail_content:
-                new_content.append('')
-                new_content.append(preserved_tail_content)
-
-            with open(ini_file, 'w', encoding='utf-8') as f:
-                f.write("\n".join(new_content))
+            with open(ini_file, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(new_content)
 
         _LOG.info(f"   ✅ 材质转资源节点执行完成")
 

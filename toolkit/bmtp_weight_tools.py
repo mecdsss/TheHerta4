@@ -1,6 +1,9 @@
 import bpy
 import json
 
+from ..utils.vertexgroup_utils import VertexGroupUtils
+from ..utils.format_utils import Fatal
+
 
 class BMTP_OT_TransferWeights(bpy.types.Operator):
     bl_idname = "toolkit.bmtp_transfer_weights"
@@ -552,10 +555,124 @@ class BMTP_OT_SpreadWeights(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class BMTP_OT_RefreshMergeVertexGroups(bpy.types.Operator):
+    bl_idname = "toolkit.bmtp_refresh_merge_vertex_groups"
+    bl_label = "刷新合并顶点组"
+    bl_description = "刷新当前活动网格物体的顶点组列表，用于顶点组合并"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'MESH'
+
+    def execute(self, context):
+        props = context.scene.bmtp_props
+        obj = context.active_object
+
+        if getattr(props, "wt_merge_source_object", None) is not obj:
+            props.wt_merge_target_name = ""
+        props.wt_merge_source_object = obj
+        props.wt_merge_source_object_name = obj.name
+        props.wt_merge_vertex_groups.clear()
+
+        for index, vg in enumerate(obj.vertex_groups):
+            item = props.wt_merge_vertex_groups.add()
+            item.name = vg.name
+            item.index = index
+            item.selected = False
+
+        props.wt_merge_vertex_groups_index = min(
+            props.wt_merge_vertex_groups_index,
+            max(0, len(props.wt_merge_vertex_groups) - 1)
+        )
+        self.report({'INFO'}, f"已加载 {len(obj.vertex_groups)} 个顶点组用于合并")
+        return {'FINISHED'}
+
+
+class BMTP_OT_SelectMergeVertexGroups(bpy.types.Operator):
+    bl_idname = "toolkit.bmtp_select_merge_vertex_groups"
+    bl_label = "切换合并顶点组选择"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    select: bpy.props.BoolProperty(default=True)
+
+    def execute(self, context):
+        props = context.scene.bmtp_props
+        for item in props.wt_merge_vertex_groups:
+            item.selected = self.select
+
+        self.report({'INFO'}, "已全选顶点组" if self.select else "已全不选顶点组")
+        return {'FINISHED'}
+
+
+class BMTP_OT_MergeVertexGroups(bpy.types.Operator):
+    bl_idname = "toolkit.bmtp_merge_vertex_groups"
+    bl_label = "合并顶点组"
+    bl_description = "将当前活动物体上选中的多个顶点组合并为一个"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'MESH' and getattr(obj, "mode", "OBJECT") == 'OBJECT'
+
+    def execute(self, context):
+        props = context.scene.bmtp_props
+        obj = context.active_object
+
+        if (
+            getattr(props, "wt_merge_source_object", None) is not obj
+            or props.wt_merge_source_object_name != obj.name
+        ):
+            self.report({'ERROR'}, "活动物体已变化，请先刷新合并顶点组列表")
+            return {'CANCELLED'}
+
+        selected_group_names = [item.name for item in props.wt_merge_vertex_groups if item.selected]
+        if len(selected_group_names) < 2:
+            self.report({'ERROR'}, "请至少勾选两个顶点组进行合并")
+            return {'CANCELLED'}
+
+        try:
+            result = VertexGroupUtils.merge_vertex_groups(
+                obj=obj,
+                source_group_names=selected_group_names,
+                target_group_name=props.wt_merge_target_name,
+            )
+        except Fatal as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        except Exception as exc:
+            self.report({'ERROR'}, f"合并顶点组失败: {exc}")
+            return {'CANCELLED'}
+
+        props.wt_merge_target_name = result["target_name"]
+        props.wt_merge_vertex_groups.clear()
+        for index, vg in enumerate(obj.vertex_groups):
+            item = props.wt_merge_vertex_groups.add()
+            item.name = vg.name
+            item.index = index
+            item.selected = (vg.name == result["target_name"])
+        props.wt_merge_vertex_groups_index = min(
+            props.wt_merge_vertex_groups_index,
+            max(0, len(props.wt_merge_vertex_groups) - 1),
+        )
+
+        self.report(
+            {'INFO'},
+            f"已将 {len(selected_group_names)} 个顶点组合并到 '{result['target_name']}'，"
+            f"删除 {result['removed_groups']} 个原顶点组"
+        )
+        return {'FINISHED'}
+
+
 bmtp_weight_tools_list = (
     BMTP_OT_TransferWeights,
     BMTP_OT_RefreshVertexGroups,
     BMTP_OT_SelectAllVertexGroups,
     BMTP_OT_SmoothWeights,
     BMTP_OT_SpreadWeights,
+    BMTP_OT_RefreshMergeVertexGroups,
+    BMTP_OT_SelectMergeVertexGroups,
+    BMTP_OT_MergeVertexGroups,
 )

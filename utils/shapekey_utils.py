@@ -347,7 +347,7 @@ class ShapeKeyUtils:
         if not key_blocks:
             return
 
-        matrix_np = numpy.array(matrix, dtype=numpy.float64)
+        matrix_np = numpy.array([list(row) for row in matrix], dtype=numpy.float64)
         linear = matrix_np[:3, :3]
         translation = matrix_np[:3, 3]
 

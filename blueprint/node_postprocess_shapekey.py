@@ -4,6 +4,7 @@ import glob
 import re
 import shutil
 import struct
+import tempfile
 from collections import OrderedDict, Counter, defaultdict
 
 try:
@@ -69,6 +70,7 @@ def clear_name_mapping_cache():
 
 
 class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
+    INI_PREAMBLE_KEY = "__SSMT_INI_PREAMBLE__"
     bl_idname = 'SSMTNode_PostProcess_ShapeKey'
     bl_label = '形态键配置'
     bl_description = '读取分类文本，生成支持多形态叠加混合的INI配置'
@@ -295,9 +297,12 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return f"${assigned_name}"
 
     def collect_blueprint_shape_key_names(self):
+        from .export_helper import BlueprintExportHelper
         result = set()
         for obj_name in self._iter_connected_source_object_names():
             obj = bpy.data.objects.get(obj_name)
+            if not obj:
+                obj = BlueprintExportHelper._resolve_shapekey_object_in_scene(obj_name)
             if not obj or obj.type != "MESH" or not getattr(obj, "data", None):
                 continue
             shape_keys = getattr(getattr(obj.data, "shape_keys", None), "key_blocks", None)
@@ -357,87 +362,345 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         return result
 
+    @staticmethod
+    def _normalize_ini_section_lookup_key(section_name):
+        normalized_name = str(section_name or "").strip()
+        if normalized_name.startswith('[') and normalized_name.endswith(']'):
+            normalized_name = normalized_name[1:-1].strip()
+        return normalized_name.casefold()
+
+    def _build_ini_section_lookup(self, sections):
+        section_lookup = {}
+        for section_name in sections.keys():
+            normalized_name = self._normalize_ini_section_lookup_key(section_name)
+            if normalized_name and normalized_name not in section_lookup:
+                section_lookup[normalized_name] = section_name
+        return section_lookup
+
+    @staticmethod
+    def _extract_ini_assignment_value(line, key_name):
+        stripped_line = str(line or "").strip()
+        if '=' not in stripped_line:
+            return ""
+        assignment_name, value = stripped_line.split('=', 1)
+        if assignment_name.strip().casefold() != str(key_name or "").strip().casefold():
+            return ""
+        return value.strip()
+
+    @staticmethod
+    def _extract_run_target_name(line):
+        target_name = SSMTNode_PostProcess_ShapeKey._extract_ini_assignment_value(line, "run")
+        if target_name.startswith('[') and target_name.endswith(']'):
+            target_name = target_name[1:-1].strip()
+        return target_name
+
+    def _resolve_run_section_name(self, section_lookup, run_target_name):
+        if not run_target_name:
+            return ""
+        return section_lookup.get(self._normalize_ini_section_lookup_key(run_target_name), "")
+
+    @staticmethod
+    def _parse_draw_command_line(stripped_line):
+        stripped_line = str(stripped_line or "").strip()
+        if '=' not in stripped_line:
+            return None
+        command_name, raw_params = stripped_line.split('=', 1)
+        command_name = command_name.strip().casefold()
+        if command_name not in {'drawindexed', 'drawindexedinstanced'}:
+            return None
+
+        def safe_int_parse(value):
+            try:
+                value = str(value or "").strip()
+                if value.lstrip('-').isdigit():
+                    return int(value)
+            except Exception:
+                pass
+            return None
+
+        parts = [part.strip() for part in raw_params.strip().split(',')]
+        if command_name == 'drawindexedinstanced':
+            if len(parts) < 5:
+                return None
+            draw_params = (
+                safe_int_parse(parts[0]),
+                safe_int_parse(parts[2]),
+                safe_int_parse(parts[3]),
+            )
+        else:
+            if len(parts) != 3:
+                return None
+            draw_params = (
+                safe_int_parse(parts[0]),
+                safe_int_parse(parts[1]),
+                safe_int_parse(parts[2]),
+            )
+        return draw_params if all(value is not None for value in draw_params) else None
+
+    @staticmethod
+    def _resolve_ib_resource_path(resource_map, ib_resource_ref):
+        resource_ref = str(ib_resource_ref or "").strip()
+        if not resource_ref:
+            return None
+
+        if resource_ref.lower().startswith('ref '):
+            resource_ref = resource_ref[4:].strip()
+        if resource_ref.startswith('[') and resource_ref.endswith(']'):
+            resource_ref = resource_ref[1:-1].strip()
+        return resource_map.get(resource_ref.casefold())
+
+    def _resolve_draw_command_from_section(self, sections, section_lookup, section_name, run_path=None, visited_sections=None):
+        if not section_name:
+            return None
+
+        if visited_sections is None:
+            visited_sections = set()
+        if section_name in visited_sections:
+            return None
+
+        visited_sections = set(visited_sections)
+        visited_sections.add(section_name)
+        lines = sections.get(section_name, []) or []
+        current_run_path = list(run_path or [])
+
+        for line_index, line in enumerate(lines):
+            draw_params = self._parse_draw_command_line(line.strip())
+            if draw_params is not None:
+                return {
+                    "draw_params": draw_params,
+                    "draw_section_name": section_name,
+                    "draw_line_index": line_index,
+                    "run_path": current_run_path,
+                }
+
+            run_target_name = self._extract_run_target_name(line)
+            if not run_target_name:
+                continue
+
+            target_section_name = self._resolve_run_section_name(section_lookup, run_target_name)
+            if not target_section_name:
+                continue
+
+            result = self._resolve_draw_command_from_section(
+                sections,
+                section_lookup,
+                target_section_name,
+                run_path=current_run_path + [(section_name, line_index)],
+                visited_sections=visited_sections,
+            )
+            if result is not None:
+                return result
+
+        return None
+
+    def _resolve_draw_command_from_mesh_block(self, sections, section_lookup, section_name, lines, mesh_line_index, block_end_index):
+        for line_index in range(mesh_line_index + 1, block_end_index):
+            draw_params = self._parse_draw_command_line(lines[line_index].strip())
+            if draw_params is not None:
+                return {
+                    "draw_params": draw_params,
+                    "draw_section_name": section_name,
+                    "draw_line_index": line_index,
+                    "run_path": [],
+                }
+
+            run_target_name = self._extract_run_target_name(lines[line_index])
+            if not run_target_name:
+                continue
+
+            target_section_name = self._resolve_run_section_name(section_lookup, run_target_name)
+            if not target_section_name:
+                continue
+
+            result = self._resolve_draw_command_from_section(
+                sections,
+                section_lookup,
+                target_section_name,
+                run_path=[(section_name, line_index)],
+                visited_sections={section_name},
+            )
+            if result is not None:
+                return result
+
+        return None
+
+    def _resolve_ib_path_from_section(self, sections, section_lookup, resource_map, section_name, visited_sections=None):
+        if not section_name:
+            return None
+
+        if visited_sections is None:
+            visited_sections = set()
+        if section_name in visited_sections:
+            return None
+
+        visited_sections = set(visited_sections)
+        visited_sections.add(section_name)
+        lines = sections.get(section_name, []) or []
+
+        for line in lines:
+            ib_resource_ref = self._extract_ini_assignment_value(line, "ib")
+            ib_path = self._resolve_ib_resource_path(resource_map, ib_resource_ref)
+            if ib_path:
+                return ib_path
+
+        for line in lines:
+            run_target_name = self._extract_run_target_name(line)
+            if not run_target_name:
+                continue
+
+            target_section_name = self._resolve_run_section_name(section_lookup, run_target_name)
+            if not target_section_name:
+                continue
+
+            ib_path = self._resolve_ib_path_from_section(
+                sections,
+                section_lookup,
+                resource_map,
+                target_section_name,
+                visited_sections=visited_sections,
+            )
+            if ib_path:
+                return ib_path
+
+        return None
+
+    def _resolve_ib_path_from_anchor(self, sections, section_lookup, resource_map, section_name, anchor_line_index):
+        lines = sections.get(section_name, []) or []
+        anchor_line_index = min(max(int(anchor_line_index or 0), 0), len(lines))
+
+        for line_index in range(anchor_line_index - 1, -1, -1):
+            stripped_line = lines[line_index].strip()
+            if stripped_line.startswith('if ') or stripped_line == 'endif':
+                continue
+
+            ib_resource_ref = self._extract_ini_assignment_value(stripped_line, "ib")
+            ib_path = self._resolve_ib_resource_path(resource_map, ib_resource_ref)
+            if ib_path:
+                return ib_path
+
+            run_target_name = self._extract_run_target_name(stripped_line)
+            if not run_target_name:
+                continue
+
+            target_section_name = self._resolve_run_section_name(section_lookup, run_target_name)
+            if not target_section_name:
+                continue
+
+            ib_path = self._resolve_ib_path_from_section(
+                sections,
+                section_lookup,
+                resource_map,
+                target_section_name,
+                visited_sections={section_name},
+            )
+            if ib_path:
+                return ib_path
+
+        return None
+
     def _parse_ini_for_draw_info(self, sections, base_path):
         draw_info, resource_map = {}, {}
+        section_lookup = self._build_ini_section_lookup(sections)
         for section_name, lines in sections.items():
             if section_name.lower().startswith('[resource'):
-                filename = next((l.split('=', 1)[1].strip() for l in lines if l.strip().lower().startswith('filename =')), None)
-                if filename: resource_map[section_name.strip('[]')] = os.path.join(base_path, filename.replace('/', os.sep))
-        
-        print(f"  [DEBUG] resource_map 键: {list(resource_map.keys())}")
-        
+                filename = next(
+                    (
+                        value
+                        for value in (
+                            self._extract_ini_assignment_value(line, "filename")
+                            for line in lines
+                        )
+                        if value
+                    ),
+                    None,
+                )
+                if filename:
+                    resource_name = self._normalize_ini_section_lookup_key(section_name)
+                    resource_map[resource_name] = os.path.join(base_path, filename.replace('/', os.sep))
+
+        print(f"  [DEBUG] resource_map keys: {list(resource_map.keys())}")
+
         for section_name, lines in sections.items():
-            if section_name.lower().startswith('[textureoverride'):
-                print(f"  [DEBUG] 处理 section: {section_name}")
-                current_mesh_name = None
-                for i, line in enumerate(lines):
-                    stripped_line = line.strip()
-                    
-                    mesh_match = re.search(r'\[mesh:([^\]]+)\]', stripped_line)
-                    if mesh_match:
-                        current_mesh_name = mesh_match.group(1).strip()
-                        print(f"    [DEBUG] 发现 mesh 注释: '{stripped_line}' -> 名称: '{current_mesh_name}'")
-                        continue
-                    
-                    if current_mesh_name:
-                        lower_line = stripped_line.lower()
-                        if lower_line.startswith('drawindexed ') or lower_line.startswith('drawindexedinstanced '):
-                            print(f"    [DEBUG] 发现绘制命令: '{stripped_line}' (mesh: '{current_mesh_name}')")
-                            ib_path = None
-                            
-                            for j in range(i - 1, -1, -1):
-                                prev_line = lines[j].strip()
-                                if prev_line.startswith('if ') or prev_line == 'endif':
-                                    continue
-                                if prev_line.lower().startswith('ib ='):
-                                    ib_resource_ref = prev_line.split('=', 1)[1].strip()
-                                    if ib_resource_ref.lower().startswith('ref '):
-                                        ib_resource_name = ib_resource_ref[4:].strip()
-                                    else:
-                                        ib_resource_name = ib_resource_ref
-                                    print(f"      [DEBUG] 向上找到 IB: '{prev_line}' -> 资源名: '{ib_resource_name}'")
-                                    if ib_resource_name in resource_map:
-                                        ib_path = resource_map[ib_resource_name]
-                                        print(f"      [DEBUG] IB 路径: '{ib_path}'")
-                                    else:
-                                        print(f"      [DEBUG] 警告: IB 资源 '{ib_resource_name}' 不在 resource_map 中")
-                                    break
-                            
+            if not section_name.lower().startswith('[textureoverride'):
+                continue
+
+            print(f"  [DEBUG] processing section: {section_name}")
+            for mesh_line_index, line in enumerate(lines):
+                stripped_line = line.strip()
+                mesh_match = re.search(r'\[mesh:([^\]]+)\]', stripped_line)
+                if not mesh_match:
+                    continue
+
+                current_mesh_name = mesh_match.group(1).strip()
+                print(f"    [DEBUG] found mesh comment: '{stripped_line}' -> name: '{current_mesh_name}'")
+
+                block_end_index = len(lines)
+                for next_index in range(mesh_line_index + 1, len(lines)):
+                    if re.search(r'\[mesh:([^\]]+)\]', lines[next_index].strip()):
+                        block_end_index = next_index
+                        break
+
+                resolved_draw = self._resolve_draw_command_from_mesh_block(
+                    sections,
+                    section_lookup,
+                    section_name,
+                    lines,
+                    mesh_line_index,
+                    block_end_index,
+                )
+                if resolved_draw is None:
+                    print(f"    [WARNING] draw command not found, skip mesh: '{current_mesh_name}'")
+                    continue
+
+                draw_params = resolved_draw.get("draw_params")
+                draw_section_name = resolved_draw.get("draw_section_name", "")
+                draw_line_index = resolved_draw.get("draw_line_index", -1)
+                run_path = list(resolved_draw.get("run_path", []) or [])
+
+                ib_path = None
+                if run_path:
+                    ib_path = self._resolve_ib_path_from_anchor(
+                        sections,
+                        section_lookup,
+                        resource_map,
+                        draw_section_name,
+                        draw_line_index,
+                    )
+                    if not ib_path:
+                        for anchor_section_name, anchor_line_index in reversed(run_path):
+                            ib_path = self._resolve_ib_path_from_anchor(
+                                sections,
+                                section_lookup,
+                                resource_map,
+                                anchor_section_name,
+                                anchor_line_index,
+                            )
                             if ib_path:
-                                try:
-                                    def safe_int_parse(s, default=0):
-                                        try:
-                                            s = s.strip()
-                                            if s.lstrip('-').isdigit():
-                                                return int(s)
-                                            return default
-                                        except:
-                                            return default
-                                    
-                                    if lower_line.startswith('drawindexed '):
-                                        parts = [p.strip() for p in stripped_line.split('=')[1].strip().split(',')]
-                                        if len(parts) == 3:
-                                            index_count = safe_int_parse(parts[0])
-                                            start_index_location = safe_int_parse(parts[1])
-                                            base_vertex_location = safe_int_parse(parts[2])
-                                            info_item = {'draw_params': (index_count, start_index_location, base_vertex_location), 'ib_path': ib_path}
-                                            print(f"    [DEBUG] drawindexed 解析成功: mesh={current_mesh_name}, index_count={index_count}, start_index_location={start_index_location}, base_vertex_location={base_vertex_location}")
-                                    else:
-                                        parts = [p.strip() for p in stripped_line.split('=')[1].strip().split(',')]
-                                        if len(parts) >= 5:
-                                            index_count = safe_int_parse(parts[0])
-                                            start_index_location = safe_int_parse(parts[2])
-                                            base_vertex_location = safe_int_parse(parts[3])
-                                            info_item = {'draw_params': (index_count, start_index_location, base_vertex_location), 'ib_path': ib_path}
-                                            print(f"    [DEBUG] drawindexedinstanced 解析成功: mesh={current_mesh_name}, index_count={index_count}, start_index_location={start_index_location}, base_vertex_location={base_vertex_location}")
-                                    if current_mesh_name not in draw_info:
-                                        draw_info[current_mesh_name] = []
-                                    draw_info[current_mesh_name].append(info_item)
-                                except (ValueError, IndexError) as e:
-                                    print(f"    [WARNING] 解析 draw 命令失败: {e}")
-                            else:
-                                print(f"    [WARNING] 未找到 IB 路径，跳过 mesh: '{current_mesh_name}'")
-                            current_mesh_name = None
+                                break
+                else:
+                    ib_path = self._resolve_ib_path_from_anchor(
+                        sections,
+                        section_lookup,
+                        resource_map,
+                        draw_section_name,
+                        draw_line_index,
+                    )
+
+                if not ib_path:
+                    print(f"    [WARNING] IB path not found, skip mesh: '{current_mesh_name}'")
+                    continue
+
+                print(f"      [DEBUG] resolved IB path: '{ib_path}'")
+                print(
+                    f"    [DEBUG] draw parsed: mesh={current_mesh_name}, "
+                    f"index_count={draw_params[0]}, start_index_location={draw_params[1]}, "
+                    f"base_vertex_location={draw_params[2]}"
+                )
+                draw_info.setdefault(current_mesh_name, []).append({
+                    'draw_params': draw_params,
+                    'ib_path': ib_path,
+                })
+
         return draw_info
 
     def _calculate_vertex_range(self, ib_path, draw_params):
@@ -1066,7 +1329,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return True, hash_to_actual_file_hash
 
     def _read_ini_to_ordered_dict(self, ini_file_path):
-        sections = OrderedDict()
+        sections = OrderedDict([(self.INI_PREAMBLE_KEY, [])])
         current_section = None
         preserved_tail_content = ""
 
@@ -1085,18 +1348,40 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     if current_section not in sections:
                         sections[current_section] = []
                     continue
+                if current_section is None:
+                    sections[self.INI_PREAMBLE_KEY].append(line)
+                    continue
                 if not stripped_line:
                     continue
                 if current_section:
                     sections[current_section].append(line)
         except Exception as e:
-            print(f"读取INI文件失败: {e}")
+            raise RuntimeError(f"读取INI文件失败: {e}") from e
+        if not sections[self.INI_PREAMBLE_KEY]:
+            del sections[self.INI_PREAMBLE_KEY]
         return sections, preserved_tail_content
 
     def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content=""):
+        temp_path = None
+        file_descriptor = None
         try:
-            with open(ini_file_path, 'w', encoding='utf-8') as f:
+            target_path = os.path.abspath(ini_file_path)
+            target_stat = os.stat(target_path)
+            file_descriptor, temp_path = tempfile.mkstemp(
+                dir=os.path.dirname(target_path),
+                prefix=f".{os.path.basename(target_path)}.",
+                suffix=".tmp",
+            )
+            file_object = os.fdopen(file_descriptor, 'w', encoding='utf-8', newline='\n')
+            file_descriptor = None
+            with file_object as f:
                 for section_name, lines in sections.items():
+                    if section_name == self.INI_PREAMBLE_KEY:
+                        for line in lines:
+                            f.write(line + '\n')
+                        if lines and str(lines[-1]).strip():
+                            f.write('\n')
+                        continue
                     if section_name.startswith(';;'):
                         f.write(section_name + '\n')
                     else:
@@ -1108,8 +1393,24 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 if preserved_tail_content:
                     f.write('\n')
                     f.write(preserved_tail_content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(temp_path, target_stat.st_mode)
+            os.replace(temp_path, target_path)
+            temp_path = None
         except Exception as e:
-            print(f"写入INI文件失败: {e}")
+            raise RuntimeError(f"写入INI文件失败: {e}") from e
+        finally:
+            if file_descriptor is not None:
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
+            if temp_path is not None:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
     def _get_vertex_count(self, sections, hash_value):
         for section_name, lines in sections.items():
@@ -1993,6 +2294,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             print(f"生成形态键配置时发生未知错误: {e}")
             import traceback
             traceback.print_exc()
+            raise
 
         print("形态键配置后处理节点执行完成")
 

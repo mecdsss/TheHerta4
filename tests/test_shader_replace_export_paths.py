@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -83,7 +84,14 @@ class _FakeExportUnity:
 
 
 class _FakeDrawCall:
-    def __init__(self, obj_name, *, condition=""):
+    def __init__(
+        self,
+        obj_name,
+        *,
+        condition="",
+        shader_replace_info_list=None,
+        shader_replace_info_resolved=False,
+    ):
         self.obj_name = obj_name
         self.vertex_count = 77
         self.index_count = 12
@@ -91,6 +99,8 @@ class _FakeDrawCall:
         self.match_draw_ib = "drawhash"
         self.match_first_index = "56"
         self._condition = condition
+        self.shader_replace_info_list = list(shader_replace_info_list or [])
+        self.shader_replace_info_resolved = shader_replace_info_resolved
 
     def get_condition_str(self):
         return self._condition
@@ -189,6 +199,23 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         def _record_shader_replace_sections(**kwargs):
             self.shader_replace_section_calls.append(kwargs)
 
+        def _resolve_draw_call_shader_infos(
+            draw_call,
+            shader_replace_object_names=None,
+            shader_replace_object_info_map=None,
+            shader_replace_info_list=None,
+        ):
+            direct_infos = list(getattr(draw_call, "shader_replace_info_list", []) or [])
+            if getattr(draw_call, "shader_replace_info_resolved", False) or direct_infos:
+                return direct_infos
+            if draw_call.obj_name not in (shader_replace_object_names or set()):
+                return []
+            return list(
+                (shader_replace_object_info_map or {}).get(draw_call.obj_name, [])
+                or shader_replace_info_list
+                or []
+            )
+
         _install_module(
             f"{self.pkg}.common.m_ini_helper",
             M_IniHelper=types.SimpleNamespace(
@@ -198,6 +225,7 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
                 get_drawindexed_instanced_str_list=lambda drawcall_list, obj_name_draw_offset_dict=None: [
                     f"drawindexedinstanced = {item.obj_name}" for item in drawcall_list
                 ],
+                get_draw_call_shader_replace_info_list=_resolve_draw_call_shader_infos,
                 get_shader_replace_run_logic=lambda info, ib_hash, first_index, component, index_count, index_offset, base_vertex=0: [
                     f"if ${info['name_prefix']}_ps_replace == 1",
                     f"    run = CustomShader_{info['name_prefix']}_{ib_hash}_{first_index}_{component}_{index_count}_{index_offset}_{base_vertex}_World",
@@ -205,6 +233,7 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
                     f"    run = CustomShader_{info['name_prefix']}_{ib_hash}_{first_index}_{component}_{index_count}_{index_offset}_{base_vertex}_Normal",
                     "endif",
                 ],
+                build_draw_call_offset_map=lambda _drawib_models: {},
                 add_shader_replace_sections=_record_shader_replace_sections,
                 generate_hash_style_texture_ini=lambda **_kwargs: None,
                 generate_shared_slot_style_texture_ini=lambda **_kwargs: None,
@@ -219,6 +248,10 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
             M_IniHelperGUI=types.SimpleNamespace(add_branch_mod_gui_section=lambda **_kwargs: None),
         )
         _install_module(f"{self.pkg}.common.drawib_model", DrawIBModel=object)
+        _install_module(f"{self.pkg}.common.draw_call_model", DrawCallModel=object)
+        _install_module(f"{self.pkg}.common.m_key", M_Key=object)
+        _install_module(f"{self.pkg}.common.logic_name", LogicName=types.SimpleNamespace())
+        _install_module(f"{self.pkg}.common.workspace_helper", WorkSpaceHelper=types.SimpleNamespace())
         _install_module(f"{self.pkg}.common.submesh_model", SubMeshModel=object)
         _install_module(f"{self.pkg}.blueprint.model", BluePrintModel=object)
         _install_module(
@@ -236,6 +269,11 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         _install_module(f"{self.pkg}.common.buffer_export_helper", BufferExportHelper=types.SimpleNamespace())
         _install_module(f"{self.pkg}.ui.universal.unity", ExportUnity=_FakeExportUnity)
         _install_module("bpy", context=types.SimpleNamespace())
+
+        self.actual_m_ini_module = _load_module(
+            f"{self.pkg}.common.m_ini_helper_actual",
+            "common/m_ini_helper.py",
+        )
 
         self.zzmi_module = _load_module(
             f"{self.pkg}.ui.universal.zzmi",
@@ -344,6 +382,440 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         self.assertEqual(call["shader_replace_object_names"], blueprint_model.shader_replace_object_names)
         self.assertEqual(call["draw_call_models"], blueprint_model.ordered_draw_obj_data_model_list)
         self.assertTrue(call["use_instanced_draw"])
+
+    def test_shader_replace_validation_rejects_duplicate_prefixes(self):
+        infos = [
+            {"name_prefix": "Rain", "shaders": [{"variant_name": "World"}]},
+            {"name_prefix": "rain", "shaders": [{"variant_name": "NonWorld"}]},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "名称前缀.*重复"):
+            self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(infos)
+
+    def test_shader_replace_validation_rejects_duplicate_variants(self):
+        infos = [{
+            "name_prefix": "Rain",
+            "shaders": [
+                {"variant_name": "World"},
+                {"variant_name": "world"},
+            ],
+        }]
+
+        with self.assertRaisesRegex(ValueError, "变体名称.*重复"):
+            self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(infos)
+
+    def test_shader_replace_validation_rejects_reserved_normal_variant(self):
+        infos = [{
+            "name_prefix": "Rain",
+            "shaders": [{"variant_name": "normal"}],
+        }]
+
+        with self.assertRaisesRegex(ValueError, "保留名称"):
+            self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(infos)
+
+    def test_shader_replace_validation_rejects_duplicate_hashes_and_multiline_key(self):
+        duplicate_hashes = [{
+            "name_prefix": "Rain",
+            "shaders": [
+                {"variant_name": "World", "shader_hash": "AABB"},
+                {"variant_name": "NonWorld", "shader_hash": "aabb"},
+            ],
+        }]
+        multiline_key = [{
+            "name_prefix": "Rain",
+            "toggle_key": "VK_F5\ntype = hold",
+            "shaders": [{"variant_name": "World"}],
+        }]
+
+        with self.assertRaisesRegex(ValueError, "哈希.*重复"):
+            self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(duplicate_hashes)
+        with self.assertRaisesRegex(ValueError, "快捷键.*换行"):
+            self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(multiline_key)
+
+    def test_shader_replace_validation_rejects_invalid_identifiers_and_hashes(self):
+        invalid_prefix = [{"name_prefix": "Rain Effect", "shaders": [{"variant_name": "World"}]}]
+        invalid_variant = [{"name_prefix": "Rain", "shaders": [{"variant_name": "World]"}]}]
+        invalid_hash = [{
+            "name_prefix": "Rain",
+            "shaders": [{"variant_name": "World", "shader_hash": "not-a-hash"}],
+        }]
+
+        with self.assertRaisesRegex(ValueError, "名称前缀.*非法"):
+            self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(invalid_prefix)
+        with self.assertRaisesRegex(ValueError, "变体名称.*非法"):
+            self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(invalid_variant)
+        with self.assertRaisesRegex(ValueError, "哈希.*非法"):
+            self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(invalid_hash)
+
+    def test_shader_files_with_same_basename_export_to_unique_names(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_a = root / "A" / "shader.txt"
+            source_b = root / "B" / "shader.txt"
+            source_a.parent.mkdir()
+            source_b.parent.mkdir()
+            source_a.write_text("shader-a", encoding="utf-8")
+            source_b.write_text("shader-b", encoding="utf-8")
+            info_a = {
+                "name_prefix": "RainA",
+                "toggle_key": "",
+                "component_index": 0,
+                "shaders": [{
+                    "variant_name": "World",
+                    "shader_hash": "aa",
+                    "env_value": 1,
+                    "shader_file_path": str(source_a),
+                }],
+            }
+            info_b = {
+                "name_prefix": "RainB",
+                "toggle_key": "",
+                "component_index": 0,
+                "shaders": [{
+                    "variant_name": "World",
+                    "shader_hash": "bb",
+                    "env_value": 1,
+                    "shader_file_path": str(source_b),
+                }],
+            }
+            draw_a = _FakeDrawCall("mesh_a", shader_replace_info_list=[info_a])
+            draw_b = _FakeDrawCall("mesh_b", shader_replace_info_list=[info_b])
+            builder = _FakeIniBuilder()
+
+            self.actual_m_ini_module.M_IniHelper.add_shader_replace_sections(
+                ini_builder=builder,
+                shader_replace_info_list=[info_a, info_b],
+                shader_replace_object_names={"mesh_a", "mesh_b"},
+                draw_call_models=[draw_a, draw_b],
+                mod_export_path=temp_dir,
+            )
+
+            self.assertEqual((root / "Shaders" / "RainA_World_aa.txt").read_text(encoding="utf-8"), "shader-a")
+            self.assertEqual((root / "Shaders" / "RainB_World_bb.txt").read_text(encoding="utf-8"), "shader-b")
+            key_sections = [s for s in builder.ini_section_list if s.SectionName.startswith("KeyToggle_")]
+            self.assertEqual(key_sections, [])
+            custom_lines = [
+                line
+                for section in builder.ini_section_list
+                if section.SectionName.startswith("CustomShader_")
+                for line in section.SectionLineList
+            ]
+            self.assertIn("ps = ./Shaders/RainA_World_aa.txt", custom_lines)
+            self.assertIn("ps = ./Shaders/RainB_World_bb.txt", custom_lines)
+
+    def test_missing_shader_file_aborts_section_generation(self):
+        info = {
+            "name_prefix": "Rain",
+            "toggle_key": "",
+            "component_index": 0,
+            "shaders": [{
+                "variant_name": "World",
+                "shader_hash": "aa",
+                "env_value": 1,
+                "shader_file_path": "Z:/missing/shader.txt",
+            }],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(RuntimeError, "文件不存在"):
+                self.actual_m_ini_module.M_IniHelper.add_shader_replace_sections(
+                    ini_builder=_FakeIniBuilder(),
+                    shader_replace_info_list=[info],
+                    shader_replace_object_names={"mesh"},
+                    draw_call_models=[_FakeDrawCall("mesh", shader_replace_info_list=[info])],
+                    mod_export_path=temp_dir,
+                )
+
+    def test_shader_replace_generation_normalizes_whitespace(self):
+        info = {
+            "name_prefix": " Rain ",
+            "toggle_key": "   ",
+            "component_index": 0,
+            "shaders": [{
+                "variant_name": " World ",
+                "shader_hash": " aa ",
+                "env_value": 1,
+                "shader_file_path": "",
+            }],
+        }
+        builder = _FakeIniBuilder()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.actual_m_ini_module.M_IniHelper.add_shader_replace_sections(
+                ini_builder=builder,
+                shader_replace_info_list=[info],
+                shader_replace_object_names={"mesh"},
+                draw_call_models=[_FakeDrawCall("mesh", shader_replace_info_list=[info])],
+                mod_export_path=temp_dir,
+            )
+
+        section_names = [section.SectionName for section in builder.ini_section_list]
+        all_lines = [line for section in builder.ini_section_list for line in section.SectionLineList]
+        self.assertNotIn("KeyToggle_Rain", section_names)
+        self.assertIn("ShaderOverride_RainEnvA_World", section_names)
+        self.assertIn("hash = aa", all_lines)
+        self.assertIn("global persist $Rain_ps_replace = 0", all_lines)
+        self.assertTrue(any(name.startswith("CustomShader_Rain_") for name in section_names))
+        self.assertFalse(any(" Rain " in name or " World " in name for name in section_names))
+
+        run_lines = self.actual_m_ini_module.M_IniHelper.get_shader_replace_run_logic(
+            info,
+            "drawhash",
+            "56",
+            0,
+            12,
+            34,
+        )
+        self.assertTrue(any("CustomShader_Rain_drawhash_56_0_12_34_0_World" in line for line in run_lines))
+
+    def test_draw_call_shader_info_takes_precedence_over_object_fallback(self):
+        info_a = {"name_prefix": "RainA", "component_index": 0, "shaders": []}
+        info_b = {"name_prefix": "RainB", "component_index": 0, "shaders": []}
+        exporter = self.zzmi_module.ExportZZMI(self._make_blueprint_model())
+        exporter.shader_replace_info_list = [info_a, info_b]
+        exporter.shader_replace_object_names = {"shared"}
+        exporter.shader_replace_object_info_map = {"shared": [info_b]}
+        section = _FakeIniSection(_FakeSectionType.TextureOverrideIB)
+
+        exporter._append_drawindexed_with_shader_replace(
+            section,
+            [
+                _FakeDrawCall("shared", shader_replace_info_list=[info_a]),
+                _FakeDrawCall("shared", shader_replace_info_list=[info_b]),
+            ],
+            {},
+        )
+
+        joined = "\n".join(section.SectionLineList)
+        self.assertIn("$RainA_ps_replace", joined)
+        self.assertIn("$RainB_ps_replace", joined)
+
+    def test_same_export_name_keeps_explicit_non_shader_chain_normal(self):
+        info = {
+            "name_prefix": "Rain",
+            "component_index": 0,
+            "shaders": [{"variant_name": "World", "env_value": 1}],
+        }
+        exporter = self.zzmi_module.ExportZZMI(self._make_blueprint_model())
+        exporter.shader_replace_info_list = [info]
+        exporter.shader_replace_object_names = {"shared"}
+        exporter.shader_replace_object_info_map = {"shared": [info]}
+        section = _FakeIniSection(_FakeSectionType.TextureOverrideIB)
+
+        exporter._append_drawindexed_with_shader_replace(
+            section,
+            [
+                _FakeDrawCall(
+                    "shared",
+                    shader_replace_info_list=[],
+                    shader_replace_info_resolved=True,
+                ),
+                _FakeDrawCall(
+                    "shared",
+                    shader_replace_info_list=[info],
+                    shader_replace_info_resolved=True,
+                ),
+            ],
+            {},
+        )
+
+        self.assertEqual(section.SectionLineList.count("drawindexed = shared"), 1)
+        self.assertEqual(
+            sum("CustomShader_Rain_" in line and "_World" in line for line in section.SectionLineList),
+            1,
+        )
+
+    def test_efmi_same_export_name_keeps_explicit_non_shader_chain_normal(self):
+        info = {
+            "name_prefix": "Rain",
+            "component_index": 0,
+            "shaders": [{"variant_name": "World", "env_value": 1}],
+        }
+        exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
+        exporter.has_shader_replace = True
+        exporter.shader_replace_info_list = [info]
+        exporter.shader_replace_object_names = {"shared"}
+        exporter.shader_replace_object_info_map = {"shared": [info]}
+        section = _FakeIniSection(_FakeSectionType.TextureOverrideIB)
+
+        exporter._append_drawindexed_instanced_with_shader_replace(
+            section,
+            [
+                _FakeDrawCall(
+                    "shared",
+                    shader_replace_info_list=[],
+                    shader_replace_info_resolved=True,
+                ),
+                _FakeDrawCall(
+                    "shared",
+                    shader_replace_info_list=[info],
+                    shader_replace_info_resolved=True,
+                ),
+            ],
+            {},
+        )
+
+        self.assertEqual(
+            section.SectionLineList.count("drawindexedinstanced = shared"),
+            1,
+        )
+        self.assertEqual(
+            sum("CustomShader_Rain_" in line and "_World" in line for line in section.SectionLineList),
+            1,
+        )
+
+    def test_shader_replace_preserves_interleaved_draw_call_order(self):
+        info = {
+            "name_prefix": "Rain",
+            "component_index": 0,
+            "shaders": [{"variant_name": "World", "env_value": 1}],
+        }
+        shader_draw = _FakeDrawCall(
+            "shader",
+            shader_replace_info_list=[info],
+            shader_replace_info_resolved=True,
+        )
+        normal_draw = _FakeDrawCall(
+            "normal",
+            shader_replace_info_list=[],
+            shader_replace_info_resolved=True,
+        )
+
+        zzmi_exporter = self.zzmi_module.ExportZZMI(self._make_blueprint_model())
+        zzmi_exporter.shader_replace_info_list = [info]
+        zzmi_exporter.shader_replace_object_names = {"shader"}
+        zzmi_exporter.shader_replace_object_info_map = {"shader": [info]}
+        zzmi_section = _FakeIniSection(_FakeSectionType.TextureOverrideIB)
+        zzmi_exporter._append_drawindexed_with_shader_replace(
+            zzmi_section,
+            [shader_draw, normal_draw],
+            {},
+        )
+
+        efmi_exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
+        efmi_exporter.has_shader_replace = True
+        efmi_exporter.shader_replace_info_list = [info]
+        efmi_exporter.shader_replace_object_names = {"shader"}
+        efmi_exporter.shader_replace_object_info_map = {"shader": [info]}
+        efmi_section = _FakeIniSection(_FakeSectionType.TextureOverrideIB)
+        efmi_exporter._append_drawindexed_instanced_with_shader_replace(
+            efmi_section,
+            [shader_draw, normal_draw],
+            {},
+        )
+
+        self.assertLess(
+            zzmi_section.SectionLineList.index("; [mesh:shader] [vertex_count:77]"),
+            zzmi_section.SectionLineList.index("drawindexed = normal"),
+        )
+        self.assertLess(
+            efmi_section.SectionLineList.index("; [mesh:shader] [vertex_count:77]"),
+            efmi_section.SectionLineList.index("drawindexedinstanced = normal"),
+        )
+
+    def test_shader_sections_use_final_drawib_offset(self):
+        info = {
+            "name_prefix": "Rain",
+            "toggle_key": "",
+            "component_index": 0,
+            "shaders": [{
+                "variant_name": "World",
+                "shader_file_path": "",
+                "shader_hash": "",
+                "env_value": 1,
+            }],
+        }
+        draw_call = _FakeDrawCall(
+            "mesh",
+            shader_replace_info_list=[info],
+            shader_replace_info_resolved=True,
+        )
+        builder = _FakeIniBuilder()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.actual_m_ini_module.M_IniHelper.add_shader_replace_sections(
+                ini_builder=builder,
+                shader_replace_info_list=[info],
+                shader_replace_object_names={"mesh"},
+                draw_call_models=[draw_call],
+                mod_export_path=tmpdir,
+                draw_call_offset_map={id(draw_call): 91},
+            )
+
+        section_names = {section.SectionName for section in builder.ini_section_list}
+        self.assertIn("CustomShader_Rain_drawhash_56_0_12_91_0_World", section_names)
+        self.assertNotIn("CustomShader_Rain_drawhash_56_0_12_34_0_World", section_names)
+
+    def test_shader_export_allows_source_file_already_at_destination(self):
+        builder = _FakeIniBuilder()
+        draw_call = _FakeDrawCall(
+            "mesh",
+            shader_replace_info_resolved=True,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shaders_dir = Path(tmpdir) / "Shaders"
+            shaders_dir.mkdir()
+            shader_path = shaders_dir / "Rain_World_aa.txt"
+            shader_path.write_text("shader", encoding="utf-8")
+            info = {
+                "name_prefix": "Rain",
+                "toggle_key": "",
+                "component_index": 0,
+                "shaders": [{
+                    "variant_name": "World",
+                    "shader_file_path": str(shader_path),
+                    "shader_hash": "aa",
+                    "env_value": 1,
+                }],
+            }
+            draw_call.shader_replace_info_list = [info]
+
+            self.actual_m_ini_module.M_IniHelper.add_shader_replace_sections(
+                ini_builder=builder,
+                shader_replace_info_list=[info],
+                shader_replace_object_names={"mesh"},
+                draw_call_models=[draw_call],
+                mod_export_path=tmpdir,
+            )
+
+            self.assertEqual(shader_path.read_text(encoding="utf-8"), "shader")
+
+    def test_shader_constants_ignore_comments_and_reuse_real_declarations(self):
+        constants = _FakeIniSection(_FakeSectionType.Constants)
+        constants.SectionName = "Constants"
+        constants.append("; global persist $Rain_ps_replace = 0")
+        constants.append("global persist $Rain_env_a = 9")
+        builder = _FakeIniBuilder()
+        builder.append_section(constants)
+        info = {
+            "name_prefix": "Rain",
+            "toggle_key": "",
+            "component_index": 0,
+            "shaders": [],
+        }
+        draw_call = _FakeDrawCall(
+            "mesh",
+            shader_replace_info_list=[info],
+            shader_replace_info_resolved=True,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.actual_m_ini_module.M_IniHelper.add_shader_replace_sections(
+                ini_builder=builder,
+                shader_replace_info_list=[info],
+                shader_replace_object_names={"mesh"},
+                draw_call_models=[draw_call],
+                mod_export_path=tmpdir,
+            )
+
+        self.assertIn("global persist $Rain_ps_replace = 0", constants.SectionLineList)
+        self.assertEqual(
+            sum(
+                line.strip().lower().startswith("global persist $rain_env_a")
+                for line in constants.SectionLineList
+            ),
+            1,
+        )
 
 if __name__ == "__main__":
     unittest.main()
