@@ -730,9 +730,15 @@ class SSMTNode_PostProcess_CrossIB(SSMTNodeBase):
         hlsl_files = [
             'extract_cb1_ps.hlsl',
             'extract_cb1_vs.hlsl',
+            'extract_capture_cb1_vs.hlsl',
             'record_bones_cs.hlsl',
             'redirect_cb1_cs.hlsl'
         ]
+
+        refresh_hlsl_files = {
+            'extract_cb1_vs.hlsl',
+            'extract_capture_cb1_vs.hlsl',
+        }
 
         res_dir = os.path.join(mod_export_path, "res")
         os.makedirs(res_dir, exist_ok=True)
@@ -743,7 +749,7 @@ class SSMTNode_PostProcess_CrossIB(SSMTNodeBase):
             target_file = os.path.join(res_dir, hlsl_file)
 
             if os.path.exists(source_file):
-                if not os.path.exists(target_file):
+                if hlsl_file in refresh_hlsl_files or not os.path.exists(target_file):
                     shutil.copy2(source_file, target_file)
                     print(f"[CrossIB] 已复制: {hlsl_file}")
                     copied_count += 1

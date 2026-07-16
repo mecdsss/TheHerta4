@@ -15,7 +15,7 @@ class ATP_PT_MainPanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="版本: 4.4.18")
+        layout.label(text="版本: 4.4.19")
 
 
 class ATP_PT_ShapeKeyTools(bpy.types.Panel):
@@ -535,4 +535,3 @@ ui_panel_animation_list = (
     ATP_PT_AutomationShapeKeyExport,
     ATP_PT_AutomationBufferMerge,
 )
-

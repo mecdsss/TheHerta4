@@ -4,16 +4,14 @@ struct V2P {
     nointerpolation uint4 raw_bits : TEXCOORD1;
 };
 
-cbuffer CB2 : register(b2) { float4 cb2_data[4096]; };
+cbuffer CaptureCB1 : register(b1) { float4 capture_cb1_data[4096]; };
 
 V2P main(uint id : SV_VertexID) {
     V2P o;
-    // 64x64 紧凑点阵，绝对防止视锥体剔除 (NDC空间内)
     float x = -0.98 + (id % 64) * 0.03;
     float y = -0.98 + (id / 64) * 0.03;
     o.pos = float4(x, y, 0.5, 1.0);
     o.id = id;
-
-    o.raw_bits = asuint(cb2_data[id]);
+    o.raw_bits = asuint(capture_cb1_data[id]);
     return o;
 }

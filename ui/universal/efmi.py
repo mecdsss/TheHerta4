@@ -232,6 +232,58 @@ class ExportEFMI:
 
         return grouped
 
+    @staticmethod
+    def _get_source_cross_ib_variants(vb_condition):
+        """Split the EFMI capture VS from replay VS stages."""
+        condition = str(vb_condition or "").strip()
+        if not condition:
+            return []
+
+        condition_match = re.fullmatch(r"if\s+(.+)", condition, re.IGNORECASE)
+        if not condition_match:
+            return [(condition, "CustomShader_ExtractCB1", 2)]
+
+        filters = []
+        for term in condition_match.group(1).split("||"):
+            term_match = re.fullmatch(
+                r"\s*\(?\s*vs\s*==\s*(\d+)\s*\)?\s*",
+                term,
+                re.IGNORECASE,
+            )
+            if not term_match:
+                return [(condition, "CustomShader_ExtractCB1", 2)]
+            filter_index = int(term_match.group(1))
+            if filter_index not in filters:
+                filters.append(filter_index)
+
+        if 200 not in filters:
+            return [(condition, "CustomShader_ExtractCB1", 2)]
+
+        variants = [("if vs == 200", "CustomShader_ExtractCaptureCB1", 1)]
+        replay_filters = [filter_index for filter_index in filters if filter_index != 200]
+        if replay_filters:
+            replay_condition = "if " + " || ".join(
+                f"vs == {filter_index}" for filter_index in replay_filters
+            )
+            variants.append((replay_condition, "CustomShader_ExtractCB1", 2))
+        return variants
+
+    def _append_source_cross_ib_replay(self, section, vb_condition, objects, source_identifier):
+        for condition, extract_shader, cb_slot in self._get_source_cross_ib_variants(vb_condition):
+            indent = "    " if condition else ""
+            if condition:
+                section.append(condition)
+            section.append(f"{indent}run = {extract_shader}")
+            section.append(f"{indent}cs-t2 = ResourceID_{source_identifier}")
+            section.append(f"{indent}run = CustomShader_RecordBones_{source_identifier}")
+            section.append(f"{indent}run = CustomShader_RedirectCB1_{source_identifier}")
+            section.append(f"{indent}vs-t0 = ResourceFakeT0_SRV_{source_identifier}")
+            section.append(f"{indent}vs-cb{cb_slot} = ResourceFakeCB1_{source_identifier}")
+            section.append(";所有需要跨 Ib 的物体引用")
+            self._append_drawindexed_instanced_with_shader_replace(section, objects, None)
+            if condition:
+                section.append("endif")
+
     def _generate_cross_ib_block_for_source(self, source_identifier, drawcall_model_list, source_ib_key=None, target_ib_key=None):
         lines = []
 
@@ -246,55 +298,41 @@ class ExportEFMI:
 
         grouped_drawcalls = self._group_drawcalls_by_cross_ib_target(cross_ib_drawcalls, source_ib_key, target_ib_keys)
 
+        class _ListSectionAdapter:
+            def __init__(self, target_lines):
+                self._target_lines = target_lines
+
+            def append(self, line):
+                self._target_lines.append(line)
+
+        section_adapter = _ListSectionAdapter(lines)
+
         for (tgt_ib_key, vb_condition), objects in grouped_drawcalls.items():
             if not objects:
                 continue
 
             lines.append(";跨 iB 区域")
-            lines.append(vb_condition)
-            lines.append("    run = CustomShader_ExtractCB1")
-            lines.append(f"    cs-t2 = ResourceID_{source_identifier}")
-            lines.append(f"    run = CustomShader_RecordBones_{source_identifier}")
-            lines.append(f"    run = CustomShader_RedirectCB1_{source_identifier}")
-            lines.append(f"    vs-t0 = ResourceFakeT0_SRV_{source_identifier}")
-            lines.append(f"    vs-cb1 = ResourceFakeCB1_{source_identifier}")
-            lines.append(";所有需要跨 Ib 的物体引用")
-
-            class _ListSectionAdapter:
-                def __init__(self, target_lines):
-                    self._target_lines = target_lines
-
-                def append(self, line):
-                    self._target_lines.append(line)
-
-            self._append_drawindexed_instanced_with_shader_replace(
-                _ListSectionAdapter(lines),
+            self._append_source_cross_ib_replay(
+                section_adapter,
+                vb_condition,
                 objects,
-                None,
+                source_identifier,
             )
-
-            lines.append("endif")
 
         lines.append(";不需要跨 Ib 的物体引用")
 
         if non_cross_ib_drawcalls:
-            class _ListSectionAdapter:
-                def __init__(self, target_lines):
-                    self._target_lines = target_lines
-
-                def append(self, line):
-                    self._target_lines.append(line)
-
             self._append_drawindexed_instanced_with_shader_replace(
-                _ListSectionAdapter(lines),
+                section_adapter,
                 non_cross_ib_drawcalls,
                 None,
             )
 
         lines.append("")
-        lines.append(f"post vs-cb1 = null")
-        lines.append(f"post vs-t0 = null")
-        lines.append(f"post cs-t2 = null")
+        lines.append("post vs-cb1 = null")
+        lines.append("post vs-cb2 = null")
+        lines.append("post vs-t0 = null")
+        lines.append("post cs-t2 = null")
 
         return lines
 
@@ -379,6 +417,19 @@ class ExportEFMI:
         present_section.append("ResourceDumpedCB1_SRV = copy ResourceDumpedCB1_UAV")
         present_section.new_line()
 
+        present_section.append("[CustomShader_ExtractCaptureCB1]")
+        present_section.append("vs = ./res/extract_capture_cb1_vs.hlsl")
+        present_section.append("ps = ./res/extract_cb1_ps.hlsl")
+        present_section.append("ps-u7 = ResourceDumpedCB1_UAV")
+        present_section.append("depth_enable = false")
+        present_section.append("blend = ADD SRC_ALPHA INV_SRC_ALPHA")
+        present_section.append("cull = none")
+        present_section.append("topology = point_list")
+        present_section.append("draw = 4096, 0")
+        present_section.append("ps-u7 = null")
+        present_section.append("ResourceDumpedCB1_SRV = copy ResourceDumpedCB1_UAV")
+        present_section.new_line()
+
         for identifier in sorted(all_identifiers):
             present_section.append(f"[CustomShader_RecordBones_{identifier}]")
             present_section.append("cs = ./res/record_bones_cs.hlsl")
@@ -404,27 +455,19 @@ class ExportEFMI:
             present_section.new_line()
 
         shader_overrides = [
-            ("ShaderOverridevs1000", "241383a9d64b4978", "200"),
-            ("ShaderOverridevs1001", "6733250da4e23fd6", "200"),
-            ("ShaderOverridevs1002", "d66e2204be43808b", "200"),
-            ("ShaderOverridevs1003", "9bac7486f7930a24", "201"),
-            ("ShaderOverridevs1004", "f2c6f6a1e116c2bf", "201"),
-            ("ShaderOverridevs1005", "a33eb5546f729a5d", "201"),
-            ("ShaderOverridevs1006", "1bd133ecc1915893", "201"),
-            ("ShaderOverridevs1007", "b30cc5ad521e0700", "202"),
-            ("ShaderOverridevs1008", "5eb5517c9d2c7e6c", "202"),
-            ("ShaderOverridevs1009", "1eaaa259e9a4285b", "202"),
-            ("ShaderOverridevs1010", "4921f64a7c74226d", "203"),
-            ("ShaderOverridevs1011", "1b835d0e8dbbfb8f", "203"),
-            ("ShaderOverridevs1012", "0742626cbcda30ed", "203"),
-            ("ShaderOverridevs1013", "0ba16985f9f74f8d", "204"),
-            ("ShaderOverridevs1014", "06c94dd56f447210", "204"),
-            ("ShaderOverridevs1015", "f47b1f797f5831d0", "204"),
-            ("ShaderOverridevs1016", "906a3976f3e33cfb", "204"),
-            ("ShaderOverridevs1017", "837329f2db1a1aa7", "202"),
-            ("ShaderOverridevs1018", "7c07eb49eebc45b0", "202"),
-            ("ShaderOverridevs1019", "79f0a91fbaadcbd4", "202"),
-            ("ShaderOverridevs1020", "6c3ac1e2c6ca8ffe", "202"),
+            ("ShaderOverridevs1000", "f11c7e1dbf876a69", "200"),
+            ("ShaderOverridevs1001", "303f45d5266d0369", "201"),
+            ("ShaderOverridevs1002", "7b3a141f99cd9b39", "201"),
+            ("ShaderOverridevs1003", "1479b2b594b9c91a", "202"),
+            ("ShaderOverridevs1004", "c6e55aaa8f4b3218", "202"),
+            ("ShaderOverridevs1005", "784f11ae11c97112", "203"),
+            ("ShaderOverridevs1006", "f1b10202c73c72c3", "204"),
+            ("ShaderOverridevs1007", "12ad3cc5f56f853c", "204"),
+            ("ShaderOverridevs1008", "86cb3bc0a3e2e013", "204"),
+            ("ShaderOverridevs1009", "906a3976f3e33cfb", "204"),
+            ("ShaderOverridevs1010", "0ba16985f9f74f8d", "204"),
+            ("ShaderOverridevs1011", "06c94dd56f447210", "204"),
+            ("ShaderOverridevs1012", "f47b1f797f5831d0", "204"),
         ]
 
         for name, hash_val, filter_idx in shader_overrides:
@@ -628,22 +671,12 @@ class ExportEFMI:
                         continue
 
                     texture_override_ib_section.append(";跨 iB 区域")
-                    texture_override_ib_section.append(vb_condition)
-                    texture_override_ib_section.append("    run = CustomShader_ExtractCB1")
-                    texture_override_ib_section.append(f"    cs-t2 = ResourceID_{current_identifier}")
-                    texture_override_ib_section.append(f"    run = CustomShader_RecordBones_{current_identifier}")
-                    texture_override_ib_section.append(f"    run = CustomShader_RedirectCB1_{current_identifier}")
-                    texture_override_ib_section.append(f"    vs-t0 = ResourceFakeT0_SRV_{current_identifier}")
-                    texture_override_ib_section.append(f"    vs-cb1 = ResourceFakeCB1_{current_identifier}")
-                    texture_override_ib_section.append(";所有需要跨 Ib 的物体引用")
-
-                    self._append_drawindexed_instanced_with_shader_replace(
+                    self._append_source_cross_ib_replay(
                         texture_override_ib_section,
+                        vb_condition,
                         objects,
-                        None,
+                        current_identifier,
                     )
-
-                    texture_override_ib_section.append("endif")
 
                 texture_override_ib_section.append(";不需要跨 Ib 的物体引用")
 
@@ -661,6 +694,7 @@ class ExportEFMI:
 
                 texture_override_ib_section.append("")
                 texture_override_ib_section.append("post vs-cb1 = null")
+                texture_override_ib_section.append("post vs-cb2 = null")
                 texture_override_ib_section.append("post vs-t0 = null")
                 texture_override_ib_section.append("post cs-t2 = null")
 
@@ -689,6 +723,7 @@ class ExportEFMI:
 
                 texture_override_ib_section.append("")
                 texture_override_ib_section.append("post vs-cb1 = null")
+                texture_override_ib_section.append("post vs-cb2 = null")
                 texture_override_ib_section.append("post vs-t0 = null")
                 texture_override_ib_section.append("post cs-t2 = null")
 
@@ -810,16 +845,15 @@ class ExportEFMI:
                 grouped_cross_drawcalls[vb_condition_target].append(drawcall_model)
 
             for vb_condition_target, objects in grouped_cross_drawcalls.items():
-                if not objects:
+                if not objects or not vb_condition_target:
                     continue
 
                 section.append(f";跨 IB 身份块,绘制 {source_identifier} 需要跨 Ib 的物体引用")
-                if vb_condition_target:
-                    section.append(vb_condition_target)
+                section.append(vb_condition_target)
                 section.append(f"    cs-t2 = ResourceID_{source_identifier}")
                 section.append(f"    run = CustomShader_RedirectCB1_{source_identifier}")
                 section.append(f"    vs-t0 = ResourceFakeT0_SRV_{source_identifier}")
-                section.append(f"    vs-cb1 = ResourceFakeCB1_{source_identifier}")
+                section.append(f"    vs-cb2 = ResourceFakeCB1_{source_identifier}")
                 section.append("    ;跨 IB 块数据区域")
 
                 source_unique_str = source_submesh.unique_str
@@ -851,9 +885,15 @@ class ExportEFMI:
         hlsl_files = [
             'extract_cb1_ps.hlsl',
             'extract_cb1_vs.hlsl',
+            'extract_capture_cb1_vs.hlsl',
             'record_bones_cs.hlsl',
             'redirect_cb1_cs.hlsl'
         ]
+
+        refresh_hlsl_files = {
+            'extract_cb1_vs.hlsl',
+            'extract_capture_cb1_vs.hlsl',
+        }
 
         mod_export_path = GlobalConfig.path_generate_mod_folder()
         res_dir = os.path.join(mod_export_path, "res")
@@ -865,7 +905,7 @@ class ExportEFMI:
             target_file = os.path.join(res_dir, hlsl_file)
 
             if os.path.exists(source_file):
-                if not os.path.exists(target_file):
+                if hlsl_file in refresh_hlsl_files or not os.path.exists(target_file):
                     shutil.copy2(source_file, target_file)
                     print(f"[CrossIB] 已复制: {hlsl_file}")
                     copied_count += 1

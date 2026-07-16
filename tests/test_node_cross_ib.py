@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -107,6 +108,38 @@ class CrossIBNodeTests(unittest.TestCase):
 
     def test_cross_ib_set_method_operator_is_registered_in_module_classes(self):
         self.assertIn(node_cross_ib.SSMT_OT_CrossIB_SetMethod, node_cross_ib.classes)
+
+    def test_postprocess_refreshes_existing_extract_shader(self):
+        node = object.__new__(node_cross_ib.SSMTNode_PostProcess_CrossIB)
+
+        with tempfile.TemporaryDirectory() as directory:
+            export_root = Path(directory)
+            extract_shader = export_root / "res" / "extract_cb1_vs.hlsl"
+            extract_shader.parent.mkdir(parents=True)
+            extract_shader.write_text("cbuffer CB1 : register(b1) {}\n", encoding="utf-8")
+            capture_shader = export_root / "res" / "extract_capture_cb1_vs.hlsl"
+            capture_shader.write_text("stale capture shader\n", encoding="utf-8")
+
+            node._copy_hlsl_files(str(export_root))
+
+            refreshed = extract_shader.read_text(encoding="utf-8")
+            refreshed_capture = capture_shader.read_text(encoding="utf-8")
+            copied_hlsl = {path.name for path in (export_root / "res").glob("*.hlsl")}
+
+        self.assertIn("cbuffer CB2 : register(b2)", refreshed)
+        self.assertNotIn("register(b1)", refreshed)
+        self.assertIn("cbuffer CaptureCB1 : register(b1)", refreshed_capture)
+        self.assertNotIn("stale capture shader", refreshed_capture)
+        self.assertEqual(
+            copied_hlsl,
+            {
+                "extract_cb1_ps.hlsl",
+                "extract_cb1_vs.hlsl",
+                "extract_capture_cb1_vs.hlsl",
+                "record_bones_cs.hlsl",
+                "redirect_cb1_cs.hlsl",
+            },
+        )
 
 
 if __name__ == "__main__":

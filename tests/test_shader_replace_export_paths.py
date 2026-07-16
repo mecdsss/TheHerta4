@@ -60,6 +60,7 @@ class _FakeSectionType:
     Key = "Key"
     Present = "Present"
     ShaderReplace = "ShaderReplace"
+    CrossIBPresent = "CrossIBPresent"
 
 
 class _FakeExportUnity:
@@ -351,6 +352,199 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         self.assertIn("drawindexedinstanced = mesh_normal", lines)
         self.assertTrue(any("run = CustomShader_Rain_drawhash_56_0_12_34_0_World" in line for line in lines))
         self.assertFalse(any(line == "drawindexedinstanced = mesh_sr" for line in lines))
+
+    def test_efmi_cross_ib_uses_current_vs_hashes(self):
+        exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
+        exporter.has_cross_ib = True
+        exporter._get_all_cross_ib_identifiers = lambda: {"source"}
+        ini_builder = _FakeIniBuilder()
+
+        exporter._add_cross_ib_present_section(ini_builder)
+
+        lines = ini_builder.ini_section_list[0].SectionLineList
+        hashes = [line.removeprefix("hash = ") for line in lines if line.startswith("hash = ")]
+        section_names = [line for line in lines if line.startswith("[ShaderOverridevs")]
+        self.assertEqual(
+            hashes,
+            [
+                "f11c7e1dbf876a69",
+                "303f45d5266d0369",
+                "7b3a141f99cd9b39",
+                "1479b2b594b9c91a",
+                "c6e55aaa8f4b3218",
+                "784f11ae11c97112",
+                "f1b10202c73c72c3",
+                "12ad3cc5f56f853c",
+                "86cb3bc0a3e2e013",
+                "906a3976f3e33cfb",
+                "0ba16985f9f74f8d",
+                "06c94dd56f447210",
+                "f47b1f797f5831d0",
+            ],
+        )
+        self.assertEqual(
+            section_names,
+            [f"[ShaderOverridevs{index}]" for index in range(1000, 1013)],
+        )
+        self.assertIn("[CustomShader_ExtractCaptureCB1]", lines)
+        capture_section_index = lines.index("[CustomShader_ExtractCaptureCB1]")
+        self.assertEqual(
+            lines[capture_section_index + 1],
+            "vs = ./res/extract_capture_cb1_vs.hlsl",
+        )
+
+        referenced_hlsl = {
+            Path(line.split("=", 1)[1].strip()).name
+            for line in lines
+            if line.lstrip().startswith(("vs =", "ps =", "cs =")) and ".hlsl" in line
+        }
+        expected_hlsl = {
+            "extract_cb1_ps.hlsl",
+            "extract_cb1_vs.hlsl",
+            "extract_capture_cb1_vs.hlsl",
+            "record_bones_cs.hlsl",
+            "redirect_cb1_cs.hlsl",
+        }
+        self.assertEqual(referenced_hlsl, expected_hlsl)
+        source_dir = Path(__file__).resolve().parents[1] / "Toolset" / "old"
+        self.assertTrue(all((source_dir / filename).is_file() for filename in expected_hlsl))
+
+    def test_efmi_cross_ib_splits_capture_cb1_from_cb2_replay(self):
+        exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
+        drawcall = _FakeDrawCall("cross_obj")
+        exporter.cross_ib_source_to_target_dict = {"source": ["target"]}
+        exporter._split_drawcalls_by_cross_ib = lambda *_args, **_kwargs: ([drawcall], [])
+        exporter._group_drawcalls_by_cross_ib_target = (
+            lambda *_args, **_kwargs: {
+                ("target", "if vs == 200 || vs == 201 || vs == 204"): [drawcall]
+            }
+        )
+        exporter._append_drawindexed_instanced_with_shader_replace = (
+            lambda section, *_args, **_kwargs: section.append("drawindexedinstanced = test")
+        )
+
+        source_lines = exporter._generate_cross_ib_block_for_source(
+            "source", [drawcall], source_ib_key="source", target_ib_key="target"
+        )
+
+        self.assertIn("if vs == 200", source_lines)
+        self.assertIn("    run = CustomShader_ExtractCaptureCB1", source_lines)
+        self.assertIn("    vs-cb1 = ResourceFakeCB1_source", source_lines)
+        self.assertIn("if vs == 201 || vs == 204", source_lines)
+        self.assertIn("    run = CustomShader_ExtractCB1", source_lines)
+        self.assertIn("    vs-cb2 = ResourceFakeCB1_source", source_lines)
+        self.assertEqual(source_lines.count("drawindexedinstanced = test"), 2)
+        self.assertIn("post vs-cb1 = null", source_lines)
+        self.assertIn("post vs-cb2 = null", source_lines)
+
+        exporter.cross_ib_match_mode = "IB_HASH"
+        exporter._find_source_submesh_by_ib_key = lambda _key: types.SimpleNamespace(
+            unique_str="source-12-0",
+            drawcall_model_list=[drawcall],
+        )
+        exporter._find_source_drawib_by_ib_key = lambda _key: types.SimpleNamespace(
+            obj_name_draw_offset={}
+        )
+        exporter._get_vb_condition_for_object = lambda *_args, **_kwargs: "if vs == 202"
+        target_section = _FakeIniSection(_FakeSectionType.TextureOverrideIB)
+
+        exporter._append_target_cross_ib_blocks(target_section, ["source_0"], "target_0")
+
+        self.assertIn("    vs-cb2 = ResourceFakeCB1_source", target_section.SectionLineList)
+        self.assertFalse(any("vs-cb1" in line for line in target_section.SectionLineList))
+
+    def test_efmi_cross_ib_single_capture_filter_uses_cb1_only(self):
+        exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
+
+        self.assertEqual(
+            exporter._get_source_cross_ib_variants("if vs == 200"),
+            [("if vs == 200", "CustomShader_ExtractCaptureCB1", 1)],
+        )
+        self.assertEqual(
+            exporter._get_source_cross_ib_variants("if vs == 201 || vs == 204"),
+            [("if vs == 201 || vs == 204", "CustomShader_ExtractCB1", 2)],
+        )
+        self.assertEqual(exporter._get_source_cross_ib_variants(""), [])
+
+        exporter.cross_ib_match_mode = "IB_HASH"
+        exporter._find_source_submesh_by_ib_key = lambda _key: types.SimpleNamespace(
+            unique_str="source-12-0",
+            drawcall_model_list=[_FakeDrawCall("cross_obj")],
+        )
+        exporter._find_source_drawib_by_ib_key = lambda _key: types.SimpleNamespace(
+            obj_name_draw_offset={}
+        )
+        exporter._split_drawcalls_by_cross_ib = lambda *_args, **_kwargs: (
+            [_FakeDrawCall("cross_obj")],
+            [],
+        )
+        exporter._get_vb_condition_for_object = lambda *_args, **_kwargs: ""
+        exporter._append_drawindexed_instanced_with_shader_replace = (
+            lambda section, *_args, **_kwargs: section.append("unexpected draw")
+        )
+        target_section = _FakeIniSection(_FakeSectionType.TextureOverrideIB)
+
+        exporter._append_target_cross_ib_blocks(target_section, ["source_0"], "target_0")
+
+        self.assertEqual(target_section.SectionLineList, [])
+
+    def test_efmi_cross_ib_extract_shader_reads_cb2(self):
+        repo_root = Path(__file__).resolve().parents[1]
+
+        for relative_path in (
+            "Toolset/extract_cb1_vs.hlsl",
+            "Toolset/old/extract_cb1_vs.hlsl",
+        ):
+            shader = (repo_root / relative_path).read_text(encoding="utf-8")
+            self.assertIn("cbuffer CB2 : register(b2)", shader)
+            self.assertIn("asuint(cb2_data[id])", shader)
+            self.assertNotIn("register(b1)", shader)
+            self.assertNotIn("cb1_data", shader)
+
+        for relative_path in (
+            "Toolset/extract_capture_cb1_vs.hlsl",
+            "Toolset/old/extract_capture_cb1_vs.hlsl",
+        ):
+            shader = (repo_root / relative_path).read_text(encoding="utf-8")
+            self.assertIn("cbuffer CaptureCB1 : register(b1)", shader)
+            self.assertIn("asuint(capture_cb1_data[id])", shader)
+            self.assertNotIn("register(b2)", shader)
+
+    def test_efmi_cross_ib_refreshes_existing_extract_shader(self):
+        exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
+        original_mod_folder = self.efmi_module.GlobalConfig.path_generate_mod_folder
+
+        with tempfile.TemporaryDirectory() as directory:
+            export_root = Path(directory)
+            extract_shader = export_root / "res" / "extract_cb1_vs.hlsl"
+            extract_shader.parent.mkdir(parents=True)
+            extract_shader.write_text("cbuffer CB1 : register(b1) {}\n", encoding="utf-8")
+            capture_shader = export_root / "res" / "extract_capture_cb1_vs.hlsl"
+            capture_shader.write_text("stale capture shader\n", encoding="utf-8")
+            self.efmi_module.GlobalConfig.path_generate_mod_folder = lambda: str(export_root)
+            try:
+                exporter._copy_cross_ib_hlsl_files()
+            finally:
+                self.efmi_module.GlobalConfig.path_generate_mod_folder = original_mod_folder
+
+            refreshed = extract_shader.read_text(encoding="utf-8")
+            refreshed_capture = capture_shader.read_text(encoding="utf-8")
+            copied_hlsl = {path.name for path in (export_root / "res").glob("*.hlsl")}
+
+        self.assertIn("cbuffer CB2 : register(b2)", refreshed)
+        self.assertNotIn("register(b1)", refreshed)
+        self.assertIn("cbuffer CaptureCB1 : register(b1)", refreshed_capture)
+        self.assertNotIn("stale capture shader", refreshed_capture)
+        self.assertEqual(
+            copied_hlsl,
+            {
+                "extract_cb1_ps.hlsl",
+                "extract_cb1_vs.hlsl",
+                "extract_capture_cb1_vs.hlsl",
+                "record_bones_cs.hlsl",
+                "redirect_cb1_cs.hlsl",
+            },
+        )
 
     def test_efmi_generate_ini_file_emits_shader_replace_sections(self):
         exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
