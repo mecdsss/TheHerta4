@@ -837,7 +837,6 @@ class M_IniHelper:
                 )
             seen_prefixes[prefix_key] = info_index
 
-            seen_variants = {}
             seen_shader_hashes = {}
             for variant_index, shader in enumerate(info.get('shaders', []) or [], start=1):
                 variant = str(shader.get('variant_name', '') or '').strip()
@@ -863,27 +862,50 @@ class M_IniHelper:
                     )
                 if shader_hash:
                     shader_hash_key = shader_hash.casefold()
-                    previous_hash_index = seen_shader_hashes.get(shader_hash_key)
-                    if previous_hash_index is not None:
+                    previous_hash = seen_shader_hashes.get(shader_hash_key)
+                    if previous_hash is not None and previous_hash[1] != variant.casefold():
                         raise ValueError(
-                            f"着色器替换配置 {info_index} 的哈希 '{shader_hash}' 重复："
-                            f"变体 {previous_hash_index} 与 {variant_index}。"
+                            f"着色器替换配置 {info_index} 的哈希 '{shader_hash}' 同时用于不同变体："
+                            f"变体 {previous_hash[0]} 与 {variant_index}。"
                         )
-                    seen_shader_hashes[shader_hash_key] = variant_index
-                variant_key = variant.casefold()
-                previous_variant_index = seen_variants.get(variant_key)
-                if previous_variant_index is not None:
-                    raise ValueError(
-                        f"着色器替换配置 {info_index} 的变体名称 '{variant}' 重复："
-                        f"变体 {previous_variant_index} 与 {variant_index}。"
-                    )
-                seen_variants[variant_key] = variant_index
+                    seen_shader_hashes[shader_hash_key] = (variant_index, variant.casefold())
 
             toggle_key = str(info.get('toggle_key', '') or '').strip()
             if '\r' in toggle_key or '\n' in toggle_key:
                 raise ValueError(
                     f"着色器替换配置 {info_index} 的快捷键包含非法换行符"
                 )
+
+    @staticmethod
+    def _normalize_shader_replace_shaders(info):
+        """Annotate variants with automatic groups while accepting older node data."""
+        variant_occurrences = {}
+        variant_values = {}
+        normalized = []
+        for shader in info.get('shaders', []) or []:
+            entry = dict(shader)
+            variant = str(entry.get('variant_name', '') or '').strip()
+            variant_key = variant.casefold()
+            inferred_group = variant_occurrences.get(variant_key, 0) + 1
+            variant_occurrences[variant_key] = inferred_group
+            if variant_key not in variant_values:
+                try:
+                    variant_values[variant_key] = int(entry.get('env_value', len(variant_values) + 1))
+                except (TypeError, ValueError):
+                    variant_values[variant_key] = len(variant_values) + 1
+
+            try:
+                group_index = max(1, int(entry.get('group_index', inferred_group)))
+            except (TypeError, ValueError):
+                group_index = inferred_group
+            entry.update({
+                'variant_name': variant,
+                'group_index': group_index,
+                'env_value': variant_values[variant_key],
+                'variant_id': variant if group_index == 1 else f"{variant}_Group{group_index}",
+            })
+            normalized.append(entry)
+        return normalized
 
     @staticmethod
     def get_draw_call_shader_replace_info_list(
@@ -937,8 +959,8 @@ class M_IniHelper:
         """生成着色器替换相关的 INI 段。
 
         生成内容:
-        - CustomShader 段（World / NonWorld / Normal 变体）
-        - KeyToggle 段（开关循环）
+        - CustomShader 段（按替换组区分的着色器变体及 Normal 回退）
+        - KeyToggle 段（原始状态与替换组循环）
         - ShaderOverride 段（基于哈希的自动判定）
 
         Args:
@@ -954,6 +976,16 @@ class M_IniHelper:
             return
 
         cls._validate_shader_replace_info_list(shader_replace_info_list)
+        normalized_shaders = {
+            id(info): cls._normalize_shader_replace_shaders(info)
+            for info in shader_replace_info_list
+        }
+
+        def get_normalized_shaders(info):
+            info_id = id(info)
+            if info_id not in normalized_shaders:
+                normalized_shaders[info_id] = cls._normalize_shader_replace_shaders(info)
+            return normalized_shaders[info_id]
 
         # 复制着色器文件到导出目录
         shaders_dir = os.path.join(mod_export_path, "Shaders")
@@ -961,25 +993,28 @@ class M_IniHelper:
         shader_export_filenames = {}
         for info in shader_replace_info_list:
             prefix = str(info['name_prefix']).strip()
-            for shader_index, shader in enumerate(info['shaders'], start=1):
+            for shader_index, shader in enumerate(get_normalized_shaders(info), start=1):
                 src = str(shader.get('shader_file_path', '') or '').strip()
                 if not src:
                     continue
                 if not os.path.isfile(src):
                     raise RuntimeError(f"着色器替换文件不存在: {src}")
 
-                variant = str(shader.get('variant_name', '') or '').strip()
+                variant = shader['variant_name']
+                variant_id = shader['variant_id']
                 shader_hash = str(shader.get('shader_hash', '') or '').strip()
                 extension = os.path.splitext(src)[1] or ".txt"
                 hash_or_index = shader_hash or str(shader_index)
-                export_filename = f"{prefix}_{variant}_{hash_or_index}{extension}"
+                export_filename = f"{prefix}_{variant_id}_{hash_or_index}{extension}"
                 dst = os.path.join(shaders_dir, export_filename)
                 try:
                     if not (os.path.exists(dst) and os.path.samefile(src, dst)):
                         shutil.copy2(src, dst)
                 except Exception as exc:
                     raise RuntimeError(f"复制着色器替换文件失败: {src} -> {dst}: {exc}") from exc
-                shader_export_filenames[(prefix.casefold(), variant.casefold())] = export_filename
+                shader_export_filenames[
+                    (prefix.casefold(), shader['group_index'], variant.casefold())
+                ] = export_filename
 
         # --- 在 [Constants] 中声明变量 ---
         constants_section = None
@@ -1039,9 +1074,10 @@ class M_IniHelper:
         for info in shader_replace_info_list:
             prefix = str(info.get('name_prefix', '') or '').strip()
             toggle_key = str(info.get('toggle_key', '') or '').strip()
-            shaders = info['shaders']
+            shaders = get_normalized_shaders(info)
             ps_replace_var = f"${prefix}_ps_replace"
             env_a_var = f"${prefix}_env_a"
+            group_count = max((shader['group_index'] for shader in shaders), default=1)
 
             # --- KeyToggle 段（在最上面，去重） ---
             keytoggle_name = f"KeyToggle_{prefix}"
@@ -1051,19 +1087,26 @@ class M_IniHelper:
                 keytoggle_section.SectionName = keytoggle_name
                 keytoggle_section.append(f"key = {toggle_key}")
                 keytoggle_section.append("type = cycle")
-                keytoggle_section.append(f"{ps_replace_var} = 0,1,")
+                cycle_values = ",".join(str(value) for value in range(group_count + 1))
+                keytoggle_section.append(f"{ps_replace_var} = {cycle_values},")
                 keytoggle_section.new_line()
                 ini_builder.append_section(keytoggle_section)
 
             # --- ShaderOverride 段（每个着色器哈希一个，去重） ---
+            override_entries = {}
             for shader in shaders:
                 shader_hash = str(shader.get('shader_hash', '') or '').strip()
-                variant = str(shader.get('variant_name', '') or '').strip()
-                env_value = shader.get('env_value', 1)
                 if not shader_hash:
                     continue
+                override_entries.setdefault(shader_hash.casefold(), []).append(shader)
 
-                so_name = f"ShaderOverride_{prefix}EnvA_{variant}"
+            for hash_entries in override_entries.values():
+                shader = hash_entries[0]
+                shader_hash = str(shader.get('shader_hash', '') or '').strip()
+                variant_id = shader['variant_id']
+                env_value = shader['env_value']
+                active_groups = sorted({entry['group_index'] for entry in hash_entries})
+                so_name = f"ShaderOverride_{prefix}EnvA_{variant_id}"
                 if so_name in generated_override_names:
                     continue
                 generated_override_names.add(so_name)
@@ -1071,8 +1114,13 @@ class M_IniHelper:
                 so_section.SectionName = so_name
                 so_section.append(f"hash = {shader_hash}")
                 so_section.append("allow_duplicate_hash = overrule")
-                so_section.append(f"if {ps_replace_var} == 1")
+                condition = " || ".join(
+                    f"{ps_replace_var} == {group_index}" for group_index in active_groups
+                )
+                so_section.append(f"if {condition}")
                 so_section.append(f"    {env_a_var} = {env_value}")
+                so_section.append("else")
+                so_section.append(f"    {env_a_var} = 0")
                 so_section.append("endif")
                 so_section.new_line()
                 ini_builder.append_section(so_section)
@@ -1085,7 +1133,7 @@ class M_IniHelper:
             for info in obj_infos:
                 prefix = str(info.get('name_prefix', '') or '').strip()
                 component = info.get('component_index', 0)
-                shaders = info['shaders']
+                shaders = get_normalized_shaders(info)
                 ib_hash = dm.match_draw_ib or "0"
                 first_index = dm.match_first_index if dm.match_first_index else "0"
                 index_count = dm.index_count or 0
@@ -1101,11 +1149,12 @@ class M_IniHelper:
 
                 # 为每个变体生成 CustomShader 段
                 for shader in shaders:
-                    variant = str(shader.get('variant_name', '') or '').strip()
+                    variant = shader['variant_name']
+                    variant_id = shader['variant_id']
                     src = str(shader.get('shader_file_path', '') or '').strip()
                     section_name = cls._build_custom_shader_section_name(
                         prefix, ib_hash, first_index, component,
-                        index_count, index_offset, base_vertex, variant
+                        index_count, index_offset, base_vertex, variant_id
                     )
                     if section_name in generated_section_names:
                         continue
@@ -1113,7 +1162,9 @@ class M_IniHelper:
                     cs_section = M_IniSection(M_SectionType.ShaderReplace)
                     cs_section.SectionName = section_name
                     if src:
-                        filename = shader_export_filenames.get((prefix.casefold(), variant.casefold()))
+                        filename = shader_export_filenames.get(
+                            (prefix.casefold(), shader['group_index'], variant.casefold())
+                        )
                         if not filename:
                             raise RuntimeError(
                                 f"着色器替换文件未准备完成: prefix={prefix}, variant={variant}"
@@ -1145,44 +1196,43 @@ class M_IniHelper:
         返回 None 表示无需替换。
         """
         prefix = str(info.get('name_prefix', '') or '').strip()
-        shaders = info['shaders']
+        shaders = cls._normalize_shader_replace_shaders(info)
         ps_replace_var = f"${prefix}_ps_replace"
         env_a_var = f"${prefix}_env_a"
 
         lines = []
-        lines.append(f"if {ps_replace_var} == 1")
-
         if shaders:
-            for i, shader in enumerate(shaders):
-                variant = str(shader.get('variant_name', '') or '').strip()
-                section_name = cls._build_custom_shader_section_name(
-                    prefix, ib_hash, first_index, component,
-                    index_count, index_offset, base_vertex, variant
-                )
-                if i == 0:
-                    lines.append(f"    if {env_a_var} == {shader.get('env_value', i + 1)}")
-                else:
-                    lines.append(f"    else if {env_a_var} == {shader.get('env_value', i + 1)}")
-                lines.append(f"        run = {section_name}")
-
             normal_name = cls._build_custom_shader_section_name(
                 prefix, ib_hash, first_index, component,
                 index_count, index_offset, base_vertex, "Normal"
             )
-            lines.append("    else")
-            lines.append(f"        run = {normal_name}")
-            lines.append("    endif")
+            groups = {}
+            for shader in shaders:
+                groups.setdefault(shader['group_index'], []).append(shader)
+
+            for group_position, (group_index, group_shaders) in enumerate(sorted(groups.items())):
+                outer_keyword = "if" if group_position == 0 else "else if"
+                lines.append(f"{outer_keyword} {ps_replace_var} == {group_index}")
+                for variant_position, shader in enumerate(group_shaders):
+                    variant_id = shader['variant_id']
+                    section_name = cls._build_custom_shader_section_name(
+                        prefix, ib_hash, first_index, component,
+                        index_count, index_offset, base_vertex, variant_id
+                    )
+                    inner_keyword = "if" if variant_position == 0 else "else if"
+                    lines.append(f"    {inner_keyword} {env_a_var} == {shader['env_value']}")
+                    lines.append(f"        run = {section_name}")
+                lines.append("    else")
+                lines.append(f"        run = {normal_name}")
+                lines.append("    endif")
         else:
             normal_name = cls._build_custom_shader_section_name(
                 prefix, ib_hash, first_index, component,
                 index_count, index_offset, base_vertex, "Normal"
             )
+            lines.append(f"if {ps_replace_var} == 1")
             lines.append(f"    run = {normal_name}")
 
-        normal_name = cls._build_custom_shader_section_name(
-            prefix, ib_hash, first_index, component,
-            index_count, index_offset, base_vertex, "Normal"
-        )
         lines.append("else")
         lines.append(f"    run = {normal_name}")
         lines.append("endif")

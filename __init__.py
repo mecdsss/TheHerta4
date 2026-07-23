@@ -77,7 +77,7 @@ bl_info = {
     "name": "TheHerta4",
     "description": "Blender Plugin of SSMT4",
     "blender": (4, 5, 0),
-    "version": (4, 4, 19),
+    "version": (4, 4, 20),
     "location": "View3D",
     "category": "Generic"
 }
@@ -245,6 +245,5 @@ def unregister():
 
     global_properties.unregister()
     _log_utils.LOG.uninstall_print_hook()
-
 
 

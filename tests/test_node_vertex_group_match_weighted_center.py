@@ -105,6 +105,29 @@ class _FakeObject:
         )
 
 
+class _OffsetMatrix:
+    def __init__(self, offset):
+        self.offset = np.asarray(offset, dtype=np.float32)
+
+    def __matmul__(self, value):
+        return np.asarray(value, dtype=np.float32) + self.offset
+
+
+class _EvaluatedObject:
+    def __init__(self):
+        self.matrix_world = _OffsetMatrix((10.0, 20.0, 30.0))
+        self.mesh = types.SimpleNamespace(
+            vertices=[types.SimpleNamespace(co=np.array((1.0, 2.0, 3.0), dtype=np.float32))]
+        )
+        self.cleared = False
+
+    def to_mesh(self, **_kwargs):
+        return self.mesh
+
+    def to_mesh_clear(self):
+        self.cleared = True
+
+
 class VertexGroupMatchWeightedCenterTests(unittest.TestCase):
     """测试顶点组匹配的加权质心计算：权重大的顶点对质心影响更大"""
 
@@ -125,6 +148,20 @@ class VertexGroupMatchWeightedCenterTests(unittest.TestCase):
         self.assertAlmostEqual(float(cloud["weighted_centroid"][0]), 9.0)
         self.assertAlmostEqual(float(cloud["centroid"][0]), 9.0)
         self.assertGreater(float(cloud["weighted_centroid"][0]), 5.0)
+
+    def test_deformed_positions_use_evaluated_object_world_matrix(self):
+        matcher = module.VertexGroupMatcherOptimized()
+        evaluated = _EvaluatedObject()
+        obj = types.SimpleNamespace(
+            matrix_world=_OffsetMatrix((100.0, 100.0, 100.0)),
+            evaluated_get=lambda _depsgraph: evaluated,
+        )
+        context = types.SimpleNamespace(evaluated_depsgraph_get=lambda: object())
+
+        positions = matcher.get_vertex_positions(obj, use_shape_key=True, context=context)
+
+        np.testing.assert_allclose(positions, [[11.0, 22.0, 33.0]])
+        self.assertTrue(evaluated.cleared)
 
 
 if __name__ == "__main__":

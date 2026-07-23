@@ -102,6 +102,7 @@ pingpong_module = _load_blueprint_module("anim_driver_pingpong")
 runtime_module = _load_blueprint_module("anim_driver_runtime")
 toggle_module = _load_blueprint_module("anim_driver_toggle")
 trigger_module = _load_blueprint_module("anim_driver_trigger")
+accumulative_trigger_module = _load_blueprint_module("anim_driver_accumulative_trigger")
 cond_trigger_module = _load_blueprint_module("anim_driver_conditional_trigger")
 shapekey_seq_module = _load_blueprint_module("anim_driver_shapekey_seq")
 node_menu_module = _load_blueprint_module("node_menu")
@@ -293,6 +294,73 @@ class AnimDriverBaseTests(unittest.TestCase):
 
         self.assertIn("global persist $cond_paused = 1", ini)
         self.assertIn("global persist $cond_state1 = 0", ini)
+
+    def test_accumulative_trigger_stacks_each_matching_condition_dynamically(self):
+        node = accumulative_trigger_module.SSMTNode_AnimDriver_AccumulativeTrigger()
+        node.name = "AccumulativeTrigger"
+        node.auto_index = 1
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.default_paused = True
+        node.custom_paused_var = "$acc_paused"
+        node.accumulator_variable = "$progress"
+        node.condition_list = [
+            types.SimpleNamespace(
+                variable_name="$a", comparison_op="==", compare_value="1", increment_value="0.1"
+            ),
+            types.SimpleNamespace(
+                variable_name="$b", comparison_op="==", compare_value="1", increment_value="0.1"
+            ),
+        ]
+        node.target_list = [
+            types.SimpleNamespace(threshold_value="3", variable_name="$d", trigger_value="1"),
+            types.SimpleNamespace(threshold_value="1", variable_name="$c", trigger_value="1"),
+        ]
+        node._find_runtime_node = lambda: types.SimpleNamespace(fps=30, playback_rate=2)
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("global persist $speed_auto1 = 2", ini)
+        self.assertIn("if $swapvar % $speed_auto1 == 0", ini)
+        self.assertIn("if $a == 1\n            $progress = $progress + 0.1", ini)
+        self.assertIn("if $b == 1\n            $progress = $progress + 0.1", ini)
+        self.assertEqual(ini.count("$progress = $progress + 0.1"), 2)
+        self.assertIn("if $progress >= 1\n                $c = 1", ini)
+        self.assertIn("$accumulative_threshold_state1_1 = 1", ini)
+        self.assertIn("if $progress >= 3\n            $d = 1\n            $progress = 0", ini)
+        self.assertIn("$progress = 0\n            $accumulative_threshold_state1_1 = 0", ini)
+        self.assertEqual(ini.count("$progress = 0"), 2)
+        _assert_balanced_conditionals(self, ini)
+
+    def test_new_accumulative_trigger_is_not_treated_as_legacy_on_reload(self):
+        tree = types.SimpleNamespace(bl_idname='SSMTBlueprintTreeType', nodes=[])
+        node = accumulative_trigger_module.SSMTNode_AnimDriver_AccumulativeTrigger()
+        node.name = "AccumulativeTrigger"
+        node.id_data = tree
+        node.inputs = types.SimpleNamespace(new=lambda *_args, **_kwargs: None)
+        node.outputs = types.SimpleNamespace(new=lambda *_args, **_kwargs: None)
+        tree.nodes.append(node)
+
+        node.init(context=None)
+
+        migration_key = anim_driver_base.SSMTNode_AnimDriver_Base.PLAY_STATE_MIGRATION_KEY
+        self.assertTrue(getattr(node, migration_key))
+
+    def test_accumulative_trigger_keeps_non_finite_thresholds_in_user_order(self):
+        targets = [
+            types.SimpleNamespace(
+                threshold_value="NaN", variable_name="$first", trigger_value="1"
+            ),
+            types.SimpleNamespace(
+                threshold_value="1", variable_name="$second", trigger_value="1"
+            ),
+        ]
+
+        groups = (
+            accumulative_trigger_module.SSMTNode_AnimDriver_AccumulativeTrigger
+            ._group_threshold_targets(targets)
+        )
+
+        self.assertEqual([group["threshold"] for group in groups], ["NaN", "1"])
 
     def test_conditional_trigger_and_mode_resets_when_any_condition_fails(self):
         node = cond_trigger_module.SSMTNode_AnimDriver_ConditionalTrigger()
@@ -1324,6 +1392,7 @@ class AnimDriverBaseTests(unittest.TestCase):
         node_menu_module.draw_node_add_menu(fake_self, fake_context)
 
         self.assertTrue(any(call[1] == "运行时间" for call in calls if call[0] == "node.add_node"))
+        self.assertTrue(any(call[1] == "累计触发" for call in calls if call[0] == "node.add_node"))
         self.assertTrue(any(call[1] == "动画驱动开关" for call in calls if call[0] == "node.add_node"))
 
 

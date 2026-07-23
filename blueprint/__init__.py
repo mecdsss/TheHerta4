@@ -92,6 +92,7 @@ _MODULE_REGISTRY = [
     {"name": "anim_driver_forward_play", "required": False},
     {"name": "anim_driver_pingpong", "required": False},
     {"name": "anim_driver_trigger", "required": False},
+    {"name": "anim_driver_accumulative_trigger", "required": False},
     {"name": "anim_driver_conditional_trigger", "required": False},
     {"name": "anim_driver_toggle", "required": False},
     {"name": "anim_driver_shapekey_seq", "required": False},

@@ -548,7 +548,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         
         return stripped_names
 
-    def find_object_by_mesh_name(self, mesh_name):
+    def find_object_by_mesh_name(self, mesh_name, object_filter=None):
         from ..utils.log_utils import LOG as _LOG
         _LOG.debug(f"[find_object_by_mesh_name] 输入 mesh_name: '{mesh_name}'")
         
@@ -600,6 +600,9 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         for name in potential_names:
             obj = bpy.data.objects.get(name)
             if obj:
+                if object_filter is not None and not object_filter(obj):
+                    _LOG.debug(f"  ⚠️ 找到物体但材质不匹配，继续查找: '{name}'")
+                    continue
                 _LOG.debug(f"  ✅ 找到物体: '{name}'")
                 return obj
             else:
@@ -654,6 +657,9 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             for name in potential_clean_names:
                 obj = bpy.data.objects.get(name)
                 if obj:
+                    if object_filter is not None and not object_filter(obj):
+                        _LOG.debug(f"  ⚠️ 找到物体但材质不匹配，继续查找: '{name}'")
+                        continue
                     _LOG.debug(f"  ✅ 找到物体: '{name}'")
                     return obj
                 else:
@@ -1138,6 +1144,34 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
         return []
 
+    def _object_has_matching_materials(self, obj, ini_mapping):
+        for slot_info in self._collect_modimp_texture_slots(obj).values():
+            texture_type = str(slot_info.get("mark_name", "") or "").strip()
+            if texture_type and texture_type != "FXMap" and self._find_workspace_slot_materials(obj, slot_info):
+                return True
+
+        for param_name, texture_type in ini_mapping.items():
+            param_lower = str(param_name or "").lower()
+            is_supported_param = (
+                param_lower.startswith("ps-t")
+                or param_lower.startswith("resource\\zzmi\\")
+                or param_lower.startswith("resource\\rabbitfx\\")
+            )
+            if not is_supported_param:
+                continue
+            if texture_type == "FXMap" and param_lower.startswith("ps-t"):
+                continue
+            if self.find_matching_materials(obj, texture_type):
+                return True
+
+        if self._collect_ps_texture_slot_materials(obj):
+            return True
+
+        return any(
+            self.find_matching_materials(obj, texture_type)
+            for texture_type in ("Glowmap", "FXMap")
+        )
+
     @staticmethod
     def _build_material_signature(material):
         if not material:
@@ -1520,6 +1554,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             return next_swap_key_num
 
         ini_mapping = self.build_mapping_for_section(lines)
+        material_candidate_filter = lambda candidate: self._object_has_matching_materials(candidate, ini_mapping)
         preserved_ps_slots = set()
         workspace_slots = OrderedDict()
         if getattr(self, "_ntmi_modimp_extra_ps_t2_diffuse_map", False):
@@ -1541,8 +1576,9 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         mesh_lines_info_phase1 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
         
         for insert_index, mesh_name in reversed(mesh_lines_info_phase1):
-            obj = self.find_object_by_mesh_name(mesh_name)
+            obj = self.find_object_by_mesh_name(mesh_name, object_filter=material_candidate_filter)
             if not obj:
+                _LOG.info(f"      找到 '{mesh_name}', 所有候选均未匹配到材质")
                 continue
             if not obj.material_slots:
                 continue
@@ -1744,12 +1780,25 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 lines.insert(mesh_index + 1, f"run = {transparency_shader_name}")
                 start_move_idx = mesh_index + 2
                 end_move_idx = len(lines)
+                conditional_depth = 0
+                draw_seen = False
                 for i in range(start_move_idx, len(lines)):
                     stripped = lines[i].strip()
                     if self.extract_mesh_name(lines[i]) or (
                         stripped.startswith('[') and not stripped.startswith('[mesh:')
                     ):
                         end_move_idx = i
+                        break
+                    if re.match(r'^if\s+', stripped, re.IGNORECASE):
+                        conditional_depth += 1
+                    elif stripped.casefold() == 'endif':
+                        conditional_depth = max(0, conditional_depth - 1)
+
+                    if re.match(r'^drawindexed(?:instanced)?\s*=', stripped, re.IGNORECASE):
+                        draw_seen = True
+
+                    if draw_seen and conditional_depth == 0:
+                        end_move_idx = i + 1
                         break
                 if start_move_idx < end_move_idx:
                     block_to_move = lines[start_move_idx:end_move_idx]

@@ -61,6 +61,7 @@ class _FakeSectionType:
     Present = "Present"
     ShaderReplace = "ShaderReplace"
     CrossIBPresent = "CrossIBPresent"
+    ResourceID = "ResourceID"
 
 
 class _FakeExportUnity:
@@ -362,6 +363,9 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         exporter._add_cross_ib_present_section(ini_builder)
 
         lines = ini_builder.ini_section_list[0].SectionLineList
+        self.assertNotIn("[Present]", lines)
+        self.assertNotIn("ResourcePrev_SRV = ResourceFakeT0_SRV", lines)
+        self.assertIn("[ResourcePrev_SRV]", lines)
         hashes = [line.removeprefix("hash = ") for line in lines if line.startswith("hash = ")]
         section_names = [line for line in lines if line.startswith("[ShaderOverridevs")]
         self.assertEqual(
@@ -406,7 +410,7 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
             "redirect_cb1_cs.hlsl",
         }
         self.assertEqual(referenced_hlsl, expected_hlsl)
-        source_dir = Path(__file__).resolve().parents[1] / "Toolset" / "old"
+        source_dir = Path(__file__).resolve().parents[1] / "Toolset"
         self.assertTrue(all((source_dir / filename).is_file() for filename in expected_hlsl))
 
     def test_efmi_cross_ib_splits_capture_cb1_from_cb2_replay(self):
@@ -493,7 +497,6 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
 
         for relative_path in (
             "Toolset/extract_cb1_vs.hlsl",
-            "Toolset/old/extract_cb1_vs.hlsl",
         ):
             shader = (repo_root / relative_path).read_text(encoding="utf-8")
             self.assertIn("cbuffer CB2 : register(b2)", shader)
@@ -503,7 +506,6 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
 
         for relative_path in (
             "Toolset/extract_capture_cb1_vs.hlsl",
-            "Toolset/old/extract_capture_cb1_vs.hlsl",
         ):
             shader = (repo_root / relative_path).read_text(encoding="utf-8")
             self.assertIn("cbuffer CaptureCB1 : register(b1)", shader)
@@ -546,6 +548,176 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
             },
         )
 
+    def test_efmi_cross_ib_classifier_variants_split_cb_stages(self):
+        variants = self.efmi_module.ExportEFMI._get_source_cross_ib_classifier_variants(
+            "if vs == 200 || vs == 201 || vs == 204 || vs == 205"
+        )
+        self.assertEqual(
+            variants,
+            [
+                ("if vs == 200", "CustomShader_ExtractCB1", 1, [200]),
+                ("if vs == 201 || vs == 204", "CustomShader_ExtractCB2", 2, [201, 204]),
+                ("if vs == 205", "CustomShader_ExtractCB3", 3, [205]),
+            ],
+        )
+        self.assertEqual(
+            self.efmi_module.ExportEFMI._get_source_cross_ib_classifier_variants(""), []
+        )
+
+    def test_efmi_cross_ib_classifier_storage_binding(self):
+        # 204 -> EFFECT
+        section = _FakeIniSection(_FakeSectionType.CrossIBPresent)
+        self.efmi_module.ExportEFMI._append_classifier_storage_binding(section, "    ", [204], "source")
+        self.assertIn("    cs-t2 = ResourceID_source_EFFECT", section.SectionLineList)
+
+        # 201 -> normal
+        section = _FakeIniSection(_FakeSectionType.CrossIBPresent)
+        self.efmi_module.ExportEFMI._append_classifier_storage_binding(section, "    ", [201], "source")
+        self.assertIn("    cs-t2 = ResourceID_source", section.SectionLineList)
+        self.assertNotIn("    cs-t2 = ResourceID_source_EFFECT", section.SectionLineList)
+
+        # 201/204 mixed -> nested if
+        section = _FakeIniSection(_FakeSectionType.CrossIBPresent)
+        self.efmi_module.ExportEFMI._append_classifier_storage_binding(section, "    ", [201, 204], "source")
+        lines = section.SectionLineList
+        self.assertIn("    if vs == 204", lines)
+        self.assertIn("        cs-t2 = ResourceID_source_EFFECT", lines)
+        self.assertIn("    else", lines)
+        self.assertIn("        cs-t2 = ResourceID_source", lines)
+        self.assertIn("    endif", lines)
+
+    def test_efmi_cross_ib_classifier_present_section_has_no_hash_overrides(self):
+        exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
+        exporter.has_cross_ib = True
+        exporter._get_all_cross_ib_identifiers = lambda: {"source"}
+        ini_builder = _FakeIniBuilder()
+
+        exporter._add_cross_ib_classifier_present_section(ini_builder)
+
+        lines = ini_builder.ini_section_list[0].SectionLineList
+        self.assertIn("[CustomShader_ExtractCB1]", lines)
+        self.assertIn("[CustomShader_ExtractCB2]", lines)
+        self.assertIn("[CustomShader_ExtractCB3]", lines)
+        self.assertIn("vs = hlsl/extract_cb1_vs.hlsl", lines)
+        self.assertIn("vs = hlsl/extract_cb2_vs.hlsl", lines)
+        self.assertIn("vs = hlsl/extract_cb3_vs.hlsl", lines)
+        self.assertIn("cs = hlsl/record_bones_cs.hlsl", lines)
+        self.assertIn("cs = hlsl/redirect_cb1_cs.hlsl", lines)
+        self.assertFalse(any(line.startswith("[ShaderOverride") for line in lines))
+        self.assertFalse(any(line.startswith("hash = ") for line in lines))
+
+    def test_efmi_cross_ib_classifier_grows_fake_t0_for_effect_offsets(self):
+        exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
+        exporter.has_cross_ib = True
+        exporter._get_all_cross_ib_identifiers = lambda: {
+            f"source_{index:03d}" for index in range(51)
+        }
+        ini_builder = _FakeIniBuilder()
+
+        exporter._add_cross_ib_classifier_present_section(ini_builder)
+
+        lines = ini_builder.ini_section_list[0].SectionLineList
+        first_resource = lines.index("[ResourceFakeT0_UAV_source_000]")
+        self.assertEqual(lines[first_resource + 3], "array = 201768")
+
+    def test_efmi_cross_ib_classifier_resource_ids_include_effect(self):
+        exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
+        exporter.has_cross_ib = True
+        exporter._get_all_cross_ib_identifiers = lambda: {"bbb", "aaa"}
+        ini_builder = _FakeIniBuilder()
+
+        exporter._add_cross_ib_classifier_resource_id_sections(ini_builder)
+
+        lines = ini_builder.ini_section_list[0].SectionLineList
+        self.assertIn("[ResourceID_aaa]", lines)
+        self.assertIn("[ResourceID_bbb]", lines)
+        self.assertIn("[ResourceID_aaa_EFFECT]", lines)
+        self.assertIn("[ResourceID_bbb_EFFECT]", lines)
+        self.assertEqual(lines[lines.index("[ResourceID_aaa]") + 3], "data = 0.0")
+        self.assertEqual(lines[lines.index("[ResourceID_bbb]") + 3], "data = 1000.0")
+        self.assertEqual(lines[lines.index("[ResourceID_aaa_EFFECT]") + 3], "data = 2000.0")
+        self.assertEqual(lines[lines.index("[ResourceID_bbb_EFFECT]") + 3], "data = 3000.0")
+
+    def test_efmi_cross_ib_classifier_copies_assets_byte_equal(self):
+        exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
+        original_mod_folder = self.efmi_module.GlobalConfig.path_generate_mod_folder
+        source_dir = Path(__file__).resolve().parents[1] / "Toolset" / "efmi_classifier"
+
+        with tempfile.TemporaryDirectory() as directory:
+            export_root = Path(directory)
+            self.efmi_module.GlobalConfig.path_generate_mod_folder = lambda: str(export_root)
+            try:
+                exporter._copy_cross_ib_classifier_files()
+            finally:
+                self.efmi_module.GlobalConfig.path_generate_mod_folder = original_mod_folder
+
+            expected_hlsl = {
+                "extract_cb1_vs.hlsl",
+                "extract_cb2_vs.hlsl",
+                "extract_cb3_vs.hlsl",
+                "extract_cb1_ps.hlsl",
+                "record_bones_cs.hlsl",
+                "redirect_cb1_cs.hlsl",
+            }
+            hlsl_dir = export_root / "hlsl"
+            copied_hlsl = {path.name for path in hlsl_dir.glob("*.hlsl")}
+            self.assertEqual(copied_hlsl, expected_hlsl)
+            for name in expected_hlsl:
+                self.assertEqual((hlsl_dir / name).read_bytes(), (source_dir / name).read_bytes())
+
+            classifier = export_root / "CrossIBClassifier.ini"
+            self.assertTrue(classifier.is_file())
+            self.assertEqual(classifier.read_bytes(), (source_dir / "CrossIBClassifier.ini").read_bytes())
+
+    def test_efmi_cross_ib_classifier_source_replay_routing(self):
+        exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
+        exporter.has_cross_ib = True
+        exporter.cross_ib_method_dict = {"node": "END_FIELD_CLASSIFIER"}
+        exporter._append_drawindexed_instanced_with_shader_replace = (
+            lambda section, *_args, **_kwargs: section.append("drawindexedinstanced = test")
+        )
+        section = _FakeIniSection(_FakeSectionType.TextureOverrideIB)
+
+        exporter._append_source_cross_ib_replay(
+            section, "if vs == 200 || vs == 201 || vs == 204 || vs == 205", [object()], "source"
+        )
+
+        lines = section.SectionLineList
+        self.assertIn("    run = CustomShader_ExtractCB1", lines)
+        self.assertIn("    run = CustomShader_ExtractCB2", lines)
+        self.assertIn("    run = CustomShader_ExtractCB3", lines)
+        self.assertIn("    vs-cb1 = ResourceFakeCB1_source", lines)
+        self.assertIn("    vs-cb2 = ResourceFakeCB1_source", lines)
+        self.assertIn("    vs-cb3 = ResourceFakeCB1_source", lines)
+        self.assertIn("    run = CustomShader_RecordBones_source", lines)
+        self.assertIn("    run = CustomShader_RedirectCB1_source", lines)
+        self.assertIn("cs-t2 = ResourceID_source_EFFECT", "\n".join(lines))
+
+    def test_cross_ib_classifier_assets_abi_and_hlsl(self):
+        import re
+
+        repo_root = Path(__file__).resolve().parents[1]
+        hlsl_dir = repo_root / "Toolset" / "efmi_classifier"
+        classifier = (hlsl_dir / "CrossIBClassifier.ini").read_text(encoding="utf-8")
+
+        filters = {int(x) for x in re.findall(r"(?im)^\s*filter_index\s*=\s*(\d+)\s*$", classifier)}
+        self.assertEqual(filters, {200, 201, 202, 203, 204, 205})
+        self.assertNotRegex(classifier, r"(?im)^\s*hash\s*=")
+        self.assertNotRegex(classifier, r"(?im)^\s*namespace\s*=")
+
+        for name in (
+            "extract_cb1_vs.hlsl",
+            "extract_cb2_vs.hlsl",
+            "extract_cb3_vs.hlsl",
+            "extract_cb1_ps.hlsl",
+            "record_bones_cs.hlsl",
+            "redirect_cb1_cs.hlsl",
+        ):
+            self.assertTrue((hlsl_dir / name).is_file(), name)
+        self.assertIn("register(b1)", (hlsl_dir / "extract_cb1_vs.hlsl").read_text(encoding="utf-8"))
+        self.assertIn("register(b2)", (hlsl_dir / "extract_cb2_vs.hlsl").read_text(encoding="utf-8"))
+        self.assertIn("register(b3)", (hlsl_dir / "extract_cb3_vs.hlsl").read_text(encoding="utf-8"))
+
     def test_efmi_generate_ini_file_emits_shader_replace_sections(self):
         exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
         blueprint_model = self._make_blueprint_model()
@@ -586,17 +758,16 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "名称前缀.*重复"):
             self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(infos)
 
-    def test_shader_replace_validation_rejects_duplicate_variants(self):
+    def test_shader_replace_validation_allows_same_variant_in_multiple_groups(self):
         infos = [{
             "name_prefix": "Rain",
             "shaders": [
-                {"variant_name": "World"},
-                {"variant_name": "world"},
+                {"variant_name": "World", "shader_hash": "aa"},
+                {"variant_name": "world", "shader_hash": "AA"},
             ],
         }]
 
-        with self.assertRaisesRegex(ValueError, "变体名称.*重复"):
-            self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(infos)
+        self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(infos)
 
     def test_shader_replace_validation_rejects_reserved_normal_variant(self):
         infos = [{
@@ -607,7 +778,7 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "保留名称"):
             self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(infos)
 
-    def test_shader_replace_validation_rejects_duplicate_hashes_and_multiline_key(self):
+    def test_shader_replace_validation_rejects_hash_shared_by_different_variants_and_multiline_key(self):
         duplicate_hashes = [{
             "name_prefix": "Rain",
             "shaders": [
@@ -621,7 +792,7 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
             "shaders": [{"variant_name": "World"}],
         }]
 
-        with self.assertRaisesRegex(ValueError, "哈希.*重复"):
+        with self.assertRaisesRegex(ValueError, "哈希.*不同变体"):
             self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(duplicate_hashes)
         with self.assertRaisesRegex(ValueError, "快捷键.*换行"):
             self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(multiline_key)
@@ -640,6 +811,88 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
             self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(invalid_variant)
         with self.assertRaisesRegex(ValueError, "哈希.*非法"):
             self.actual_m_ini_module.M_IniHelper._validate_shader_replace_info_list(invalid_hash)
+
+    def test_shader_replace_duplicate_variants_generate_independent_switch_groups(self):
+        info = {
+            "name_prefix": "Rain",
+            "toggle_key": "VK_F5",
+            "component_index": 0,
+            "shaders": [
+                {"variant_name": "World", "shader_hash": "aa", "shader_file_path": ""},
+                {"variant_name": "NonWorld", "shader_hash": "bb", "shader_file_path": ""},
+                {"variant_name": "World", "shader_hash": "aa", "shader_file_path": ""},
+                {"variant_name": "NonWorld", "shader_hash": "bb", "shader_file_path": ""},
+            ],
+        }
+        draw_call = _FakeDrawCall(
+            "mesh",
+            shader_replace_info_list=[info],
+            shader_replace_info_resolved=True,
+        )
+        builder = _FakeIniBuilder()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.actual_m_ini_module.M_IniHelper.add_shader_replace_sections(
+                ini_builder=builder,
+                shader_replace_info_list=[info],
+                shader_replace_object_names={"mesh"},
+                draw_call_models=[draw_call],
+                mod_export_path=temp_dir,
+            )
+
+        sections = {section.SectionName: section.SectionLineList for section in builder.ini_section_list}
+        self.assertIn("$Rain_ps_replace = 0,1,2,", sections["KeyToggle_Rain"])
+        self.assertIn(
+            "if $Rain_ps_replace == 1 || $Rain_ps_replace == 2",
+            sections["ShaderOverride_RainEnvA_World"],
+        )
+        self.assertIn("CustomShader_Rain_drawhash_56_0_12_34_0_World", sections)
+        self.assertIn("CustomShader_Rain_drawhash_56_0_12_34_0_World_Group2", sections)
+        self.assertIn("CustomShader_Rain_drawhash_56_0_12_34_0_NonWorld_Group2", sections)
+
+        run_lines = self.actual_m_ini_module.M_IniHelper.get_shader_replace_run_logic(
+            info, "drawhash", "56", 0, 12, 34
+        )
+        self.assertIn("else if $Rain_ps_replace == 2", run_lines)
+        self.assertTrue(any(line.endswith("_World_Group2") for line in run_lines))
+        self.assertTrue(any(line.endswith("_NonWorld_Group2") for line in run_lines))
+
+    def test_shader_replace_incomplete_group_resets_unmatched_variant_state(self):
+        info = {
+            "name_prefix": "Rain",
+            "toggle_key": "VK_F5",
+            "component_index": 0,
+            "shaders": [
+                {"variant_name": "World", "shader_hash": "aa", "shader_file_path": ""},
+                {"variant_name": "NonWorld", "shader_hash": "bb", "shader_file_path": ""},
+                {"variant_name": "World", "shader_hash": "aa", "shader_file_path": ""},
+            ],
+        }
+        builder = _FakeIniBuilder()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.actual_m_ini_module.M_IniHelper.add_shader_replace_sections(
+                ini_builder=builder,
+                shader_replace_info_list=[info],
+                shader_replace_object_names={"mesh"},
+                draw_call_models=[_FakeDrawCall("mesh", shader_replace_info_list=[info])],
+                mod_export_path=temp_dir,
+            )
+
+        sections = {section.SectionName: section.SectionLineList for section in builder.ini_section_list}
+        nonworld_override = sections["ShaderOverride_RainEnvA_NonWorld"]
+        self.assertIn("if $Rain_ps_replace == 1", nonworld_override)
+        self.assertIn("else", nonworld_override)
+        self.assertIn("    $Rain_env_a = 0", nonworld_override)
+
+        run_lines = self.actual_m_ini_module.M_IniHelper.get_shader_replace_run_logic(
+            info, "drawhash", "56", 0, 12, 34
+        )
+        group2_index = run_lines.index("else if $Rain_ps_replace == 2")
+        self.assertIn(
+            "        run = CustomShader_Rain_drawhash_56_0_12_34_0_Normal",
+            run_lines[group2_index:],
+        )
 
     def test_shader_files_with_same_basename_export_to_unique_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:

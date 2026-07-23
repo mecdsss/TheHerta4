@@ -76,6 +76,10 @@ from .ui_panel_animation import (
     ATP_PT_AutomationBufferMerge,
 )
 
+from .pc_properties import pc_properties_list, PC_Properties
+from .pc_operators import pc_operators_list, shutdown as pc_shutdown
+from .pc_panel import pc_panel_list
+
 __all__ = [
     'ToolkitPanel',
     'VGToolsPanel',
@@ -135,6 +139,9 @@ __all__ = [
     'at_animation_export_list',
     'at_buffer_merge_list',
     'ui_panel_animation_list',
+    'pc_properties_list',
+    'pc_operators_list',
+    'pc_panel_list',
     'register',
     'unregister',
 ]
@@ -431,9 +438,56 @@ def register():
     bpy.utils.register_class(ATP_PT_AutomationShapeKeyExport)
     bpy.utils.register_class(ATP_PT_AutomationBufferMerge)
     
+    # 点云姿态匹配（实验功能）
+    for op_class in pc_properties_list:
+        try:
+            bpy.utils.register_class(op_class)
+            print(f"[TheHerta4]   已注册PC属性: {op_class.__name__}")
+        except Exception as e:
+            print(f"[TheHerta4]   注册PC属性失败: {op_class.__name__} - {e}")
+
+    bpy.types.Scene.pc_props = bpy.props.PointerProperty(type=PC_Properties)
+
+    for op_class in pc_operators_list:
+        try:
+            bpy.utils.register_class(op_class)
+            print(f"[TheHerta4]   已注册PC操作符: {op_class.__name__}")
+        except Exception as e:
+            print(f"[TheHerta4]   注册PC操作符失败: {op_class.__name__} - {e}")
+
+    for op_class in pc_panel_list:
+        try:
+            bpy.utils.register_class(op_class)
+            print(f"[TheHerta4]   已注册PC面板: {op_class.__name__}")
+        except Exception as e:
+            print(f"[TheHerta4]   注册PC面板失败: {op_class.__name__} - {e}")
+
     print("[TheHerta4] 工具集注册完成")
 
 def unregister():
+    # 点云姿态匹配：先停计时器再对称注销
+    try:
+        pc_shutdown()
+    except Exception:
+        pass
+    for op_class in reversed(pc_panel_list):
+        try:
+            bpy.utils.unregister_class(op_class)
+        except Exception:
+            pass
+    for op_class in reversed(pc_operators_list):
+        try:
+            bpy.utils.unregister_class(op_class)
+        except Exception:
+            pass
+    if hasattr(bpy.types.Scene, 'pc_props'):
+        del bpy.types.Scene.pc_props
+    for op_class in reversed(pc_properties_list):
+        try:
+            bpy.utils.unregister_class(op_class)
+        except Exception:
+            pass
+
     bpy.utils.unregister_class(ATP_PT_AutomationBufferMerge)
     bpy.utils.unregister_class(ATP_PT_AutomationShapeKeyExport)
     bpy.utils.unregister_class(ATP_PT_ShapeKeyAnimationExport)

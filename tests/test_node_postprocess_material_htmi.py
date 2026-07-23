@@ -365,6 +365,32 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.process_texture_override_section("[TextureOverride_Test]", sections, ...)
             self.assertIn("ps-t0 = Resource_DiffuseMap_Current", sections["[TextureOverride_Test]"])
 
+    def test_material_lookup_skips_renamed_candidates_without_matching_materials(self):
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        node.name = "MaterialNode"
+
+        original_name = "LOD0.a6431856-1020-0.Body"
+        original_copy_name = f"{original_name}_copy"
+        renamed_copy_name = "LOD0.aa9ffb85-13377-0.Body_copy"
+
+        original_obj = _FakeObject(original_name, {}, ["DiffuseMap_Body"])
+        original_copy = _FakeObject(original_copy_name, {}, ["DiffuseMap_Body"])
+        renamed_copy = _FakeObject(renamed_copy_name, {}, ["NormalMap_Body"])
+        original_copy.material_slots.clear()
+
+        for obj in (original_obj, original_copy, renamed_copy):
+            _fake_bpy.data.objects[obj.name] = obj
+
+        node.apply_name_mapping({original_copy_name: renamed_copy_name})
+
+        ini_mapping = OrderedDict([("ps-t0", "DiffuseMap")])
+        resolved = node.find_object_by_mesh_name(
+            renamed_copy_name,
+            object_filter=lambda candidate: node._object_has_matching_materials(candidate, ini_mapping),
+        )
+
+        self.assertIs(resolved, original_obj)
+
     def test_htmi_does_not_fallback_to_source_candidate_when_current_object_has_no_materials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source_texture = os.path.join(temp_dir, "source-candidate.png")
@@ -688,6 +714,87 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             sum(line.strip().startswith("if ") for line in moved_lines),
             sum(line.strip() == "endif" for line in moved_lines),
         )
+
+    def test_transparency_stops_moving_content_after_draw_command(self):
+        obj = _FakeObject("Body_透明0.5", {}, ["ImportedObject_Material"])
+        _fake_bpy.data.objects[obj.name] = obj
+        sections = OrderedDict([
+            ("[TextureOverride_Test]", [
+                f"[mesh:{obj.name}]",
+                r"Resource\ZZMI\Diffuse = ref Resource_DiffuseMap_Color",
+                r"run = CommandList\ZZMI\SetTextures",
+                "  drawindexed = 1410,277422,0",
+                "endif",
+                "if $swapkey11 == 1",
+                r"  run = CommandList\Unrelated",
+                "endif",
+            ]),
+            ("_config_path", ""),
+        ])
+        transparency_sections = OrderedDict()
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        node.name = "MaterialNode"
+        node.material_to_resource_override = False
+        node.material_switch_var = "$swapkey150"
+
+        node.process_texture_override_section(
+            "[TextureOverride_Test]",
+            sections,
+            material_group_to_swapkey={},
+            swap_key_prefix="$swapkey",
+            next_swap_key_num=150,
+            used_swap_keys=set(),
+            transparency_sections_to_add=transparency_sections,
+        )
+
+        moved_lines = next(iter(transparency_sections.values()))
+        self.assertEqual(moved_lines[-1].strip(), "drawindexed = 1410,277422,0")
+        override_lines = sections["[TextureOverride_Test]"]
+        self.assertIn("endif", override_lines)
+        self.assertIn("if $swapkey11 == 1", override_lines)
+        self.assertIn(r"  run = CommandList\Unrelated", override_lines)
+
+    def test_transparency_keeps_conditional_draw_block_balanced(self):
+        obj = _FakeObject("Body_透明0.5", {}, ["ImportedObject_Material"])
+        _fake_bpy.data.objects[obj.name] = obj
+        sections = OrderedDict([
+            ("[TextureOverride_Test]", [
+                f"[mesh:{obj.name}]",
+                "if $swapkey11 == 1",
+                r"  run = CommandList\ZZMI\SetTextures",
+                "  drawindexed = 1410,277422,0",
+                "endif",
+                "if $swapkey12 == 1",
+                r"  run = CommandList\Unrelated",
+                "endif",
+            ]),
+            ("_config_path", ""),
+        ])
+        transparency_sections = OrderedDict()
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        node.name = "MaterialNode"
+        node.material_to_resource_override = False
+        node.material_switch_var = "$swapkey150"
+
+        node.process_texture_override_section(
+            "[TextureOverride_Test]",
+            sections,
+            material_group_to_swapkey={},
+            swap_key_prefix="$swapkey",
+            next_swap_key_num=150,
+            used_swap_keys=set(),
+            transparency_sections_to_add=transparency_sections,
+        )
+
+        moved_lines = next(iter(transparency_sections.values()))
+        self.assertEqual(moved_lines[-1], "endif")
+        self.assertEqual(
+            sum(line.strip().startswith("if ") for line in moved_lines),
+            sum(line.strip() == "endif" for line in moved_lines),
+        )
+        override_lines = sections["[TextureOverride_Test]"]
+        self.assertIn("if $swapkey12 == 1", override_lines)
+        self.assertIn(r"  run = CommandList\Unrelated", override_lines)
 
     def test_transparency_keeps_distinct_blocks_for_duplicate_mesh_names(self):
         obj = _FakeObject("Body_透明0.5", {}, ["ImportedObject_Material"])

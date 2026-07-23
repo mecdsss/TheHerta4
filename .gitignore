@@ -12,3 +12,5 @@ reports/
 dist/
 DIST/
 test_result.txt
+.kunsdd/
+.dbg/

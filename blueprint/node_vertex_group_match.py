@@ -36,30 +36,52 @@ class VertexGroupMatcherOptimized:
         return np.average(points, axis=0, weights=weights).astype(np.float32, copy=False)
     
     def get_vertex_positions(self, obj, use_shape_key: bool = False, context=None) -> np.ndarray:
-        """获取物体所有顶点的世界坐标"""
+        """获取物体所有顶点的世界坐标（use_shape_key=True 时包含骨骼/形态键等修改器变形）"""
         if use_shape_key and context:
             depsgraph = context.evaluated_depsgraph_get()
-            eval_obj = obj.evaluated_get(depsgraph)
-            positions = np.array([
-                (eval_obj.matrix_world @ v.co)[:]
-                for v in eval_obj.data.vertices
-            ], dtype=np.float32)
+            evaluated_obj = obj.evaluated_get(depsgraph)
+            evaluated_mesh = evaluated_obj.to_mesh(
+                preserve_all_data_layers=False,
+                depsgraph=depsgraph,
+            )
+            if not evaluated_mesh:
+                return np.zeros((0, 3), dtype=np.float32)
+
+            try:
+                positions = np.array([
+                    (evaluated_obj.matrix_world @ v.co)[:]
+                    for v in evaluated_mesh.vertices
+                ], dtype=np.float32)
+            finally:
+                evaluated_obj.to_mesh_clear()
+            return positions
         else:
             positions = np.array([
                 (obj.matrix_world @ v.co)[:]
                 for v in obj.data.vertices
             ], dtype=np.float32)
-        return positions
+            return positions
     
     def get_vg_point_clouds(self, obj, positions: np.ndarray) -> Dict[str, Dict[str, np.ndarray]]:
         """获取每个顶点组影响的所有顶点点云"""
         vg_points = {}
         vg_weights = {}
-        
+
         for vg in obj.vertex_groups:
             vg_points[vg.name] = []
             vg_weights[vg.name] = []
-        
+
+        vert_count = len(obj.data.vertices)
+        if len(positions) != vert_count:
+            LOG.warning(
+                f"[VertexGroupMatch] 点云位置数({len(positions)})与网格顶点数({vert_count})不一致，"
+                f"物体 '{obj.name}' 将回退到原始网格位置"
+            )
+            positions = np.array([
+                (obj.matrix_world @ v.co)[:]
+                for v in obj.data.vertices
+            ], dtype=np.float32)
+
         for vert_idx, vert in enumerate(obj.data.vertices):
             for vgroup in vert.groups:
                 try:
@@ -203,8 +225,8 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
     )
 
     use_shape_key: bpy.props.BoolProperty(
-        name="使用形态键",
-        description="计算顶点组中心时考虑形态键变形",
+        name="使用变形后位置",
+        description="匹配时使用形态键和骨骼修改器变形后的顶点位置（同时影响调试物体、中心点与 Chamfer 距离计算）",
         default=False
     )
 
@@ -395,19 +417,24 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
         """获取经过骨骼和形态键变换后的顶点世界坐标"""
         if not obj or obj.type != 'MESH':
             return None
-        
+
         depsgraph = context.evaluated_depsgraph_get()
-        eval_obj = obj.evaluated_get(depsgraph)
-        
-        if not eval_obj or not eval_obj.data:
+        evaluated_obj = obj.evaluated_get(depsgraph)
+        evaluated_mesh = evaluated_obj.to_mesh(
+            preserve_all_data_layers=False,
+            depsgraph=depsgraph,
+        )
+        if not evaluated_mesh:
             return None
-        
-        vertices = []
-        for vert in eval_obj.data.vertices:
-            world_pos = eval_obj.matrix_world @ vert.co
-            vertices.append(world_pos)
-        
-        return vertices
+
+        try:
+            vertices = []
+            for vert in evaluated_mesh.vertices:
+                world_pos = evaluated_obj.matrix_world @ vert.co
+                vertices.append(world_pos)
+            return vertices
+        finally:
+            evaluated_obj.to_mesh_clear()
 
     def get_vertex_group_centers(self, context, obj, deformed_vertices=None):
         """获取物体所有顶点组的中心位置"""
@@ -422,6 +449,14 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
             original_name, _ = self.parse_vg_name(vg.name)
             group_centers[original_name] = Vector((0, 0, 0))
             group_counts[original_name] = 0
+
+        vert_count = len(mesh.vertices)
+        if deformed_vertices and len(deformed_vertices) != vert_count:
+            LOG.warning(
+                f"[VertexGroupMatch] 变形顶点数({len(deformed_vertices)})与网格顶点数({vert_count})不一致，"
+                f"将回退到原始网格位置计算物体 '{obj.name}' 的顶点组中心"
+            )
+            deformed_vertices = None
 
         for i, vert in enumerate(mesh.vertices):
             global_pos = deformed_vertices[i] if deformed_vertices else obj.matrix_world @ vert.co
@@ -479,7 +514,7 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
         return [source_obj], ""
 
     @staticmethod
-    def _merge_source_objects_for_match(context, source_objects, temp_prefix="SSMT_VGMatchTemp", force_temp=False, object_name=""):
+    def _merge_source_objects_for_match(context, source_objects, temp_prefix="SSMT_VGMatchTemp", force_temp=False, object_name="", use_shape_key=False):
         valid_sources = [obj for obj in source_objects if obj and obj.type == 'MESH' and obj.data]
         if len(valid_sources) == 1 and not force_temp:
             return valid_sources[0], False
@@ -503,8 +538,29 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
         vertex_offset = 0
 
         for source_obj in valid_sources:
-            evaluated_obj = source_obj.evaluated_get(depsgraph)
-            evaluated_mesh = evaluated_obj.to_mesh(preserve_all_data_layers=False, depsgraph=depsgraph)
+            evaluated_obj = None
+            if use_shape_key:
+                evaluated_obj = source_obj.evaluated_get(depsgraph)
+                evaluated_mesh = evaluated_obj.to_mesh(
+                    preserve_all_data_layers=False,
+                    depsgraph=depsgraph,
+                )
+                if evaluated_mesh and len(evaluated_mesh.vertices) != len(source_obj.data.vertices):
+                    LOG.warning(
+                        f"[VertexGroupMatch] 物体 '{source_obj.name}' 的修改器改变了顶点数 "
+                        f"(原始: {len(source_obj.data.vertices)}, 变形后: {len(evaluated_mesh.vertices)})，"
+                        f"将回退到原始网格位置以确保顶点组权重正确"
+                    )
+                    evaluated_obj.to_mesh_clear()
+                    evaluated_obj = None
+                    evaluated_mesh = source_obj.data
+                    source_matrix = source_obj.matrix_world
+                else:
+                    source_matrix = evaluated_obj.matrix_world
+            else:
+                evaluated_mesh = source_obj.data
+                source_matrix = source_obj.matrix_world
+
             try:
                 if not evaluated_mesh or len(evaluated_mesh.vertices) == 0:
                     continue
@@ -513,7 +569,7 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
                 vertex_count = len(evaluated_mesh.vertices)
 
                 for vert in evaluated_mesh.vertices:
-                    vertices.append(tuple((evaluated_obj.matrix_world @ vert.co)[:]))
+                    vertices.append(tuple((source_matrix @ vert.co)[:]))
 
                 for edge in evaluated_mesh.edges:
                     edges.append((
@@ -542,7 +598,8 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
 
                 vertex_offset += vertex_count
             finally:
-                evaluated_obj.to_mesh_clear()
+                if evaluated_obj is not None:
+                    evaluated_obj.to_mesh_clear()
 
         if not vertices:
             bpy.data.objects.remove(merged_obj, do_unlink=True)
@@ -559,6 +616,7 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
             for vert_index, weight in assignments:
                 vertex_group.add([vert_index], weight, 'REPLACE')
 
+        context.view_layer.update()
         return merged_obj, True
 
     @staticmethod
@@ -600,6 +658,7 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
             temp_prefix=self._get_runtime_source_object_base_name(),
             force_temp=True,
             object_name=runtime_name,
+            use_shape_key=self.use_shape_key,
         )
         if not runtime_obj:
             return None, False
@@ -611,6 +670,7 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
         runtime_obj.hide_render = True
         runtime_obj.display_type = 'WIRE'
         self.runtime_source_object = runtime_obj.name
+        context.view_layer.update()
         return runtime_obj, is_temp_object
 
     def build_runtime_source_object(self, context):
@@ -621,7 +681,9 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
         if self.source_collection:
             source_obj, is_temp_object = self.ensure_runtime_source_object(context, source_objects)
         else:
-            source_obj, is_temp_object = self._merge_source_objects_for_match(context, source_objects)
+            source_obj, is_temp_object = self._merge_source_objects_for_match(
+                context, source_objects, use_shape_key=self.use_shape_key
+            )
             if self.runtime_source_object:
                 self.clear_runtime_source_object()
 
@@ -1264,6 +1326,7 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
         text.write(f"# 目标物体: {target_obj.name}\n")
         text.write(f"# 匹配阈值: {self.match_threshold}\n")
         text.write(f"# 使用Chamfer匹配: {self.use_chamfer_matching}\n")
+        text.write(f"# 使用变形后位置(形态键/骨骼): {self.use_shape_key}\n")
         if self.use_chamfer_matching:
             text.write(f"# Chamfer阈值: {self.chamfer_threshold}\n")
         text.write(f"# 匹配时间: {int(time.time())}\n")
@@ -1289,6 +1352,7 @@ class SSMTNode_VertexGroupMatch(SSMTNodeBase):
             debug_parent["vgtp_matched_count"] = matched_count
             debug_parent["vgtp_total_count"] = len(source_centers)
             debug_parent["vgtp_use_chamfer"] = self.use_chamfer_matching
+            debug_parent["vgtp_use_shape_key"] = self.use_shape_key
 
         self.mapping_text_name = text_name
 
@@ -2070,26 +2134,74 @@ class SSMT_OT_VertexGroupMatchQuickWeight(bpy.types.Operator):
             return {'CANCELLED'}
         
         temp_mesh = bpy.data.meshes.new(temp_mesh_name)
-        
-        source_mesh = source_obj.data
-        target_mesh = target_obj.data
-        
-        source_matrix = source_obj.matrix_world
-        target_matrix = target_obj.matrix_world
-        
-        source_vert_count = len(source_mesh.vertices)
-        
-        source_verts = [(source_matrix @ v.co)[:] for v in source_mesh.vertices]
-        target_verts = [(target_matrix @ v.co)[:] for v in target_mesh.vertices]
-        all_verts = source_verts + target_verts
-        
-        source_edges = [(e.vertices[0], e.vertices[1]) for e in source_mesh.edges]
-        target_edges = [(e.vertices[0] + source_vert_count, e.vertices[1] + source_vert_count) for e in target_mesh.edges]
-        all_edges = source_edges + target_edges
-        
-        source_faces = [list(p.vertices) for p in source_mesh.polygons]
-        target_faces = [list(v + source_vert_count for v in p.vertices) for p in target_mesh.polygons]
-        all_faces = source_faces + target_faces
+
+        use_shape_key = debug_parent.get("vgtp_use_shape_key", False)
+
+        if use_shape_key:
+            depsgraph = context.evaluated_depsgraph_get()
+            source_eval_obj = source_obj.evaluated_get(depsgraph)
+            target_eval_obj = target_obj.evaluated_get(depsgraph)
+            source_eval_mesh = source_eval_obj.to_mesh(
+                preserve_all_data_layers=False,
+                depsgraph=depsgraph,
+            )
+            target_eval_mesh = target_eval_obj.to_mesh(
+                preserve_all_data_layers=False,
+                depsgraph=depsgraph,
+            )
+            try:
+                topology_matches = (
+                    source_eval_mesh is not None
+                    and target_eval_mesh is not None
+                    and len(source_eval_mesh.vertices) == len(source_obj.data.vertices)
+                    and len(target_eval_mesh.vertices) == len(target_obj.data.vertices)
+                )
+                if topology_matches:
+                    source_mesh = source_eval_mesh
+                    target_mesh = target_eval_mesh
+                    source_matrix = source_eval_obj.matrix_world
+                    target_matrix = target_eval_obj.matrix_world
+                else:
+                    self.report(
+                        {'WARNING'},
+                        "修改器改变了顶点数，快速权重将回退到原始网格位置",
+                    )
+                    source_mesh = source_obj.data
+                    target_mesh = target_obj.data
+                    source_matrix = source_obj.matrix_world
+                    target_matrix = target_obj.matrix_world
+
+                source_vert_count = len(source_mesh.vertices)
+                target_vert_count = len(target_mesh.vertices)
+                source_verts = [(source_matrix @ v.co)[:] for v in source_mesh.vertices]
+                target_verts = [(target_matrix @ v.co)[:] for v in target_mesh.vertices]
+                all_verts = source_verts + target_verts
+                source_edges = [(e.vertices[0], e.vertices[1]) for e in source_mesh.edges]
+                target_edges = [(e.vertices[0] + source_vert_count, e.vertices[1] + source_vert_count) for e in target_mesh.edges]
+                all_edges = source_edges + target_edges
+                source_faces = [list(p.vertices) for p in source_mesh.polygons]
+                target_faces = [list(v + source_vert_count for v in p.vertices) for p in target_mesh.polygons]
+                all_faces = source_faces + target_faces
+            finally:
+                source_eval_obj.to_mesh_clear()
+                target_eval_obj.to_mesh_clear()
+        else:
+            source_mesh = source_obj.data
+            target_mesh = target_obj.data
+            source_matrix = source_obj.matrix_world
+            target_matrix = target_obj.matrix_world
+
+            source_vert_count = len(source_mesh.vertices)
+            target_vert_count = len(target_mesh.vertices)
+            source_verts = [(source_matrix @ v.co)[:] for v in source_mesh.vertices]
+            target_verts = [(target_matrix @ v.co)[:] for v in target_mesh.vertices]
+            all_verts = source_verts + target_verts
+            source_edges = [(e.vertices[0], e.vertices[1]) for e in source_mesh.edges]
+            target_edges = [(e.vertices[0] + source_vert_count, e.vertices[1] + source_vert_count) for e in target_mesh.edges]
+            all_edges = source_edges + target_edges
+            source_faces = [list(p.vertices) for p in source_mesh.polygons]
+            target_faces = [list(v + source_vert_count for v in p.vertices) for p in target_mesh.polygons]
+            all_faces = source_faces + target_faces
         
         temp_mesh.from_pydata(all_verts, all_edges, all_faces)
         
@@ -2110,7 +2222,7 @@ class SSMT_OT_VertexGroupMatchQuickWeight(bpy.types.Operator):
         temp_vg_source = temp_obj.vertex_groups.new(name=f"Source_{source_vg_name}")
         temp_vg_target = temp_obj.vertex_groups.new(name=f"Target_{target_vg_name}")
         
-        for i, v in enumerate(source_mesh.vertices):
+        for i in range(source_vert_count):
             try:
                 weight = source_vg.weight(i)
                 if weight > 0:
@@ -2118,7 +2230,7 @@ class SSMT_OT_VertexGroupMatchQuickWeight(bpy.types.Operator):
             except RuntimeError:
                 pass
         
-        for i, v in enumerate(target_mesh.vertices):
+        for i in range(target_vert_count):
             try:
                 weight = target_vg.weight(i)
                 if weight > 0:

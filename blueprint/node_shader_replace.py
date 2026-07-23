@@ -346,12 +346,7 @@ class SSMT_OT_ShaderReplace_AddItem(bpy.types.Operator):
             return {'CANCELLED'}
         new_item = node.shader_list.add()
         variant_count = len(node.shader_list)
-        if variant_count == 1:
-            new_item.variant_name = "World"
-        elif variant_count == 2:
-            new_item.variant_name = "NonWorld"
-        else:
-            new_item.variant_name = f"Variant{variant_count}"
+        new_item.variant_name = "World" if variant_count % 2 == 1 else "NonWorld"
         return {'FINISHED'}
 
 
@@ -655,12 +650,21 @@ class SSMTNode_ShaderReplace(SSMTNodeBase):
     def get_shader_replace_info(self):
         """返回着色器替换配置，供导出使用。"""
         shaders = []
-        for i, item in enumerate(self.shader_list):
+        variant_occurrences = {}
+        variant_values = {}
+        for item in self.shader_list:
+            variant_name = str(item.variant_name or "").strip()
+            variant_key = variant_name.casefold()
+            group_index = variant_occurrences.get(variant_key, 0) + 1
+            variant_occurrences[variant_key] = group_index
+            if variant_key not in variant_values:
+                variant_values[variant_key] = len(variant_values) + 1
             shaders.append({
-                'variant_name': item.variant_name,
+                'variant_name': variant_name,
                 'shader_file_path': _resolve_shader_file_path(item.shader_file_path),
                 'shader_hash': item.shader_hash,
-                'env_value': i + 1,
+                'env_value': variant_values[variant_key],
+                'group_index': group_index,
             })
         return {
             'name_prefix': self.name_prefix,

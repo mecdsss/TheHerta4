@@ -268,7 +268,99 @@ class ExportEFMI:
             variants.append((replay_condition, "CustomShader_ExtractCB1", 2))
         return variants
 
+    def _resolve_efmi_cross_ib_method(self):
+        """确定 EFMI 跨 IB 使用的方式; 方式不受支持或不一致时禁用跨 IB 并返回 None。"""
+        if not getattr(self, 'has_cross_ib', False):
+            return None
+
+        method = None
+        for node_name, cross_ib_method in getattr(self, 'cross_ib_method_dict', {}).items():
+            if cross_ib_method not in ('END_FIELD', 'END_FIELD_CLASSIFIER'):
+                print(f"[CrossIB] 警告: 节点 {node_name} 使用的跨 IB 方式 '{cross_ib_method}' 不适用于 EFMI 模式")
+                self.has_cross_ib = False
+                return None
+            if method is None:
+                method = cross_ib_method
+            elif method != cross_ib_method:
+                print(f"[CrossIB] 警告: 节点 {node_name} 的跨 IB 方式 '{cross_ib_method}' 与 '{method}' 不一致, 请保持所有 EFMI 跨 IB 节点方式相同")
+                self.has_cross_ib = False
+                return None
+        return method or 'END_FIELD'
+
+    @staticmethod
+    def _get_source_cross_ib_classifier_variants(vb_condition):
+        """拆分规则分类器捕获 VS 阶段: 200->CB1, 201/204->CB2, 205->CB3。"""
+        condition = str(vb_condition or "").strip()
+        if not condition:
+            return []
+
+        condition_match = re.fullmatch(r"if\s+(.+)", condition, re.IGNORECASE)
+        if not condition_match:
+            return [(condition, "CustomShader_ExtractCB1", 1, [200])]
+
+        filters = []
+        for term in condition_match.group(1).split("||"):
+            term_match = re.fullmatch(
+                r"\s*\(?\s*vs\s*==\s*(\d+)\s*\)?\s*",
+                term,
+                re.IGNORECASE,
+            )
+            if not term_match:
+                return [(condition, "CustomShader_ExtractCB1", 1, [200])]
+            filters.append(int(term_match.group(1)))
+
+        variants = []
+        cb2_filters = [filter_index for filter_index in filters if filter_index in (201, 204)]
+        if 200 in filters:
+            variants.append(("if vs == 200", "CustomShader_ExtractCB1", 1, [200]))
+        if cb2_filters:
+            replay_condition = "if " + " || ".join(
+                f"vs == {filter_index}" for filter_index in cb2_filters
+            )
+            variants.append((replay_condition, "CustomShader_ExtractCB2", 2, cb2_filters))
+        if 205 in filters:
+            variants.append(("if vs == 205", "CustomShader_ExtractCB3", 3, [205]))
+        return variants
+
+    @staticmethod
+    def _append_classifier_storage_binding(section, indent, filters, source_identifier):
+        """按 200-205 ABI 选择 RecordBones/RedirectCB1 的存储: 204/205 用独立特效存储。"""
+        effect_filters = [filter_index for filter_index in filters if filter_index in (204, 205)]
+        normal_filters = [filter_index for filter_index in filters if filter_index not in (204, 205)]
+
+        if effect_filters and normal_filters:
+            effect_condition = " || ".join(f"vs == {filter_index}" for filter_index in effect_filters)
+            section.append(f"{indent}if {effect_condition}")
+            section.append(f"{indent}    cs-t2 = ResourceID_{source_identifier}_EFFECT")
+            section.append(f"{indent}else")
+            section.append(f"{indent}    cs-t2 = ResourceID_{source_identifier}")
+            section.append(f"{indent}endif")
+        elif effect_filters:
+            section.append(f"{indent}cs-t2 = ResourceID_{source_identifier}_EFFECT")
+        else:
+            section.append(f"{indent}cs-t2 = ResourceID_{source_identifier}")
+
+    def _append_source_cross_ib_classifier_replay(self, section, vb_condition, objects, source_identifier):
+        for condition, extract_shader, cb_slot, filters in self._get_source_cross_ib_classifier_variants(vb_condition):
+            indent = "    " if condition else ""
+            if condition:
+                section.append(condition)
+            section.append(f"{indent}run = {extract_shader}")
+            self._append_classifier_storage_binding(section, indent, filters, source_identifier)
+            section.append(f"{indent}run = CustomShader_RecordBones_{source_identifier}")
+            section.append(f"{indent}run = CustomShader_RedirectCB1_{source_identifier}")
+            section.append(f"{indent}vs-t0 = ResourceFakeT0_SRV_{source_identifier}")
+            section.append(f"{indent}vs-cb{cb_slot} = ResourceFakeCB1_{source_identifier}")
+            section.append(";所有需要跨 Ib 的物体引用")
+            self._append_drawindexed_instanced_with_shader_replace(section, objects, None)
+            if condition:
+                section.append("endif")
+
     def _append_source_cross_ib_replay(self, section, vb_condition, objects, source_identifier):
+        if self._resolve_efmi_cross_ib_method() == 'END_FIELD_CLASSIFIER':
+            self._append_source_cross_ib_classifier_replay(section, vb_condition, objects, source_identifier)
+            return
+
         for condition, extract_shader, cb_slot in self._get_source_cross_ib_variants(vb_condition):
             indent = "    " if condition else ""
             if condition:
@@ -331,20 +423,18 @@ class ExportEFMI:
         lines.append("")
         lines.append("post vs-cb1 = null")
         lines.append("post vs-cb2 = null")
+        if self._resolve_efmi_cross_ib_method() == 'END_FIELD_CLASSIFIER':
+            lines.append("post vs-cb3 = null")
         lines.append("post vs-t0 = null")
         lines.append("post cs-t2 = null")
 
         return lines
 
-    def _add_cross_ib_present_section(self, ini_builder):
-        if not self.has_cross_ib:
-            return
-
-        present_section = M_IniSection(M_SectionType.CrossIBPresent)
-        present_section.append(";特殊追加固定区域")
-        present_section.append("[Present]")
-        present_section.append("ResourcePrev_SRV = ResourceFakeT0_SRV")
-        present_section.new_line()
+    def _append_cross_ib_fake_resources(self, present_section, all_identifiers, include_effect=False):
+        identifier_count = len(all_identifiers)
+        offset_region_count = identifier_count * (2 if include_effect else 1)
+        max_base_offset = max(0, offset_region_count - 1) * 1000
+        fake_t0_array_size = max(200000, max_base_offset + 100000 + 768)
 
         present_section.append("[ResourceDumpedCB1_UAV]")
         present_section.append("type = RWStructuredBuffer")
@@ -357,8 +447,6 @@ class ExportEFMI:
         present_section.append("stride = 16")
         present_section.append("array = 4096")
         present_section.new_line()
-
-        all_identifiers = self._get_all_cross_ib_identifiers()
 
         for identifier in sorted(all_identifiers):
             present_section.append(f"[ResourceFakeCB1_UAV_{identifier}]")
@@ -377,32 +465,42 @@ class ExportEFMI:
             present_section.append(f"[ResourceFakeT0_UAV_{identifier}]")
             present_section.append("type = RWStructuredBuffer")
             present_section.append("stride = 16")
-            present_section.append("array = 200000")
+            present_section.append(f"array = {fake_t0_array_size}")
             present_section.new_line()
 
             present_section.append(f"[ResourceFakeT0_SRV_{identifier}]")
             present_section.append("type = StructuredBuffer")
             present_section.append("stride = 16")
-            present_section.append("array = 200000")
+            present_section.append(f"array = {fake_t0_array_size}")
             present_section.new_line()
 
         present_section.append("[ResourceFakeT0_UAV]")
         present_section.append("type = RWStructuredBuffer")
         present_section.append("stride = 16")
-        present_section.append("array = 200000")
+        present_section.append(f"array = {fake_t0_array_size}")
         present_section.new_line()
 
         present_section.append("[ResourceFakeT0_SRV]")
         present_section.append("type = StructuredBuffer")
         present_section.append("stride = 16")
-        present_section.append("array = 200000")
+        present_section.append(f"array = {fake_t0_array_size}")
         present_section.new_line()
 
         present_section.append("[ResourcePrev_SRV]")
         present_section.append("type = StructuredBuffer")
         present_section.append("stride = 16")
-        present_section.append("array = 200000")
+        present_section.append(f"array = {fake_t0_array_size}")
         present_section.new_line()
+
+    def _add_cross_ib_present_section(self, ini_builder):
+        if not self.has_cross_ib:
+            return
+
+        present_section = M_IniSection(M_SectionType.CrossIBPresent)
+        present_section.append(";特殊追加固定区域")
+
+        all_identifiers = self._get_all_cross_ib_identifiers()
+        self._append_cross_ib_fake_resources(present_section, all_identifiers)
 
         present_section.append("[CustomShader_ExtractCB1]")
         present_section.append("vs = ./res/extract_cb1_vs.hlsl")
@@ -478,6 +576,86 @@ class ExportEFMI:
             present_section.new_line()
 
         ini_builder.append_section(present_section)
+
+    def _add_cross_ib_classifier_present_section(self, ini_builder):
+        if not self.has_cross_ib:
+            return
+
+        present_section = M_IniSection(M_SectionType.CrossIBPresent)
+        present_section.append(";特殊追加固定区域 (规则分类器)")
+
+        all_identifiers = self._get_all_cross_ib_identifiers()
+        self._append_cross_ib_fake_resources(
+            present_section,
+            all_identifiers,
+            include_effect=True,
+        )
+
+        for cb_slot in (1, 2, 3):
+            present_section.append(f"[CustomShader_ExtractCB{cb_slot}]")
+            present_section.append(f"vs = hlsl/extract_cb{cb_slot}_vs.hlsl")
+            present_section.append("ps = hlsl/extract_cb1_ps.hlsl")
+            present_section.append("ps-u7 = ResourceDumpedCB1_UAV")
+            present_section.append("depth_enable = false")
+            present_section.append("blend = ADD SRC_ALPHA INV_SRC_ALPHA")
+            present_section.append("cull = none")
+            present_section.append("topology = point_list")
+            present_section.append("draw = 4096, 0")
+            present_section.append("ps-u7 = null")
+            present_section.append("ResourceDumpedCB1_SRV = copy ResourceDumpedCB1_UAV")
+            present_section.new_line()
+
+        for identifier in sorted(all_identifiers):
+            present_section.append(f"[CustomShader_RecordBones_{identifier}]")
+            present_section.append("cs = hlsl/record_bones_cs.hlsl")
+            present_section.append("cs-t0 = vs-t0")
+            present_section.append("cs-t1 = ResourceDumpedCB1_SRV")
+            present_section.append(f"cs-u1 = ResourceFakeT0_UAV_{identifier}")
+            present_section.append("dispatch = 12, 1, 1")
+            present_section.append("cs-u1 = null")
+            present_section.append("cs-t0 = null")
+            present_section.append("cs-t1 = null")
+            present_section.append(f"ResourceFakeT0_SRV_{identifier} = copy ResourceFakeT0_UAV_{identifier}")
+            present_section.new_line()
+
+            present_section.append(f"[CustomShader_RedirectCB1_{identifier}]")
+            present_section.append("cs = hlsl/redirect_cb1_cs.hlsl")
+            present_section.append("cs-t0 = ResourceDumpedCB1_SRV")
+            present_section.append(f"ResourceFakeCB1_UAV_{identifier} = copy ResourceDumpedCB1_SRV")
+            present_section.append(f"cs-u0 = ResourceFakeCB1_UAV_{identifier}")
+            present_section.append("dispatch = 4, 1, 1")
+            present_section.append("cs-u0 = null")
+            present_section.append("cs-t0 = null")
+            present_section.append(f"ResourceFakeCB1_{identifier} = copy ResourceFakeCB1_UAV_{identifier}")
+            present_section.new_line()
+
+        ini_builder.append_section(present_section)
+
+    def _add_cross_ib_classifier_resource_id_sections(self, ini_builder):
+        if not self.has_cross_ib:
+            return
+
+        resource_id_section = M_IniSection(M_SectionType.ResourceID)
+        resource_id_section.append(";特殊追加身份证区域 (规则分类器)")
+
+        sorted_identifiers = sorted(self._get_all_cross_ib_identifiers())
+
+        for idx, identifier in enumerate(sorted_identifiers):
+            resource_id_section.append(f"[ResourceID_{identifier}]")
+            resource_id_section.append("type = Buffer")
+            resource_id_section.append("format = R32_FLOAT")
+            resource_id_section.append(f"data = {idx * 1000}.0")
+            resource_id_section.new_line()
+
+        effect_offset_base = len(sorted_identifiers) * 1000
+        for idx, identifier in enumerate(sorted_identifiers):
+            resource_id_section.append(f"[ResourceID_{identifier}_EFFECT]")
+            resource_id_section.append("type = Buffer")
+            resource_id_section.append("format = R32_FLOAT")
+            resource_id_section.append(f"data = {effect_offset_base + idx * 1000}.0")
+            resource_id_section.new_line()
+
+        ini_builder.append_section(resource_id_section)
 
     def _add_cross_ib_resource_id_sections(self, ini_builder):
         if not self.has_cross_ib:
@@ -557,16 +735,15 @@ class ExportEFMI:
             for index, drawib_model in enumerate(self.drawib_model_list)
         }
 
-        if self.has_cross_ib:
-            for node_name, cross_ib_method in self.cross_ib_method_dict.items():
-                if cross_ib_method != 'END_FIELD':
-                    print(f"[CrossIB] 警告: 节点 {node_name} 使用的跨 IB 方式 '{cross_ib_method}' 不适用于 EFMI 模式")
-                    self.has_cross_ib = False
-                    break
+        cross_ib_method = self._resolve_efmi_cross_ib_method()
 
         if self.has_cross_ib:
-            self._add_cross_ib_present_section(ini_builder)
-            self._add_cross_ib_resource_id_sections(ini_builder)
+            if cross_ib_method == 'END_FIELD_CLASSIFIER':
+                self._add_cross_ib_classifier_present_section(ini_builder)
+                self._add_cross_ib_classifier_resource_id_sections(ini_builder)
+            else:
+                self._add_cross_ib_present_section(ini_builder)
+                self._add_cross_ib_resource_id_sections(ini_builder)
 
         M_IniHelper.generate_hash_style_texture_ini(
             ini_builder=ini_builder,
@@ -695,6 +872,8 @@ class ExportEFMI:
                 texture_override_ib_section.append("")
                 texture_override_ib_section.append("post vs-cb1 = null")
                 texture_override_ib_section.append("post vs-cb2 = null")
+                if self._resolve_efmi_cross_ib_method() == 'END_FIELD_CLASSIFIER':
+                    texture_override_ib_section.append("post vs-cb3 = null")
                 texture_override_ib_section.append("post vs-t0 = null")
                 texture_override_ib_section.append("post cs-t2 = null")
 
@@ -724,6 +903,8 @@ class ExportEFMI:
                 texture_override_ib_section.append("")
                 texture_override_ib_section.append("post vs-cb1 = null")
                 texture_override_ib_section.append("post vs-cb2 = null")
+                if self._resolve_efmi_cross_ib_method() == 'END_FIELD_CLASSIFIER':
+                    texture_override_ib_section.append("post vs-cb3 = null")
                 texture_override_ib_section.append("post vs-t0 = null")
                 texture_override_ib_section.append("post cs-t2 = null")
 
@@ -811,7 +992,10 @@ class ExportEFMI:
         ini_builder.save_to_file(ini_filepath)
 
         if self.has_cross_ib:
-            self._copy_cross_ib_hlsl_files()
+            if self._resolve_efmi_cross_ib_method() == 'END_FIELD_CLASSIFIER':
+                self._copy_cross_ib_classifier_files()
+            else:
+                self._copy_cross_ib_hlsl_files()
 
     def _append_target_cross_ib_blocks(self, section, source_ib_list_for_target, current_ib_key):
         for source_ib_key in source_ib_list_for_target:
@@ -876,7 +1060,7 @@ class ExportEFMI:
 
     def _copy_cross_ib_hlsl_files(self):
         addon_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-        source_dir = os.path.join(addon_dir, "Toolset", "old")
+        source_dir = os.path.join(addon_dir, "Toolset")
 
         if not os.path.exists(source_dir):
             print(f"[CrossIB] 警告: Toolset目录不存在: {source_dir}")
@@ -915,6 +1099,49 @@ class ExportEFMI:
                 print(f"[CrossIB] 警告: 源文件不存在: {source_file}")
 
         print(f"[CrossIB] 共复制 {copied_count} 个HLSL文件到 {res_dir}")
+
+    def _copy_cross_ib_classifier_files(self):
+        addon_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+        source_dir = os.path.join(addon_dir, "Toolset", "efmi_classifier")
+
+        if not os.path.exists(source_dir):
+            print(f"[CrossIB] 警告: 规则分类器资源目录不存在: {source_dir}")
+            return
+
+        hlsl_files = [
+            'extract_cb1_vs.hlsl',
+            'extract_cb2_vs.hlsl',
+            'extract_cb3_vs.hlsl',
+            'extract_cb1_ps.hlsl',
+            'record_bones_cs.hlsl',
+            'redirect_cb1_cs.hlsl',
+        ]
+
+        mod_export_path = GlobalConfig.path_generate_mod_folder()
+        hlsl_dir = os.path.join(mod_export_path, "hlsl")
+        os.makedirs(hlsl_dir, exist_ok=True)
+
+        copied_count = 0
+        for hlsl_file in hlsl_files:
+            source_file = os.path.join(source_dir, hlsl_file)
+            target_file = os.path.join(hlsl_dir, hlsl_file)
+
+            if os.path.exists(source_file):
+                shutil.copy2(source_file, target_file)
+                copied_count += 1
+            else:
+                print(f"[CrossIB] 警告: 源文件不存在: {source_file}")
+
+        classifier_source = os.path.join(source_dir, "CrossIBClassifier.ini")
+        classifier_target = os.path.join(mod_export_path, "CrossIBClassifier.ini")
+        if os.path.exists(classifier_source):
+            # 逐字节文件系统复制, 不重写模板内容
+            shutil.copyfile(classifier_source, classifier_target)
+            copied_count += 1
+        else:
+            print(f"[CrossIB] 警告: 规则分类器模板不存在: {classifier_source}")
+
+        print(f"[CrossIB] 规则分类器方式: 已复制 {copied_count} 个文件到 {mod_export_path} (hlsl/ + CrossIBClassifier.ini)")
 
     def _integrate_object_swap_ini_hook(self, ini_builder: M_IniBuilder):
         try:

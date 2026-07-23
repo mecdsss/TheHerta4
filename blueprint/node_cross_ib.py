@@ -89,6 +89,10 @@ class CrossIBMethodEnum:
     END_FIELD_LABEL = '终末地跨 IB'
     END_FIELD_LOGIC_NAME = 'EFMI'
 
+    END_FIELD_CLASSIFIER = 'END_FIELD_CLASSIFIER'
+    END_FIELD_CLASSIFIER_LABEL = '终末地跨 IB (规则分类器)'
+    END_FIELD_CLASSIFIER_LOGIC_NAME = 'EFMI'
+
     VB_COPY = 'VB_COPY'
     VB_COPY_LABEL = 'VB 复制'
     VB_COPY_LOGIC_NAME = 'ZZMI'
@@ -105,6 +109,7 @@ class CrossIBMethodEnum:
     def get_items(cls):
         return [
             (cls.END_FIELD, cls.END_FIELD_LABEL, "终末地跨 IB 方式 (仅 EFMI)"),
+            (cls.END_FIELD_CLASSIFIER, cls.END_FIELD_CLASSIFIER_LABEL, "终末地跨 IB 方式 (ShaderRegex 规则分类器, 200-205 ABI, 仅 EFMI)"),
             (cls.VB_COPY, cls.VB_COPY_LABEL, "VB 复制方式 (仅 ZZMI)"),
             (cls.VB_COPY_CB1, cls.VB_COPY_CB1_LABEL, "VB 复制并捕获/恢复 VS-CB1 (仅 ZZMI)"),
             (cls.VB_REF_SO0, cls.VB_REF_SO0_LABEL, "通过 SO0 引用 Body VB0 的方式 (仅 ZZMI)"),
@@ -257,6 +262,12 @@ class SSMTNode_CrossIB(SSMTNodeBase):
         default=True
     )
 
+    vb_slot_205: BoolProperty(
+        name="205",
+        description="源块 VS 槽位 205 (CB3 特效/自渲染, 仅规则分类器方式)",
+        default=True
+    )
+
     current_logic_name: StringProperty(
         name="当前运行模式",
         description="当前游戏的运行模式",
@@ -356,6 +367,8 @@ class SSMTNode_CrossIB(SSMTNodeBase):
             row.prop(self, "vb_slot_200", text="200")
             row.prop(self, "vb_slot_201", text="201")
             row.prop(self, "vb_slot_204", text="204")
+            if self.cross_ib_method == CrossIBMethodEnum.END_FIELD_CLASSIFIER:
+                row.prop(self, "vb_slot_205", text="205")
 
             row = box_vb.row()
             row.label(text="目标块:")
@@ -420,6 +433,8 @@ class SSMTNode_CrossIB(SSMTNodeBase):
             vb_slots.append("201")
         if self.vb_slot_204:
             vb_slots.append("204")
+        if self.cross_ib_method == CrossIBMethodEnum.END_FIELD_CLASSIFIER and self.vb_slot_205:
+            vb_slots.append("205")
 
         if not vb_slots:
             return ""
@@ -721,7 +736,7 @@ class SSMTNode_PostProcess_CrossIB(SSMTNodeBase):
 
     def _copy_hlsl_files(self, mod_export_path):
         addon_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-        source_dir = os.path.join(addon_dir, "Toolset", "old")
+        source_dir = os.path.join(addon_dir, "Toolset")
 
         if not os.path.exists(source_dir):
             print(f"[CrossIB] 警告: Toolset目录不存在: {source_dir}")
