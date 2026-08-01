@@ -80,6 +80,10 @@ from .pc_properties import pc_properties_list, PC_Properties
 from .pc_operators import pc_operators_list, shutdown as pc_shutdown
 from .pc_panel import pc_panel_list
 
+from .gb_properties import gb_properties_list, GB_Properties, GB_BallSettings
+from .gb_operators import gb_operators_list, shutdown as gb_shutdown
+from .gb_panel import gb_panel_list
+
 __all__ = [
     'ToolkitPanel',
     'VGToolsPanel',
@@ -142,6 +146,9 @@ __all__ = [
     'pc_properties_list',
     'pc_operators_list',
     'pc_panel_list',
+    'gb_properties_list',
+    'gb_operators_list',
+    'gb_panel_list',
     'register',
     'unregister',
 ]
@@ -462,9 +469,59 @@ def register():
         except Exception as e:
             print(f"[TheHerta4]   注册PC面板失败: {op_class.__name__} - {e}")
 
+    # 高斯权重球（实验功能）
+    for op_class in gb_properties_list:
+        try:
+            bpy.utils.register_class(op_class)
+            print(f"[TheHerta4]   已注册GB属性: {op_class.__name__}")
+        except Exception as e:
+            print(f"[TheHerta4]   注册GB属性失败: {op_class.__name__} - {e}")
+
+    bpy.types.Scene.gb_props = bpy.props.PointerProperty(type=GB_Properties)
+    bpy.types.Object.gb_ball = bpy.props.PointerProperty(type=GB_BallSettings)
+
+    for op_class in gb_operators_list:
+        try:
+            bpy.utils.register_class(op_class)
+            print(f"[TheHerta4]   已注册GB操作符: {op_class.__name__}")
+        except Exception as e:
+            print(f"[TheHerta4]   注册GB操作符失败: {op_class.__name__} - {e}")
+
+    for op_class in gb_panel_list:
+        try:
+            bpy.utils.register_class(op_class)
+            print(f"[TheHerta4]   已注册GB面板: {op_class.__name__}")
+        except Exception as e:
+            print(f"[TheHerta4]   注册GB面板失败: {op_class.__name__} - {e}")
+
     print("[TheHerta4] 工具集注册完成")
 
 def unregister():
+    # 高斯权重球：先停计时器/绘制回调再对称注销
+    try:
+        gb_shutdown()
+    except Exception:
+        pass
+    for op_class in reversed(gb_panel_list):
+        try:
+            bpy.utils.unregister_class(op_class)
+        except Exception:
+            pass
+    for op_class in reversed(gb_operators_list):
+        try:
+            bpy.utils.unregister_class(op_class)
+        except Exception:
+            pass
+    if hasattr(bpy.types.Object, 'gb_ball'):
+        del bpy.types.Object.gb_ball
+    if hasattr(bpy.types.Scene, 'gb_props'):
+        del bpy.types.Scene.gb_props
+    for op_class in reversed(gb_properties_list):
+        try:
+            bpy.utils.unregister_class(op_class)
+        except Exception:
+            pass
+
     # 点云姿态匹配：先停计时器再对称注销
     try:
         pc_shutdown()
