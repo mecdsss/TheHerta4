@@ -230,6 +230,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         default='LMB',
     )
     enable_poke: bpy.props.BoolProperty(name="启用戳", default=True)
+    drag_enabled_default: bpy.props.BoolProperty(
+        name="默认启用模型拖拽",
+        default=True,
+        description=(
+            "生成运行时变量 $ssmtdrag_drag_enabled_<后缀> 的默认值。"
+            "关闭该变量时仍执行鼠标命中检测并更新命中 ID/区域，仅停止抓取、戳击和模型形变输入"
+        ),
+    )
     enable_hand_cursor: bpy.props.BoolProperty(
         name="启用手型光标",
         default=True,
@@ -302,6 +310,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         row = layout.row(align=True)
         row.prop(self, "enable_poke")
         row.prop(self, "enable_hand_cursor")
+        layout.prop(self, "drag_enabled_default")
 
         box = layout.box()
         box.label(text="全局物理档案（弹簧常数）", icon='PHYSICS')
@@ -2049,6 +2058,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         const_lines = sections.setdefault(const_sec, [])
         globals_to_add = [
             f"global $ssmtdrag_mode_{ns} = 0",
+            f"global persist $ssmtdrag_drag_enabled_{ns} = {1 if getattr(self, 'drag_enabled_default', True) else 0}",
             f"global $ssmtdrag_drawn_{ns} = 0",
             f"global $ssmtdrag_booted_{ns} = 0",
             f"global $ssmtdrag_lmb_down_{ns} = 0",
@@ -2084,6 +2094,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # run= 命令列表边界传递必须声明为 global，否则子列表里置 1 后回调用方仍读 0 →
             # 视口恒无效 → cursor 恒 (-1,-1) → 检测永不命中且手型光标锚定屏幕外（导出模组无效果的根因）
             f"global $ssmtdrag_viewport_valid = 0",
+            # UI 构造器桥接：把 GPU 检测结果回读成可跨 INI 命名空间引用的只读全局量。
+            # detected < 0 表示未命中；zone 仅在 detected >= 0 时有效。
+            f"global $ssmtdrag_ui_detected_{ns} = -1",
+            f"global $ssmtdrag_ui_zone_{ns} = -1",
         ]
         if self.enable_viewport_probe:
             globals_to_add.extend([
@@ -2134,7 +2148,59 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # ---- Present 块（手势归约 + 手部蓄力进度 + S8 手部绘制）----
         present_sec = "[Present]"
         present_lines = sections.setdefault(present_sec, [])
+        ui_bridge_lines = [
+            "\t; --- DRAG UI BRIDGE BEGIN ---",
+            # PinnedDetectInfo[7].w 是区域索引；按 float 标量索引即 7*4+3 = 31。
+            # store 读取上一份已完成的 GPU 数据，允许 UI 侧以一帧延迟稳定消费。
+            # 目标未绘制时必须主动失效，避免消费上一帧/上一个角色的残留命中。
+            f"if $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_booted_{ns} == 1",
+            f"\tstore = $ssmtdrag_ui_detected_{ns}, ref ResourceDragPinnedDetectID_{ns}, 0",
+            f"\tstore = $ssmtdrag_ui_zone_{ns}, ref ResourceDragPinnedDetectInfo_{ns}, 31",
+            "else",
+            f"\t$ssmtdrag_ui_detected_{ns} = -1",
+            f"\t$ssmtdrag_ui_zone_{ns} = -1",
+            "endif",
+            "\t; --- DRAG UI BRIDGE END ---",
+        ]
+        interaction_gate_lines = [
+            "\t; --- DRAG INTERACTION GATE BEGIN ---",
+            f"if $ssmtdrag_drag_enabled_{ns} == 0",
+            "\t$isMouseButtonDown = 0",
+            f"\t$ssmtdrag_poke_sign_{ns} = 0",
+            f"\t$ssmtdrag_combo_active_{ns} = 0",
+        ]
+        if self.enable_hand_cursor:
+            interaction_gate_lines.extend([
+                f"\t$ssmtdrag_lmb_hold_fraction_{ns} = 0",
+                f"\t$ssmtdrag_rmb_hold_fraction_{ns} = 0",
+                f"\t$ssmtdrag_rmb_lone_hold_{ns} = 0",
+            ])
+        interaction_gate_lines.extend([
+            "endif",
+            "\t; --- DRAG INTERACTION GATE END ---",
+        ])
         if any("DRAG PRESENT BEGIN" in line for line in present_lines):
+            if not any("DRAG UI BRIDGE BEGIN" in line for line in present_lines):
+                insert_at = next(
+                    (i for i, line in enumerate(present_lines) if f"post $ssmtdrag_drawn_{ns} = 0" in line),
+                    len(present_lines),
+                )
+                present_lines[insert_at:insert_at] = ui_bridge_lines
+            if not any("DRAG INTERACTION GATE BEGIN" in line for line in present_lines):
+                pin_run_at = next(
+                    (i for i, line in enumerate(present_lines) if f"pre run = CommandListDragPinDetected_{ns}" in line),
+                    -1,
+                )
+                if pin_run_at >= 0:
+                    insert_at = pin_run_at
+                    if pin_run_at > 0 and present_lines[pin_run_at - 1].strip() == f"if $ssmtdrag_mode_{ns} == 1":
+                        insert_at -= 1
+                else:
+                    insert_at = next(
+                        (i for i, line in enumerate(present_lines) if f"post $ssmtdrag_drawn_{ns} = 0" in line),
+                        len(present_lines),
+                    )
+                present_lines[insert_at:insert_at] = interaction_gate_lines
             return
         # 抓取手势条件（原作默认 左右键同按/X；可选 左键/右键 单键抓取）
         if self.grab_gesture == 'RMB':
@@ -2242,6 +2308,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\t$ssmtdrag_viewport_probe_armed_{ns} = 0",
                 "endif",
             ])
+        block.extend(interaction_gate_lines)
         block.extend([
             # 执行序列
             f"if $ssmtdrag_mode_{ns} == 1",
@@ -2249,6 +2316,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "endif",
             f"run = CommandListDragCursorUpdate_{ns}",
         ])
+        block.extend(ui_bridge_lines)
         if self.enable_hand_cursor:
             # S8 手型光标：先更新手部屏幕位置，描边先画垫底（只露轮廓边）、填充后画；
             # 抓取中或 RMB 独按蓄力时用 Action 网格（握拳），否则 NoAction（张开）

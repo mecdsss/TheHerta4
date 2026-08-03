@@ -589,6 +589,75 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn(self.mod.DRAG_TAIL_MARKER, sections)
         self.assertEqual(sum(key == self.mod.DRAG_TAIL_MARKER for key in sections), 1)
 
+    def test_ui_drag_bridge_exports_detected_and_zone_globals(self):
+        """模型区域拖动 UI 依赖稳定的 GPU -> INI 全局变量桥接。"""
+        node, sections, comps = self._emit()
+        node._emit_present_and_constants(sections, comps, "testns")
+
+        constants = "\n".join(sections["[Constants]"])
+        present = "\n".join(sections["[Present]"])
+        self.assertIn("global $ssmtdrag_ui_detected_testns = -1", constants)
+        self.assertIn("global $ssmtdrag_ui_zone_testns = -1", constants)
+        self.assertIn(
+            "store = $ssmtdrag_ui_detected_testns, ref ResourceDragPinnedDetectID_testns, 0",
+            present,
+        )
+        self.assertIn(
+            "store = $ssmtdrag_ui_zone_testns, ref ResourceDragPinnedDetectInfo_testns, 31",
+            present,
+        )
+        self.assertIn("$ssmtdrag_ui_detected_testns = -1", present)
+        self.assertIn("$ssmtdrag_ui_zone_testns = -1", present)
+
+        # 旧版 Present 已存在时仍可幂等补齐桥接，而不是被提前 return 跳过。
+        legacy_sections = _base_sections()
+        legacy_sections["[Present]"] = [
+            "; --- DRAG PRESENT BEGIN ---",
+            "post $ssmtdrag_drawn_testns = 0",
+            "; --- DRAG PRESENT END ---",
+        ]
+        node._emit_present_and_constants(legacy_sections, comps, "testns")
+        upgraded = "\n".join(legacy_sections["[Present]"])
+        self.assertEqual(upgraded.count("DRAG UI BRIDGE BEGIN"), 1)
+        node._emit_present_and_constants(legacy_sections, comps, "testns")
+        self.assertEqual("\n".join(legacy_sections["[Present]"]).count("DRAG UI BRIDGE BEGIN"), 1)
+
+    def test_drag_runtime_switch_gates_interaction_but_not_detection(self):
+        node, sections, comps = self._emit(drag_enabled_default=False, enable_hand_cursor=True)
+        node._emit_present_and_constants(sections, comps, "testns")
+
+        constants = "\n".join(sections["[Constants]"])
+        present = "\n".join(sections["[Present]"])
+        pin = "\n".join(sections["[CommandListDragPinDetected_testns]"])
+        self.assertIn("global persist $ssmtdrag_drag_enabled_testns = 0", constants)
+        self.assertIn("if $ssmtdrag_drag_enabled_testns == 0", present)
+        self.assertIn("$isMouseButtonDown = 0", present)
+        self.assertIn("$ssmtdrag_poke_sign_testns = 0", present)
+        self.assertIn("$ssmtdrag_rmb_lone_hold_testns = 0", present)
+        # 开关不得参与检测调度，否则关闭后 UI 区域桥接也会失去命中。
+        self.assertNotIn("ssmtdrag_drag_enabled", pin)
+        self.assertIn("run = CustomShaderDragPinDetected_testns", pin)
+
+    def test_drag_runtime_switch_defaults_on_and_upgrades_legacy_present(self):
+        node, sections, comps = self._emit()
+        legacy_present = [
+            "; --- DRAG PRESENT BEGIN ---",
+            "if $ssmtdrag_mode_testns == 1",
+            "\tpre run = CommandListDragPinDetected_testns",
+            "endif",
+            "post $ssmtdrag_drawn_testns = 0",
+            "; --- DRAG PRESENT END ---",
+        ]
+        sections["[Present]"] = legacy_present
+        node._emit_present_and_constants(sections, comps, "testns")
+        constants = "\n".join(sections["[Constants]"])
+        present = "\n".join(sections["[Present]"])
+        self.assertIn("global persist $ssmtdrag_drag_enabled_testns = 1", constants)
+        self.assertEqual(present.count("DRAG INTERACTION GATE BEGIN"), 1)
+        self.assertLess(present.index("DRAG INTERACTION GATE BEGIN"), present.index("pre run = CommandListDragPinDetected_testns"))
+        node._emit_present_and_constants(sections, comps, "testns")
+        self.assertEqual("\n".join(sections["[Present]"]).count("DRAG INTERACTION GATE BEGIN"), 1)
+
     def test_grabbable_always_explicit(self):
         _, sections, _ = self._emit()
         jig = "\n".join(sections["[CustomShaderDragJiggleabc123_43191_testns]"])
