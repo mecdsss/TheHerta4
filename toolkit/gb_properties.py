@@ -32,6 +32,11 @@ class GB_BallSettings(bpy.types.PropertyGroup):
         description="采样场模式：球范围内目标顶点直接取最近源顶点的原始权重，"
                     "保留多峰/非对称分布，不穿透网格；关闭则退回解析高斯拟合",
         update=_mark_dirty)
+    use_surface_propagation: bpy.props.BoolProperty(
+        name="沿表面传播", default=True,
+        description="解析高斯模式：权重从球与表面的接触点沿网格表面扩散（测地距离），"
+                    "不穿透到球体积覆盖的背面/对侧；关闭回退体积球",
+        update=_mark_dirty)
     enabled: bpy.props.BoolProperty(
         name="启用", default=True,
         description="临时停用此球（不参与权重计算）",

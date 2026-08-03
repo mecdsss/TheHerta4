@@ -143,8 +143,18 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
                 return False
         return True
 
+    @staticmethod
+    def _split_target_hash_values(target_hash: str) -> list[str]:
+        """拆分目标哈希为多个值：支持用逗号分隔多个哈希/前缀。
+
+        例如 "LOD0.789ae812-11451-16590,LOD0.789ae812-16590-0" 会同时匹配
+        两个前缀的物体。空白段自动忽略；全部为空的返回空列表（表示不限制）。
+        """
+        raw = str(target_hash or "")
+        return [part.strip() for part in raw.split(",") if part.strip()]
+
     @classmethod
-    def _matches_target_hash(cls, obj_name: str, target_hash: str) -> bool:
+    def _matches_single_target_hash(cls, obj_name: str, target_hash: str) -> bool:
         clean_obj_name = str(obj_name or "").strip()
         normalized_target_hash, bare_target_hash = cls._normalize_target_hash_variants(target_hash)
         if not normalized_target_hash and not bare_target_hash:
@@ -170,6 +180,21 @@ class SSMTNode_VertexGroupProcess(SSMTNodeBase):
         if bare_target_hash and obj_bare_prefix.startswith(bare_target_hash + "-"):
             return True
 
+        return False
+
+    @classmethod
+    def _matches_target_hash(cls, obj_name: str, target_hash: str) -> bool:
+        """判断物体是否命中目标哈希。
+
+        支持逗号分隔多个哈希/前缀：任意一个命中即匹配；
+        留空（或全部为空白段）表示不限制，所有物体都匹配。
+        """
+        values = cls._split_target_hash_values(target_hash)
+        if not values:
+            return True
+        for value in values:
+            if cls._matches_single_target_hash(obj_name, value):
+                return True
         return False
 
     def get_merged_mapping_for_object(self, obj_name, mapping_nodes):

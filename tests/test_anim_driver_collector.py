@@ -89,6 +89,52 @@ class AnimationDriverCollectorTests(unittest.TestCase):
         self.assertIn("global $speed_auto1 = 1", merged_text)
         self.assertIn("global $speed_auto2 = 2", merged_text)
 
+    def test_branched_topological_order_is_stable(self):
+        root = _FakeNode("Root", "Driver", "[Present]\nroot = 1")
+        branch_b = _FakeNode("BranchB", "Driver", "[Present]\nb = 1")
+        branch_a = _FakeNode("BranchA", "Driver", "[Present]\na = 1")
+        end = _FakeNode("End", "Driver", "[Present]\nend = 1")
+
+        socket = types.SimpleNamespace(bl_idname="SSMTSocketAnimDriver")
+
+        def link(from_node, to_node):
+            return types.SimpleNamespace(
+                from_node=from_node,
+                to_node=to_node,
+                from_socket=socket,
+                to_socket=socket,
+            )
+
+        links = [
+            link(root, branch_b),
+            link(root, branch_a),
+            link(branch_b, end),
+            link(branch_a, end),
+        ]
+        expected = ["Root", "BranchA", "BranchB", "End"]
+        for nodes in (
+            [branch_b, end, root, branch_a],
+            [end, branch_a, branch_b, root],
+        ):
+            collector = AnimationDriverCollector(types.SimpleNamespace(nodes=nodes, links=links))
+            graph, node_set = collector._build_graph(nodes)
+            paragraph = collector._divide_into_paragraphs(graph, node_set)[0]
+            ordered = collector._topological_sort(paragraph, graph)
+            self.assertEqual([node.name for node in ordered], expected)
+
+    def test_collect_orders_disconnected_paragraphs_by_node_name(self):
+        node_b = _FakeNode("NodeB", "Driver", "[Present]\nb = 1")
+        node_a = _FakeNode("NodeA", "Driver", "[Present]\na = 1")
+
+        result = AnimationDriverCollector(
+            types.SimpleNamespace(nodes=[node_b, node_a], links=[])
+        ).collect()
+
+        self.assertEqual(
+            [paragraph["node_names"] for paragraph in result],
+            [["NodeA"], ["NodeB"]],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

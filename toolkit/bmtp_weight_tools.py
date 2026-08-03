@@ -1,4 +1,7 @@
 import bpy
+
+
+WEIGHT_TRANSFER_VERTEX_MAPPING = 'POLYINTERP_NEAREST'
 import json
 
 from ..utils.vertexgroup_utils import VertexGroupUtils
@@ -183,7 +186,7 @@ class BMTP_OT_TransferWeights(bpy.types.Operator):
                         use_reverse_transfer=True,
                         data_type='VGROUP_WEIGHTS',
                         use_create=True,
-                        vert_mapping='NEAREST',
+                        vert_mapping=WEIGHT_TRANSFER_VERTEX_MAPPING,
                         layers_select_src='NAME',
                         layers_select_dst='ALL'
                     )
@@ -257,7 +260,7 @@ class BMTP_OT_TransferWeights(bpy.types.Operator):
                         use_reverse_transfer=True,
                         data_type='VGROUP_WEIGHTS',
                         use_create=True,
-                        vert_mapping='NEAREST',
+                        vert_mapping=WEIGHT_TRANSFER_VERTEX_MAPPING,
                         layers_select_src='NAME',
                         layers_select_dst='ALL'
                     )

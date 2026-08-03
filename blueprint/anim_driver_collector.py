@@ -8,6 +8,12 @@ class AnimationDriverCollector:
     def __init__(self, node_group):
         self.node_group = node_group
 
+    @staticmethod
+    def _node_sort_key(node):
+        tree_name = str(getattr(getattr(node, "id_data", None), "name", "") or "")
+        node_name = str(getattr(node, "name", "") or "")
+        return tree_name.casefold(), node_name.casefold(), tree_name, node_name
+
     def count_paragraphs(self) -> int:
         """轻量方法：只统计段落数，不调用 generate_ini_segment。
         适用于 draw 回调等只读上下文。"""
@@ -122,7 +128,7 @@ class AnimationDriverCollector:
         visited = set()
         paragraphs = []
 
-        for node in node_set:
+        for node in sorted(node_set, key=self._node_sort_key):
             if node in visited:
                 continue
             component = self._bfs_component(node, graph, visited)
@@ -138,7 +144,8 @@ class AnimationDriverCollector:
         while queue:
             node = queue.popleft()
             component.append(node)
-            for neighbor in graph[node]["inputs"] | graph[node]["outputs"]:
+            neighbors = graph[node]["inputs"] | graph[node]["outputs"]
+            for neighbor in sorted(neighbors, key=self._node_sort_key):
                 if neighbor not in visited:
                     visited.add(neighbor)
                     queue.append(neighbor)
@@ -153,19 +160,24 @@ class AnimationDriverCollector:
         for node in nodes:
             in_degree[node] = len([n for n in graph[node]["inputs"] if n in set(nodes)])
 
-        queue = deque([n for n in nodes if in_degree[n] == 0])
+        queue = [n for n in nodes if in_degree[n] == 0]
+        queue.sort(key=self._node_sort_key)
         sorted_nodes = []
 
         while queue:
-            node = queue.popleft()
+            node = queue.pop(0)
             sorted_nodes.append(node)
-            for neighbor in graph[node]["outputs"]:
+            for neighbor in sorted(graph[node]["outputs"], key=self._node_sort_key):
                 if neighbor in in_degree:
                     in_degree[neighbor] -= 1
                     if in_degree[neighbor] == 0:
                         queue.append(neighbor)
+                        queue.sort(key=self._node_sort_key)
 
-        remaining = [n for n in nodes if n not in sorted_nodes]
+        remaining = sorted(
+            (n for n in nodes if n not in sorted_nodes),
+            key=self._node_sort_key,
+        )
         return sorted_nodes + remaining
 
 

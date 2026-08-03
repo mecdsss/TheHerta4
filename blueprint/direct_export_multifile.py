@@ -20,6 +20,7 @@ from .direct_export_runtime_utils import (
     iter_drawib_models as _iter_drawib_models,
     normalize_runtime_name as _normalize_runtime_name,
 )
+from . import deform_chain
 
 
 class MultiFileDirectExportError(RuntimeError):
@@ -660,6 +661,7 @@ class DirectMultiFileGenerator:
         present_section = "[Present]"
         present_lines = sections.get(present_section, [])
         run_lines_to_add = []
+        mf_ran_vars = []
 
         for actual_hash, runtime_info in runtime_infos.items():
             state_outputs = generated_states.get(actual_hash, {})
@@ -678,7 +680,9 @@ class DirectMultiFileGenerator:
             source_resource_candidates = [
                 original_section_name[1:-1] if original_section_name else "",
                 f"{base_resource_name}_0",
+                f"{base_resource_name}_1",
                 f"{legacy_base_resource_name}_0",
+                f"{legacy_base_resource_name}_1",
                 legacy_base_resource_name,
             ]
             if not any(f"[{candidate}]" in sections for candidate in source_resource_candidates if candidate):
@@ -689,7 +693,7 @@ class DirectMultiFileGenerator:
             base_section_name = ensure_resource_alias_section(
                 sections,
                 base_resource_name,
-                "_1",
+                "_0",
                 source_candidates=source_resource_candidates,
             )
             base_resource_alias_name = base_section_name[1:-1]
@@ -730,6 +734,7 @@ class DirectMultiFileGenerator:
             shader_lines.append("")
             shader_lines.append("    cs = ./res/merge_anim_packed_delta.hlsl")
             shader_lines.append(f"    cs-u5 = copy {base_resource_alias_name}")
+            shader_lines.append(f"    {base_resource_name}_mf = ref cs-u5")
             shader_lines.append(f"    {base_resource_name} = ref cs-u5")
             vertex_count = runtime_info["vertex_count"] or 100000
             dispatch_count = self.config_node._compute_dispatch_group_count(vertex_count, threads_per_group=16)
@@ -781,11 +786,21 @@ class DirectMultiFileGenerator:
             run_line = f"    run = CustomShader_{actual_hash}_1Anim"
             if run_line not in run_lines_to_add:
                 run_lines_to_add.append(run_line)
+            ran_var = deform_chain.mf_ran_var(base_resource_name)
+            if ran_var not in mf_ran_vars:
+                mf_ran_vars.append(ran_var)
 
-        self._ensure_present_run_lines(present_lines, run_lines_to_add)
+        present_lines = deform_chain.ensure_multifile_present_block(
+            present_lines,
+            self.config_node.active_swapkey,
+            self.config_node.active_value,
+            mf_ran_vars,
+            [line.strip() for line in run_lines_to_add],
+        )
 
         sections[constants_section] = constants_lines
         sections[present_section] = present_lines
+        deform_chain.finalize_deform_chain(sections)
         self.config_node._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content)
 
     def _ensure_present_run_lines(self, present_lines, run_lines):

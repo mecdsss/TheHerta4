@@ -84,6 +84,69 @@ class ExactMatchPriorityTests(unittest.TestCase):
             )
         )
 
+    def test_comma_separated_target_hash_matches_multiple_prefixes(self):
+        """逗号分隔的多个目标哈希应同时匹配多个前缀的物体"""
+        process_node = node_vertex_group_process.SSMTNode_VertexGroupProcess()
+        target_hash = "LOD0.789ae812-11451-16590,LOD0.789ae812-16590-0"
+
+        # 两个前缀各自的物体都命中
+        self.assertTrue(
+            process_node._matches_target_hash("LOD0.789ae812-11451-16590.body", target_hash)
+        )
+        self.assertTrue(
+            process_node._matches_target_hash("LOD0.789ae812-16590-0.hair", target_hash)
+        )
+        # 名称完全等于某个值时也命中
+        self.assertTrue(
+            process_node._matches_target_hash("LOD0.789ae812-11451-16590", target_hash)
+        )
+        # 其他前缀不命中
+        self.assertFalse(
+            process_node._matches_target_hash("LOD0.789ae812-99999-0.skirt", target_hash)
+        )
+        self.assertFalse(
+            process_node._matches_target_hash("LOD1.789ae812-11451-16590.body", target_hash)
+        )
+
+    def test_comma_separated_target_hash_tolerates_spaces_and_empty_segments(self):
+        """逗号分隔值容忍空格和空段"""
+        process_node = node_vertex_group_process.SSMTNode_VertexGroupProcess()
+        target_hash = " LOD0.789ae812-11451-16590 , , LOD0.789ae812-16590-0 ,"
+
+        self.assertTrue(
+            process_node._matches_target_hash("LOD0.789ae812-11451-16590.body", target_hash)
+        )
+        self.assertTrue(
+            process_node._matches_target_hash("LOD0.789ae812-16590-0.hair", target_hash)
+        )
+
+    def test_comma_separated_target_hash_applies_mapping_to_both_objects(self):
+        """逗号分隔的目标哈希应给两个前缀的物体都应用映射表"""
+        process_node = node_vertex_group_process.SSMTNode_VertexGroupProcess()
+        match_node = _FakeMatchNode(
+            "Multi",
+            {"DEF-A": "1"},
+            "LOD0.789ae812-11451-16590,LOD0.789ae812-16590-0",
+            False,
+        )
+        mapping_nodes = [
+            {"node": match_node, "target_hash": match_node.target_hash, "index": 1, "type": "input"},
+        ]
+
+        merged_a = process_node.get_merged_mapping_for_object(
+            "LOD0.789ae812-11451-16590.body", mapping_nodes
+        )
+        merged_b = process_node.get_merged_mapping_for_object(
+            "LOD0.789ae812-16590-0.hair", mapping_nodes
+        )
+        merged_other = process_node.get_merged_mapping_for_object(
+            "LOD0.789ae812-99999-0.skirt", mapping_nodes
+        )
+
+        self.assertEqual(merged_a, {"DEF-A": "1"})
+        self.assertEqual(merged_b, {"DEF-A": "1"})
+        self.assertEqual(merged_other, {})
+
     def test_exact_match_stops_further_merging(self):
         """测试精确匹配节点阻止后续映射的合并"""
         process_node = node_vertex_group_process.SSMTNode_VertexGroupProcess()

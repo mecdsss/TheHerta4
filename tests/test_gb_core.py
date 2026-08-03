@@ -450,5 +450,72 @@ class SampledFieldTests(unittest.TestCase):
         self.assertEqual(float(field[0]), 0.0)
 
 
+class GeodesicFieldTests(unittest.TestCase):
+    """沿表面传播（测地）权重场：接触点种子 + Dijkstra 表面距离。"""
+
+    def _two_strips(self):
+        """front z=0（顶点0-4）、back z=0.5（顶点5-9），各自连边、片间不连通。"""
+        front = np.array([[x * 0.1, 0.0, 0.0] for x in range(5)])
+        back = np.array([[x * 0.1, 0.0, 0.5] for x in range(5)])
+        verts = np.vstack([front, back])
+        tris = np.array([[0, 1, 2], [0, 2, 3], [0, 3, 4],
+                         [5, 6, 7], [5, 7, 8], [5, 8, 9]])
+        return verts, gb_core.edges_from_triangles(tris)
+
+    def _ball(self, radius=0.6):
+        return _matrix(scale=(radius, radius, radius))
+
+    def test_edges_from_triangles_dedup(self):
+        tris = np.array([[2, 0, 1], [1, 0, 2]])  # 同一三角形写两遍（边重复）
+        e = gb_core.edges_from_triangles(tris)
+        np.testing.assert_array_equal(e, np.array([[0, 1], [0, 2], [1, 2]]))
+
+    def test_contact_point_matches_volumetric(self):
+        verts, edges = self._two_strips()
+        ball = self._ball()
+        local = gb_core._to_ball_local(verts, ball)
+        contact = int(np.argmin(np.einsum("ij,ij->i", local, local)))
+        g_geo = gb_core.geodesic_field(verts, ball, 1.0, 4.6, edges)
+        g_vol = gb_core.gaussian_field(verts, ball, 1.0, 4.6)
+        self.assertAlmostEqual(float(g_geo[contact]), float(g_vol[contact]), places=9)
+
+    def test_disconnected_back_strip_gets_zero(self):
+        verts, edges = self._two_strips()
+        ball = self._ball()
+        g_vol = gb_core.gaussian_field(verts, ball, 1.0, 4.6)
+        g_geo = gb_core.geodesic_field(verts, ball, 1.0, 4.6, edges)
+        self.assertGreater(float(g_vol[7]), 0.0)               # 体积球穿透到 back
+        np.testing.assert_array_equal(g_geo[5:], np.zeros(5))  # 测地：back 全 0
+        self.assertGreater(float(g_geo[2]), 0.3)               # 接触面仍有权重
+
+    def test_surface_distance_wraps_around(self):
+        verts, edges = self._two_strips()
+        ball = _matrix(loc=(0.2, 0.0, 0.0), scale=(0.6, 0.6, 0.6))  # 球心正对 front[2]
+        edges2 = np.vstack([edges, [0, 5]])  # 长边连通两片
+        local = gb_core._to_ball_local(verts, ball)
+        seeds = np.zeros(10, dtype=bool)
+        seeds[2] = True
+        d = gb_core.surface_distances(local, edges2, seeds)
+        # 接触点 front[2]（|local|=0）→ front[0]：1/3；→ back[5]：1/3+5/6=7/6 > 1
+        self.assertAlmostEqual(float(d[0]), 1.0 / 3.0, places=3)
+        self.assertAlmostEqual(float(d[5]), 7.0 / 6.0, places=3)
+        g_vol = gb_core.gaussian_field(verts, ball, 1.0, 4.6)
+        g_geo = gb_core.geodesic_field(verts, ball, 1.0, 4.6, edges2)
+        self.assertGreater(float(g_vol[5]), 0.0)   # 体积球穿透到 back[5]
+        self.assertEqual(float(g_geo[5]), 0.0)     # 测地：绕行距离 > 1 → 0
+
+    def test_degenerate_inputs(self):
+        verts, edges = self._two_strips()
+        ball = self._ball()
+        # 空边：仅剩接触点一个种子，不炸且有权重
+        f = gb_core.geodesic_field(verts, ball, 1.0, 4.6, np.zeros((0, 2), dtype=np.int64))
+        self.assertGreater(float(f.max()), 0.0)
+        # 球远离表面：最近顶点距离 > 1 → 全 0
+        far = _matrix(loc=(0.0, 0.0, 5.0), scale=(0.6, 0.6, 0.6))
+        np.testing.assert_array_equal(gb_core.geodesic_field(verts, far, 1.0, 4.6, edges), np.zeros(10))
+        # 零顶点
+        self.assertEqual(gb_core.geodesic_field(np.zeros((0, 3)), ball, 1.0, 4.6, edges).shape, (0,))
+
+
 if __name__ == "__main__":
     unittest.main()

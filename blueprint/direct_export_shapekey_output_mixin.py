@@ -20,6 +20,29 @@ from .direct_export_shapekey_shared import ShapeKeyDirectExportError, _buffer_to
 
 
 class DirectShapeKeyOutputMixin:
+    _PRESENT_RUN_BEGIN = "; --- SSMT DIRECT SHAPEKEY PRESENT BEGIN ---"
+    _PRESENT_RUN_END = "; --- SSMT DIRECT SHAPEKEY PRESENT END ---"
+
+    def _uses_active_guard(self):
+        key_map = getattr(getattr(self, "blueprint_model", None), "keyname_mkey_dict", None)
+        return bool(key_map)
+
+    def _build_present_run_block(self, unique_hashes):
+        lines = [self._PRESENT_RUN_BEGIN]
+        if self._uses_active_guard():
+            lines.extend([
+                'if $active0 == 1',
+                *[f"    run = CustomShader_{logical_hash}_Anim" for logical_hash in unique_hashes],
+                'endif',
+            ])
+        else:
+            lines.extend(
+                f"run = CustomShader_{logical_hash}_Anim"
+                for logical_hash in unique_hashes
+            )
+        lines.append(self._PRESENT_RUN_END)
+        return lines
+
     def _write_slot_files(self, logical_hash, runtime_info, hash_slot_data, slot_position_overrides):
         use_packed = self.node.use_packed_Meshess
         use_delta = self.node.store_deltas
@@ -463,9 +486,22 @@ class DirectShapeKeyOutputMixin:
             sections['[Present]'] = []
         present_lines = sections['[Present]']
         rebuilt_present_lines = []
+        generated_run_lines = {
+            f"run = CustomShader_{logical_hash}_Anim"
+            for logical_hash in unique_hashes
+        }
         line_index = 0
         while line_index < len(present_lines):
             stripped_line = present_lines[line_index].strip()
+            if stripped_line == self._PRESENT_RUN_BEGIN:
+                end_index = line_index + 1
+                while end_index < len(present_lines):
+                    if present_lines[end_index].strip() == self._PRESENT_RUN_END:
+                        break
+                    end_index += 1
+                if end_index < len(present_lines):
+                    line_index = end_index + 1
+                    continue
             if stripped_line == 'if $active0 == 1':
                 end_index = line_index + 1
                 inner_lines = []
@@ -480,22 +516,19 @@ class DirectShapeKeyOutputMixin:
                 if (
                     end_index < len(present_lines)
                     and inner_lines
-                    and all(
-                        (not inner_line) or inner_line.startswith('run = CustomShader_')
-                        for inner_line in inner_lines
-                    )
+                    and {line for line in inner_lines if line} == generated_run_lines
                 ):
                     line_index = end_index + 1
                     continue
 
+            if stripped_line in generated_run_lines:
+                line_index += 1
+                continue
+
             rebuilt_present_lines.append(present_lines[line_index])
             line_index += 1
 
-        rebuilt_present_lines.extend([
-            'if $active0 == 1',
-            *[f"    run = CustomShader_{h}_Anim" for h in unique_hashes],
-            'endif',
-        ])
+        rebuilt_present_lines.extend(self._build_present_run_block(unique_hashes))
         sections['[Present]'] = rebuilt_present_lines
 
         compute_blocks_to_add = OrderedDict()

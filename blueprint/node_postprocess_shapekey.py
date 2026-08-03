@@ -14,6 +14,10 @@ except ImportError:
     NUMPY_AVAILABLE = False
 
 from .direct_export import sync_shapekey_direct_mode
+try:
+    from . import deform_chain
+except ImportError:  # 测试 stub 包无 __path__ 时退化为绝对导入
+    from blueprint import deform_chain
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 from .variable_registry import allocate_shape_key_variable_name, mark_variable_name_used, normalize_variable_name
 from ..common.mod_path_compat import collect_base_position_resource_map
@@ -2280,6 +2284,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     )
 
             sections.update(compute_blocks_to_add)
+
+            # 终态规整（幂等）：检测到 rank10 多文件段时改为条件锚定、
+            # 接力块 rank 排序、复位行去重、_mf 声明、post run 移除（接力协议 v3）
+            deform_chain.finalize_deform_chain(sections)
+
             self._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content)
 
             mode_str = (

@@ -1,7 +1,11 @@
 import bpy
 from bpy.props import IntProperty
 
-from .anim_driver_base import SSMTNode_AnimDriver_Base
+from .anim_driver_base import (
+    ANIM_DRIVER_INPUT_SOCKET_NAME,
+    ANIM_DRIVER_OUTPUT_SOCKET_NAME,
+    SSMTNode_AnimDriver_Base,
+)
 
 
 class SSMTNode_AnimDriver_Runtime(SSMTNode_AnimDriver_Base):
@@ -26,8 +30,8 @@ class SSMTNode_AnimDriver_Runtime(SSMTNode_AnimDriver_Base):
     )
 
     def init(self, context):
-        self.inputs.new('SSMTSocketAnimDriver', "链输入")
-        self.outputs.new('SSMTSocketAnimDriver', "链输出")
+        self.inputs.new('SSMTSocketAnimDriver', ANIM_DRIVER_INPUT_SOCKET_NAME)
+        self.outputs.new('SSMTSocketAnimDriver', ANIM_DRIVER_OUTPUT_SOCKET_NAME)
         self.width = 300
         self._assign_next_available_index()
 
@@ -58,7 +62,7 @@ def _runtime_load_handler(dummy):
         for node in tree.nodes:
             if node.bl_idname == 'SSMTNode_AnimDriver_Runtime':
                 try:
-                    SSMTNode_AnimDriver_Base._migrate_base_sockets(node)
+                    SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
                 except Exception:
                     pass
 

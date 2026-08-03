@@ -11,6 +11,11 @@ from ..common.global_config import GlobalConfig
 from ..common.logic_name import LogicName
 
 
+ANIM_DRIVER_SOCKET_TYPE = 'SSMTSocketAnimDriver'
+ANIM_DRIVER_INPUT_SOCKET_NAME = "链输入"
+ANIM_DRIVER_OUTPUT_SOCKET_NAME = "链输出"
+
+
 class DrivenVariableItem(bpy.types.PropertyGroup):
     variable_name: StringProperty(
         name="驱动变量",
@@ -731,6 +736,30 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
     def update(self):
         if getattr(self, "use_continuous_shapekey_mode", False):
             self._ensure_initial_visible_continuous_index_variable_name()
+        self._update_dynamic_sockets()
+
+    def _update_dynamic_sockets(self):
+        """输入输出均采用动态拓展：末尾始终保留一个空闲插槽，连接后自动追加，连续空闲则收缩。"""
+        self._apply_dynamic_socket_expansion(getattr(self, "inputs", None), ANIM_DRIVER_INPUT_SOCKET_NAME)
+        self._apply_dynamic_socket_expansion(getattr(self, "outputs", None), ANIM_DRIVER_OUTPUT_SOCKET_NAME)
+
+    @staticmethod
+    def _apply_dynamic_socket_expansion(sockets, socket_name):
+        if not sockets:
+            return
+        try:
+            if sockets[-1].is_linked:
+                sockets.new(ANIM_DRIVER_SOCKET_TYPE, socket_name)
+            if len(sockets) > 1 and not sockets[-1].is_linked and not sockets[-2].is_linked:
+                sockets.remove(sockets[-1])
+        except Exception:
+            pass
+
+    def _has_linked_input(self):
+        return any(getattr(socket, "is_linked", False) for socket in getattr(self, "inputs", []) or [])
+
+    def _has_linked_output(self):
+        return any(getattr(socket, "is_linked", False) for socket in getattr(self, "outputs", []) or [])
 
     def _get_chain_links(self):
         tree = self.id_data
@@ -739,9 +768,9 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
         upstream = []
         downstream = []
         for link in tree.links:
-            if link.to_node == self and link.to_socket.name == '链输入':
+            if link.to_node == self and getattr(link.to_socket, 'bl_idname', '') == ANIM_DRIVER_SOCKET_TYPE:
                 upstream.append(link.from_node)
-            if link.from_node == self and link.from_socket.name == '链输出':
+            if link.from_node == self and getattr(link.from_socket, 'bl_idname', '') == ANIM_DRIVER_SOCKET_TYPE:
                 downstream.append(link.to_node)
         return upstream, downstream
 
@@ -852,65 +881,56 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
         tree = self.id_data
         if not tree:
             return None
-        for link in tree.links:
-            if link.to_node == self and link.to_socket.name == '时间输入':
-                node = link.from_node
-                if hasattr(node, 'fps') and hasattr(node, 'playback_rate'):
-                    return node
         visited = {self.name}
-        queue = deque([self])
-        while queue:
-            current = queue.popleft()
-            if hasattr(current, 'fps') and hasattr(current, 'playback_rate'):
-                return current
+        frontier = [self]
+        while frontier:
+            runtime_nodes = [
+                node for node in frontier
+                if node is not self and hasattr(node, 'fps') and hasattr(node, 'playback_rate')
+            ]
+            if runtime_nodes:
+                return min(runtime_nodes, key=self._runtime_node_sort_key)
+
+            next_nodes = []
             for link in tree.links:
-                if link.to_node == current and link.to_socket.name == '时间输入':
-                    upstream_node = link.from_node
-                    if upstream_node.name not in visited:
-                        visited.add(upstream_node.name)
-                        queue.append(upstream_node)
-        visited = {self.name}
-        queue = deque([self])
-        while queue:
-            current = queue.popleft()
-            if hasattr(current, 'fps') and hasattr(current, 'playback_rate'):
-                return current
-            for link in tree.links:
-                if link.to_node == current and link.to_socket.name == '链输入':
-                    upstream_node = link.from_node
-                    if upstream_node.name not in visited:
-                        visited.add(upstream_node.name)
-                        queue.append(upstream_node)
+                if link.to_node not in frontier:
+                    continue
+                if getattr(link.to_socket, 'bl_idname', '') != ANIM_DRIVER_SOCKET_TYPE:
+                    continue
+                upstream_node = link.from_node
+                if upstream_node.name in visited:
+                    continue
+                visited.add(upstream_node.name)
+                next_nodes.append(upstream_node)
+            frontier = sorted(next_nodes, key=self._runtime_node_sort_key)
         return None
 
     @staticmethod
-    def _migrate_play_sockets(node):
-        required_inputs = ["链输入", "时间输入", "驱动输入"]
-        required_outputs = ["链输出", "时间输出"]
-        SSMTNode_AnimDriver_Base._migrate_node_sockets(node, required_inputs, required_outputs)
+    def _runtime_node_sort_key(node):
+        tree_name = str(getattr(getattr(node, 'id_data', None), 'name', '') or '')
+        node_name = str(getattr(node, 'name', '') or '')
+        return tree_name.casefold(), node_name.casefold(), tree_name, node_name
 
     @staticmethod
-    def _migrate_base_sockets(node):
-        required_inputs = ["链输入"]
-        required_outputs = ["链输出"]
-        SSMTNode_AnimDriver_Base._migrate_node_sockets(node, required_inputs, required_outputs)
+    def _migrate_dynamic_sockets(node):
+        """旧版按 链输入/时间输入/驱动输入 等名字区分插槽；统一重命名为 链输入/链输出 并规范动态拓展末尾空位。"""
+        SSMTNode_AnimDriver_Base._normalize_dynamic_sockets(getattr(node, "inputs", None), ANIM_DRIVER_INPUT_SOCKET_NAME)
+        SSMTNode_AnimDriver_Base._normalize_dynamic_sockets(getattr(node, "outputs", None), ANIM_DRIVER_OUTPUT_SOCKET_NAME)
 
     @staticmethod
-    def _migrate_controlled_sockets(node):
-        required_inputs = ["链输入", "时间输入", "驱动输入"]
-        required_outputs = ["链输出"]
-        SSMTNode_AnimDriver_Base._migrate_node_sockets(node, required_inputs, required_outputs)
-
-    @staticmethod
-    def _migrate_node_sockets(node, required_inputs, required_outputs):
-        existing_input_names = {s.name for s in node.inputs}
-        existing_output_names = {s.name for s in node.outputs}
-        for name in required_inputs:
-            if name not in existing_input_names:
-                node.inputs.new('SSMTSocketAnimDriver', name)
-        for name in required_outputs:
-            if name not in existing_output_names:
-                node.outputs.new('SSMTSocketAnimDriver', name)
+    def _normalize_dynamic_sockets(sockets, socket_name):
+        if sockets is None:
+            return
+        for socket in sockets:
+            if socket.name != socket_name:
+                socket.name = socket_name
+        if len(sockets) == 0:
+            sockets.new(ANIM_DRIVER_SOCKET_TYPE, socket_name)
+            return
+        while len(sockets) > 1 and not sockets[-1].is_linked and not sockets[-2].is_linked:
+            sockets.remove(sockets[-1])
+        if sockets[-1].is_linked:
+            sockets.new(ANIM_DRIVER_SOCKET_TYPE, socket_name)
 
 
 classes = (

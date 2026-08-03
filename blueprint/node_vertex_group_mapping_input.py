@@ -21,7 +21,8 @@ class SSMTNode_VertexGroupMappingInput(SSMTNodeBase):
 
     target_hash: bpy.props.StringProperty(
         name="目标哈希",
-        description="应用此映射表的物体哈希标识（物体名称以'哈希-'开头时匹配），留空则应用于所有物体",
+        description="应用此映射表的物体哈希标识（物体名称以'哈希-'开头时匹配），留空则应用于所有物体；"
+        "支持逗号分隔多个值同时匹配多个前缀，如 LOD0.789ae812-11451-16590,LOD0.789ae812-16590-0",
         default=""
     )
 

@@ -125,6 +125,39 @@ def _assert_balanced_conditionals(test_case, ini_text):
     test_case.assertEqual(stack, [], f"Unclosed if blocks: {stack}")
 
 
+class _FakeDynamicSocket:
+    def __init__(self, name, linked=False):
+        self.bl_idname = "SSMTSocketAnimDriver"
+        self.name = name
+        self.is_linked = linked
+
+
+class _FakeDynamicSocketList:
+    def __init__(self, sockets=None):
+        self._sockets = list(sockets or [])
+        self.created = []
+        self.removed = []
+
+    def __len__(self):
+        return len(self._sockets)
+
+    def __getitem__(self, index):
+        return self._sockets[index]
+
+    def __iter__(self):
+        return iter(self._sockets)
+
+    def new(self, socket_type, name):
+        socket = _FakeDynamicSocket(name)
+        self._sockets.append(socket)
+        self.created.append((socket_type, name))
+        return socket
+
+    def remove(self, socket):
+        self._sockets.remove(socket)
+        self.removed.append(socket.name)
+
+
 class AnimDriverBaseTests(unittest.TestCase):
     def test_default_play_state_migration_flips_legacy_flag_once(self):
         node = {}
@@ -463,6 +496,216 @@ class AnimDriverBaseTests(unittest.TestCase):
         self.assertEqual(node.custom_continuous_index_variable_name, "continuous_shapekey_frame1")
         self.assertTrue(node.continuous_index_var_initialized)
 
+    def test_dynamic_socket_expansion_grows_when_last_socket_linked(self):
+        sockets = _FakeDynamicSocketList([_FakeDynamicSocket("链输入", linked=True)])
+
+        anim_driver_base.SSMTNode_AnimDriver_Base._apply_dynamic_socket_expansion(sockets, "链输入")
+
+        self.assertEqual(len(sockets), 2)
+        self.assertEqual(sockets.created, [("SSMTSocketAnimDriver", "链输入")])
+        self.assertFalse(sockets[-1].is_linked)
+
+    def test_dynamic_socket_expansion_shrinks_trailing_unlinked_sockets(self):
+        sockets = _FakeDynamicSocketList([
+            _FakeDynamicSocket("链输入", linked=True),
+            _FakeDynamicSocket("链输入"),
+            _FakeDynamicSocket("链输入"),
+        ])
+
+        anim_driver_base.SSMTNode_AnimDriver_Base._apply_dynamic_socket_expansion(sockets, "链输入")
+
+        self.assertEqual(len(sockets), 2)
+        self.assertEqual(sockets.removed, ["链输入"])
+
+    def test_dynamic_socket_expansion_keeps_single_empty_socket(self):
+        sockets = _FakeDynamicSocketList([_FakeDynamicSocket("链输入")])
+
+        anim_driver_base.SSMTNode_AnimDriver_Base._apply_dynamic_socket_expansion(sockets, "链输入")
+
+        self.assertEqual(len(sockets), 1)
+        self.assertEqual(sockets.created, [])
+        self.assertEqual(sockets.removed, [])
+
+    def test_update_expands_linked_sockets_and_keeps_empty_output(self):
+        node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
+        node.use_continuous_shapekey_mode = False
+        node.inputs = _FakeDynamicSocketList([_FakeDynamicSocket("链输入", linked=True)])
+        node.outputs = _FakeDynamicSocketList([_FakeDynamicSocket("链输出")])
+
+        node.update()
+
+        self.assertEqual(len(node.inputs), 2)
+        self.assertEqual(node.inputs.created, [("SSMTSocketAnimDriver", "链输入")])
+        self.assertEqual(len(node.outputs), 1)
+        self.assertEqual(node.outputs.created, [])
+
+    def test_migrate_dynamic_sockets_renames_legacy_sockets_and_normalizes(self):
+        node = types.SimpleNamespace(
+            inputs=_FakeDynamicSocketList([
+                _FakeDynamicSocket("链输入", linked=True),
+                _FakeDynamicSocket("时间输入"),
+                _FakeDynamicSocket("驱动输入"),
+            ]),
+            outputs=_FakeDynamicSocketList([
+                _FakeDynamicSocket("链输出", linked=True),
+                _FakeDynamicSocket("时间输出", linked=True),
+            ]),
+        )
+
+        anim_driver_base.SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
+
+        self.assertEqual([socket.name for socket in node.inputs], ["链输入", "链输入"])
+        self.assertEqual(node.inputs.removed, ["链输入"])
+        self.assertEqual(
+            [socket.name for socket in node.outputs],
+            ["链输出", "链输出", "链输出"],
+        )
+        self.assertEqual(node.outputs.created, [("SSMTSocketAnimDriver", "链输出")])
+
+    def test_migrate_dynamic_sockets_creates_socket_when_empty(self):
+        node = types.SimpleNamespace(
+            inputs=_FakeDynamicSocketList(),
+            outputs=_FakeDynamicSocketList(),
+        )
+
+        anim_driver_base.SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
+
+        self.assertEqual(node.inputs.created, [("SSMTSocketAnimDriver", "链输入")])
+        self.assertEqual(node.outputs.created, [("SSMTSocketAnimDriver", "链输出")])
+
+    def test_find_runtime_node_traverses_anim_sockets_regardless_of_name(self):
+        runtime_node = runtime_module.SSMTNode_AnimDriver_Runtime()
+        runtime_node.name = "Runtime"
+        runtime_node.fps = 30
+        runtime_node.playback_rate = 1
+
+        play_node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
+        play_node.name = "Forward"
+
+        class _FakeSocket:
+            def __init__(self, name):
+                self.bl_idname = "SSMTSocketAnimDriver"
+                self.name = name
+
+        class _FakeLink:
+            def __init__(self, from_node, to_node, from_name, to_name):
+                self.from_node = from_node
+                self.to_node = to_node
+                self.from_socket = _FakeSocket(from_name)
+                self.to_socket = _FakeSocket(to_name)
+
+        node_group = types.SimpleNamespace(
+            nodes=[runtime_node, play_node],
+            links=[_FakeLink(runtime_node, play_node, "任意输出", "任意输入")],
+        )
+        runtime_node.id_data = node_group
+        play_node.id_data = node_group
+
+        self.assertIs(play_node._find_runtime_node(), runtime_node)
+
+    def test_find_runtime_node_reaches_runtime_through_intermediate_node(self):
+        runtime_node = runtime_module.SSMTNode_AnimDriver_Runtime()
+        runtime_node.name = "Runtime"
+        runtime_node.fps = 30
+        runtime_node.playback_rate = 1
+
+        toggle_node = toggle_module.SSMTNode_AnimDriver_Toggle()
+        toggle_node.name = "Toggle"
+
+        play_node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
+        play_node.name = "Forward"
+
+        class _FakeSocket:
+            def __init__(self, name):
+                self.bl_idname = "SSMTSocketAnimDriver"
+                self.name = name
+
+        class _FakeLink:
+            def __init__(self, from_node, to_node):
+                self.from_node = from_node
+                self.to_node = to_node
+                self.from_socket = _FakeSocket("链输出")
+                self.to_socket = _FakeSocket("链输入")
+
+        node_group = types.SimpleNamespace(
+            nodes=[runtime_node, toggle_node, play_node],
+            links=[
+                _FakeLink(runtime_node, toggle_node),
+                _FakeLink(toggle_node, play_node),
+            ],
+        )
+        runtime_node.id_data = node_group
+        toggle_node.id_data = node_group
+        play_node.id_data = node_group
+
+        self.assertIs(play_node._find_runtime_node(), runtime_node)
+
+    def test_find_runtime_node_is_stable_when_multiple_runtimes_are_equally_near(self):
+        runtime_b = runtime_module.SSMTNode_AnimDriver_Runtime()
+        runtime_b.name = "Runtime B"
+        runtime_b.fps = 60
+        runtime_b.playback_rate = 2
+
+        runtime_a = runtime_module.SSMTNode_AnimDriver_Runtime()
+        runtime_a.name = "Runtime A"
+        runtime_a.fps = 30
+        runtime_a.playback_rate = 1
+
+        play_node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
+        play_node.name = "Forward"
+
+        class _FakeSocket:
+            bl_idname = "SSMTSocketAnimDriver"
+
+        class _FakeLink:
+            def __init__(self, from_node, to_node):
+                self.from_node = from_node
+                self.to_node = to_node
+                self.from_socket = _FakeSocket()
+                self.to_socket = _FakeSocket()
+
+        links = [
+            _FakeLink(runtime_b, play_node),
+            _FakeLink(runtime_a, play_node),
+        ]
+        node_group = types.SimpleNamespace(name="Tree", links=links)
+        runtime_a.id_data = node_group
+        runtime_b.id_data = node_group
+        play_node.id_data = node_group
+
+        self.assertIs(play_node._find_runtime_node(), runtime_a)
+        node_group.links = list(reversed(links))
+        self.assertIs(play_node._find_runtime_node(), runtime_a)
+
+    def test_get_chain_links_matches_links_by_socket_type_not_name(self):
+        upstream_node = types.SimpleNamespace(name="Up")
+        downstream_node = types.SimpleNamespace(name="Down")
+
+        node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
+        node.name = "Self"
+
+        class _FakeSocket:
+            def __init__(self, name):
+                self.bl_idname = "SSMTSocketAnimDriver"
+                self.name = name
+
+        class _FakeLink:
+            def __init__(self, from_node, to_node, from_name, to_name):
+                self.from_node = from_node
+                self.to_node = to_node
+                self.from_socket = _FakeSocket(from_name)
+                self.to_socket = _FakeSocket(to_name)
+
+        node.id_data = types.SimpleNamespace(links=[
+            _FakeLink(upstream_node, node, "任意输出", "旧时间输入"),
+            _FakeLink(node, downstream_node, "旧时间输出", "任意输入"),
+        ])
+
+        upstream, downstream = node._get_chain_links()
+
+        self.assertEqual(upstream, [upstream_node])
+        self.assertEqual(downstream, [downstream_node])
+
     def test_forward_play_load_handler_backfills_continuous_index_variable_for_legacy_node(self):
         node = forward_play_module.SSMTNode_AnimDriver_ForwardPlay()
         node.bl_idname = 'SSMTNode_AnimDriver_ForwardPlay'
@@ -475,7 +718,8 @@ class AnimDriverBaseTests(unittest.TestCase):
         node.driven_variable_list = []
         node.inputs = []
         node.outputs = []
-        anim_driver_base.SSMTNode_AnimDriver_Base._migrate_play_sockets = staticmethod(lambda _node: None)
+        original_migrate = anim_driver_base.SSMTNode_AnimDriver_Base._migrate_dynamic_sockets
+        anim_driver_base.SSMTNode_AnimDriver_Base._migrate_dynamic_sockets = staticmethod(lambda _node: None)
         node._ensure_initial_visible_continuous_index_variable_name = lambda: setattr(
             node, "custom_continuous_index_variable_name", "continuous_shapekey_frame1"
         ) or setattr(node, "continuous_index_var_initialized", True)
@@ -487,7 +731,10 @@ class AnimDriverBaseTests(unittest.TestCase):
             )
         ]
 
-        forward_play_module._forward_play_load_handler(dummy=None)
+        try:
+            forward_play_module._forward_play_load_handler(dummy=None)
+        finally:
+            anim_driver_base.SSMTNode_AnimDriver_Base._migrate_dynamic_sockets = original_migrate
 
         self.assertEqual(node.custom_paused_var, "$animation_paused1")
         self.assertEqual(node.custom_continuous_index_variable_name, "continuous_shapekey_frame1")
@@ -505,7 +752,8 @@ class AnimDriverBaseTests(unittest.TestCase):
         node.driven_variable_list = []
         node.inputs = []
         node.outputs = []
-        anim_driver_base.SSMTNode_AnimDriver_Base._migrate_play_sockets = staticmethod(lambda _node: None)
+        original_migrate = anim_driver_base.SSMTNode_AnimDriver_Base._migrate_dynamic_sockets
+        anim_driver_base.SSMTNode_AnimDriver_Base._migrate_dynamic_sockets = staticmethod(lambda _node: None)
         node._ensure_initial_visible_continuous_index_variable_name = lambda: setattr(
             node, "custom_continuous_index_variable_name", "continuous_shapekey_frame2"
         ) or setattr(node, "continuous_index_var_initialized", True)
@@ -517,7 +765,10 @@ class AnimDriverBaseTests(unittest.TestCase):
             )
         ]
 
-        pingpong_module._pingpong_load_handler(dummy=None)
+        try:
+            pingpong_module._pingpong_load_handler(dummy=None)
+        finally:
+            anim_driver_base.SSMTNode_AnimDriver_Base._migrate_dynamic_sockets = original_migrate
 
         self.assertEqual(node.custom_paused_var, "$animation_paused2")
         self.assertEqual(node.custom_continuous_index_variable_name, "continuous_shapekey_frame2")
@@ -1369,8 +1620,9 @@ class AnimDriverBaseTests(unittest.TestCase):
 
         class _FakeLayout:
             def operator(self, op_idname, text="", icon=""):
-                calls.append((op_idname, text, icon))
-                return _FakeOperator()
+                op = _FakeOperator()
+                calls.append((op_idname, text, icon, op))
+                return op
 
             def menu(self, *args, **kwargs):
                 calls.append(("menu", args, kwargs))
@@ -1394,6 +1646,10 @@ class AnimDriverBaseTests(unittest.TestCase):
         self.assertTrue(any(call[1] == "运行时间" for call in calls if call[0] == "node.add_node"))
         self.assertTrue(any(call[1] == "累计触发" for call in calls if call[0] == "node.add_node"))
         self.assertTrue(any(call[1] == "动画驱动开关" for call in calls if call[0] == "node.add_node"))
+        self.assertTrue(any(call[1] == "随机驱动" for call in calls if call[0] == "node.add_node"))
+        random_entry = next(call for call in calls if call[0] == "node.add_node" and call[1] == "随机驱动")
+        self.assertEqual(random_entry[2], "RNDCURVE")
+        self.assertEqual(random_entry[3].type, "SSMTNode_AnimDriver_Random")
 
 
 if __name__ == "__main__":

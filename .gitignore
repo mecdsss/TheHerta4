@@ -1,16 +1,16 @@
 __pycache__
-Logs/
-herta-blender_updater/
-theherta4_updater/
-test/
-references/
 .agents/
-docs/
-reports/
-# Codex benchmark output directory
 .codex_benchmarks/
+.dbg/
+.kunsdd/
+# Codex benchmark output directory
 dist/
 DIST/
+docs/
+herta-blender_updater/
+Logs/
+references/
+reports/
 test_result.txt
-.kunsdd/
-.dbg/
+test/
+theherta4_updater/

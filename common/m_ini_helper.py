@@ -833,7 +833,7 @@ class M_IniHelper:
             if previous_index is not None:
                 raise ValueError(
                     f"着色器替换名称前缀 '{prefix}' 重复：配置 {previous_index} 与 {info_index}。"
-                    "每个着色器替换节点必须使用唯一前缀。"
+                    "配置完全相同的节点会被自动合并；参数不同的节点必须使用唯一前缀。"
                 )
             seen_prefixes[prefix_key] = info_index
 

@@ -7,6 +7,7 @@ from bpy.props import StringProperty
 from ..common.global_config import GlobalConfig
 from ..common.object_prefix_helper import ObjectPrefixHelper
 
+from .anim_driver_base import ANIM_DRIVER_INPUT_SOCKET_NAME, ANIM_DRIVER_OUTPUT_SOCKET_NAME
 from .node_base import SSMTBlueprintTree, SSMTNodeBase, refresh_blueprint_node_colors
 
 
@@ -1228,6 +1229,17 @@ class SSMT_OT_ConvertAnimDriverNode(bpy.types.Operator):
             self.report({'ERROR'}, f"创建目标动画驱动节点失败: {exc}")
             return {'CANCELLED'}
 
+        # 目标节点为动态拓展插槽，初始只有 1 入 1 出，按需补齐到源节点连接的最大索引
+        max_input_index = max((index for index, _socket in input_links), default=-1)
+        max_output_index = max((index for index, _socket in output_links), default=-1)
+        try:
+            while len(new_node.inputs) <= max_input_index:
+                new_node.inputs.new('SSMTSocketAnimDriver', ANIM_DRIVER_INPUT_SOCKET_NAME)
+            while len(new_node.outputs) <= max_output_index:
+                new_node.outputs.new('SSMTSocketAnimDriver', ANIM_DRIVER_OUTPUT_SOCKET_NAME)
+        except Exception:
+            pass
+
         missing_input = next((index for index, _socket in input_links if index >= len(new_node.inputs)), None)
         missing_output = next((index for index, _socket in output_links if index >= len(new_node.outputs)), None)
         if missing_input is not None or missing_output is not None:
@@ -1367,9 +1379,11 @@ class SSMT_MT_NodeMenu_PostProcess(bpy.types.Menu):
         _add_node_entry(layout, "材质转资源", 'MATERIAL', "SSMTNode_PostProcess_Material")
         _add_node_entry(layout, "血量检测", 'HEART', "SSMTNode_PostProcess_HealthDetection")
         _add_node_entry(layout, "滑块面板", 'GRIP', "SSMTNode_PostProcess_SliderPanel")
+        _add_node_entry(layout, "UI面板注入", 'RESTRICT_VIEW_OFF', "SSMTNode_PostProcess_UIPanel")
         _add_node_entry(layout, "贴图资源去重", 'PACKAGE', "SSMTNode_PostProcess_ResourceMerge")
         _add_node_entry(layout, "缓冲区清理", 'TRASH', "SSMTNode_PostProcess_BufferCleanup")
         _add_node_entry(layout, "多文件配置", 'FILE_FOLDER', "SSMTNode_PostProcess_MultiFile")
+        _add_node_entry(layout, "拖拽交互", 'MOUSE_MOVE', "SSMTNode_PostProcess_DragInteraction")
         _add_node_entry(layout, "动画驱动蓝图", 'ACTION', "SSMTNode_PostProcess_AnimDriver")
 
 
@@ -1739,6 +1753,7 @@ def draw_node_add_menu(self, context):
         layout.operator("node.add_node", text="计时触发", icon='TIME').type = "SSMTNode_AnimDriver_Trigger"
         layout.operator("node.add_node", text="累计触发", icon='SORTTIME').type = "SSMTNode_AnimDriver_AccumulativeTrigger"
         layout.operator("node.add_node", text="条件触发", icon='ORIENTATION_CURSOR').type = "SSMTNode_AnimDriver_ConditionalTrigger"
+        layout.operator("node.add_node", text="随机驱动", icon='RNDCURVE').type = "SSMTNode_AnimDriver_Random"
         layout.operator("node.add_node", text="动画驱动开关", icon='KEYFRAME').type = "SSMTNode_AnimDriver_Toggle"
         layout.operator("node.add_node", text="形态键动画序列", icon='SHAPEKEY_DATA').type = "SSMTNode_AnimDriver_ShapeKeySequence"
         return
@@ -1783,6 +1798,7 @@ def draw_node_context_menu(self, context):
         layout.operator("node.add_node", text="计时触发", icon='TIME').type = "SSMTNode_AnimDriver_Trigger"
         layout.operator("node.add_node", text="累计触发", icon='SORTTIME').type = "SSMTNode_AnimDriver_AccumulativeTrigger"
         layout.operator("node.add_node", text="条件触发", icon='ORIENTATION_CURSOR').type = "SSMTNode_AnimDriver_ConditionalTrigger"
+        layout.operator("node.add_node", text="随机驱动", icon='RNDCURVE').type = "SSMTNode_AnimDriver_Random"
         layout.operator("node.add_node", text="动画驱动开关", icon='KEYFRAME').type = "SSMTNode_AnimDriver_Toggle"
         layout.operator("node.add_node", text="形态键动画序列", icon='SHAPEKEY_DATA').type = "SSMTNode_AnimDriver_ShapeKeySequence"
         layout.separator()

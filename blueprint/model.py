@@ -54,6 +54,29 @@ def _get_node_unique_key(node: bpy.types.Node) -> str:
     return f"{tree_name}::{node.name}"
 
 
+def _get_shader_replace_config_key(info) -> tuple:
+    """构建着色器替换配置的合并键。
+
+    配置完全相同（名称前缀、快捷键、组件、着色器列表顺序与内容）的不同节点
+    会合并为同一份导出配置，避免同前缀生成重复的 INI 段名和全局变量。
+    前缀大小写不敏感，与全局前缀唯一性校验（_validate_shader_replace_info_list）一致。
+    """
+    shaders = tuple(
+        (
+            str(shader.get('variant_name', '') or '').strip().casefold(),
+            str(shader.get('shader_file_path', '') or '').strip(),
+            str(shader.get('shader_hash', '') or '').strip().casefold(),
+        )
+        for shader in (info.get('shaders') or [])
+    )
+    return (
+        str(info.get('name_prefix', '') or '').strip().casefold(),
+        str(info.get('toggle_key', '') or '').strip(),
+        info.get('component_index', 0),
+        shaders,
+    )
+
+
 def _is_postprocess_node(bl_idname: str) -> bool:
     """判断是否为后处理节点类型"""
     return bl_idname.startswith('SSMTNode_PostProcess_')
@@ -1337,6 +1360,7 @@ class BluePrintModel:
         # 仅解析实际被有效链选中的最近节点。仅连接到输出但没有对象输入的节点，
         # 以及同一链上被最近节点遮蔽的配置，都不应参与文件复制和全局前缀校验。
         node_info_map = {}
+        info_by_config_key = {}
         sr_chain_count = 0
         for chain in valid_chains:
             sr_nodes_in_chain = [n for n in chain.node_path if n.bl_idname == _NODE_TYPE_SHADER_REPLACE]
@@ -1355,11 +1379,24 @@ class BluePrintModel:
             if info is None:
                 info = nearest_sr_node.get_shader_replace_info()
                 node_info_map[node_key] = info
-                self.shader_replace_info_list.append(info)
-                LOG.info(
-                    f"🎨 着色器替换节点 '{nearest_sr_node.name}': "
-                    f"prefix={info['name_prefix']}, shaders={len(info['shaders'])}"
-                )
+                config_key = _get_shader_replace_config_key(info)
+                merged_info = info_by_config_key.get(config_key)
+                if merged_info is None:
+                    info_by_config_key[config_key] = info
+                    self.shader_replace_info_list.append(info)
+                    LOG.info(
+                        f"🎨 着色器替换节点 '{nearest_sr_node.name}': "
+                        f"prefix={info['name_prefix']}, shaders={len(info['shaders'])}"
+                    )
+                else:
+                    # 不同链路上的节点配置完全相同：合并为同一份配置，
+                    # 所有关联物体共享同一前缀、快捷键和着色器。
+                    info = merged_info
+                    node_info_map[node_key] = merged_info
+                    LOG.info(
+                        f"🎨 着色器替换节点 '{nearest_sr_node.name}' 与已有节点配置完全相同，"
+                        f"已合并为同一份配置 (prefix={info['name_prefix']})"
+                    )
             if info:
                 chain.shader_replace_info_list = [info]
                 object_infos = self.shader_replace_object_info_map.setdefault(export_obj_name, [])

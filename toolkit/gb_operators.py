@@ -257,6 +257,12 @@ def _ensure_islands(tcache, target, props):
     """选项开启时懒计算岛 ID。"""
     if not props.only_nearest_island or tcache.island_ids is not None:
         return
+    # 防御：edge_verts 正常由 _build_target_batch 初始化，但本函数不应
+    # 隐式依赖它必须先被调用——此处自行补齐，避免 None 引用。
+    if tcache.edge_verts is None:
+        edges = np.empty(len(target.data.edges) * 2, dtype=np.int64)
+        target.data.edges.foreach_get("vertices", edges)
+        tcache.edge_verts = edges.reshape(-1, 2)
     tcache.island_ids = gb_core.compute_island_ids(
         len(target.data.vertices), tcache.edge_verts)
     tcache.island_count = len(set(tcache.island_ids.tolist()))
@@ -281,6 +287,12 @@ def _compute_merged_field(session, tcache, target, props):
             field = gb_core.sampled_field(
                 verts, session.source_positions, session.source_weights,
                 mw, strength_scale=ball.gb_ball.strength)
+        elif (getattr(ball.gb_ball, "use_surface_propagation", True)
+                and tcache.edge_verts is not None):
+            # 沿表面传播：权重从接触点沿网格表面扩散，不穿透到背面/对侧
+            field = gb_core.geodesic_field(
+                verts, mw, ball.gb_ball.strength, ball.gb_ball.falloff_k,
+                tcache.edge_verts)
         else:
             field = gb_core.gaussian_field(
                 verts, mw, ball.gb_ball.strength, ball.gb_ball.falloff_k)

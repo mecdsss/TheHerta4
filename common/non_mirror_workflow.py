@@ -49,7 +49,7 @@ class NonMirrorWorkflowHelper:
     def _mirror_apply_and_flip(cls, obj: bpy.types.Object):
         mesh = obj.data
         mirror_matrix = Matrix.Scale(-1.0, 4, cls._AXIS_VECTOR)
-        source_vertex_normals = cls._capture_vertex_normals(mesh)
+        source_corner_normals = cls._capture_corner_normals(mesh)
 
         cls._transform_mesh_with_shape_keys(mesh, mirror_matrix)
 
@@ -65,7 +65,7 @@ class NonMirrorWorkflowHelper:
         mesh.update()
         if hasattr(mesh, "calc_normals"):
             mesh.calc_normals()
-        cls._restore_mirrored_vertex_normals(mesh, source_vertex_normals, mirror_matrix)
+        cls._restore_mirrored_corner_normals(mesh, source_corner_normals, mirror_matrix)
         mesh.update()
 
     @classmethod
@@ -103,42 +103,74 @@ class NonMirrorWorkflowHelper:
             return False
 
     @classmethod
-    def _capture_vertex_normals(cls, mesh: bpy.types.Mesh) -> list[tuple[float, float, float]]:
-        if len(mesh.vertices) == 0:
+    def _capture_corner_normals(cls, mesh: bpy.types.Mesh) -> list[list[tuple[int, tuple[float, float, float]]]]:
+        loops = getattr(mesh, "loops", None)
+        polygons = getattr(mesh, "polygons", None)
+        if not loops or not polygons:
             return []
 
-        if hasattr(mesh, "calc_normals"):
-            mesh.calc_normals()
+        if hasattr(mesh, "calc_normals_split"):
+            mesh.calc_normals_split()
 
-        raw_normals = [0.0] * (len(mesh.vertices) * 3)
-        mesh.vertices.foreach_get("normal", raw_normals)
+        raw_normals = [0.0] * (len(loops) * 3)
+        vertex_indices = [0] * len(loops)
+        loops.foreach_get("normal", raw_normals)
+        loops.foreach_get("vertex_index", vertex_indices)
 
-        return [
-            (raw_normals[index], raw_normals[index + 1], raw_normals[index + 2])
-            for index in range(0, len(raw_normals), 3)
-        ]
+        captured = []
+        for polygon in polygons:
+            polygon_normals = []
+            for loop_index in polygon.loop_indices:
+                normal_index = loop_index * 3
+                polygon_normals.append((
+                    vertex_indices[loop_index],
+                    (
+                        raw_normals[normal_index],
+                        raw_normals[normal_index + 1],
+                        raw_normals[normal_index + 2],
+                    ),
+                ))
+            captured.append(polygon_normals)
+        return captured
 
     @classmethod
-    def _restore_mirrored_vertex_normals(
+    def _restore_mirrored_corner_normals(
         cls,
         mesh: bpy.types.Mesh,
-        source_vertex_normals: list[tuple[float, float, float]],
+        source_corner_normals: list[list[tuple[int, tuple[float, float, float]]]],
         mirror_matrix: Matrix,
     ):
-        if not source_vertex_normals or len(source_vertex_normals) != len(mesh.vertices):
+        polygons = getattr(mesh, "polygons", None)
+        loops = getattr(mesh, "loops", None)
+        if not source_corner_normals or not polygons or not loops:
+            return
+        if len(source_corner_normals) != len(polygons):
             return
 
         normal_matrix = mirror_matrix.inverted_safe().transposed().to_3x3()
-        mirrored_normals = []
+        mirrored_normals = [None] * len(loops)
 
-        for normal in source_vertex_normals:
-            mirrored = normal_matrix @ Vector(normal)
-            if mirrored.length_squared > 0.0:
-                mirrored.normalize()
-            mirrored_normals.append((mirrored.x, mirrored.y, mirrored.z))
+        for polygon, source_normals in zip(polygons, source_corner_normals):
+            remaining = list(source_normals)
+            for loop_index in polygon.loop_indices:
+                vertex_index = loops[loop_index].vertex_index
+                source_index = next(
+                    (index for index, item in enumerate(remaining) if item[0] == vertex_index),
+                    None,
+                )
+                if source_index is None:
+                    return
+                _source_vertex_index, normal = remaining.pop(source_index)
+                mirrored = normal_matrix @ Vector(normal)
+                if mirrored.length_squared > 0.0:
+                    mirrored.normalize()
+                mirrored_normals[loop_index] = (mirrored.x, mirrored.y, mirrored.z)
+
+        if any(normal is None for normal in mirrored_normals):
+            return
 
         try:
-            mesh.normals_split_custom_set_from_vertices(mirrored_normals)
+            mesh.normals_split_custom_set(mirrored_normals)
         except Exception as exc:
             LOG.warning(
                 f"   ⚠️ 非镜像工作流重建自定义法线失败 "

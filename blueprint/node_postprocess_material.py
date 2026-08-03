@@ -1,6 +1,7 @@
 import bpy
 import os
 import glob
+import hashlib
 import re
 from collections import OrderedDict
 import shutil
@@ -717,11 +718,32 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         return token or "Texture"
 
     @staticmethod
+    def _latin_token_for_text(text):
+        # 非 ASCII 文本（如中文）映射为确定性的“随机”英文串：由内容哈希派生，
+        # 同一文本永远得到同一串字母，引用行与资源定义段才能始终对应。
+        digest = hashlib.md5(str(text).encode("utf-8")).digest()
+        value = int.from_bytes(digest[:8], "big")
+        letters = []
+        for _ in range(10):
+            letters.append(chr(ord("a") + (value % 26)))
+            value //= 26
+        return "".join(letters).capitalize()
+
+    @staticmethod
+    def _replace_non_ascii_runs(text):
+        return re.sub(
+            r"[^\x00-\x7f]+",
+            lambda match: SSMTNode_PostProcess_Material._latin_token_for_text(match.group(0)),
+            str(text or ""),
+        )
+
+    @staticmethod
     def _material_resource_stem(material):
         material_name = str(getattr(material, "name", "") or "").strip()
         if not material_name:
             material_name = "Texture"
         stem = re.sub(r'[\r\n\[\]=<>:"/\\|?*\s]+', "_", material_name).strip()
+        stem = SSMTNode_PostProcess_Material._replace_non_ascii_runs(stem)
         return stem.strip("._") or "Texture"
 
     @staticmethod
@@ -1246,7 +1268,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 new_filename = forced_filename
             else:
                 _, file_extension = os.path.splitext(os.path.basename(source_path))
-                new_filename = f"{material.name}{file_extension}"
+                new_filename = f"{SSMTNode_PostProcess_Material._material_resource_stem(material)}{file_extension}"
 
             target_path = os.path.join(target_folder, new_filename)
             if os.path.exists(target_path) and not self.material_to_resource_override:

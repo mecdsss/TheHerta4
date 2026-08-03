@@ -1,7 +1,11 @@
 import bpy
 from bpy.props import IntProperty, StringProperty, BoolProperty, EnumProperty, CollectionProperty
 
-from .anim_driver_base import SSMTNode_AnimDriver_Base
+from .anim_driver_base import (
+    ANIM_DRIVER_INPUT_SOCKET_NAME,
+    ANIM_DRIVER_OUTPUT_SOCKET_NAME,
+    SSMTNode_AnimDriver_Base,
+)
 
 
 _INVERTED_COMPARISON_OPS = {
@@ -346,9 +350,8 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
     )
 
     def init(self, context):
-        self.inputs.new('SSMTSocketAnimDriver', "链输入")
-        self.inputs.new('SSMTSocketAnimDriver', "驱动输入")
-        self.outputs.new('SSMTSocketAnimDriver', "链输出")
+        self.inputs.new('SSMTSocketAnimDriver', ANIM_DRIVER_INPUT_SOCKET_NAME)
+        self.outputs.new('SSMTSocketAnimDriver', ANIM_DRIVER_OUTPUT_SOCKET_NAME)
         self.width = 350
         self._assign_next_available_index()
         self._ensure_paused_variable_name("cond_trigger_paused")
@@ -436,13 +439,15 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
         else:
             row.label(text=f"$cond_trigger_paused{safe_idx}")
 
-        # 输入说明
+        # 连接状态
         box.separator()
-        box.label(text="输入说明:", icon='INFO')
-        if self.inputs.get("驱动输入") and self.inputs["驱动输入"].is_linked:
-            box.label(text="  [驱动输入] 已连接", icon='KEYFRAME')
+        box.label(text="连接状态:", icon='INFO')
+        if self._has_linked_input():
+            box.label(text="  [链输入] 已连接", icon='KEYFRAME')
         else:
-            box.label(text="  [驱动输入] 未连接", icon='SNAP_FACE')
+            box.label(text="  [链输入] 未连接", icon='SNAP_FACE')
+        if self._has_linked_output():
+            box.label(text="  [链输出] 已连接（传递到下一节点）", icon='FORWARD')
 
     def generate_ini_segment(self, connected_nodes=None) -> str:
         idx = self._read_safe_index()
@@ -623,9 +628,7 @@ def _cond_trigger_load_handler(dummy):
             if node.bl_idname == 'SSMTNode_AnimDriver_ConditionalTrigger':
                 try:
                     SSMTNode_AnimDriver_Base.migrate_default_play_state_flag(node)
-                    required_inputs = ["链输入", "驱动输入"]
-                    required_outputs = ["链输出"]
-                    SSMTNode_AnimDriver_Base._migrate_node_sockets(node, required_inputs, required_outputs)
+                    SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
                     if not node.custom_paused_var:
                         node._ensure_indexed_paused_variable_name("cond_trigger_paused")
                 except Exception:

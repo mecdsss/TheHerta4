@@ -125,6 +125,7 @@ class GB_PT_MainPanel(bpy.types.Panel):
                 col.prop(active.gb_ball, "strength", slider=True,
                          text="中心强度")
                 col.prop(active.gb_ball, "falloff_k", slider=True)
+                col.prop(active.gb_ball, "use_surface_propagation")
             col.prop(active.gb_ball, "enabled")
             row = sub.row(align=True)
             row.label(text="设半径:")

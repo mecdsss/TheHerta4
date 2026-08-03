@@ -7,6 +7,8 @@
 - 权重公式：w = strength * exp(-falloff_k * d^2)，d >= 1 时严格为 0。
 - 所有坐标均为世界坐标 float64；ball_matrix_world 为 4x4 前向世界矩阵（含平移/旋转/缩放）。
 """
+import heapq
+
 import numpy as np
 
 # 默认衰减系数：exp(-4.6) ≈ 0.0100，即球面处权重约为中心值的 1%
@@ -199,6 +201,87 @@ def gaussian_field(verts_world, ball_matrix_world, strength, falloff_k):
     d2 = np.einsum("ij,ij->i", local, local)
     field = float(strength) * np.exp(-float(falloff_k) * d2)
     field[d2 >= 1.0] = 0.0
+    return field
+
+
+# ---------------------------------------------------------------------------
+# 测地（沿表面传播）权重场
+# ---------------------------------------------------------------------------
+
+def edges_from_triangles(tri_indices):
+    """从三角形索引提取去重边 (E,2) int64；空输入返回 (0,2)。"""
+    t = np.asarray(tri_indices, dtype=np.int64).reshape(-1, 3)
+    if t.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    e = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]], axis=0)
+    e.sort(axis=1)
+    return np.unique(e, axis=0)
+
+
+def surface_distances(local_pts, edge_verts, seed_mask):
+    """多源 Dijkstra 表面距离（球局部坐标度量）。
+
+    种子顶点初始距离 = 其欧氏 |local|，其余顶点从 ∞ 开始沿网格边松弛。
+    表面距离 ≥ 欧氏距离恒成立；典型用法是只把“球与表面的接触点”（离球心
+    最近的顶点）作种子，球体积内的其余表面（背面/对侧）因表面绕行距离
+    ≥1 而自然拿到 0 权重。
+
+    Args:
+        local_pts: (N,3) 球局部坐标（d = |local|，球面 d=1）。
+        edge_verts: (E,2) int 边顶点索引。
+        seed_mask: (N,) bool，种子（球内顶点）。
+
+    Returns:
+        (N,) float64 表面距离；未与任何种子连通的顶点为 inf。
+    """
+    n = local_pts.shape[0]
+    dist = np.full(n, np.inf)
+    adj = [[] for _ in range(n)]
+    edges = np.asarray(edge_verts, dtype=np.int64).reshape(-1, 2)
+    for a, b in edges:
+        if 0 <= a < n and 0 <= b < n:
+            w = float(np.linalg.norm(local_pts[a] - local_pts[b]))
+            adj[a].append((b, w))
+            adj[b].append((a, w))
+    heap = []
+    for i in np.nonzero(np.asarray(seed_mask, dtype=bool).reshape(-1))[0]:
+        d0 = float(np.linalg.norm(local_pts[i]))
+        dist[i] = d0
+        heapq.heappush(heap, (d0, int(i)))
+    while heap:
+        d, u = heapq.heappop(heap)
+        if d > dist[u] + 1e-12 or d >= 1.0:
+            continue  # 陈旧堆项，或已出球面半径（权重为 0，无需继续传播）
+        for v, w in adj[u]:
+            nd = d + w
+            if nd < dist[v] - 1e-12:
+                dist[v] = nd
+                heapq.heappush(heap, (nd, v))
+    return dist
+
+
+def geodesic_field(verts_world, ball_matrix_world, strength, falloff_k, edge_verts):
+    """沿表面传播的高斯权重场（测地版 gaussian_field）。
+
+    与 gaussian_field 同形：w = strength * exp(-falloff_k * d²)，d ≥ 1 严格为 0。
+    核心区别：种子不是球内全部顶点，而是“球与表面的接触点”（离球心最近的
+    表面顶点），其余顶点按沿网格表面传播的距离衰减——权重只从接触点沿表面
+    向四周扩散，不会穿透到球体积覆盖的背面/对侧表面。
+    """
+    verts = np.asarray(verts_world, dtype=np.float64).reshape(-1, 3)
+    n = verts.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    local = _to_ball_local(verts, ball_matrix_world)
+    if local is None:
+        return np.zeros(n, dtype=np.float64)
+    d2 = np.einsum("ij,ij->i", local, local)
+    # 种子 = 离球心最近的表面顶点（接触点）；其初始距离 = 其欧氏 |local|
+    seeds = np.zeros(n, dtype=bool)
+    seeds[int(np.argmin(d2))] = True
+    d = surface_distances(local, edge_verts, seeds)
+    field = float(strength) * np.exp(-float(falloff_k) * d * d)
+    field[d >= 1.0] = 0.0
     return field
 
 

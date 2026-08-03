@@ -13,6 +13,7 @@ class SSMTNode_PostProcess_Base(SSMTNodeBase):
     AUTO_APPENDED_SECTION_MARKERS = (
         "; --- AUTO-APPENDED SLIDER CONTROL PANEL ---",
         "; --- AUTO-APPENDED HEALTH DETECTION MODULE ---",
+        "; --- AUTO-APPENDED DRAG INTERACTION MODULE ---",
     )
 
     def init(self, context):

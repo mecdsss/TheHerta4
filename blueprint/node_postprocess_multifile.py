@@ -18,6 +18,10 @@ from ..common.mod_path_compat import find_base_position_resource_name
 from ..common.mod_path_compat import iter_position_buffer_candidates
 from ..common.mod_path_compat import is_stale_texture_override_position_copy_desc_line
 from ..common.object_prefix_helper import ObjectPrefixHelper
+try:
+    from . import deform_chain
+except ImportError:  # 测试 stub 包无 __path__ 时退化为绝对导入
+    from blueprint import deform_chain
 
 
 class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
@@ -400,11 +404,13 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                         remapped_lines.append(updated_line)
                     sections[section_name] = remapped_lines
                     if "Position" in resource_name:
+                        # 锚点别名统一为共享的 _0（接力协议 v3；旧版 _1 由 ensure 的
+                        # source_candidates 兼容承接，finalize 时迁移）
                         ensure_resource_alias_section(
                             sections,
                             resource_name,
-                            "_1",
-                            source_candidates=[resource_name],
+                            "_0",
+                            source_candidates=[resource_name, f"{resource_name}_1"],
                         )
 
                 processed_entries = []
@@ -481,8 +487,8 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                     base_resource_alias = ensure_resource_alias_section(
                         sections,
                         base_resource_name,
-                        "_1",
-                        source_candidates=[base_resource_name, f"{base_resource_name}_0"],
+                        "_0",
+                        source_candidates=[base_resource_name, f"{base_resource_name}_1"],
                     )[1:-1]
                     if f"[{base_resource_alias}]" not in sections:
                         print(
@@ -511,6 +517,8 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                     shader_lines.append("")
                     shader_lines.append("    cs = ./res/merge_anim_packed_delta.hlsl")
                     shader_lines.append(f"    cs-u5 = copy {base_resource_alias}")
+                    # 输出双写：中间资源 _mf（接力下一级）与规范名 X（单用兼容）
+                    shader_lines.append(f"    {base_resource_name}_mf = ref cs-u5")
                     shader_lines.append(f"    {base_resource_name} = ref cs-u5")
 
                     vertex_count = self._get_vertex_count(sections, hash_value)
@@ -548,9 +556,17 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                 if not any(self.active_swapkey in line for line in constants_lines):
                     constants_lines.append(f"global persist {self.active_swapkey} = 0")
 
+                # 声明每个资源的运行时就位标志（接力协议 v3 §2.2-3）
+                for entry in processed_entries:
+                    ran_var = deform_chain.mf_ran_var(entry["base_resource_name"])
+                    if not any(ran_var in line for line in constants_lines):
+                        constants_lines.append(f"global persist {ran_var} = 0")
+
                 for entry in processed_entries:
                     legacy_base_resource_name = f"Resource{entry['hash_prefix']}Position"
+                    # 旧版遗留的 _1 锚点/post 复位行一并清理
                     legacy_post_copy_line = f"post {legacy_base_resource_name} = copy_desc {legacy_base_resource_name}_1"
+                    legacy_post_copy_line_v1 = f"post {entry['base_resource_name']} = copy_desc {entry['base_resource_name']}_1"
                     post_copy_line = f"post {entry['base_resource_name']} = copy_desc {entry['base_resource_alias']}"
                     post_run_line = f"post run = CustomShader_{entry['base_name']}_1Anim"
                     stale_alias_names = []
@@ -579,6 +595,7 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                         line
                         for line in constants_lines
                         if line != legacy_post_copy_line
+                        and line != legacy_post_copy_line_v1
                         and line != post_copy_line
                         and line != post_run_line
                         and not any(
@@ -590,30 +607,23 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                     constants_lines.append(post_run_line)
                 sections[constants_section] = constants_lines
 
+                # 把 run 行迁入带 mf_ran 标志的激活块（接力协议 v3 §2.2-5）
                 present_section = "[Present]"
                 present_lines = sections.get(present_section, [])
-                active_block_start = -1
-                active_block_end = -1
-                for index, line in enumerate(present_lines):
-                    if line.strip() == f"if {self.active_swapkey} == {self.active_value}":
-                        active_block_start = index
-                    elif active_block_start >= 0 and line.strip() == "endif":
-                        active_block_end = index
-                        break
-
-                if active_block_start >= 0 and active_block_end >= 0:
-                    for entry in processed_entries:
-                        run_line = f"    run = CustomShader_{entry['base_name']}_1Anim"
-                        if run_line not in present_lines[active_block_start:active_block_end]:
-                            present_lines.insert(active_block_end, run_line)
-                else:
-                    present_lines.append("")
-                    present_lines.append(f"if {self.active_swapkey} == {self.active_value}")
-                    for entry in processed_entries:
-                        present_lines.append(f"    run = CustomShader_{entry['base_name']}_1Anim")
-                    present_lines.append("endif")
-
+                mf_ran_vars = [deform_chain.mf_ran_var(e["base_resource_name"]) for e in processed_entries]
+                run_lines = [f"run = CustomShader_{e['base_name']}_1Anim" for e in processed_entries]
+                present_lines = deform_chain.ensure_multifile_present_block(
+                    present_lines,
+                    self.active_swapkey,
+                    self.active_value,
+                    mf_ran_vars,
+                    run_lines,
+                )
                 sections[present_section] = present_lines
+
+                # 终态规整（幂等）：形态键条件锚定、接力块排序、复位行去重、_mf 声明
+                deform_chain.finalize_deform_chain(sections)
+
                 self._write_ordered_dict_to_ini(sections, ini_file_path, preserved_tail_content)
 
             print("MultiFile postprocess completed.")

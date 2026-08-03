@@ -118,6 +118,7 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
 
     def init(self, context):
         self.inputs.new('SSMTSocketPostProcess', "Input")
+        self.outputs.new('SSMTSocketPostProcess', "Output")
         self.width = 300
 
     def draw_buttons(self, context, layout):

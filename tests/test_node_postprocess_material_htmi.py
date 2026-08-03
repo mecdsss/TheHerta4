@@ -222,7 +222,8 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.process_texture_override_section("[TextureOverride_Test]", sections, material_group_to_swapkey={},
                 swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(), transparency_sections_to_add=OrderedDict())
             override_lines = sections["[TextureOverride_Test]"]
-            self.assertIn("ps-t0 = Resource_DiffuseMap_琛ｆ湇00", override_lines)
+            mojibake_token = node_postprocess_material.SSMTNode_PostProcess_Material._latin_token_for_text("琛ｆ湇")
+            self.assertIn(f"ps-t0 = Resource_DiffuseMap_{mojibake_token}00", override_lines)
             self.assertIn("ps-t1 = Resource_LightMap_Body", override_lines)
             self.assertIn("Resource\\RabbitFX\\FXMap = ref Resource_FXMap_Body", override_lines)
 
@@ -431,6 +432,51 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
         node = node_postprocess_material.SSMTNode_PostProcess_Material()
         self.assertEqual(node._workspace_material_resource_name(material), "Resource-Highlight_Metal_12261_01")
 
+    def test_material_resource_stem_replaces_chinese_with_deterministic_english(self):
+        """测试中文材质名替换为确定性的随机英文串，保证引用一致"""
+        material_cls = node_postprocess_material.SSMTNode_PostProcess_Material
+        cloth_token = material_cls._latin_token_for_text("衣服")
+        # 锁定映射算法：纯英文字母、首字母大写、长度固定
+        self.assertRegex(cloth_token, r"^[A-Z][a-z]{9}$")
+        stem = material_cls._material_resource_stem(_FakeMaterial("DiffuseMap_衣服02"))
+        self.assertEqual(stem, f"DiffuseMap_{cloth_token}02")
+        self.assertTrue(stem.isascii())
+        # 同一中文永远得到同一串字母（跨调用、跨对象），不同中文得到不同串
+        self.assertEqual(cloth_token, material_cls._latin_token_for_text("衣服"))
+        self.assertNotEqual(cloth_token, material_cls._latin_token_for_text("裤子"))
+        # 纯中文材质名也能生成合法纯英文 stem
+        pure_chinese_stem = material_cls._material_resource_stem(_FakeMaterial("贴图"))
+        self.assertEqual(pure_chinese_stem, material_cls._latin_token_for_text("贴图"))
+        self.assertTrue(pure_chinese_stem.isascii())
+
+    def test_chinese_material_generates_pure_english_resource_texture_section(self):
+        """测试中文材质生成的 ResourceTexture 引用段落为纯英文且引用与资源段对应"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            texture_path = os.path.join(temp_dir, "generic-diffuse.png")
+            with open(texture_path, "wb") as file_obj:
+                file_obj.write(b"generic")
+            obj = _FakeObject("GenericMesh", {}, [("DiffuseMap_贴图", texture_path)])
+            _fake_bpy.data.objects[obj.name] = obj
+            sections = OrderedDict([("[TextureOverride_Generic]", [f"[mesh:{obj.name}]", "hash = 12345678", "ps-t0 = Resource-old-DiffuseMap", "drawindexed = 3, 0, 0"]), ("_config_path", temp_dir)])
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"; node.material_to_resource_override = False; node.material_switch_var = "$swapkey150"
+            node.process_texture_override_section("[TextureOverride_Generic]", sections, ...)
+
+            material_cls = node_postprocess_material.SSMTNode_PostProcess_Material
+            stem = material_cls._material_resource_stem(_FakeMaterial("DiffuseMap_贴图"))
+            resource_name = f"ResourceTexture_{stem}"
+            # 引用行为纯英文且指向资源段
+            reference_line = f"ps-t0 = {resource_name}"
+            self.assertIn(reference_line, sections["[TextureOverride_Generic]"])
+            self.assertTrue(reference_line.isascii())
+            # 资源段存在且 filename 行同为纯英文，贴图文件已按新名字复制
+            section_name = f"[{resource_name}]"
+            self.assertIn(section_name, sections)
+            filename_line = f"filename = Textures/{stem}.png"
+            self.assertIn(filename_line, sections[section_name])
+            self.assertTrue(filename_line.isascii())
+            self.assertTrue(os.path.exists(os.path.join(temp_dir, "Textures", f"{stem}.png")))
+
     def test_htmi_prefers_prefix_cache_texture_slots_over_stale_object_prop(self):
         """测试 HTMI 优先使用前缀缓存的纹理槽而非过时的对象属性"""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -589,8 +635,9 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node._ntmi_modimp_extra_ps_t2_diffuse_map = True
             node.process_texture_override_section("[TextureOverride_Test]", sections, ...)
             override_lines = sections["[TextureOverride_Test]"]
-            self.assertIn("ps-t7 = Resource_DiffuseMap_衣服02", override_lines)
-            self.assertIn("ps-t2 = Resource_DiffuseMap_衣服02", override_lines)
+            cloth_token = node_postprocess_material.SSMTNode_PostProcess_Material._latin_token_for_text("衣服")
+            self.assertIn(f"ps-t7 = Resource_DiffuseMap_{cloth_token}02", override_lines)
+            self.assertIn(f"ps-t2 = Resource_DiffuseMap_{cloth_token}02", override_lines)
 
     def test_ntmi_modimp_extra_ps_t2_diffuse_map_does_not_duplicate_unrelated_ps_slots(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -638,11 +685,14 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.process_texture_override_section("[TextureOverride_Test]", sections, ...)
 
             joined = "\n".join(sections["[TextureOverride_Test]"])
-            self.assertEqual(joined.count("ps-t5 = Resource_NormalMap_DiffuseMap_衣服03"), 1)
-            self.assertEqual(joined.count("ps-t7 = Resource_DiffuseMap_衣服03"), 1)
-            self.assertEqual(joined.count("ps-t2 = Resource_DiffuseMap_衣服03"), 1)
-            self.assertEqual(joined.count("ps-t8 = Resource_LightMap_LOD0.14076dfb-111345-159309.切断器.001"), 1)
-            self.assertEqual(joined.count("ps-t18 = Resource_HighLightMap_LOD0.14076dfb-111345-159309.切断器.001"), 1)
+            material_cls = node_postprocess_material.SSMTNode_PostProcess_Material
+            cloth_token = material_cls._latin_token_for_text("衣服")
+            cutter_token = material_cls._latin_token_for_text("切断器")
+            self.assertEqual(joined.count(f"ps-t5 = Resource_NormalMap_DiffuseMap_{cloth_token}03"), 1)
+            self.assertEqual(joined.count(f"ps-t7 = Resource_DiffuseMap_{cloth_token}03"), 1)
+            self.assertEqual(joined.count(f"ps-t2 = Resource_DiffuseMap_{cloth_token}03"), 1)
+            self.assertEqual(joined.count(f"ps-t8 = Resource_LightMap_LOD0.14076dfb-111345-159309.{cutter_token}.001"), 1)
+            self.assertEqual(joined.count(f"ps-t18 = Resource_HighLightMap_LOD0.14076dfb-111345-159309.{cutter_token}.001"), 1)
 
     def test_ntmi_modimp_extra_ps_t2_diffuse_map_adds_base_alias_for_diffuse_workspace_slot(self):
         with tempfile.TemporaryDirectory() as temp_dir:
