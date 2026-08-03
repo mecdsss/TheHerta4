@@ -13,6 +13,7 @@ from ..common.global_properties import GlobalProterties
 from .obj_utils import ObjUtils
 from .shapekey_utils import ShapeKeyUtils
 from .timer_utils import TimerUtils
+from .export_space import convert_position_coords
 
 from ..common.d3d11_gametype import D3D11GameType
 from ..blueprint.export_helper import BlueprintExportHelper
@@ -181,36 +182,8 @@ class ExportUtils:
 
     @staticmethod
     def convert_position_coords_for_export(sampled_coords, logic_name: Optional[str] = None) -> numpy.ndarray:
-        coords = numpy.asarray(sampled_coords, dtype=numpy.float32)
-        if coords.size == 0:
-            return coords
-
         resolved_logic_name = ExportUtils.get_effective_export_logic_name(logic_name)
-        if resolved_logic_name in {
-            getattr(LogicName, "SRMI", "SRMI"),
-            getattr(LogicName, "GIMI", "GIMI"),
-            getattr(LogicName, "HIMI", "HIMI"),
-            getattr(LogicName, "YYSLS", "YYSLS"),
-            getattr(LogicName, "IdentityV", "IdentityV"),
-        }:
-            rot = numpy.array(
-                [[1, 0, 0],
-                 [0, 0, 1],
-                 [0, -1, 0]],
-                dtype=numpy.float32,
-            )
-            return coords @ rot
-
-        if resolved_logic_name == getattr(LogicName, "SnowBreak", "SnowBreak"):
-            rot = numpy.array(
-                [[-1, 0, 0],
-                 [0, -1, 0],
-                 [0, 0, 1]],
-                dtype=numpy.float32,
-            )
-            return 100.0 * (coords @ rot)
-
-        return coords
+        return convert_position_coords(sampled_coords, logic_name=resolved_logic_name)
 
     @staticmethod
     def convert_position_deltas_for_export(sampled_deltas, logic_name: Optional[str] = None) -> numpy.ndarray:

@@ -19,7 +19,7 @@
 //   [4] xyz = barycentric hit weights; w = inside-triangle flag
 //   [5] xyz = geometric face normal, world space; w = screen winding sign
 //   [6] xyz = nearest vertex position, world space; w = screen distance squared
-//   [7] x = layout version; y = object index; z = object count; w = nearest vertex index
+//   [7] x = layout version; y = object index; z = object count; w = stable zone ID for mode 7
 //   [14] x = reconstructed clip depth; y/z = clip w/z; w = valid
 //
 // After running:

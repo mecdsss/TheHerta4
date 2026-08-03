@@ -3,6 +3,7 @@ import os
 import re
 import struct
 import shutil
+import time
 from collections import OrderedDict
 
 try:
@@ -19,6 +20,7 @@ from ..common.mod_path_compat import (
     ensure_resource_alias_section,
     iter_position_buffer_candidates,
 )
+from ..utils.export_space import position_export_matrix
 
 try:
     from ..toolkit import gb_core
@@ -28,24 +30,13 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
-# 常量与 zone 寄存器映射（与原作 LEWDHAND 完全一致，保留 77-124，115 空档跳过）
+# 稀疏区域 ABI
 # ---------------------------------------------------------------------------
 
-MAX_ZONES = 12
-
-# 每组参数 → (zone0-3 寄存器, zone4-7 寄存器, zone8-11 寄存器)
-ZONE_REGISTER_MAP = OrderedDict([
-    ("radius",     (77, 78, 103)),
-    ("strength",   (79, 80, 106)),
-    ("max_offset", (81, 82, 109)),
-    ("grabbable",  (99, 100, 112)),
-    ("falloff",    (101, 102, 116)),
-    ("path",       (119, 120, 121)),
-    ("damping",    (122, 123, 124)),
-])
-
-# 有 "0=继承回退" 语义的参数（grabbable 例外，始终显式生成）
-ZONE_FALLBACK_PARAMS = ("radius", "strength", "max_offset", "falloff", "damping")
+MAX_ZONES = 256
+SPARSE_ZONE_SLOTS = 4
+INVALID_ZONE_ID = 0xFFFFFFFF
+ZONES_PER_PAGE = 16
 
 SHADER_FILES = (
     "rzm_gs_probe.hlsl",
@@ -105,10 +96,32 @@ class SSMT_DragZoneSettings(bpy.types.PropertyGroup):
 
 class SSMT_DragZoneRef(bpy.types.PropertyGroup):
     """节点 zone_objects 列表里的一项：指向一个 Empty。"""
+    zone_id: bpy.props.IntProperty(
+        name="区域 ID", default=-1, min=-1, max=MAX_ZONES - 1,
+        description="稳定区域编号；用于运行时命中和 UI 绑定，不随前方区域禁用而改变",
+    )
+    expanded: bpy.props.BoolProperty(name="展开区域参数", default=False)
     zone_object: bpy.props.PointerProperty(
         name="区域空物体", type=bpy.types.Object,
         poll=lambda self, obj: obj.type == 'EMPTY',
     )
+
+
+def _zone_page_count(node):
+    return max(1, (len(node.zone_objects) + ZONES_PER_PAGE - 1) // ZONES_PER_PAGE)
+
+
+def _zone_page_state(node, requested_page=None):
+    page_count = _zone_page_count(node)
+    raw_page = getattr(node, "zone_page", 0) if requested_page is None else requested_page
+    page = min(max(int(raw_page), 0), page_count - 1)
+    return page, page_count
+
+
+def _clamp_zone_page(node, requested_page=None):
+    page, page_count = _zone_page_state(node, requested_page)
+    node.zone_page = page
+    return page, page_count
 
 
 # ---------------------------------------------------------------------------
@@ -127,17 +140,29 @@ class SSMT_OT_DragZoneAdd(bpy.types.Operator):
         tree = bpy.data.node_groups.get(self.node_tree)
         node = tree.nodes.get(self.node_name) if tree else None
         if node is None or len(node.zone_objects) >= MAX_ZONES:
-            self.report({'WARNING'}, "节点不存在或区域已达上限 12")
+            self.report({'WARNING'}, f"节点不存在或区域已达上限 {MAX_ZONES}")
             return {'CANCELLED'}
 
-        empty = bpy.data.objects.new(f"SSMT_DragZone_{len(node.zone_objects)}", None)
+        used_ids = {
+            int(getattr(entry, "zone_id", -1))
+            for entry in node.zone_objects
+            if 0 <= int(getattr(entry, "zone_id", -1)) < MAX_ZONES
+        }
+        zone_id = next((candidate for candidate in range(MAX_ZONES) if candidate not in used_ids), -1)
+        if zone_id < 0:
+            self.report({'WARNING'}, f"没有可用区域 ID（0-{MAX_ZONES - 1}）")
+            return {'CANCELLED'}
+
+        empty = bpy.data.objects.new(f"SSMT_DragZone_{zone_id}", None)
         empty.empty_display_type = 'SPHERE'
         empty.empty_display_size = 0.25
         empty.ssmt_drag_zone.radius = 0.5
         context.scene.collection.objects.link(empty)
 
         item = node.zone_objects.add()
+        item.zone_id = zone_id
         item.zone_object = empty
+        _clamp_zone_page(node, (len(node.zone_objects) - 1) // ZONES_PER_PAGE)
         self.report({'INFO'}, f"已创建区域空物体 {empty.name}")
         return {'FINISHED'}
 
@@ -174,6 +199,7 @@ class SSMT_OT_DragZoneRemove(bpy.types.Operator):
         item = node.zone_objects[self.index]
         obj = item.zone_object
         node.zone_objects.remove(self.index)
+        _clamp_zone_page(node)
         # 只有 SSMT 创建的区域空物体、且不再被任何拖拽节点引用时才随引用一并删除；
         # 用户手动指定的已有空物体（可能复用于其他用途）只移除引用
         if obj is not None and obj.name.startswith("SSMT_DragZone") and not self._zone_empty_in_use(obj, node):
@@ -182,6 +208,25 @@ class SSMT_OT_DragZoneRemove(bpy.types.Operator):
             self.report({'INFO'}, f"已移除引用并删除空物体 {name}")
         else:
             self.report({'INFO'}, "已从列表移除（空物体保留在场景中）")
+        return {'FINISHED'}
+
+
+class SSMT_OT_DragZonePage(bpy.types.Operator):
+    bl_idname = "ssmt.drag_zone_page"
+    bl_label = "切换拖拽区域页"
+    bl_options = {'INTERNAL'}
+
+    node_name: bpy.props.StringProperty()
+    node_tree: bpy.props.StringProperty()
+    direction: bpy.props.IntProperty(default=0)
+
+    def execute(self, context):
+        tree = bpy.data.node_groups.get(self.node_tree)
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None:
+            return {'CANCELLED'}
+        current_page, _page_count = _zone_page_state(node)
+        _clamp_zone_page(node, current_page + self.direction)
         return {'FINISHED'}
 
 
@@ -269,12 +314,19 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     # ---- 区域空物体引用列表 ----
     zone_objects: bpy.props.CollectionProperty(type=SSMT_DragZoneRef)
+    zone_page: bpy.props.IntProperty(
+        name="区域页", default=0, min=0, max=(MAX_ZONES // ZONES_PER_PAGE) - 1,
+    )
 
     # ---- 权重预览（视口热力图，仿高斯球预览）----
     preview_weights: bpy.props.BoolProperty(name="权重预览", default=False)
     preview_target: bpy.props.PointerProperty(
         name="预览网格", type=bpy.types.Object,
         poll=lambda self, obj: obj.type == 'MESH',
+    )
+    preview_collection: bpy.props.PointerProperty(
+        name="预览集合", type=bpy.types.Collection,
+        description="递归预览集合及其子集合中的全部网格；设置后优先于单个预览网格",
     )
 
     # ---- 权重平台化（烘焙 + 预览共用）----
@@ -338,15 +390,39 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         add.node_name = self.name
         add.node_tree = self.id_data.name if self.id_data else ""
 
-        for i, item in enumerate(self.zone_objects):
+        # draw 回调只读页码，避免在绘制中改 RNA 属性导致后续面板短暂消失。
+        page, page_count = _zone_page_state(self)
+        page_row = box.row(align=True)
+        previous_row = page_row.row(align=True)
+        previous_row.enabled = page > 0
+        previous = previous_row.operator(SSMT_OT_DragZonePage.bl_idname, text="", icon='TRIA_LEFT')
+        previous.node_name = self.name
+        previous.node_tree = self.id_data.name if self.id_data else ""
+        previous.direction = -1
+        page_row.label(text=f"第 {page + 1} / {page_count} 页")
+        next_row = page_row.row(align=True)
+        next_row.enabled = page + 1 < page_count
+        next_page = next_row.operator(SSMT_OT_DragZonePage.bl_idname, text="", icon='TRIA_RIGHT')
+        next_page.node_name = self.name
+        next_page.node_tree = self.id_data.name if self.id_data else ""
+        next_page.direction = 1
+        start = page * ZONES_PER_PAGE
+        end = min(start + ZONES_PER_PAGE, len(self.zone_objects))
+        for i in range(start, end):
+            item = self.zone_objects[i]
             row = box.row(align=True)
-            row.prop(item, "zone_object", text=f"区域 {i}")
+            zone_id = int(getattr(item, "zone_id", i))
+            row.prop(
+                item, "expanded", text="", emboss=False,
+                icon='DISCLOSURE_TRI_DOWN' if item.expanded else 'DISCLOSURE_TRI_RIGHT',
+            )
+            row.prop(item, "zone_object", text=f"区域 {zone_id}")
             rm = row.operator(SSMT_OT_DragZoneRemove.bl_idname, text="", icon='X')
             rm.node_name = self.name
             rm.node_tree = self.id_data.name if self.id_data else ""
             rm.index = i
             obj = item.zone_object
-            if obj is not None:
+            if obj is not None and item.expanded:
                 sub = box.column(align=True)
                 sub.use_property_split = True
                 sub.prop(obj.ssmt_drag_zone, "enabled")
@@ -374,11 +450,13 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         col = box.column(align=True)
         col.prop(self, "preview_weights")
         col.prop(self, "preview_target")
+        col.prop(self, "preview_collection")
         if self.preview_weights:
-            if self.preview_target is None:
-                col.label(text="请选择预览网格以显示热力图", icon='INFO')
+            preview_count = len(_preview_targets(self))
+            if preview_count == 0:
+                col.label(text="请选择预览网格或包含网格的集合", icon='INFO')
             else:
-                col.label(text="空物体缩放=影响半径；颜色=烘焙掩码（brush 参数）", icon='INFO')
+                col.label(text=f"正在预览 {preview_count} 个网格", icon='INFO')
         _ensure_preview_running()
 
         if not NUMPY_AVAILABLE:
@@ -604,7 +682,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ns = self._resolve_namespace(ini_path)
             self._create_cumulative_backup(ini_path, mod_export_path)
 
-            # 1) 资源烘焙（JiggleMasks/ObjectMap/PathVectors）
+            # 1) 资源烘焙（稀疏区域权重/ObjectMap/ZoneParams/PathVectors）
+            self._write_zone_resources(mod_export_path, ns)
             for comp in components:
                 self._bake_component_resources(mod_export_path, sections, comp, ns)
 
@@ -880,10 +959,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             dest = os.path.join(res_dir, fname)
             with open(dest, 'w', encoding='utf-8') as f:
                 f.write(content)
-        # PathVectors 模板占位
-        pv_src = os.path.join(toolset, "PathVectors.buf")
-        if os.path.exists(pv_src):
-            shutil.copy2(pv_src, os.path.join(res_dir, "PathVectors.buf"))
+        # PathVectors 按稳定区域 ID 容量在导出阶段生成，不再复制旧版 12 项模板。
         # 手部着色器 + 网格/法线资产：全部字节级原样复制。手部着色器读自己
         # 的 vb0（stride 28 固定布局），不含 struct VertexAttributes，无需也
         # 不许走文本替换路径（避免行尾转换）——与原作保持字节一致。
@@ -904,14 +980,47 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     print(f"[DragInteraction][WARNING] 视口探针着色器缺失: {src}")
 
     # =======================================================================
-    # 资源烘焙（JiggleMasks / ObjectMap / PathVectors）
+    # 资源烘焙（稀疏区域权重 / ObjectMap / ZoneParams / PathVectors）
     # =======================================================================
 
     def _bake_component_resources(self, mod_export_path, sections, comp, ns):
         # ObjectMap：游戏索引空间 (1+N)×16B
         self._write_object_map(mod_export_path, sections, comp)
-        # JiggleMasks：高斯场烘焙
+        # 每顶点 Top-K 区域权重：高斯场烘焙
         self._write_jiggle_masks(mod_export_path, sections, comp, ns)
+
+    def _write_zone_resources(self, mod_export_path, ns):
+        """写每区域物理参数和路径向量；按稳定 zone_id 直接索引。"""
+        entries = self._collect_enabled_zone_entries()
+        capacity = self._zone_capacity(entries)
+        params = np.zeros((capacity * 2, 4), dtype=np.float32)
+        paths = np.zeros((capacity, 4), dtype=np.float32)
+
+        if not entries:
+            # 与旧版“无区域时 zone0 全模型”回退一致。
+            params[1] = (0.0, 1.0, 0.0, 1.0)
+        for zone_id, empty in entries:
+            settings = empty.ssmt_drag_zone
+            params[zone_id * 2 + 0] = (
+                float(settings.radius),
+                float(settings.strength),
+                float(settings.max_offset),
+                float(settings.falloff),
+            )
+            params[zone_id * 2 + 1] = (
+                float(settings.damping),
+                1.0 if settings.grabbable else 0.0,
+                0.0,  # path mode 尚未进入节点 UI，保留 ABI 槽位
+                1.0,
+            )
+
+        res_dir = os.path.join(mod_export_path, "res", "drag_interaction")
+        os.makedirs(res_dir, exist_ok=True)
+        params.tofile(os.path.join(res_dir, f"ZoneParams_{ns}.buf"))
+        paths.tofile(os.path.join(res_dir, f"PathVectors_{ns}.buf"))
+        legacy_path_vectors = os.path.join(res_dir, "PathVectors.buf")
+        if os.path.isfile(legacy_path_vectors):
+            os.remove(legacy_path_vectors)
 
     def _write_object_map(self, mod_export_path, sections, comp):
         parts = comp["parts"]
@@ -946,13 +1055,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         return "Meshes"
 
     def _write_jiggle_masks(self, mod_export_path, sections, comp, ns):
-        zones = self._collect_enabled_zones()
+        entries = self._collect_enabled_zone_entries()
+        zones = [empty for _, empty in entries]
         vertex_count = comp["vertex_count"]
-        mask_count = max(1, (max(len(zones), 1) + 3) // 4)  # ceil(zones/4)，至少 1
 
         # 无区域 → zone0 全 1
         if not zones or not GB_CORE_AVAILABLE:
-            self._write_masks_fallback(mod_export_path, sections, comp, vertex_count, mask_count)
+            fallback_zone_id = entries[0][0] if entries else 0
+            self._write_masks_fallback(mod_export_path, sections, comp, vertex_count, fallback_zone_id)
             return
 
         # radius 参数与球尺度失配检查（防“整块刚体动”失配，原版实测 ratio 0.3~2.2）
@@ -970,49 +1080,89 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 读取 Position.buf 顶点坐标
         positions = self._read_position_buf(mod_export_path, sections, comp, vertex_count)
         if positions is None:
-            self._write_masks_fallback(mod_export_path, sections, comp, vertex_count, mask_count)
+            self._write_masks_fallback(mod_export_path, sections, comp, vertex_count, entries[0][0])
             return
 
         # 烘焙参考物体世界矩阵的逆（坐标系换算）
         ref_matrix_inv = self._get_reference_matrix_inv(comp)
+        export_matrix = self._get_export_space_matrix()
         # 非镜像工作流补偿：场景网格被 X 镜像过（导入时 mesh.transform 翻转、物体矩阵不变）
         # 而空物体矩阵未跟随 → 需对球矩阵施加同样的 X 镜像后才与 Position.buf（还原后
         # 朝向）同空间，否则掩码左右颠倒（用户报告）。预览不受影响（所见即所得）。
         mirror = self._get_non_mirror_mirror()
 
-        mask_arrays = [np.zeros((vertex_count, 4), dtype=np.float32) for _ in range(mask_count)]
-        for z_idx, empty in enumerate(zones):
-            buf_idx = z_idx // 4
-            channel = z_idx % 4
+        zone_ids = np.full((vertex_count, SPARSE_ZONE_SLOTS), INVALID_ZONE_ID, dtype=np.uint32)
+        zone_weights = np.zeros((vertex_count, SPARSE_ZONE_SLOTS), dtype=np.float32)
+        overlap_counts = np.zeros(vertex_count, dtype=np.uint16)
+        row_indices = np.arange(vertex_count)
+        for zone_id, empty in entries:
             settings = empty.ssmt_drag_zone
-            field = self._evaluate_zone_field(positions, empty, settings, ref_matrix_inv, mirror, edge_verts)
+            field = self._evaluate_zone_field(
+                positions,
+                empty,
+                settings,
+                ref_matrix_inv,
+                mirror,
+                edge_verts,
+                export_matrix=export_matrix,
+            )
             if field is None:
                 continue
-            mask_arrays[buf_idx][:, channel] = field
+            field = np.asarray(field, dtype=np.float32)
+            positive = field > 1e-4
+            overlap_counts[positive] += 1
+            weakest_slot = np.argmin(zone_weights, axis=1)
+            weakest_weight = zone_weights[row_indices, weakest_slot]
+            replace = field > weakest_weight
+            replace_rows = row_indices[replace]
+            replace_slots = weakest_slot[replace]
+            zone_weights[replace_rows, replace_slots] = field[replace]
+            zone_ids[replace_rows, replace_slots] = np.uint32(zone_id)
 
-        # 恒定写 3 个缓冲（未用通道清零填充），与 ini 里 3 个资源段一一对应
-        for buf_idx in range(3):
-            arr = mask_arrays[buf_idx] if buf_idx < len(mask_arrays) else np.zeros((vertex_count, 4), dtype=np.float32)
-            out = os.path.join(
-                mod_export_path, self._buffer_dir(sections, comp),
-                f"{comp['base_name']}JiggleMasks{buf_idx}.buf",
+        if not np.any(zone_weights > 1e-4):
+            raise RuntimeError(
+                f"[DragInteraction] {comp['comp_name']}: all configured drag zones produced zero weights; "
+                "check the game coordinate mapping and Empty placement"
             )
-            os.makedirs(os.path.dirname(out), exist_ok=True)
-            arr.tofile(out)
-        print(f"[DragInteraction] JiggleMasks: {comp['comp_name']} ×3 缓冲 ({vertex_count} 顶点, {len(zones)} 区域)")
 
-    def _write_masks_fallback(self, mod_export_path, sections, comp, vertex_count, mask_count):
-        for buf_idx in range(3):
-            arr = np.zeros((vertex_count, 4), dtype=np.float32)
-            if buf_idx == 0:
-                arr[:, 0] = 1.0  # zone0 全 1
-            out = os.path.join(
-                mod_export_path, self._buffer_dir(sections, comp),
-                f"{comp['base_name']}JiggleMasks{buf_idx}.buf",
+        out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
+        os.makedirs(out_dir, exist_ok=True)
+        zone_ids.tofile(os.path.join(out_dir, f"{comp['base_name']}JiggleZoneIDs.buf"))
+        zone_weights.tofile(os.path.join(out_dir, f"{comp['base_name']}JiggleZoneWeights.buf"))
+        self._remove_legacy_mask_files(out_dir, comp["base_name"])
+        overflow_vertices = int(np.count_nonzero(overlap_counts > SPARSE_ZONE_SLOTS))
+        if overflow_vertices:
+            max_overlap = int(overlap_counts.max())
+            print(
+                f"[DragInteraction][WARNING] {comp['comp_name']} 有 {overflow_vertices} 个顶点同时覆盖超过 "
+                f"{SPARSE_ZONE_SLOTS} 个区域（最大 {max_overlap}）；仅保留权重最高的 {SPARSE_ZONE_SLOTS} 个"
             )
-            os.makedirs(os.path.dirname(out), exist_ok=True)
-            arr.tofile(out)
-        print(f"[DragInteraction] JiggleMasks（回退 zone0 全 1）: {comp['comp_name']} ({vertex_count} 顶点)")
+        print(
+            f"[DragInteraction] SparseZoneMasks: {comp['comp_name']} "
+            f"({vertex_count} 顶点, {len(zones)} 区域, Top-{SPARSE_ZONE_SLOTS})"
+        )
+
+    def _write_masks_fallback(self, mod_export_path, sections, comp, vertex_count, fallback_zone_id=0):
+        zone_ids = np.full((vertex_count, SPARSE_ZONE_SLOTS), INVALID_ZONE_ID, dtype=np.uint32)
+        zone_weights = np.zeros((vertex_count, SPARSE_ZONE_SLOTS), dtype=np.float32)
+        zone_ids[:, 0] = np.uint32(fallback_zone_id)
+        zone_weights[:, 0] = 1.0
+        out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
+        os.makedirs(out_dir, exist_ok=True)
+        zone_ids.tofile(os.path.join(out_dir, f"{comp['base_name']}JiggleZoneIDs.buf"))
+        zone_weights.tofile(os.path.join(out_dir, f"{comp['base_name']}JiggleZoneWeights.buf"))
+        self._remove_legacy_mask_files(out_dir, comp["base_name"])
+        print(
+            f"[DragInteraction] SparseZoneMasks（回退 zone{fallback_zone_id} 全 1）: "
+            f"{comp['comp_name']} ({vertex_count} 顶点)"
+        )
+
+    @staticmethod
+    def _remove_legacy_mask_files(out_dir, base_name):
+        for index in range(3):
+            legacy_path = os.path.join(out_dir, f"{base_name}JiggleMasks{index}.buf")
+            if os.path.isfile(legacy_path):
+                os.remove(legacy_path)
 
     def _read_position_buf(self, mod_export_path, sections, comp, vertex_count):
         """从 ini 的 Position 资源段 filename 解析路径读取顶点坐标（float3×N）。"""
@@ -1078,6 +1228,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             return ref.matrix_world.inverted()
         return None  # None = 单位变换
 
+    @staticmethod
+    def _get_export_space_matrix(logic_name=None):
+        if logic_name is None:
+            try:
+                from ..common.global_config import GlobalConfig
+                logic_name = GlobalConfig.logic_name
+            except Exception:
+                logic_name = ""
+        return position_export_matrix(logic_name)
+
     def _get_non_mirror_mirror(self):
         """非镜像工作流补偿矩阵：检测场景网格是否带 _ssmt_non_mirror_workflow_processed 标记
         （导入时被 X 镜像处理）。命中返回 X 镜像矩阵；否则返回 None。
@@ -1112,7 +1272,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     return mirror
         return None
 
-    def _evaluate_zone_field(self, positions, empty, settings, ref_matrix_inv, mirror=None, edge_verts=None):
+    def _evaluate_zone_field(
+        self,
+        positions,
+        empty,
+        settings,
+        ref_matrix_inv,
+        mirror=None,
+        edge_verts=None,
+        export_matrix=None,
+    ):
         """对单个区域空物体求权重场（0..1），含 bbox sanity check。
 
         mirror: 非镜像工作流 X 镜像矩阵（(4,4) numpy）或 None。矩阵运算统一走
@@ -1129,6 +1298,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 ball_matrix = np.asarray(ref_matrix_inv, dtype=np.float64).reshape(4, 4) @ ball_world
             else:
                 ball_matrix = ball_world
+            if export_matrix is not None:
+                ball_matrix = np.asarray(export_matrix, dtype=np.float64).reshape(4, 4) @ ball_matrix
 
             d = self._zone_distances(positions, ball_matrix, edge_verts)
             if d is None:
@@ -1246,18 +1417,46 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 )
         return warned
 
-    def _collect_enabled_zones(self):
-        zones = []
+    def _collect_enabled_zone_entries(self):
+        """返回 (稳定 zone_id, Empty)；为旧工程和重复 ID 自动分配空闲编号。"""
+        entries = []
+        used_ids = set()
+        next_candidate = 0
         for item in self.zone_objects:
             obj = item.zone_object
             if obj is None:
                 print("[DragInteraction][WARNING] 区域空物体已被删除，跳过")
                 continue
+
+            try:
+                zone_id = int(getattr(item, "zone_id", -1))
+            except (TypeError, ValueError):
+                zone_id = -1
+            if not (0 <= zone_id < MAX_ZONES) or zone_id in used_ids:
+                while next_candidate in used_ids and next_candidate < MAX_ZONES:
+                    next_candidate += 1
+                if next_candidate >= MAX_ZONES:
+                    print(f"[DragInteraction][WARNING] 区域超过稳定 ID 上限 {MAX_ZONES}，其余区域已跳过")
+                    break
+                zone_id = next_candidate
+                try:
+                    item.zone_id = zone_id
+                except Exception:
+                    pass
+            used_ids.add(zone_id)
+            while next_candidate in used_ids and next_candidate < MAX_ZONES:
+                next_candidate += 1
             if obj.ssmt_drag_zone.enabled:
-                zones.append(obj)
-            if len(zones) >= MAX_ZONES:
-                break
-        return zones
+                entries.append((zone_id, obj))
+        return sorted(entries, key=lambda entry: entry[0])
+
+    def _collect_enabled_zones(self):
+        """兼容预览/参数检查调用方；顺序按稳定区域 ID。"""
+        return [obj for _, obj in self._collect_enabled_zone_entries()]
+
+    @staticmethod
+    def _zone_capacity(entries):
+        return max(1, max((zone_id for zone_id, _ in entries), default=0) + 1)
 
     # =======================================================================
     # 段生成（CustomShader / CommandList / Resource）与钩子注入、Present/Constants
@@ -1276,8 +1475,18 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"[ResourceDragPinnedDetectID_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
             f"[ResourceDragPinnedDetectInfo_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
             f"[ResourceDragJiggleScreenState_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
-            f"[ResourceDragPathProgressState_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 12"],
-            f"[ResourceDragPathVectors_{ns}]": ["type = Buffer", "format = R32G32B32A32_FLOAT", f"filename = {res}/PathVectors.buf"],
+            f"[ResourceDragPathProgressState_{ns}]": [
+                "type = RWBuffer", "format = R32_FLOAT",
+                f"array = {self._zone_capacity(self._collect_enabled_zone_entries())}",
+            ],
+            f"[ResourceDragPathVectors_{ns}]": [
+                "type = Buffer", "format = R32G32B32A32_FLOAT",
+                f"filename = {res}/PathVectors_{ns}.buf",
+            ],
+            f"[ResourceDragZoneParams_{ns}]": [
+                "type = Buffer", "format = R32G32B32A32_FLOAT",
+                f"filename = {res}/ZoneParams_{ns}.buf",
+            ],
             f"[ResourceDragViewportFrameAPI_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 16"],
             f"[ResourceDragBakeRT_{ns}]": [
                 # 与原作 ResourceLLBakeRT 完全一致：bind_flags 声明渲染目标+着色器资源，
@@ -1341,9 +1550,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         cn = comp["comp_name"]
         stem = comp["base_name"]
         res_dir = self._buffer_dir(sections, comp)
-        zones = self._collect_enabled_zones()
-        mask_count = max(1, (max(len(zones), 1) + 3) // 4)
-
         comp_resources = {
             f"[ResourceDragDetect{cn}ObjectMap_{ns}]": [
                 "type = Buffer", "format = R32G32B32A32_FLOAT",
@@ -1357,13 +1563,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # TempVB0：空声明段（type=RWBuffer，无 format/array），copy 往返后换绑
             f"[ResourceDragJiggleTempVB0_{cn}_{ns}]": ["type = RWBuffer"],
         }
-        # 恒定 3 个掩码资源段（原作契约）：Detect/Jiggle 固定绑定 cs-t5/cs-t7/cs-t66/cs-t69，
-        # 缺段会成为悬空引用，导致 CustomShader 段加载失败（导出模组无拉扯+抖动的主因之一）
-        for i in range(3):
-            comp_resources[f"[ResourceDragJiggleMasks{i}_{cn}_{ns}]"] = [
-                "type = Buffer", "format = R32G32B32A32_FLOAT",
-                f"filename = {res_dir}/{stem}JiggleMasks{i}.buf",
-            ]
+        comp_resources[f"[ResourceDragJiggleZoneIDs_{cn}_{ns}]"] = [
+            "type = Buffer", "format = R32G32B32A32_UINT",
+            f"filename = {res_dir}/{stem}JiggleZoneIDs.buf",
+        ]
+        comp_resources[f"[ResourceDragJiggleZoneWeights_{cn}_{ns}]"] = [
+            "type = Buffer", "format = R32G32B32A32_FLOAT",
+            f"filename = {res_dir}/{stem}JiggleZoneWeights.buf",
+        ]
         # JiggleParams：每部件 1 条碰撞体档案（原作契约，条目同值；array = 4×部件数）
         n_parts = max(1, len(comp["parts"]))
         jp = self._jiggle_params_data(n_parts)
@@ -1400,47 +1607,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             return str(v)
         return str(int(f)) if f == int(f) else repr(f)
 
-    # ---- zone 寄存器行（77-124，115 空档跳过；path=0 显式写）----
-
-    def _zone_register_lines(self, ns, comp_tag, path_zero=True):
-        """生成全部 zone 寄存器行（读必设纪律：每消费段写完整块）。"""
-        zones = self._collect_enabled_zones()
-        lines = []
-        for param, regs in ZONE_REGISTER_MAP.items():
-            is_path = (param == "path")
-            is_grabbable = (param == "grabbable")
-            for reg_group_idx, reg in enumerate(regs):
-                comps = []
-                for chan_idx in range(4):
-                    zone_idx = reg_group_idx * 4 + chan_idx
-                    comps.append(self._zone_value(param, zone_idx, zones, ns, comp_tag, is_path, is_grabbable))
-                lines.extend([
-                    f"x{reg} = {comps[0]}",
-                    f"y{reg} = {comps[1]}",
-                    f"z{reg} = {comps[2]}",
-                    f"w{reg} = {comps[3]}",
-                ])
-        return lines
-
-    def _zone_value(self, param, zone_idx, zones, ns, comp_tag, is_path, is_grabbable):
-        if is_path:
-            return "0"  # path 永不进入，显式写 0（读必设）
-        if zone_idx >= len(zones):
-            # 无任何区域时存在隐式回退 zone0（掩码全 1）：它的 grabbable 必须为 1，
-            # 否则 ZoneGrabbable(0)=false → newCapture 永不开始（无拖拽效果的根因）。
-            # 超出启用区域数的其余槽位：掩码为 0 不会命中，grabbable/参数全部写 0。
-            if is_grabbable and zone_idx == 0 and not zones:
-                return "1"
-            return "0"
-        empty = zones[zone_idx]
-        s = empty.ssmt_drag_zone
-        if is_grabbable:
-            return "1" if s.grabbable else "0"
-        val = getattr(s, param, 0.0)
-        if param in ZONE_FALLBACK_PARAMS and float(val) > 0.0:
-            return self._fmt(val)
-        return "0"  # 0 = 继承回退
-
     # ---- Detect{Comp}（dispatch 1,1,1）----
 
     def _emit_detect_section(self, sections, comp, ns):
@@ -1455,9 +1621,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "cs-t1 = ib",
             f"cs-t2 = ResourceDragDetect{cn}ObjectMap_{ns}",
             f"cs-t3 = ResourceDragBakeRT_{ns}",
-            f"cs-t4 = ResourceDragJiggleMasks0_{cn}_{ns}",
-            f"cs-t5 = ResourceDragJiggleMasks1_{cn}_{ns}",
-            f"cs-t7 = ResourceDragJiggleMasks2_{cn}_{ns}",
+            f"cs-t4 = ResourceDragJiggleZoneIDs_{cn}_{ns}",
+            f"cs-t5 = ResourceDragJiggleZoneWeights_{cn}_{ns}",
             f"cs-t6 = ResourceDragViewportFrameAPI_{ns}",
             f"cs-u0 = ResourceDragDetectID_{ns}",
             f"cs-u1 = ResourceDragComponentDetect_{cn}_{ns}",
@@ -1517,7 +1682,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             return
         vertex_count = comp["vertex_count"] or 100000
         dispatch_n = (vertex_count + 255) // 256
-        tag = f"{self._hash_to_resource_prefix(comp['comp_name']).lower()}"
 
         lines = [
             "local $CursorXPast", "local $CursorYPast", "local $WasMouseButtonDown",
@@ -1554,16 +1718,19 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"y76 = $ssmtdrag_sim_speed_{ns}",
             f"z76 = $ssmtdrag_max_step_{ns}",
         ]
-        lines.extend(self._zone_register_lines(ns, tag, path_zero=True))
+        lines.extend([
+            "x119 = 0",  # 是否存在 Path Slide；当前节点尚未开放路径模式
+            f"y119 = {self._zone_capacity(self._collect_enabled_zone_entries())}",
+        ])
         lines.extend([
             f"cs-t67 = ResourceDragPinnedComponentInfo_{cn}_{ns}",
             f"cs-t68 = ResourceDragJiggleParams_{cn}_{ns}",
-            f"cs-t65 = ResourceDragJiggleMasks0_{cn}_{ns}",
-            f"cs-t66 = ResourceDragJiggleMasks1_{cn}_{ns}",
-            f"cs-t69 = ResourceDragJiggleMasks2_{cn}_{ns}",
+            f"cs-t65 = ResourceDragJiggleZoneIDs_{cn}_{ns}",
+            f"cs-t66 = ResourceDragJiggleZoneWeights_{cn}_{ns}",
             f"cs-t71 = ResourceDragJiggleScreenState_{ns}",
             f"cs-t73 = ResourceDragPathVectors_{ns}",
             f"cs-t74 = ResourceDragPathProgressState_{ns}",
+            f"cs-t75 = ResourceDragZoneParams_{ns}",
             f"cs-u6 = ResourceDragJiggleState_{cn}_{ns}",
             "",
             f"ResourceDragJiggleTempVB0_{cn}_{ns} = vb0",
@@ -1619,7 +1786,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         sec = f"[CustomShaderDragUpdateScreenJiggle_{ns}]"
         if sec in sections:
             return
-        tag = ns
         lines = [
             "local $LLScreenCursorXPast", "local $LLScreenCursorYPast", "local $LLScreenWasMouseDown",
             "",
@@ -1656,10 +1822,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "y84 = " + (f"$ssmtdrag_poke_hold_mult_{ns}" if self.enable_poke else "0"),
             "z84 = " + (f"$ssmtdrag_poke_hold_frames_{ns}" if self.enable_poke else "0"),
             "w84 = 0",  # 蓄力禁用
+            "x119 = 0",
+            f"y119 = {self._zone_capacity(self._collect_enabled_zone_entries())}",
         ]
-        lines.extend(self._zone_register_lines(ns, tag, path_zero=True))
         lines.extend([
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
+            f"cs-t75 = ResourceDragZoneParams_{ns}",
             f"cs-u0 = ResourceDragJiggleScreenState_{ns}",
             f"cs-u1 = ResourceDragPathProgressState_{ns}",
             "dispatch = 1, 1, 1",
@@ -2352,8 +2520,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
 # ---------------------------------------------------------------------------
 # 权重预览（视口热力图）：仿高斯球（toolkit/gb_operators）的轻量实现。
-# 单例 draw handler + 轮询 timer；节点 preview_weights 启用后，对 preview_target
-# 网格逐顶点合并各启用区域的高斯场（与导出烘焙 _write_jiggle_masks 同公式），
+# 单例 draw handler + 轮询 timer；节点 preview_weights 启用后，对单个目标或集合内
+# 全部网格逐顶点合并各启用区域的高斯场。集合或大量区域使用快速体积距离，
+# 避免交互预览反复运行逐区域 Dijkstra；导出烘焙仍使用精确的沿表面传播。
 # 热力图直接叠加在模型表面（含 xray 幽灵层）。gpu/timers 均为函数内延迟导入，
 # 测试环境（stub bpy，无 GPU）导入本模块零副作用。
 # ---------------------------------------------------------------------------
@@ -2362,29 +2531,57 @@ _preview_handler = None
 _preview_timer = None
 _preview_batches = {}          # (tree,node) -> (target_name, batch, ghost_batch)
 _preview_sig_cache = None
+_preview_pending_signature = None
+_preview_pending_since = None
 _PREVIEW_ALPHA = 0.85
 _PREVIEW_GHOST_FACTOR = 0.3
 _PREVIEW_TICK = 0.2
+_PREVIEW_DEBOUNCE = 0.6
+_PREVIEW_GEODESIC_ZONE_LIMIT = 16
+
+
+def _preview_now():
+    return time.monotonic()
 
 
 def _collect_preview_nodes():
-    """全部节点树中启用了权重预览且已选网格的拖拽节点。"""
+    """全部节点树中启用了权重预览且存在有效目标的拖拽节点。"""
     nodes = []
     for tree in bpy.data.node_groups:
         for n in tree.nodes:
             if (n.bl_idname == 'SSMTNode_PostProcess_DragInteraction'
                     and getattr(n, "preview_weights", False)
-                    and getattr(n, "preview_target", None) is not None):
+                    and _preview_targets(n)):
                 nodes.append(n)
     return nodes
 
 
+def _preview_targets(node):
+    """集合优先；递归返回其中全部网格。未设集合时回退单物体。"""
+    collection = getattr(node, "preview_collection", None)
+    if collection is not None:
+        objects = getattr(collection, "all_objects", None)
+        if objects is None:
+            objects = getattr(collection, "objects", ())
+        unique = {}
+        for obj in objects:
+            if getattr(obj, "type", None) == 'MESH':
+                unique[getattr(obj, "name_full", obj.name)] = obj
+        return [unique[name] for name in sorted(unique, key=str.casefold)]
+    target = getattr(node, "preview_target", None)
+    return [target] if target is not None else []
+
+
 def _preview_signature(n):
-    """矩阵/参数签名：移动缩放空物体、改 brush 参数、换/动网格都会触发重算。"""
-    target = n.preview_target
-    parts = [n.id_data.name, n.name, target.name,
-             tuple(round(v, 6) for v in np.array(target.matrix_world, dtype=np.float64).reshape(-1)),
-             len(target.data.vertices)]
+    """矩阵/参数签名：集合成员、网格变换和区域参数变化都会触发重算。"""
+    collection = getattr(n, "preview_collection", None)
+    parts = [n.id_data.name, n.name, getattr(collection, "name", None)]
+    for target in _preview_targets(n):
+        parts.append((
+            target.name,
+            tuple(round(v, 6) for v in np.array(target.matrix_world, dtype=np.float64).reshape(-1)),
+            len(target.data.vertices),
+        ))
     for item in n.zone_objects:
         empty = item.zone_object
         if empty is None:
@@ -2397,8 +2594,15 @@ def _preview_signature(n):
     return tuple(parts)
 
 
+def _preview_uses_surface_distance(node, enabled_zone_count):
+    """小规模单物体预览保留测地精度；集合/大量区域优先保证交互流畅。"""
+    return (getattr(node, "surface_propagate", True)
+            and getattr(node, "preview_collection", None) is None
+            and enabled_zone_count <= _PREVIEW_GEODESIC_ZONE_LIMIT)
+
+
 def _rebuild_preview_batches(nodes):
-    """重算全部启用节点的热力图批次（与导出烘焙同公式：高斯场 → weights_to_colors）。"""
+    """重算全部启用节点的热力图批次。"""
     global _preview_batches
     if not GB_CORE_AVAILABLE:
         return
@@ -2407,45 +2611,48 @@ def _rebuild_preview_batches(nodes):
     shader = gpu.shader.from_builtin('SMOOTH_COLOR')
     _preview_batches = {}
     for n in nodes:
-        target = n.preview_target
-        mesh = target.data
-        if len(mesh.vertices) == 0:
-            continue
-        verts = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
-        mesh.vertices.foreach_get("co", verts)
-        verts = verts.reshape(-1, 3)
-        mw = np.array(target.matrix_world, dtype=np.float64)
-        verts_world = verts @ mw[:3, :3].T + mw[:3, 3]
-        mesh.calc_loop_triangles()
-        tri = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
-        mesh.loop_triangles.foreach_get("vertices", tri)
-        tri = tri.reshape(-1, 3)
-        # 沿表面传播拓扑（预览与导出烘焙同路径；surface_propagate 关闭时为 None → 体积球）
-        edge_verts = None
-        if getattr(n, "surface_propagate", True):
-            edge_verts = gb_core.edges_from_triangles(tri)
-        field = np.zeros(len(verts), dtype=np.float64)
-        plateau = getattr(n, "mask_plateau", 0.0)
+        zones = []
         for item in n.zone_objects:
             empty = item.zone_object
             if empty is None or not empty.ssmt_drag_zone.enabled:
                 continue
-            s = empty.ssmt_drag_zone
-            d = n._zone_distances(verts_world, empty.matrix_world, edge_verts)
-            if d is None:
+            zones.append((empty, empty.ssmt_drag_zone))
+        use_surface_distance = _preview_uses_surface_distance(n, len(zones))
+        for target in _preview_targets(n):
+            mesh = target.data
+            if len(mesh.vertices) == 0:
                 continue
-            f = n._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)
-            np.maximum(field, f, out=field)
-        colors = gb_core.weights_to_colors(field, _PREVIEW_ALPHA).astype(np.float32)
-        ghost_colors = np.array(colors, copy=True)
-        ghost_colors[:, 3] *= _PREVIEW_GHOST_FACTOR
-        pos = verts_world.astype(np.float32)
-        key = (n.id_data.name, n.name)
-        _preview_batches[key] = (
-            target.name,
-            batch_for_shader(shader, 'TRIS', {"pos": pos, "color": colors}, indices=tri),
-            batch_for_shader(shader, 'TRIS', {"pos": pos, "color": ghost_colors}, indices=tri),
-        )
+            verts = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+            mesh.vertices.foreach_get("co", verts)
+            verts = verts.reshape(-1, 3)
+            mw = np.array(target.matrix_world, dtype=np.float64)
+            verts_world = verts @ mw[:3, :3].T + mw[:3, 3]
+            mesh.calc_loop_triangles()
+            tri = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
+            mesh.loop_triangles.foreach_get("vertices", tri)
+            tri = tri.reshape(-1, 3)
+            # 集合被视为一个预览目标，但各网格保留自身拓扑，避免跨物体虚构连接边。
+            edge_verts = None
+            if use_surface_distance:
+                edge_verts = gb_core.edges_from_triangles(tri)
+            field = np.zeros(len(verts), dtype=np.float64)
+            plateau = getattr(n, "mask_plateau", 0.0)
+            for empty, s in zones:
+                d = n._zone_distances(verts_world, empty.matrix_world, edge_verts)
+                if d is None:
+                    continue
+                f = n._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)
+                np.maximum(field, f, out=field)
+            colors = gb_core.weights_to_colors(field, _PREVIEW_ALPHA).astype(np.float32)
+            ghost_colors = np.array(colors, copy=True)
+            ghost_colors[:, 3] *= _PREVIEW_GHOST_FACTOR
+            pos = verts_world.astype(np.float32)
+            key = (n.id_data.name, n.name, target.name)
+            _preview_batches[key] = (
+                target.name,
+                batch_for_shader(shader, 'TRIS', {"pos": pos, "color": colors}, indices=tri),
+                batch_for_shader(shader, 'TRIS', {"pos": pos, "color": ghost_colors}, indices=tri),
+            )
 
 
 def _drag_preview_draw():
@@ -2500,20 +2707,37 @@ def _remove_preview_handler():
 
 
 def _preview_tick():
-    """轮询：无启用节点 → 自清理并取消 timer；签名变化 → 重算批次。"""
+    """轮询预览，并将连续编辑产生的多次变化合并为一次批次重建。"""
     global _preview_timer, _preview_sig_cache
+    global _preview_pending_signature, _preview_pending_since
     nodes = _collect_preview_nodes()
     if not nodes:
         _remove_preview_handler()
         _preview_timer = None
         _preview_sig_cache = None
+        _preview_pending_signature = None
+        _preview_pending_since = None
         return None  # 取消 timer
     _ensure_preview_handler()
     try:
         sig = tuple(_preview_signature(n) for n in nodes)
-        if sig != _preview_sig_cache:
-            _preview_sig_cache = sig
+        now = _preview_now()
+        if _preview_sig_cache is None:
             _rebuild_preview_batches(nodes)
+            _preview_sig_cache = sig
+            _preview_pending_signature = None
+            _preview_pending_since = None
+        elif sig == _preview_sig_cache:
+            _preview_pending_signature = None
+            _preview_pending_since = None
+        elif sig != _preview_pending_signature:
+            _preview_pending_signature = sig
+            _preview_pending_since = now
+        elif now - _preview_pending_since >= _PREVIEW_DEBOUNCE:
+            _rebuild_preview_batches(nodes)
+            _preview_sig_cache = sig
+            _preview_pending_signature = None
+            _preview_pending_since = None
     except Exception:
         pass
     return _PREVIEW_TICK
@@ -2531,13 +2755,17 @@ def _ensure_preview_running():
 
 def _preview_cleanup():
     """插件注销时清理 handler 与 timer，防止重载残留。"""
-    global _preview_timer
+    global _preview_timer, _preview_sig_cache
+    global _preview_pending_signature, _preview_pending_since
     if _preview_timer is not None:
         try:
             bpy.app.timers.unregister(_preview_timer)
         except Exception:
             pass
         _preview_timer = None
+    _preview_sig_cache = None
+    _preview_pending_signature = None
+    _preview_pending_since = None
     _remove_preview_handler()
 
 
@@ -2546,6 +2774,7 @@ classes = (
     SSMT_DragZoneRef,
     SSMT_OT_DragZoneAdd,
     SSMT_OT_DragZoneRemove,
+    SSMT_OT_DragZonePage,
     SSMTNode_PostProcess_DragInteraction,
 )
 

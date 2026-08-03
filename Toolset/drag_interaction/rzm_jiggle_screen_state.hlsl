@@ -8,6 +8,7 @@ RWBuffer<float4> InteractionState : register(u0);
 // fresh each game/3DMigoto session rather than being saved to disk.
 RWBuffer<float> PathProgressState : register(u1);
 Buffer<float4> PinnedDetectInfo   : register(t67);
+Buffer<float4> ZoneParams         : register(t75);
 Texture1D<float4> IniParams       : register(t120);
 
 #define CAPTURED_CURSOR    IniParams[67]
@@ -22,28 +23,12 @@ Texture1D<float4> IniParams       : register(t120);
 // like it's coming toward the camera instead of only sliding laterally.
 #define DEPTH_PULL_MULT    JIGGLE_MULT_EXTRA.z
 #define TIME_PARAMS        IniParams[76]
-#define ZONE_STRENGTH_LOW  IniParams[79]
-#define ZONE_STRENGTH_HIGH IniParams[80]
-#define ZONE_STRENGTH_R2   IniParams[106]
-#define ZONE_OFFSET_LOW    IniParams[81]
-#define ZONE_OFFSET_HIGH   IniParams[82]
-#define ZONE_OFFSET_R2     IniParams[109]
 #define POKE_PARAMS        IniParams[84]
 // 1.0 = grabbable (default), 0.0 = poke/pull only -- denies the LMB+RMB
 // grab/drag combo outright for that zone; poke is untouched by this.
-#define ZONE_GRABBABLE_LOW  IniParams[99]
-#define ZONE_GRABBABLE_HIGH IniParams[100]
-#define ZONE_GRABBABLE_R2   IniParams[112]
-// 1.0 = this zone is a rigid Path Slide (see PathProgressState above and
-// PathVectors.buf), 0.0 = normal Jiggle.
-#define ZONE_PATH_MODE_LOW  IniParams[119]
-#define ZONE_PATH_MODE_HIGH IniParams[120]
-#define ZONE_PATH_MODE_R2   IniParams[121]
+// ZoneParams row1.z: 1.0 = rigid Path Slide, 0.0 = normal Jiggle.
 // 0 = inherit the global damping multiplier (JIGGLE_MULT_EXTRA.x), else
 // overrides it for both grab and release physics while this zone is active.
-#define ZONE_DAMPING_LOW    IniParams[122]
-#define ZONE_DAMPING_HIGH   IniParams[123]
-#define ZONE_DAMPING_R2     IniParams[124]
 // .x = release damping multiplier immediately after a big/hard release
 //      (fallback 1.05, i.e. more flexible than steady-state — how much
 //      more scales with how far it was stretched at the moment of release).
@@ -85,32 +70,45 @@ float SimulationStep()
 
 float ZoneStrengthOverride(uint zone)
 {
-    float4 packed = zone < 4u ? ZONE_STRENGTH_LOW : zone < 8u ? ZONE_STRENGTH_HIGH : ZONE_STRENGTH_R2;
-    return packed[zone & 3u];
+    uint count;
+    ZoneParams.GetDimensions(count);
+    return zone * 2u < count ? ZoneParams[zone * 2u].y : 0.0;
 }
 
 bool ZoneGrabbable(uint zone)
 {
-    float4 packed = zone < 4u ? ZONE_GRABBABLE_LOW : zone < 8u ? ZONE_GRABBABLE_HIGH : ZONE_GRABBABLE_R2;
-    return packed[zone & 3u] > 0.5;
+    uint count;
+    ZoneParams.GetDimensions(count);
+    return zone * 2u + 1u < count && ZoneParams[zone * 2u + 1u].y > 0.5;
 }
 
 bool ZoneIsPathSlide(uint zone)
 {
-    float4 packed = zone < 4u ? ZONE_PATH_MODE_LOW : zone < 8u ? ZONE_PATH_MODE_HIGH : ZONE_PATH_MODE_R2;
-    return packed[zone & 3u] > 0.5;
+    uint count;
+    ZoneParams.GetDimensions(count);
+    return zone * 2u + 1u < count && ZoneParams[zone * 2u + 1u].z > 0.5;
 }
 
 float ZoneDampingOverride(uint zone)
 {
-    float4 packed = zone < 4u ? ZONE_DAMPING_LOW : zone < 8u ? ZONE_DAMPING_HIGH : ZONE_DAMPING_R2;
-    return packed[zone & 3u];
+    uint count;
+    ZoneParams.GetDimensions(count);
+    return zone * 2u + 1u < count ? ZoneParams[zone * 2u + 1u].x : 0.0;
 }
 
 float ZoneOffsetOverride(uint zone)
 {
-    float4 packed = zone < 4u ? ZONE_OFFSET_LOW : zone < 8u ? ZONE_OFFSET_HIGH : ZONE_OFFSET_R2;
-    return packed[zone & 3u];
+    uint count;
+    ZoneParams.GetDimensions(count);
+    return zone * 2u < count ? ZoneParams[zone * 2u].z : 0.0;
+}
+
+uint ClampZoneID(float zoneValue)
+{
+    uint paramCount;
+    ZoneParams.GetDimensions(paramCount);
+    uint zoneCount = max(paramCount / 2u, 1u);
+    return min((uint)max(round(zoneValue), 0.0), zoneCount - 1u);
 }
 
 float3 ClampLength(float3 v, float maxLen)
@@ -157,9 +155,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     float4 detectedPayload = PinnedDetectInfo[SLOT_HIT];
     bool hasHit = detected.x >= 0.0 && detected.y < 1e30 && abs(detectedPayload.w - 7.0) < 0.5;
 
-    // Zone-detection debounce: PinnedDetectInfo[7].w resolves to a small
-    // 0..7 zone id in practice (despite being labelled "nearest vertex
-    // index" in rzm_pin_detected.hlsl's own header), and it's a raw,
+    // Zone-detection debounce: PinnedDetectInfo[7].w resolves to the stable
+    // 0..255 zone id baked by the exporter, and it's a raw,
     // unsmoothed single-frame sample. A continuous grab tolerates one noisy
     // frame fine — you're actively watching/adjusting it — but a one-shot
     // poke has much less of a safety net: idle/breathing animation can
@@ -171,7 +168,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     // benefits from a couple of frames of hover history leading up to the
     // click instead of trusting a single instant. Computed before
     // newCapture so a fresh grab can be denied on a non-grabbable zone.
-    float rawZoneThisFrame = clamp(round(PinnedDetectInfo[7u].w), 0.0, 11.0);
+    float rawZoneThisFrame = (float)ClampZoneID(PinnedDetectInfo[7u].w);
     if (hasHit)
     {
         if (abs(rawZoneThisFrame - zoneState.y) < 0.5)
@@ -198,7 +195,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     // default instead of whatever was actually under the cursor, wrongly
     // denying real grabs. rawZoneThisFrame is recomputed fresh every frame
     // hasHit is true, so it's always the actual current zone at press time.
-    bool newCapture = pressed && hasHit && ZoneGrabbable((uint)clamp(round(rawZoneThisFrame), 0.0, 11.0));
+    bool newCapture = pressed && hasHit && ZoneGrabbable(ClampZoneID(rawZoneThisFrame));
     bool lockedCapture = held && (wasCapture || newCapture);
 
     // Poke: a lone LMB/RMB click-release (never part of the LMB+RMB grab
@@ -329,7 +326,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     float2 delta = (CURRENT_CURSOR.xy - CAPTURED_CURSOR.xy) / screenReference;
     delta *= float2(SafeNonZero(JIGGLE_MULT_EXTRA.y, 1.0), SafeNonZero(POLISH_PARAMS.z, 1.0));
 
-    uint activeZone = (uint)clamp(round(zoneState.x), 0.0, 11.0);
+    uint activeZone = ClampZoneID(zoneState.x);
     // Substitutes for the global damping multiplier (JIGGLE_MULT_EXTRA.x)
     // everywhere it's read below, when this zone has a nonzero override.
     float zoneDampingOverride = ZoneDampingOverride(activeZone);

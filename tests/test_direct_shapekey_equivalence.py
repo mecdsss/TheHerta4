@@ -20,6 +20,8 @@ for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common", f"{PKG}.utils"):
     package = _install_module(package_name)
     package.__path__ = []
 
+sys.modules[f"{PKG}.utils"].__path__ = [str(Path(__file__).resolve().parents[1] / "utils")]
+
 
 def _link_noop(_obj):
     return None

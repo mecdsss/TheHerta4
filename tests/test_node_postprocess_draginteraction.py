@@ -10,7 +10,7 @@
 - 钩子注入位置（ib= 之后、第一个 run=/drawindexed= 之前）；ib=null 段不注入；
 - ObjectMap 布局 (1+N)×16B、分区局部索引空间 (firstIndex=0, indexCount, mode=7, objectID=0)；
 - Bake 偏移 = i×⌊part_count/8⌋、gs-t1 为 part IB 资源名；
-- 寄存器完整性：zone 77-124 映射、path=0 显式、x72 两节不对称；
+- 稀疏区域 ABI：稳定 ID、Top-4 权重、ZoneParams 与 256 区域容量；
 - ini 侧裁剪：无 dump 行、无 cs-u4/u7 绑定、有 cs-u2/u6/t73/t74、w84=0、x74=0、x75=0；
 - boot-clear 块存在且幂等；grabbable 始终显式生成。
 """
@@ -56,6 +56,7 @@ def _install_stub_bpy():
         class PropertyGroup: pass
         class Operator: pass
         class Object: pass
+        class Collection: pass
         class Node: pass
         class NodeSocket: pass
         class Menu: pass
@@ -447,6 +448,26 @@ class DragNodeEmitTests(unittest.TestCase):
         node._emit_sections(sections, comps, "testns")
         return node, sections, comps
 
+    @staticmethod
+    def _zone_item(zone_id, weight=1.0, enabled=True, grabbable=True):
+        settings = types.SimpleNamespace(
+            enabled=enabled,
+            brush_strength=weight,
+            brush_falloff_k=4.6,
+            radius=0.0,
+            strength=0.0,
+            max_offset=0.0,
+            falloff=0.0,
+            damping=0.0,
+            grabbable=grabbable,
+        )
+        empty = types.SimpleNamespace(
+            name=f"zone_{zone_id}",
+            ssmt_drag_zone=settings,
+            matrix_world=np.eye(4),
+        )
+        return types.SimpleNamespace(zone_id=zone_id, zone_object=empty)
+
     def test_required_sections_present(self):
         _, sections, _ = self._emit()
         cn = "abc123_43191"
@@ -497,15 +518,15 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("y26 = 7201", sample)
         self.assertIn("drawindexed = 1, 7201, 0", sample)
 
-    def test_zone_registers_full_block(self):
+    def test_sparse_zone_resources_replace_fixed_register_block(self):
         _, sections, _ = self._emit()
         jig = "\n".join(sections["[CustomShaderDragJiggleabc123_43191_testns]"])
-        # 77-124 关键寄存器齐全、path=0 显式
-        for reg in (77, 78, 103, 79, 80, 106, 81, 82, 109, 99, 100, 112, 101, 102, 116, 119, 120, 121, 122, 123, 124):
-            self.assertIn(f"x{reg} = ", jig, f"缺少寄存器 x{reg}")
-        # path 行字面量 0
+        self.assertIn("cs-t65 = ResourceDragJiggleZoneIDs", jig)
+        self.assertIn("cs-t66 = ResourceDragJiggleZoneWeights", jig)
+        self.assertIn("cs-t75 = ResourceDragZoneParams", jig)
         self.assertIn("x119 = 0", jig)
-        self.assertIn("w121 = 0", jig)
+        self.assertNotIn("x77 = ", jig)
+        self.assertNotIn("x99 = ", jig)
 
     def test_x72_asymmetry_mirrors_original(self):
         # 显式传 mult_radius 以与默认值解耦：Jiggle y72 来自 mult_radius 属性，
@@ -539,12 +560,158 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("x86 = 1", det)
         self.assertNotIn("x86 = 0", det)
 
-    def test_masks_three_sections_always(self):
-        """Masks0/1/2 三段恒定存在（回归：缺段会让 cs-t5/cs-t7/cs-t66/cs-t69 成悬空引用）。"""
+    def test_sparse_mask_resource_sections(self):
         _, sections, _ = self._emit()
         cn = "abc123_43191"
-        for i in range(3):
-            self.assertIn(f"[ResourceDragJiggleMasks{i}_{cn}_testns]", sections)
+        ids = sections[f"[ResourceDragJiggleZoneIDs_{cn}_testns]"]
+        weights = sections[f"[ResourceDragJiggleZoneWeights_{cn}_testns]"]
+        self.assertIn("format = R32G32B32A32_UINT", ids)
+        self.assertIn("format = R32G32B32A32_FLOAT", weights)
+        self.assertIn("[ResourceDragZoneParams_testns]", sections)
+        self.assertFalse(any("JiggleMasks" in name for name in sections))
+
+    def test_stable_zone_ids_migrate_and_preserve_high_ids(self):
+        self.assertEqual(self.mod.MAX_ZONES, 256)
+        explicit = self._zone_item(200)
+        legacy = self._zone_item(-1)
+        disabled = self._zone_item(17, enabled=False)
+        node = _make_node(self.mod, zone_objects=[explicit, legacy, disabled])
+        entries = node._collect_enabled_zone_entries()
+        self.assertEqual([zone_id for zone_id, _ in entries], [0, 200])
+        self.assertEqual(legacy.zone_id, 0)
+        self.assertEqual(disabled.zone_id, 17)
+
+        highest = self._zone_item(255)
+        node = _make_node(self.mod, zone_objects=[highest])
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        self.assertIn("array = 256", sections["[ResourceDragPathProgressState_testns]"])
+        jig = "\n".join(sections["[CustomShaderDragJiggleabc123_43191_testns]"])
+        self.assertIn("y119 = 256", jig)
+
+        all_items = [self._zone_item(zone_id) for zone_id in range(256)]
+        node = _make_node(self.mod, zone_objects=all_items)
+        all_entries = node._collect_enabled_zone_entries()
+        self.assertEqual(len(all_entries), 256)
+        self.assertEqual([zone_id for zone_id, _ in all_entries], list(range(256)))
+
+    def test_zone_page_is_clamped_after_out_of_range_input_and_removal(self):
+        node = _make_node(self.mod, zone_objects=[object() for _ in range(17)])
+        object.__setattr__(node, "zone_page", 15)
+        self.assertEqual(self.mod._zone_page_state(node), (1, 2))
+        self.assertEqual(node.zone_page, 15)  # draw 路径只读，不在绘制中改 RNA
+        self.assertEqual(self.mod._clamp_zone_page(node), (1, 2))
+        self.assertEqual(node.zone_page, 1)
+
+        node.zone_objects.pop()
+        self.assertEqual(self.mod._clamp_zone_page(node), (0, 1))
+        self.assertEqual(node.zone_page, 0)
+
+        self.assertEqual(self.mod._clamp_zone_page(node, -10), (0, 1))
+
+    def test_sparse_bake_keeps_four_strongest_zone_weights(self):
+        import tempfile
+        zone_ids = [0, 1, 2, 3, 4, 255]
+        items = [self._zone_item(zone_id, weight=(index + 1) / 10.0) for index, zone_id in enumerate(zone_ids)]
+        node = _make_node(self.mod, zone_objects=items, surface_propagate=False)
+        node._check_zone_radius_scale = lambda zones: False
+        node._read_position_buf = lambda *args: np.zeros((3, 3), dtype=np.float32)
+        node._get_reference_matrix_inv = lambda comp: None
+        node._get_non_mirror_mirror = lambda: None
+        node._buffer_dir = lambda sections, comp: "Meshes"
+        node._evaluate_zone_field = lambda positions, empty, *args, **kwargs: np.full(
+            positions.shape[0], empty.ssmt_drag_zone.brush_strength, dtype=np.float32
+        )
+        comp = {"vertex_count": 3, "base_name": "sample", "comp_name": "sample", "parts": []}
+
+        with tempfile.TemporaryDirectory() as td:
+            legacy_dir = Path(td) / "Meshes"
+            legacy_dir.mkdir(parents=True)
+            for index in range(3):
+                (legacy_dir / f"sampleJiggleMasks{index}.buf").write_bytes(b"legacy")
+            node._write_jiggle_masks(td, {}, comp, "testns")
+            ids = np.fromfile(Path(td) / "Meshes" / "sampleJiggleZoneIDs.buf", dtype=np.uint32).reshape(-1, 4)
+            weights = np.fromfile(Path(td) / "Meshes" / "sampleJiggleZoneWeights.buf", dtype=np.float32).reshape(-1, 4)
+            self.assertFalse(any((legacy_dir / f"sampleJiggleMasks{index}.buf").exists() for index in range(3)))
+
+        for row_ids, row_weights in zip(ids, weights):
+            kept = {int(zone_id): float(weight) for zone_id, weight in zip(row_ids, row_weights)}
+            self.assertEqual(set(kept), {2, 3, 4, 255})
+            self.assertAlmostEqual(kept[255], 0.6, places=6)
+
+    def test_zone_field_applies_export_space_matrix_to_empty(self):
+        node = _make_node(self.mod, surface_propagate=False)
+        settings = types.SimpleNamespace(brush_strength=1.0, brush_falloff_k=4.6)
+        empty_matrix = np.eye(4)
+        empty_matrix[:3, 3] = [0.069, -0.139, 1.143]
+        empty = types.SimpleNamespace(name="SSMT_DragZone_0", matrix_world=empty_matrix)
+        positions = np.asarray([[0.069, 1.143, 0.139]], dtype=np.float32)
+        export_matrix = np.asarray([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+
+        field = node._evaluate_zone_field(
+            positions,
+            empty,
+            settings,
+            None,
+            None,
+            export_matrix=export_matrix,
+        )
+
+        np.testing.assert_allclose(field, [1.0])
+
+    def test_sparse_bake_rejects_all_zero_configured_zones(self):
+        import tempfile
+        item = self._zone_item(0)
+        node = _make_node(self.mod, zone_objects=[item], surface_propagate=False)
+        node._check_zone_radius_scale = lambda zones: False
+        node._read_position_buf = lambda *args: np.zeros((3, 3), dtype=np.float32)
+        node._get_reference_matrix_inv = lambda comp: None
+        node._get_export_space_matrix = lambda: np.eye(4)
+        node._get_non_mirror_mirror = lambda: None
+        node._buffer_dir = lambda sections, comp: "Meshes"
+        node._evaluate_zone_field = lambda *args, **kwargs: None
+        comp = {"vertex_count": 3, "base_name": "sample", "comp_name": "sample", "parts": []}
+
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaisesRegex(RuntimeError, "all configured drag zones produced zero weights"):
+                node._write_jiggle_masks(td, {}, comp, "testns")
+            self.assertFalse((Path(td) / "Meshes" / "sampleJiggleZoneWeights.buf").exists())
+
+    def test_zone_params_buffer_uses_stable_id_and_grabbable_flag(self):
+        import tempfile
+        item = self._zone_item(255, grabbable=False)
+        settings = item.zone_object.ssmt_drag_zone
+        settings.radius = 0.25
+        settings.strength = 1.5
+        settings.max_offset = 0.75
+        settings.falloff = 2.0
+        settings.damping = 0.8
+        node = _make_node(self.mod, zone_objects=[item])
+        with tempfile.TemporaryDirectory() as td:
+            node._write_zone_resources(td, "testns")
+            params = np.fromfile(Path(td) / "res" / "drag_interaction" / "ZoneParams_testns.buf", dtype=np.float32).reshape(-1, 4)
+        self.assertEqual(params.shape, (512, 4))
+        np.testing.assert_allclose(params[510], [0.25, 1.5, 0.75, 2.0])
+        np.testing.assert_allclose(params[511], [0.8, 0.0, 0.0, 1.0])
+
+    def test_sparse_zone_shaders_have_no_legacy_twelve_zone_clamp(self):
+        shader_dir = REPO_ROOT / "Toolset" / "drag_interaction"
+        detect = (shader_dir / "rzm_object_detect.hlsl").read_text(encoding="utf-8")
+        jiggle = (shader_dir / "rzm_jiggle_interaction.hlsl").read_text(encoding="utf-8")
+        screen = (shader_dir / "rzm_jiggle_screen_state.hlsl").read_text(encoding="utf-8")
+        self.assertIn("Buffer<uint4>                      gJiggleZoneIDs", detect)
+        self.assertIn("uint candidates[12]", detect)
+        self.assertIn("Buffer<float4> ZoneParams", jiggle)
+        self.assertIn("Buffer<float4> ZoneParams", screen)
+        for source in (detect, jiggle, screen):
+            self.assertNotIn("0.0, 11.0", source)
+            self.assertNotIn("ZONE_STRENGTH_R2", source)
 
     def test_grab_gesture_modes(self):
         """三种抓取手势模式的 Present 判定行（回归：原作 COMBO 语义 左右键同按/X）。"""
@@ -658,15 +825,14 @@ class DragNodeEmitTests(unittest.TestCase):
         node._emit_present_and_constants(sections, comps, "testns")
         self.assertEqual("\n".join(sections["[Present]"]).count("DRAG INTERACTION GATE BEGIN"), 1)
 
-    def test_grabbable_always_explicit(self):
-        _, sections, _ = self._emit()
-        jig = "\n".join(sections["[CustomShaderDragJiggleabc123_43191_testns]"])
-        # 无区域时隐式 zone0（掩码全 1）的 grabbable 必须为 1，
-        # 否则 ZoneGrabbable(0)=false → newCapture 永不开始（回归：无拖拽效果的根因）
-        self.assertIn("x99 = 1", jig)
-        # 其余槽位掩码为 0 不会命中，grabbable 仍为 0（显式生成，不省略）
-        self.assertIn("y99 = 0", jig)
-        self.assertIn("w99 = 0", jig)
+    def test_no_zone_fallback_zone0_remains_grabbable(self):
+        import tempfile
+        node = _make_node(self.mod)
+        with tempfile.TemporaryDirectory() as td:
+            node._write_zone_resources(td, "testns")
+            params = np.fromfile(Path(td) / "res" / "drag_interaction" / "ZoneParams_testns.buf", dtype=np.float32).reshape(-1, 4)
+        self.assertEqual(params.shape, (2, 4))
+        self.assertEqual(params[1].tolist(), [0.0, 1.0, 0.0, 1.0])
 
     def test_all_used_globals_declared(self):
         """发射的所有段中被引用的 $ 变量必须在 [Constants] 有 global 声明。
@@ -807,10 +973,11 @@ class DragNodePreviewTests(unittest.TestCase):
         return types.SimpleNamespace(name=name, matrix_world=m, ssmt_drag_zone=settings)
 
     def _make_preview_node(self, mod, tree_name="Tree", node_name="Drag",
-                           weights=True, target=None, zone_empties=()):
+                           weights=True, target=None, collection=None, zone_empties=()):
         node = _make_node(mod)
         object.__setattr__(node, "preview_weights", weights)
         object.__setattr__(node, "preview_target", target)
+        object.__setattr__(node, "preview_collection", collection)
         object.__setattr__(node, "id_data", types.SimpleNamespace(name=tree_name))
         object.__setattr__(node, "name", node_name)
         object.__setattr__(node, "zone_objects",
@@ -876,6 +1043,88 @@ class DragNodePreviewTests(unittest.TestCase):
                                               data=types.SimpleNamespace(vertices=range(100))),
             zone_empties=[empty])
         self.assertNotEqual(base, mod._preview_signature(node2))
+
+    def test_collection_preview_recursively_collects_meshes_and_takes_priority(self):
+        mod = self.mod
+        mesh_a = types.SimpleNamespace(type="MESH", name="A", name_full="A", matrix_world=np.eye(4),
+                                       data=types.SimpleNamespace(vertices=range(3)))
+        mesh_b = types.SimpleNamespace(type="MESH", name="B", name_full="B", matrix_world=np.eye(4),
+                                       data=types.SimpleNamespace(vertices=range(5)))
+        light = types.SimpleNamespace(type="LIGHT", name="Light", name_full="Light")
+        collection = types.SimpleNamespace(name="PreviewSet", all_objects=[mesh_b, light, mesh_a, mesh_a])
+        fallback = types.SimpleNamespace(type="MESH", name="Fallback", matrix_world=np.eye(4),
+                                         data=types.SimpleNamespace(vertices=range(1)))
+        node = self._make_preview_node(mod, target=fallback, collection=collection)
+        self.assertEqual([obj.name for obj in mod._preview_targets(node)], ["A", "B"])
+        signature = mod._preview_signature(node)
+        self.assertIn("PreviewSet", signature)
+        self.assertNotIn("Fallback", str(signature))
+
+    def test_collection_membership_changes_preview_signature(self):
+        mod = self.mod
+        mesh_a = types.SimpleNamespace(type="MESH", name="A", name_full="A", matrix_world=np.eye(4),
+                                       data=types.SimpleNamespace(vertices=range(3)))
+        mesh_b = types.SimpleNamespace(type="MESH", name="B", name_full="B", matrix_world=np.eye(4),
+                                       data=types.SimpleNamespace(vertices=range(5)))
+        collection = types.SimpleNamespace(name="PreviewSet", all_objects=[mesh_a])
+        node = self._make_preview_node(mod, collection=collection)
+        before = mod._preview_signature(node)
+        collection.all_objects.append(mesh_b)
+        self.assertNotEqual(before, mod._preview_signature(node))
+
+    def test_preview_tick_debounces_repeated_signature_changes(self):
+        mod = self.mod
+        node = self._make_preview_node(mod)
+        signatures = iter(("initial", "change-1", "change-2", "change-2"))
+        rebuilds = []
+        clock = iter((0.0, 0.2, 0.4, 1.2))
+        original = (
+            mod._collect_preview_nodes,
+            mod._ensure_preview_handler,
+            mod._preview_signature,
+            mod._rebuild_preview_batches,
+            mod._preview_now,
+        )
+        mod._preview_sig_cache = None
+        mod._preview_pending_signature = None
+        mod._preview_pending_since = None
+        try:
+            mod._collect_preview_nodes = lambda: [node]
+            mod._ensure_preview_handler = lambda: None
+            mod._preview_signature = lambda _node: next(signatures)
+            mod._rebuild_preview_batches = lambda nodes: rebuilds.append(list(nodes))
+            mod._preview_now = lambda: next(clock)
+
+            mod._preview_tick()  # 首次开启立即建立预览
+            mod._preview_tick()  # 连续新增区域，只记录待处理签名
+            mod._preview_tick()  # 签名继续变化，重新开始防抖计时
+            mod._preview_tick()  # 稳定超过防抖窗口，只重建一次
+        finally:
+            (mod._collect_preview_nodes,
+             mod._ensure_preview_handler,
+             mod._preview_signature,
+             mod._rebuild_preview_batches,
+             mod._preview_now) = original
+            mod._preview_sig_cache = None
+            mod._preview_pending_signature = None
+            mod._preview_pending_since = None
+
+        self.assertEqual(len(rebuilds), 2)
+
+    def test_collection_preview_uses_fast_volumetric_distance(self):
+        mod = self.mod
+        collection = types.SimpleNamespace(name="PreviewSet", all_objects=[])
+        node = self._make_preview_node(mod, collection=collection)
+        self.assertFalse(mod._preview_uses_surface_distance(node, enabled_zone_count=1))
+
+    def test_single_target_preview_keeps_surface_distance_for_small_zone_count(self):
+        mod = self.mod
+        node = self._make_preview_node(mod)
+        object.__setattr__(node, "surface_propagate", True)
+        self.assertTrue(mod._preview_uses_surface_distance(node, enabled_zone_count=1))
+        self.assertFalse(
+            mod._preview_uses_surface_distance(
+                node, enabled_zone_count=mod._PREVIEW_GEODESIC_ZONE_LIMIT + 1))
 
 
 class DragNodeMirrorTests(unittest.TestCase):

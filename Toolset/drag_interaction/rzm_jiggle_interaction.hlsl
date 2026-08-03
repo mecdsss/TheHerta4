@@ -88,14 +88,14 @@ RWStructuredBuffer<VertexAttributes> rw_buffer  : register(u5);
 RWBuffer<float4> JiggleState                    : register(u6);
 RWBuffer<float4> DebugBuffer                    : register(u7);
 RWBuffer<float4> VertexDebugBuffer              : register(u4);
-Buffer<float4> JiggleMasks0                    : register(t65);
-Buffer<float4> JiggleMasks1                    : register(t66);
-Buffer<float4> JiggleMasks2                    : register(t69);
+Buffer<uint4> JiggleZoneIDs                    : register(t65);
+Buffer<float4> JiggleZoneWeights               : register(t66);
 Buffer<float4> SharedInteractionState           : register(t71);
 // Path Slide: static per-zone start->end vectors (core/path_export.py) and
 // live per-zone progress (written by rzm_jiggle_screen_state.hlsl).
 Buffer<float4> PathVectors                      : register(t73);
 Buffer<float> PathProgressState                 : register(t74);
+Buffer<float4> ZoneParams                       : register(t75);
 
 Texture1D<float4> IniParams : register(t120);
 
@@ -109,23 +109,7 @@ Texture1D<float4> IniParams : register(t120);
 #define DEBUG_PARAMS         IniParams[74]
 #define VERTEX_DEBUG_PARAMS  IniParams[75]
 #define TIME_PARAMS          IniParams[76]
-#define ZONE_RADIUS_LOW      IniParams[77]
-#define ZONE_RADIUS_HIGH     IniParams[78]
-#define ZONE_RADIUS_R2       IniParams[103]
-#define ZONE_STRENGTH_LOW    IniParams[79]
-#define ZONE_STRENGTH_HIGH   IniParams[80]
-#define ZONE_STRENGTH_R2     IniParams[106]
-#define ZONE_OFFSET_LOW      IniParams[81]
-#define ZONE_OFFSET_HIGH     IniParams[82]
-#define ZONE_OFFSET_R2       IniParams[109]
-#define ZONE_FALLOFF_LOW     IniParams[101]
-#define ZONE_FALLOFF_HIGH    IniParams[102]
-#define ZONE_FALLOFF_R2      IniParams[116]
-// 1.0 = this zone is a rigid Path Slide (see PathVectors/PathProgressState
-// above), 0.0 = normal Jiggle.
-#define ZONE_PATH_MODE_LOW   IniParams[119]
-#define ZONE_PATH_MODE_HIGH  IniParams[120]
-#define ZONE_PATH_MODE_R2    IniParams[121]
+#define ZONE_RUNTIME_META    IniParams[119]
 
 #define DETECT_SLOT_ID       0u
 #define DETECT_SLOT_HIT      1u
@@ -185,32 +169,37 @@ float SimulationStep()
 
 float ZoneRadiusOverride(uint zone)
 {
-    float4 packed = zone < 4u ? ZONE_RADIUS_LOW : zone < 8u ? ZONE_RADIUS_HIGH : ZONE_RADIUS_R2;
-    return packed[zone & 3u];
+    uint count;
+    ZoneParams.GetDimensions(count);
+    return zone * 2u < count ? ZoneParams[zone * 2u].x : 0.0;
 }
 
 float ZoneStrengthOverride(uint zone)
 {
-    float4 packed = zone < 4u ? ZONE_STRENGTH_LOW : zone < 8u ? ZONE_STRENGTH_HIGH : ZONE_STRENGTH_R2;
-    return packed[zone & 3u];
+    uint count;
+    ZoneParams.GetDimensions(count);
+    return zone * 2u < count ? ZoneParams[zone * 2u].y : 0.0;
 }
 
 float ZoneOffsetOverride(uint zone)
 {
-    float4 packed = zone < 4u ? ZONE_OFFSET_LOW : zone < 8u ? ZONE_OFFSET_HIGH : ZONE_OFFSET_R2;
-    return packed[zone & 3u];
+    uint count;
+    ZoneParams.GetDimensions(count);
+    return zone * 2u < count ? ZoneParams[zone * 2u].z : 0.0;
 }
 
 float ZoneFalloffOverride(uint zone)
 {
-    float4 packed = zone < 4u ? ZONE_FALLOFF_LOW : zone < 8u ? ZONE_FALLOFF_HIGH : ZONE_FALLOFF_R2;
-    return packed[zone & 3u];
+    uint count;
+    ZoneParams.GetDimensions(count);
+    return zone * 2u < count ? ZoneParams[zone * 2u].w : 0.0;
 }
 
 bool ZoneIsPathSlide(uint zone)
 {
-    float4 packed = zone < 4u ? ZONE_PATH_MODE_LOW : zone < 8u ? ZONE_PATH_MODE_HIGH : ZONE_PATH_MODE_R2;
-    return packed[zone & 3u] > 0.5;
+    uint count;
+    ZoneParams.GetDimensions(count);
+    return zone * 2u + 1u < count && ZoneParams[zone * 2u + 1u].z > 0.5;
 }
 
 // Cheap, wave-uniform (every thread reads the same IniParams-derived value,
@@ -221,42 +210,39 @@ bool ZoneIsPathSlide(uint zone)
 // uses Path Slide (which is every export before this existed).
 bool AnyPathSlideZone()
 {
-    return any(ZONE_PATH_MODE_LOW) || any(ZONE_PATH_MODE_HIGH) || any(ZONE_PATH_MODE_R2);
+    return ZONE_RUNTIME_META.x > 0.5;
 }
 
-// Which zone does vertex i actually belong to (its own painted weight, not
-// the globally-active zone)? Mirrors ResolveJiggleZone in
-// rzm_object_detect.hlsl, adapted to read the per-vertex JiggleMasksN rows
-// this shader already has bound, instead of interpolating a hit triangle.
-// Each JiggleMasksN row is read and folded into (zone, ownWeight) one at a
-// time -- keeping only one float4 live at once -- to limit temp-register
-// pressure (see AnyPathSlideZone's comment for why that matters).
+uint ClampZoneID(float zoneValue)
+{
+    uint paramCount;
+    ZoneParams.GetDimensions(paramCount);
+    uint zoneCount = max(paramCount / 2u, 1u);
+    return min((uint)max(round(zoneValue), 0.0), zoneCount - 1u);
+}
+
+// Which zone does vertex i actually belong to (its strongest sparse weight,
+// not the globally-active zone)?
 uint VertexOwningZone(uint i, out float ownWeight)
 {
+    static const uint INVALID_ZONE = 0xffffffffu;
+    uint idCount;
+    uint weightCount;
+    JiggleZoneIDs.GetDimensions(idCount);
+    JiggleZoneWeights.GetDimensions(weightCount);
+    uint4 ids = i < idCount ? JiggleZoneIDs[i] : uint4(INVALID_ZONE, INVALID_ZONE, INVALID_ZONE, INVALID_ZONE);
+    float4 weights = i < weightCount ? JiggleZoneWeights[i] : 0.0f;
     uint zone = 0u;
-    uint c0;
-    JiggleMasks0.GetDimensions(c0);
-    float4 m0 = i < c0 ? JiggleMasks0[i] : 0.0f;
-    ownWeight = m0.x;
-    if (m0.y > ownWeight) { ownWeight = m0.y; zone = 1u; }
-    if (m0.z > ownWeight) { ownWeight = m0.z; zone = 2u; }
-    if (m0.w > ownWeight) { ownWeight = m0.w; zone = 3u; }
-
-    uint c1;
-    JiggleMasks1.GetDimensions(c1);
-    float4 m1 = i < c1 ? JiggleMasks1[i] : 0.0f;
-    if (m1.x > ownWeight) { ownWeight = m1.x; zone = 4u; }
-    if (m1.y > ownWeight) { ownWeight = m1.y; zone = 5u; }
-    if (m1.z > ownWeight) { ownWeight = m1.z; zone = 6u; }
-    if (m1.w > ownWeight) { ownWeight = m1.w; zone = 7u; }
-
-    uint c2;
-    JiggleMasks2.GetDimensions(c2);
-    float4 m2 = i < c2 ? JiggleMasks2[i] : 0.0f;
-    if (m2.x > ownWeight) { ownWeight = m2.x; zone = 8u; }
-    if (m2.y > ownWeight) { ownWeight = m2.y; zone = 9u; }
-    if (m2.z > ownWeight) { ownWeight = m2.z; zone = 10u; }
-    if (m2.w > ownWeight) { ownWeight = m2.w; zone = 11u; }
+    ownWeight = 0.0f;
+    [unroll]
+    for (uint slot = 0u; slot < 4u; ++slot)
+    {
+        if (ids[slot] != INVALID_ZONE && weights[slot] > ownWeight)
+        {
+            ownWeight = weights[slot];
+            zone = ids[slot];
+        }
+    }
     return zone;
 }
 
@@ -547,7 +533,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
     float4 sharedCenter = ReadSharedInteraction(2u, float4(0.0, 0.0, 0.0, -1.0));
     bool sharedAlive = sharedCurrent.w > 0.5 && sharedCenter.w >= 0.0;
     float objectID = sharedAlive ? sharedCenter.w : (stateAlive ? stateCenter.w : capturedID);
-    uint activeZone = (uint)clamp(round(ReadSharedInteraction(9u, float4(0.0, 0.0, 0.0, 0.0)).x), 0.0, 11.0);
+    uint activeZone = ClampZoneID(ReadSharedInteraction(9u, float4(0.0, 0.0, 0.0, 0.0)).x);
 
     // Default parameters from IniParams/fallbacks
     float radius       = SafePositive(JIGGLE_PARAMS.x, 0.25);
@@ -765,18 +751,22 @@ void main(uint3 threadID : SV_DispatchThreadID)
 
     VertexAttributes v = base_buffer[i];
     float3 localPos = ToJiggleSpace(v.position);
-    uint maskCount0 = 0;
-    uint maskCount1 = 0;
-    uint maskCount2 = 0;
-    JiggleMasks0.GetDimensions(maskCount0);
-    JiggleMasks1.GetDimensions(maskCount1);
-    JiggleMasks2.GetDimensions(maskCount2);
-    float4 packedMask = activeZone < 4u
-        ? (i < maskCount0 ? JiggleMasks0[i] : 0.0f)
-        : activeZone < 8u
-        ? (i < maskCount1 ? JiggleMasks1[i] : 0.0f)
-        : (i < maskCount2 ? JiggleMasks2[i] : 0.0f);
-    float mask = saturate(packedMask[activeZone & 3u]);
+    uint idCount = 0;
+    uint weightCount = 0;
+    JiggleZoneIDs.GetDimensions(idCount);
+    JiggleZoneWeights.GetDimensions(weightCount);
+    uint4 sparseIDs = i < idCount
+        ? JiggleZoneIDs[i]
+        : uint4(0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+    float4 sparseWeights = i < weightCount ? JiggleZoneWeights[i] : 0.0f;
+    float mask = 0.0f;
+    [unroll]
+    for (uint maskSlot = 0u; maskSlot < 4u; ++maskSlot)
+    {
+        if (sparseIDs[maskSlot] == activeZone)
+            mask = max(mask, sparseWeights[maskSlot]);
+    }
+    mask = saturate(mask);
     float dist = distance(localPos, nextCenter.xyz);
     // A Path Slide zone never gets spring-physics deformation, even on the
     // frame it happens to be the active zone (it still gets its own rigid

@@ -20,6 +20,8 @@ for package_name in (PKG, f"{PKG}.utils", f"{PKG}.common", f"{PKG}.blueprint"):
     package = _install_module(package_name)
     package.__path__ = []
 
+sys.modules[f"{PKG}.utils"].__path__ = [str(Path(__file__).resolve().parents[1] / "utils")]
+
 
 _install_module(
     "bpy",
@@ -83,12 +85,47 @@ class _GameType:
 
 
 class ExportSpaceTransformTests(unittest.TestCase):
+    def test_convert_position_coords_uses_global_logic_when_not_explicit(self):
+        coords = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32)
+
+        converted = export_utils.ExportUtils.convert_position_coords_for_export(coords)
+
+        np.testing.assert_allclose(converted, np.asarray([[1.0, 3.0, -2.0]], dtype=np.float32))
+
     def test_convert_position_coords_for_export_rotates_gimi_like_logics(self):
         coords = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32)
 
         converted = export_utils.ExportUtils.convert_position_coords_for_export(coords, logic_name="GIMI")
 
-        np.testing.assert_allclose(converted, np.asarray([[1.0, -3.0, 2.0]], dtype=np.float32))
+        np.testing.assert_allclose(converted, np.asarray([[1.0, 3.0, -2.0]], dtype=np.float32))
+
+    def test_export_matrix_maps_columbina_empty_into_exported_bounds(self):
+        empty_center = np.asarray([[0.069, -0.139, 1.143]], dtype=np.float32)
+
+        converted = export_utils.ExportUtils.convert_position_coords_for_export(
+            empty_center,
+            logic_name="GIMI",
+        )
+
+        np.testing.assert_allclose(converted, np.asarray([[0.069, 1.143, 0.139]], dtype=np.float32))
+
+    def test_all_game_logic_coordinate_families(self):
+        coords = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32)
+        for logic_name in ("SRMI", "GIMI", "HIMI", "YYSLS", "IdentityV"):
+            with self.subTest(logic_name=logic_name):
+                np.testing.assert_allclose(
+                    export_utils.ExportUtils.convert_position_coords_for_export(coords, logic_name=logic_name),
+                    [[1.0, 3.0, -2.0]],
+                )
+        for logic_name in (
+            "ZZMI", "ZZMIDX12", "WWMI", "EFMI", "HTMI", "GF2", "AILIMIT",
+            "DOAV", "Naraka", "NarakaM", "NTEMI", "APMI", "NEMI",
+        ):
+            with self.subTest(logic_name=logic_name):
+                np.testing.assert_allclose(
+                    export_utils.ExportUtils.convert_position_coords_for_export(coords, logic_name=logic_name),
+                    coords,
+                )
 
     def test_convert_position_coords_for_export_scales_and_rotates_snowbreak(self):
         coords = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32)
@@ -118,7 +155,7 @@ class ExportSpaceTransformTests(unittest.TestCase):
 
         np.testing.assert_allclose(
             np.frombuffer(converted, dtype=np.float32).reshape(-1, 3),
-            np.asarray([[1.0, -3.0, 2.0], [4.0, -6.0, 5.0]], dtype=np.float32),
+            np.asarray([[1.0, 3.0, -2.0], [4.0, 6.0, -5.0]], dtype=np.float32),
         )
 
 

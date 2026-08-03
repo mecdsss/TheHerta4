@@ -101,9 +101,8 @@ StructuredBuffer<VertexAttributes> gVB0         : register(t0);
 Buffer<uint>                       gIndexBuffer : register(t1);
 Buffer<float4>                     gObjectMap   : register(t2);
 Texture2D<float4>                  gCalibTex    : register(t3);
-Buffer<float4>                     gJiggleMasks0 : register(t4);
-Buffer<float4>                     gJiggleMasks1 : register(t5);
-Buffer<float4>                     gJiggleMasks2 : register(t7);
+Buffer<uint4>                      gJiggleZoneIDs : register(t4);
+Buffer<float4>                 gJiggleZoneWeights : register(t5);
 // LLMenu's own scalar viewport contract. It is read directly on GPU so UI
 // offset/resize never needs per-frame CPU synchronization.
 Buffer<float>                      gViewportFrameAPI : register(t6);
@@ -523,47 +522,63 @@ void InitPayload(out HitPayload payload)
     payload.slot7 = float4(RZM_DETECT_LAYOUT_VERSION, 0.0f, 0.0f, 0.0f);
 }
 
-// Strongest painted zone at the barycentric hit point. Zone IDs 0..11,
-// packed 4-per-buffer across 3 float4 buffers. Each buffer's 3 triangle-
-// corner samples are read, bary-blended, and folded into (zone, weight)
-// before moving to the next buffer -- keeping only one blended float4 (plus
-// its 3 short-lived corner samples) live at a time, to limit temp-register
-// pressure (this function runs per-triangle in the raycast loop, so its
-// register footprint sets a floor for this whole dispatch's occupancy, not
-// just for triangles that actually call it).
+// Strongest painted zone at the barycentric hit point. Each vertex stores
+// its four strongest (zone id, weight) pairs. The three triangle corners
+// contribute at most twelve candidate IDs, independent of the total zone
+// count (currently 256).
 float ResolveJiggleZone(uint i0, uint i1, uint i2, float3 bary, out float weight)
 {
-    uint count0;
-    gJiggleMasks0.GetDimensions(count0);
-    float4 low = (i0 < count0 ? gJiggleMasks0[i0] : 0.0f) * bary.x
-               + (i1 < count0 ? gJiggleMasks0[i1] : 0.0f) * bary.y
-               + (i2 < count0 ? gJiggleMasks0[i2] : 0.0f) * bary.z;
-    weight = low.x;
-    float zone = 0.0f;
-    if (low.y > weight) { weight = low.y; zone = 1.0f; }
-    if (low.z > weight) { weight = low.z; zone = 2.0f; }
-    if (low.w > weight) { weight = low.w; zone = 3.0f; }
+    static const uint INVALID_ZONE = 0xffffffffu;
+    uint idCount;
+    uint weightCount;
+    gJiggleZoneIDs.GetDimensions(idCount);
+    gJiggleZoneWeights.GetDimensions(weightCount);
+    uint4 invalidIDs = uint4(INVALID_ZONE, INVALID_ZONE, INVALID_ZONE, INVALID_ZONE);
+    uint4 ids0 = i0 < idCount ? gJiggleZoneIDs[i0] : invalidIDs;
+    uint4 ids1 = i1 < idCount ? gJiggleZoneIDs[i1] : invalidIDs;
+    uint4 ids2 = i2 < idCount ? gJiggleZoneIDs[i2] : invalidIDs;
+    float4 weights0 = i0 < weightCount ? gJiggleZoneWeights[i0] : 0.0f;
+    float4 weights1 = i1 < weightCount ? gJiggleZoneWeights[i1] : 0.0f;
+    float4 weights2 = i2 < weightCount ? gJiggleZoneWeights[i2] : 0.0f;
 
-    uint count1;
-    gJiggleMasks1.GetDimensions(count1);
-    float4 high = (i0 < count1 ? gJiggleMasks1[i0] : 0.0f) * bary.x
-                + (i1 < count1 ? gJiggleMasks1[i1] : 0.0f) * bary.y
-                + (i2 < count1 ? gJiggleMasks1[i2] : 0.0f) * bary.z;
-    if (high.x > weight) { weight = high.x; zone = 4.0f; }
-    if (high.y > weight) { weight = high.y; zone = 5.0f; }
-    if (high.z > weight) { weight = high.z; zone = 6.0f; }
-    if (high.w > weight) { weight = high.w; zone = 7.0f; }
+    uint candidates[12] = {
+        ids0.x, ids0.y, ids0.z, ids0.w,
+        ids1.x, ids1.y, ids1.z, ids1.w,
+        ids2.x, ids2.y, ids2.z, ids2.w
+    };
+    uint bestZone = 0u;
+    weight = 0.0f;
+    [unroll]
+    for (uint candidateIndex = 0u; candidateIndex < 12u; ++candidateIndex)
+    {
+        uint candidate = candidates[candidateIndex];
+        if (candidate == INVALID_ZONE)
+            continue;
+        bool duplicate = false;
+        [unroll]
+        for (uint previousIndex = 0u; previousIndex < 12u; ++previousIndex)
+        {
+            if (previousIndex < candidateIndex)
+                duplicate = duplicate || candidates[previousIndex] == candidate;
+        }
+        if (duplicate)
+            continue;
 
-    uint count2;
-    gJiggleMasks2.GetDimensions(count2);
-    float4 r2band = (i0 < count2 ? gJiggleMasks2[i0] : 0.0f) * bary.x
-                  + (i1 < count2 ? gJiggleMasks2[i1] : 0.0f) * bary.y
-                  + (i2 < count2 ? gJiggleMasks2[i2] : 0.0f) * bary.z;
-    if (r2band.x > weight) { weight = r2band.x; zone = 8.0f; }
-    if (r2band.y > weight) { weight = r2band.y; zone = 9.0f; }
-    if (r2band.z > weight) { weight = r2band.z; zone = 10.0f; }
-    if (r2band.w > weight) { weight = r2band.w; zone = 11.0f; }
-    return zone;
+        float candidateWeight = 0.0f;
+        [unroll]
+        for (uint slot = 0u; slot < 4u; ++slot)
+        {
+            if (ids0[slot] == candidate) candidateWeight += weights0[slot] * bary.x;
+            if (ids1[slot] == candidate) candidateWeight += weights1[slot] * bary.y;
+            if (ids2[slot] == candidate) candidateWeight += weights2[slot] * bary.z;
+        }
+        if (candidateWeight > weight)
+        {
+            weight = candidateWeight;
+            bestZone = candidate;
+        }
+    }
+    return (float)bestZone;
 }
 
 void TestTriangleRange(
