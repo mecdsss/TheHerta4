@@ -208,6 +208,42 @@ def _base_sections(hash_value="abc123", base_name="abc123-43191", vertex_count=1
     ])
 
 
+def _cross_ib_sections():
+    return OrderedDict([
+        ("[Constants]", []),
+        ("[TextureOverride_sourcehash_sourcehash_VertexLimitRaise]", [
+            "hash = sourcehash",
+            "override_vertex_count = 1000",
+        ]),
+        ("[TextureOverride_targethash_targethash_VertexLimitRaise]", [
+            "hash = targethash",
+            "override_vertex_count = 2000",
+        ]),
+        ("[TextureOverride_targethash_0]", [
+            "hash = targethash",
+            "match_first_index = 0",
+            "ib = Resource_targethash_0_Index",
+            "; [mesh:LOD0.targethash-300-0.Target_copy] [vertex_count:200]",
+            "drawindexed = 300, 0, 0",
+            "ib = Resource_sourcehash_0_Index",
+            "vb0 = ResourceBodyVB_sourcehash_0",
+            "; [mesh:LOD0.sourcehash-120-0.SourceA_copy] [vertex_count:80]",
+            "drawindexed = 90, 0, 0",
+            "; [mesh:LOD0.sourcehash-120-0.SourceB_copy] [vertex_count:40]",
+            "drawindexed = 30, 90, 0",
+        ]),
+        ("[Resource_sourcehash_Position]", [
+            "type = Buffer", "stride = 40", "filename = Meshes/sourcehash-Position.buf",
+        ]),
+        ("[Resource_targethash_Position]", [
+            "type = Buffer", "stride = 40", "filename = Meshes/targethash-Position.buf",
+        ]),
+        ("[Resource_sourcehash_0_Index]", ["type = Buffer", "format = DXGI_FORMAT_R32_UINT"]),
+        ("[Resource_targethash_0_Index]", ["type = Buffer", "format = DXGI_FORMAT_R32_UINT"]),
+        ("[Present]", []),
+    ])
+
+
 class DragNodeLocateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -226,6 +262,71 @@ class DragNodeLocateTests(unittest.TestCase):
         self.assertEqual(parts[0]["index_count"], 52688)
         self.assertEqual(parts[1]["first_index"], 52688)
         self.assertEqual(parts[0]["ib_resource"], "Resourceabc123-43191AIB")
+
+    def test_collect_draw_parts_combines_multiple_draws_in_one_ib_section(self):
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        section_name = "[TextureOverride_abc123_abc123-43191A]"
+        sections[section_name][-1:] = [
+            "drawindexed = 53994, 0, 0",
+            "drawindexed = 3618, 53994, 0",
+        ]
+
+        part = node._collect_draw_parts(sections, "abc123")[0]
+
+        self.assertEqual(part["ib_first_index"], 0)
+        self.assertEqual(part["index_count"], 57612)
+
+    def test_collect_draw_parts_uses_range_envelope_for_reused_and_unordered_draws(self):
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        section_name = "[TextureOverride_abc123_abc123-43191A]"
+        sections[section_name][-1:] = [
+            "DrawIndexed = 120, 300, 0",
+            "drawindexed = 300, 0, 0",
+            "DRAWINDEXED = 120, 300, 0",
+        ]
+
+        part = node._collect_draw_parts(sections, "abc123")[0]
+
+        self.assertEqual(part["ib_first_index"], 0)
+        self.assertEqual(part["index_count"], 420)
+
+    def test_cross_ib_draws_are_owned_by_mesh_prefix_instead_of_section_hash(self):
+        node = _make_node(self.mod)
+        sections = _cross_ib_sections()
+
+        source_parts = node._collect_draw_parts(sections, "sourcehash")
+        target_parts = node._collect_draw_parts(sections, "targethash")
+
+        self.assertEqual(len(source_parts), 1)
+        self.assertEqual(source_parts[0]["ib_resource"], "Resource_sourcehash_0_Index")
+        self.assertEqual(source_parts[0]["index_count"], 120)
+        self.assertEqual(source_parts[0]["first_index"], 0)
+        self.assertEqual(len(target_parts), 1)
+        self.assertEqual(target_parts[0]["ib_resource"], "Resource_targethash_0_Index")
+        self.assertEqual(target_parts[0]["index_count"], 300)
+
+    def test_cross_ib_shader_replacement_draws_follow_mesh_prefix_and_run_section(self):
+        node = _make_node(self.mod)
+        sections = _cross_ib_sections()
+        lines = sections["[TextureOverride_targethash_0]"]
+        first_source_draw = lines.index("drawindexed = 90, 0, 0")
+        second_source_draw = lines.index("drawindexed = 30, 90, 0")
+        lines[first_source_draw] = "run = CustomShader_SourceA"
+        lines[second_source_draw] = "run = CustomShader_SourceB"
+        sections["[CustomShader_SourceA]"] = ["handling = skip", "drawindexed = 90, 0, 0"]
+        sections["[CustomShader_SourceB]"] = ["handling = skip", "drawindexed = 30, 90, 0"]
+
+        source_parts = node._collect_draw_parts(sections, "sourcehash")
+
+        self.assertEqual(len(source_parts), 1)
+        self.assertEqual(source_parts[0]["ib_resource"], "Resource_sourcehash_0_Index")
+        self.assertEqual(source_parts[0]["index_count"], 120)
+        self.assertEqual(
+            source_parts[0]["hook_anchor_comment"],
+            "; [mesh:LOD0.sourcehash-120-0.SourceA_copy] [vertex_count:80]",
+        )
 
     def test_get_vertex_count_from_vlr(self):
         node = _make_node(self.mod)
@@ -267,6 +368,46 @@ class DragNodeLocateTests(unittest.TestCase):
             np.asarray([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32),
         )
 
+    def test_read_removes_old_drag_tail_but_preserves_other_postprocess_modules(self):
+        import tempfile
+
+        node = _make_node(self.mod)
+        content = "\n".join([
+            "[Constants]",
+            "global $active = 0",
+            "[TextureOverride_Test]",
+            "hash = abc123",
+            "ib = ResourceTestIB",
+            "\t; --- DRAG HOOK BEGIN ---",
+            "\trun = CustomShaderDragBakeOld",
+            "\t; --- DRAG HOOK END ---",
+            "drawindexed = 3, 0, 0",
+            self.mod.DRAG_TAIL_MARKER,
+            "[ResourceOldDrag]",
+            "type = Buffer",
+            "; --- AUTO-APPENDED HEALTH DETECTION MODULE ---",
+            "[ResourceHealth]",
+            "type = Buffer",
+            self.mod.DRAG_TAIL_MARKER,
+            "[ResourceOldDragDuplicate]",
+            "type = Buffer",
+        ])
+
+        with tempfile.TemporaryDirectory() as td:
+            ini_path = Path(td) / "test.ini"
+            ini_path.write_text(content, encoding="utf-8")
+            sections, preserved_tail = node._read_ini_to_ordered_dict(str(ini_path))
+
+        self.assertIn("[Constants]", sections)
+        self.assertIn("drawindexed = 3, 0, 0", sections["[TextureOverride_Test]"])
+        self.assertFalse(any("DRAG HOOK" in line for line in sections["[TextureOverride_Test]"]))
+        self.assertFalse(any("CustomShaderDragBakeOld" in line for line in sections["[TextureOverride_Test]"]))
+        self.assertNotIn("[ResourceOldDrag]", sections)
+        self.assertNotIn(self.mod.DRAG_TAIL_MARKER, preserved_tail)
+        self.assertNotIn("[ResourceOldDragDuplicate]", preserved_tail)
+        self.assertIn("; --- AUTO-APPENDED HEALTH DETECTION MODULE ---", preserved_tail)
+        self.assertIn("[ResourceHealth]", preserved_tail)
+
 
 class DragNodeObjectMapTests(unittest.TestCase):
     @classmethod
@@ -293,7 +434,6 @@ class DragNodeObjectMapTests(unittest.TestCase):
         # indexBase = firstIndex + tri*3，各部件 IB 为独立分区文件），objectID 恒 0
         #（着色器 entry.w==0 时回退 objectID=firstIndex=0，统一匹配碰撞档案条目 0）
         self.assertEqual(rec2, (0.0, 12000.0, 7.0, 0.0))
-
 
 class DragNodeEmitTests(unittest.TestCase):
     @classmethod
@@ -340,6 +480,22 @@ class DragNodeEmitTests(unittest.TestCase):
         # part B 用自己的 IB 资源名
         s1b = sections["[CustomShaderDragBakeSample1_abc123_43191P1_testns]"]
         self.assertIn("gs-t1 = Resourceabc123-43191BIB", s1b)
+
+    def test_bake_offsets_cover_multiple_draws_in_one_ib_section(self):
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        section_name = "[TextureOverride_abc123_abc123-43191A]"
+        sections[section_name][-1:] = [
+            "drawindexed = 53994, 0, 0",
+            "drawindexed = 3618, 53994, 0",
+        ]
+        comps = node._locate_components(sections, ["abc123"])
+
+        node._emit_sections(sections, comps, "testns")
+
+        sample = sections["[CustomShaderDragBakeSample1_abc123_43191P0_testns]"]
+        self.assertIn("y26 = 7201", sample)
+        self.assertIn("drawindexed = 1, 7201, 0", sample)
 
     def test_zone_registers_full_block(self):
         _, sections, _ = self._emit()
@@ -430,6 +586,9 @@ class DragNodeEmitTests(unittest.TestCase):
         for k, v in before.items():
             self.assertEqual(sections[k], v, f"段 {k} 二次 emit 后变化")
 
+        self.assertIn(self.mod.DRAG_TAIL_MARKER, sections)
+        self.assertEqual(sum(key == self.mod.DRAG_TAIL_MARKER for key in sections), 1)
+
     def test_grabbable_always_explicit(self):
         _, sections, _ = self._emit()
         jig = "\n".join(sections["[CustomShaderDragJiggleabc123_43191_testns]"])
@@ -509,6 +668,57 @@ class DragNodeInjectTests(unittest.TestCase):
         node._inject_draw_hooks(sections, comp, "testns")
         a_lines = sections["[TextureOverride_abc123_abc123-43191A]"]
         self.assertEqual(sum(1 for l in a_lines if "DRAG HOOK BEGIN" in l), 1)
+
+    def test_cross_ib_source_and_target_hooks_follow_their_mesh_prefixes(self):
+        node = _make_node(self.mod)
+        sections = _cross_ib_sections()
+        components = node._locate_components(sections, ["sourcehash", "targethash"])
+
+        node._emit_sections(sections, components, "testns")
+        for comp in components:
+            node._inject_draw_hooks(sections, comp, "testns")
+
+        lines = sections["[TextureOverride_targethash_0]"]
+        target_comment = lines.index("; [mesh:LOD0.targethash-300-0.Target_copy] [vertex_count:200]")
+        source_comment = lines.index("; [mesh:LOD0.sourcehash-120-0.SourceA_copy] [vertex_count:80]")
+        target_hook = next(i for i, line in enumerate(lines) if "DRAG HOOK BEGIN targethashP0_testns" in line)
+        source_hook = next(i for i, line in enumerate(lines) if "DRAG HOOK BEGIN sourcehashP0_testns" in line)
+
+        self.assertLess(target_hook, target_comment)
+        self.assertLess(target_comment, source_hook)
+        self.assertLess(source_hook, source_comment)
+        self.assertEqual(sum("DRAG HOOK BEGIN" in line for line in lines), 2)
+
+    def test_full_regeneration_cycle_keeps_one_tail_and_fresh_hooks(self):
+        import tempfile
+
+        node = _make_node(self.mod)
+        initial_sections = _base_sections()
+        section_name = "[TextureOverride_abc123_abc123-43191A]"
+        initial_sections[section_name][-1:] = [
+            "drawindexed = 53994, 0, 0",
+            "drawindexed = 3618, 53994, 0",
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            ini_path = Path(td) / "test.ini"
+            node._write_ordered_dict_to_ini(initial_sections, str(ini_path))
+
+            for _generation in range(2):
+                sections, preserved_tail = node._read_ini_to_ordered_dict(str(ini_path))
+                comps = node._locate_components(sections, ["abc123"])
+                node._emit_sections(sections, comps, "testns")
+                for comp in comps:
+                    node._inject_draw_hooks(sections, comp, "testns")
+                node._emit_present_and_constants(sections, comps, "testns")
+                node._write_ordered_dict_to_ini(sections, str(ini_path), preserved_tail)
+
+                output = ini_path.read_text(encoding="utf-8")
+                self.assertEqual(output.count(self.mod.DRAG_TAIL_MARKER), 1)
+                self.assertEqual(output.count("DRAG HOOK BEGIN"), 2)
+                self.assertEqual(output.count("DRAG HOOK END"), 2)
+                self.assertEqual(output.count("[ResourceDragDetectID_testns]"), 1)
+                self.assertIn("drawindexed = 1, 7201, 0", output)
 
 
 class DragNodePreviewTests(unittest.TestCase):

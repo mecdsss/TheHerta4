@@ -76,6 +76,7 @@ DEFAULT_VERTEX_STRUCT = (
 )
 
 DRAG_TAIL_MARKER = "; --- AUTO-APPENDED DRAG INTERACTION MODULE ---"
+MESH_COMMENT_RE = re.compile(r"^;\s*\[mesh:(?P<object_name>[^\]]+)\]", re.IGNORECASE)
 
 # 导出的着色器在 ini 中的引用路径（mod 根 → res/drag_interaction/）
 RES_SHADER_DIR = "res/drag_interaction"
@@ -435,6 +436,48 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # ini 读写 / hash 解析
     # =======================================================================
 
+    @classmethod
+    def _remove_existing_drag_tail_block(cls, tail_content):
+        remaining = tail_content
+        while True:
+            start = remaining.find(DRAG_TAIL_MARKER)
+            if start == -1:
+                return remaining
+
+            end = len(remaining)
+            search_from = start + len(DRAG_TAIL_MARKER)
+            for marker in cls.AUTO_APPENDED_SECTION_MARKERS:
+                marker_position = remaining.find(marker, search_from)
+                if marker_position != -1:
+                    end = min(end, marker_position)
+
+            before = remaining[:start].rstrip()
+            after = remaining[end:].lstrip()
+            remaining = "\n\n".join(part for part in (before, after) if part)
+
+    @staticmethod
+    def _remove_existing_draw_hooks(sections):
+        for section_name, lines in sections.items():
+            cleaned_lines = []
+            index = 0
+            while index < len(lines):
+                if "DRAG HOOK BEGIN" not in lines[index]:
+                    cleaned_lines.append(lines[index])
+                    index += 1
+                    continue
+
+                hook_end = next(
+                    (candidate for candidate in range(index + 1, len(lines))
+                     if "DRAG HOOK END" in lines[candidate]),
+                    None,
+                )
+                if hook_end is None:
+                    cleaned_lines.append(lines[index])
+                    index += 1
+                    continue
+                index = hook_end + 1
+            sections[section_name] = cleaned_lines
+
     def _read_ini_to_ordered_dict(self, ini_file_path):
         sections = OrderedDict()
         current_section = None
@@ -443,6 +486,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             with open(ini_file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             content, preserved_tail_content = self.split_auto_appended_tail_content(content)
+            preserved_tail_content = self._remove_existing_drag_tail_block(preserved_tail_content)
             for line in content.splitlines():
                 stripped = line.strip()
                 if stripped.startswith('[') and stripped.endswith(']'):
@@ -450,6 +494,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     sections[current_section] = []
                 elif current_section is not None:
                     sections[current_section].append(line)
+            self._remove_existing_draw_hooks(sections)
         except FileNotFoundError:
             return None, ""
         return sections, preserved_tail_content
@@ -615,54 +660,189 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 从组件 stem（如 abc123-43191）推导资源命名前缀（连字符转下划线）
         return self._hash_to_resource_prefix(base_name)
 
+    @classmethod
+    def _collect_referenced_draw_ranges(cls, sections, command_name, visited=None):
+        normalized_name = str(command_name or "").strip().casefold()
+        if not normalized_name:
+            return []
+
+        visited = set() if visited is None else visited
+        if normalized_name in visited:
+            return []
+        visited.add(normalized_name)
+
+        target_section = None
+        expected_section = f"[{normalized_name}]"
+        for section_name, section_lines in sections.items():
+            if section_name.casefold() == expected_section:
+                target_section = section_lines
+                break
+        if target_section is None:
+            return []
+
+        draw_ranges = []
+        for line in target_section:
+            stripped = line.strip()
+            normalized = stripped.casefold()
+            if normalized.startswith("drawindexed ="):
+                nums = [value.strip() for value in stripped.split("=", 1)[1].split(',')]
+                try:
+                    draw_count = int(nums[0])
+                    draw_offset = int(nums[1]) if len(nums) > 1 else 0
+                except (ValueError, IndexError):
+                    continue
+                if draw_count > 0 and draw_offset >= 0:
+                    draw_ranges.append((draw_offset, draw_count))
+            elif normalized.startswith("run ="):
+                nested_name = stripped.split("=", 1)[1].strip()
+                draw_ranges.extend(cls._collect_referenced_draw_ranges(
+                    sections, nested_name, visited,
+                ))
+        return draw_ranges
+
     def _collect_draw_parts(self, sections, hash_value):
-        """收集该 hash 下全部触发 drawindexed 的 TextureOverride 段（跳过 ib = null）。"""
+        """按 mesh 前缀归属和活动 IB 收集绘制组；无前缀配置回退到段 hash。"""
         parts = []
+        normalized_hash = hash_value.casefold()
         for section_name, lines in sections.items():
             if not (section_name.startswith("[TextureOverride_") and section_name.endswith("]")):
                 continue
-            has_hash = any(line.strip().lower() == f"hash = {hash_value.lower()}" for line in lines)
-            if not has_hash:
-                continue
-            ib_resource = None
-            index_count = None
-            first_index = 0
+
+            section_hash = None
             match_first_index = None
-            drawindexed_offset = None
             for line in lines:
                 s = line.strip()
-                if s.startswith("ib ="):
-                    val = s.split("=", 1)[1].strip()
-                    if val.lower() != "null":
-                        ib_resource = val
-                elif s.startswith("match_first_index ="):
+                normalized = s.casefold()
+                if normalized.startswith("hash ="):
+                    section_hash = s.split("=", 1)[1].strip()
+                elif normalized.startswith("match_first_index ="):
                     try:
                         match_first_index = int(s.split("=", 1)[1].strip())
                     except ValueError:
                         pass
-                elif s.startswith("drawindexed ="):
+
+            active_ib_resource = None
+            pending_mesh_owner = None
+            pending_mesh_first_index = None
+            pending_mesh_comment = None
+            pending_mesh_comment_occurrence = 0
+            comment_occurrences = {}
+            draw_ordinal = 0
+            draw_records = []
+
+            for line in lines:
+                s = line.strip()
+                normalized = s.casefold()
+                if normalized.startswith("ib ="):
+                    val = s.split("=", 1)[1].strip()
+                    active_ib_resource = None if val.casefold() == "null" else val
+                    continue
+
+                mesh_match = MESH_COMMENT_RE.match(s)
+                if mesh_match:
+                    pending_mesh_owner = None
+                    pending_mesh_first_index = None
+                    pending_mesh_comment = s
+                    pending_mesh_comment_occurrence = comment_occurrences.get(s, 0)
+                    comment_occurrences[s] = pending_mesh_comment_occurrence + 1
+                    prefix_info = ObjectPrefixHelper.extract_prefix_info(mesh_match.group("object_name"))
+                    if prefix_info:
+                        prefix_parts = ObjectPrefixHelper.parse_prefix_parts(prefix_info[0])
+                        pending_mesh_owner = str(prefix_parts.get("draw_ib", "") or "").strip() or None
+                        try:
+                            pending_mesh_first_index = int(prefix_parts.get("first_index", ""))
+                        except (TypeError, ValueError):
+                            pending_mesh_first_index = None
+                    continue
+
+                if normalized.startswith("run =") and pending_mesh_comment:
+                    command_name = s.split("=", 1)[1].strip()
+                    referenced_ranges = self._collect_referenced_draw_ranges(sections, command_name)
+                    if referenced_ranges:
+                        draw_owner = pending_mesh_owner or section_hash
+                        for draw_offset, draw_count in referenced_ranges:
+                            if draw_owner and draw_owner.casefold() == normalized_hash and active_ib_resource:
+                                draw_records.append({
+                                    "ordinal": draw_ordinal,
+                                    "ib_resource": active_ib_resource,
+                                    "draw_offset": draw_offset,
+                                    "draw_count": draw_count,
+                                    "mesh_first_index": pending_mesh_first_index,
+                                    "hook_anchor_comment": pending_mesh_comment,
+                                    "hook_anchor_occurrence": pending_mesh_comment_occurrence,
+                                })
+                            draw_ordinal += 1
+                        pending_mesh_owner = None
+                        pending_mesh_first_index = None
+                        pending_mesh_comment = None
+                        pending_mesh_comment_occurrence = 0
+                        continue
+
+                if normalized.startswith("drawindexed ="):
                     nums = [n.strip() for n in s.split("=", 1)[1].split(',')]
                     try:
-                        index_count = int(nums[0])
-                        if len(nums) > 1:
-                            drawindexed_offset = int(nums[1])
+                        draw_count = int(nums[0])
+                        draw_offset = int(nums[1]) if len(nums) > 1 else 0
                     except (ValueError, IndexError):
-                        pass
-            if ib_resource and index_count:
-                # ObjectMap 为游戏索引空间：优先 match_first_index（TheHerta4 的 drawindexed
-                # 偏移恒为 part 局部 0，直接采用会得到全 0 firstIndex——这是导出模组
-                # 检测不到可抓取区域的原因之一）
-                if match_first_index is not None:
-                    first_index = match_first_index
-                elif drawindexed_offset is not None:
-                    first_index = drawindexed_offset
+                        draw_ordinal += 1
+                        continue
+
+                    draw_owner = pending_mesh_owner or section_hash
+                    if (
+                        active_ib_resource
+                        and draw_owner
+                        and draw_owner.casefold() == normalized_hash
+                        and draw_count > 0
+                        and draw_offset >= 0
+                    ):
+                        draw_records.append({
+                            "ordinal": draw_ordinal,
+                            "ib_resource": active_ib_resource,
+                            "draw_offset": draw_offset,
+                            "draw_count": draw_count,
+                            "mesh_first_index": pending_mesh_first_index,
+                            "hook_anchor_comment": pending_mesh_comment,
+                            "hook_anchor_occurrence": pending_mesh_comment_occurrence,
+                        })
+                    draw_ordinal += 1
+                    pending_mesh_owner = None
+                    pending_mesh_first_index = None
+                    pending_mesh_comment = None
+                    pending_mesh_comment_occurrence = 0
+
+            draw_groups = []
+            for record in draw_records:
+                if (
+                    draw_groups
+                    and draw_groups[-1][-1]["ordinal"] + 1 == record["ordinal"]
+                    and draw_groups[-1][-1]["ib_resource"] == record["ib_resource"]
+                ):
+                    draw_groups[-1].append(record)
+                else:
+                    draw_groups.append([record])
+
+            for draw_group in draw_groups:
+                ib_resource = draw_group[0]["ib_resource"]
+                ib_first_index = min(record["draw_offset"] for record in draw_group)
+                ib_index_end = max(record["draw_offset"] + record["draw_count"] for record in draw_group)
+                index_count = ib_index_end - ib_first_index
+                mesh_first_index = draw_group[0]["mesh_first_index"]
+                first_index = (
+                    mesh_first_index
+                    if mesh_first_index is not None
+                    else match_first_index if match_first_index is not None
+                    else ib_first_index
+                )
                 base_name = section_name[len("[TextureOverride_"):-1]
                 parts.append({
                     "section": section_name,
                     "ib_resource": ib_resource,
                     "index_count": index_count,
+                    "ib_first_index": ib_first_index,
                     "first_index": first_index,
                     "base_name": base_name,
+                    "hook_anchor_comment": draw_group[0]["hook_anchor_comment"],
+                    "hook_anchor_occurrence": draw_group[0]["hook_anchor_occurrence"],
                 })
         return parts
 
@@ -1079,6 +1259,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     def _emit_sections(self, sections, components, ns):
         """生成 Resource / CustomShader / CommandList / Key 段（幂等：已存在跳过）。"""
         res = f"res/drag_interaction"
+        sections.setdefault(DRAG_TAIL_MARKER, [])
 
         # ---- 全局共享资源 ----
         global_resources = {
@@ -1301,9 +1482,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ]
             ib_res = part["ib_resource"]
             step = part["index_count"] // 8
+            ib_first_index = part["ib_first_index"]
             for i in range(8):
                 sample_sec = f"[CustomShaderDragBakeSample{i}_{part_tag}_{ns}]"
-                offset = i * step
+                offset = ib_first_index + i * step
                 lines.append(f"run = CustomShaderDragBakeSample{i}_{part_tag}_{ns}")
                 sections[sample_sec] = [
                     f"gs = {RES_SHADER_DIR}/rzm_gs_probe.hlsl",
@@ -1789,13 +1971,27 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             lines = sections.get(section)
             if not lines:
                 continue
-            # 幂等：已注入跳过
-            if any("DRAG HOOK BEGIN" in line for line in lines):
+            part_tag = f"{cn}P{p_idx}"
+            hook_marker = f"DRAG HOOK BEGIN {part_tag}_{ns}"
+            if any(hook_marker in line for line in lines):
                 continue
             hook = self._build_hook_block(comp, p_idx, ns)
-            insert_at = self._find_hook_insert_index(lines)
+            insert_at = self._find_part_hook_insert_index(lines, part)
             new_lines = lines[:insert_at] + hook + lines[insert_at:]
             sections[section] = new_lines
+
+    @classmethod
+    def _find_part_hook_insert_index(cls, lines, part):
+        anchor_comment = part.get("hook_anchor_comment")
+        if anchor_comment:
+            occurrence = int(part.get("hook_anchor_occurrence", 0) or 0)
+            matches = [
+                index for index, line in enumerate(lines)
+                if line.strip() == anchor_comment
+            ]
+            if occurrence < len(matches):
+                return matches[occurrence]
+        return cls._find_hook_insert_index(lines)
 
     @staticmethod
     def _find_hook_insert_index(lines):
@@ -1818,7 +2014,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         part_tag = f"{cn}P{p_idx}"
         temp_vb0 = f"ResourceDragJiggleTempVB0_{cn}_{ns}"
         last_dispatch = f"$ssmtdrag_last_dispatch_{cn}_{ns}"
-        lines = ["\t; --- DRAG HOOK BEGIN ---"]
+        lines = [f"\t; --- DRAG HOOK BEGIN {part_tag}_{ns} ---"]
         if self.enable_viewport_probe:
             # 视口探针快照：armed 且尚无快照时，抓本帧角色渲染 RT 供探针分析视口矩形
             lines.extend([
@@ -1839,7 +2035,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "\t\tendif",
             f"\t\tvb0 = {temp_vb0}",
             "\tendif",
-            "\t; --- DRAG HOOK END ---",
+            f"\t; --- DRAG HOOK END {part_tag}_{ns} ---",
         ])
         return lines
 
