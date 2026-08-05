@@ -217,28 +217,61 @@ class SSMTNode_PostProcess_Glow(SSMTNode_PostProcess_Base):
             r = layout.row(align=True)
             r.prop(self, "cs_h"); r.prop(self, "cs_s"); r.prop(self, "cs_v")
 
-    def _parse_ini(self, ini_file_path):
+    def _parse_ini(self, ini_file_path, content=None):
         sections = OrderedDict()
         cur = None
+        preamble = []
         try:
-            with open(ini_file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    s = line.strip()
-                    if s.startswith('[') and s.endswith(']'):
-                        cur = s
-                        sections[cur] = []
-                    elif cur is not None:
-                        sections[cur].append(line.rstrip())
+            if content is None:
+                with open(ini_file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            for line in content.splitlines():
+                s = line.strip()
+                if s.startswith('[') and s.endswith(']'):
+                    cur = s
+                    sections[cur] = []
+                elif cur is not None:
+                    sections[cur].append(line.rstrip())
+                else:
+                    preamble.append(line.rstrip())
         except FileNotFoundError:
             return None
-        return sections
+        return sections, preamble
+
+    @classmethod
+    def split_anim_driver_block_content(cls, content):
+        """Extract a complete animation-driver block from the top of an INI file.
+
+        Mirrors SSMTNode_PostProcess_Base.split_anim_driver_block_content on
+        main so this branch works standalone (the method was added to the base
+        class after this PR forked).
+        """
+        text = str(content or "")
+        lines = text.splitlines(keepends=True)
+        start_index = next(
+            (index for index, line in enumerate(lines)
+             if getattr(cls, "ANIM_DRIVER_SECTION_MARKER_START", "; --- ANIMATION DRIVER SECTION ---") in line),
+            None,
+        )
+        if start_index is None:
+            return "", text
+        end_marker = getattr(cls, "ANIM_DRIVER_SECTION_MARKER_END", "; --- END ANIMATION DRIVER SECTION ---")
+        end_index = next(
+            (index for index in range(start_index + 1, len(lines)) if end_marker in lines[index]),
+            None,
+        )
+        if end_index is None:
+            return "", text
+        driver_content = "".join(lines[start_index:end_index + 1])
+        remaining_content = "".join(lines[end_index + 1:]).lstrip("\r\n")
+        return driver_content, remaining_content
 
     def _process_single_target(self, ini_file, mod_export_path, hash_val, suffix):
         """处理单个目标哈希值"""
-        content, tail = self.split_auto_appended_tail_content(
-            open(ini_file, 'r', encoding='utf-8').read()
-        )
-        sections = self._parse_ini(ini_file)
+        content = open(ini_file, 'r', encoding='utf-8').read()
+        preserved_driver_content, content = self.split_anim_driver_block_content(content)
+        content, tail = self.split_auto_appended_tail_content(content)
+        sections, preamble = self._parse_ini(ini_file, content)
         if sections is None:
             return
 
@@ -314,6 +347,7 @@ class SSMTNode_PostProcess_Glow(SSMTNode_PostProcess_Base):
             '; === RabbitFX Sync ===', '; === \u7ed3\u675f Sync ===',
             '; === RabbitFX ColorShift ===', '; === \u7ed3\u675f ColorShift ===',
         }
+        remove_idx = set()
         rabbitfx_if_depth = 0
         for i, line in enumerate(lines):
             s = line.strip()
@@ -334,8 +368,8 @@ class SSMTNode_PostProcess_Glow(SSMTNode_PostProcess_Base):
                 remove = True
                 rabbitfx_if_depth -= 1
             if remove:
-                lines[i] = ""
-        lines[:] = [l for l in lines if l != ""]
+                remove_idx.add(i)
+        lines[:] = [line for i, line in enumerate(lines) if i not in remove_idx]
 
         # 构建插入行
         insert_lines = []
@@ -478,6 +512,13 @@ class SSMTNode_PostProcess_Glow(SSMTNode_PostProcess_Base):
                 sections[sec_name] = sec_lines
 
         with open(ini_file, 'w', encoding='utf-8') as f:
+            if preserved_driver_content:
+                f.write(preserved_driver_content)
+                if not preserved_driver_content.endswith('\n'):
+                    f.write('\n')
+                f.write('\n')
+            for line in preamble:
+                f.write(line + '\n')
             for sk, sl in sections.items():
                 if sk.startswith('['):
                     f.write(f"{sk}\n")

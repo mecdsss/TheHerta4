@@ -454,25 +454,63 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     # ==========================================
     # INI 解析
     # ==========================================
+    @classmethod
+    def split_anim_driver_block_content(cls, content):
+        """Extract a complete animation-driver block from the top of an INI file.
+
+        Mirrors SSMTNode_PostProcess_Base.split_anim_driver_block_content on
+        main so this branch works standalone (the method was added to the base
+        class after this PR forked).
+        """
+        text = str(content or "")
+        lines = text.splitlines(keepends=True)
+        start_index = next(
+            (index for index, line in enumerate(lines)
+             if getattr(cls, "ANIM_DRIVER_SECTION_MARKER_START", "; --- ANIMATION DRIVER SECTION ---") in line),
+            None,
+        )
+        if start_index is None:
+            return "", text
+        end_marker = getattr(cls, "ANIM_DRIVER_SECTION_MARKER_END", "; --- END ANIMATION DRIVER SECTION ---")
+        end_index = next(
+            (index for index in range(start_index + 1, len(lines)) if end_marker in lines[index]),
+            None,
+        )
+        if end_index is None:
+            return "", text
+        driver_content = "".join(lines[start_index:end_index + 1])
+        remaining_content = "".join(lines[end_index + 1:]).lstrip("\r\n")
+        return driver_content, remaining_content
+
     def _read_ini_to_ordered_dict(self, ini_file_path):
         sections = OrderedDict()
         current_section = None
+        preserved_tail_content = ""
+        preserved_driver_content = ""
         try:
             with open(ini_file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    stripped_line = line.strip()
-                    if stripped_line.startswith('[') and stripped_line.endswith(']') and len(stripped_line) > 2:
-                        current_section = stripped_line
-                        sections[current_section] = []
-                    elif current_section is not None:
-                        sections[current_section].append(line.rstrip())
+                content = f.read()
+            preserved_driver_content, content = self.split_anim_driver_block_content(content)
+            content, preserved_tail_content = self.split_auto_appended_tail_content(content)
+            for line in content.splitlines():
+                stripped_line = line.strip()
+                if stripped_line.startswith('[') and stripped_line.endswith(']') and len(stripped_line) > 2:
+                    current_section = stripped_line
+                    sections[current_section] = []
+                elif current_section is not None:
+                    sections[current_section].append(line.rstrip())
         except FileNotFoundError:
             return None
-        return sections
+        return sections, preserved_tail_content, preserved_driver_content
 
-    def _write_ordered_dict_to_ini(self, sections, ini_file_path):
+    def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content="", preserved_driver_content=""):
         try:
             with open(ini_file_path, 'w', encoding='utf-8') as f:
+                if preserved_driver_content:
+                    f.write(preserved_driver_content)
+                    if not preserved_driver_content.endswith('\n'):
+                        f.write('\n')
+                    f.write('\n')
                 for section_name, lines in sections.items():
                     if section_name.startswith(';;'):
                         f.write(section_name + '\n')
@@ -481,14 +519,17 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                     for line in lines:
                         f.write(line + '\n')
                     f.write('\n')
+                if preserved_tail_content:
+                    f.write('\n' + preserved_tail_content)
         except Exception as e:
             print(f"写入INI文件失败: {e}")
 
     def _parse_ini_key_swaps(self, ini_path):
         """解析 ini 中所有 [KeySwap_N] 段落，返回 [{index,var_name,comment,key,option_count}]。"""
-        sections = self._read_ini_to_ordered_dict(ini_path)
-        if not sections:
+        result = self._read_ini_to_ordered_dict(ini_path)
+        if result is None or not result[0]:
             return []
+        sections, _, _ = result
 
         swaps = []
         for section_name, lines in sections.items():
@@ -885,9 +926,10 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             return False
 
         # 3. 读取目标 ini
-        sections = self._read_ini_to_ordered_dict(target_ini_file)
-        if not sections:
+        result = self._read_ini_to_ordered_dict(target_ini_file)
+        if result is None or not result[0]:
             return False
+        sections, preserved_tail_content, preserved_driver_content = result
 
         # 刷新模式：先按专有标识移除本面板旧配置，再原地重新生成
         if _in_place:
@@ -1168,7 +1210,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         try:
             with open(target_ini_file, 'w', encoding='utf-8') as f:
                 f.write("")
-            self._write_ordered_dict_to_ini(sections, target_ini_file)
+            self._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content, preserved_driver_content)
             print(f"物体切换面板配置已{'原地更新' if _in_place else '合并到'}: {os.path.basename(target_ini_file)}")
             print(f"共生成 {num_buttons} 个切换按钮")
             return True

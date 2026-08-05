@@ -79,8 +79,8 @@ void main(vs2ps input, out float4 result : SV_Target0)
     float2 scale = float2(2 * SIZE.x, 2 * SIZE.y) / dims;
     float maxScale = max(scale.x, scale.y);
 
-    // 动态采样：放大时用点采样（锐利），缩小时用线性采样（抗锯齿）
-    if (maxScale > 1.0f) {
+    // 动态采样：放大或 1:1 时用点采样（锐利，与原 Load 语义一致），缩小时用线性采样（抗锯齿）
+    if (maxScale >= 1.0f) {
         result = tex.Sample(pointSampler, input.uv);
     } else {
         result = tex.Sample(linearSampler, input.uv);

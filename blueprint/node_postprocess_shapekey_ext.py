@@ -694,13 +694,44 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 interval.base_step = 10
         return s
 
+    @classmethod
+    def split_anim_driver_block_content(cls, content):
+        """Extract a complete animation-driver block from the top of an INI file.
+
+        Mirrors SSMTNode_PostProcess_Base.split_anim_driver_block_content on
+        main so this branch works standalone (the method was added to the base
+        class after this PR forked).
+        """
+        text = str(content or "")
+        lines = text.splitlines(keepends=True)
+        start_index = next(
+            (index for index, line in enumerate(lines)
+             if getattr(cls, "ANIM_DRIVER_SECTION_MARKER_START", "; --- ANIMATION DRIVER SECTION ---") in line),
+            None,
+        )
+        if start_index is None:
+            return "", text
+        end_marker = getattr(cls, "ANIM_DRIVER_SECTION_MARKER_END", "; --- END ANIMATION DRIVER SECTION ---")
+        end_index = next(
+            (index for index in range(start_index + 1, len(lines)) if end_marker in lines[index]),
+            None,
+        )
+        if end_index is None:
+            return "", text
+        driver_content = "".join(lines[start_index:end_index + 1])
+        remaining_content = "".join(lines[end_index + 1:]).lstrip("\r\n")
+        return driver_content, remaining_content
+
     def _read_ini_to_ordered_dict(self, ini_file_path):
         sections = OrderedDict()
         current_section = None
+        preserved_tail_content = ""
+        preserved_driver_content = ""
         try:
             with open(ini_file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            content, _ = self.split_auto_appended_tail_content(content)
+            preserved_driver_content, content = self.split_anim_driver_block_content(content)
+            content, preserved_tail_content = self.split_auto_appended_tail_content(content)
             for line in content.splitlines():
                 stripped = line.strip()
                 if stripped.startswith('[') and stripped.endswith(']'):
@@ -711,16 +742,23 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 if current_section: sections[current_section].append(line)
         except Exception:
             return None
-        return sections
+        return sections, preserved_tail_content, preserved_driver_content
 
-    def _write_ordered_dict_to_ini(self, sections, ini_file_path):
+    def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content="", preserved_driver_content=""):
         try:
             with open(ini_file_path, 'w', encoding='utf-8') as f:
+                if preserved_driver_content:
+                    f.write(preserved_driver_content)
+                    if not preserved_driver_content.endswith('\n'):
+                        f.write('\n')
+                    f.write('\n')
                 for section_name, lines in sections.items():
                     if section_name.startswith(';;'): f.write(section_name + '\n')
                     else: f.write(section_name + '\n')
                     for line in lines: f.write(line + '\n')
                     f.write('\n')
+                if preserved_tail_content:
+                    f.write('\n' + preserved_tail_content)
         except Exception as e:
             print(f"写入INI文件失败: {e}")
 
@@ -1038,11 +1076,11 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
     # ==========================================
     # 原地更新：按专有标识移除本节点旧配置
     # ==========================================
-    def _is_owned_section(self, sec_name):
+    def _is_owned_section(self, sec_name, ns):
         """判断段落是否由本节点生成（形态键扩展 + 合并的滑块面板）。"""
         s = sec_name.strip()
         fixed = [
-            "[KeyToggleAutoPlay]", "[CommandListToggleAutoPlay]",
+            f"[KeyToggleAutoPlay_{ns}]", f"[CommandListToggleAutoPlay_{ns}]",
             "[KeyHelp]", "[KeyResetPosition]", "[KeyZoomIn]", "[KeyZoomOut]", "[KeyMouseDrag]",
             "[CommandListZoomIn]", "[CommandListZoomOut]",
             "[ResourceImageToRender0]", "[ResourceSliderHandle]", "[ResourceLeftBar]", "[ResourceRightBar]",
@@ -1050,7 +1088,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         ]
         if s in fixed:
             return True
-        if s.startswith("[CommandListToggleAutoPlayGroup") and s.endswith("]"):
+        if s.startswith("[CommandListToggleAutoPlayGroup") and s.endswith(f"_{ns}]"):
             return True
         if s.startswith("[ResourcePlayPauseButton") and s.endswith("]"):
             return True
@@ -1109,7 +1147,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
 
         # 自有段落（整体删除）
         for sec_name in list(sections.keys()):
-            if self._is_owned_section(sec_name):
+            if self._is_owned_section(sec_name, ns):
                 del sections[sec_name]
 
     # ==========================================
@@ -1181,6 +1219,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
 
     def _apply_slider_panel(self, mod_export_path, target_ini_file, sections):
         """【已合并】生成滑块面板-自定义配置并合并到 sections（不写盘）。"""
+        ns = self._ensure_namespace()
         if '[Present]' in sections and any("SLIDER PANEL CUSTOM LOGIC (appended)" in l for l in sections['[Present]']):
             print("滑块面板配置已存在于文件中。请手动删除后再生成。")
             return False
@@ -1413,19 +1452,19 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         auto_play_key_lines = []
         if not self.auto_play_key_global:
             auto_play_key_lines.append("condition = $help == 1 && $ui_active == 1")
-        auto_play_key_lines.extend([f"key = {auto_play_key}", "type = press", "run = CommandListToggleAutoPlay"])
-        other_sections["[KeyToggleAutoPlay]"] = auto_play_key_lines
+        auto_play_key_lines.extend([f"key = {auto_play_key}", "type = press", f"run = CommandListToggleAutoPlay_{ns}"])
+        other_sections[f"[KeyToggleAutoPlay_{ns}]"] = auto_play_key_lines
 
         other_sections["[CommandListZoomIn]"] = zoom_in_lines
         other_sections["[CommandListZoomOut]"] = zoom_out_lines
 
         if multi_group_mode:
             toggle_lines = [f"$auto_play_enabled_group{gid} = 1 - $auto_play_enabled_group{gid}" for gid in group_ids]
-            other_sections["[CommandListToggleAutoPlay]"] = toggle_lines
+            other_sections[f"[CommandListToggleAutoPlay_{ns}]"] = toggle_lines
             for gid in group_ids:
-                other_sections[f"[CommandListToggleAutoPlayGroup{gid}]"] = [f"$auto_play_enabled_group{gid} = 1 - $auto_play_enabled_group{gid}"]
+                other_sections[f"[CommandListToggleAutoPlayGroup{gid}_{ns}]"] = [f"$auto_play_enabled_group{gid} = 1 - $auto_play_enabled_group{gid}"]
         else:
-            other_sections["[CommandListToggleAutoPlay]"] = ["$auto_play_enabled = 1 - $auto_play_enabled"]
+            other_sections[f"[CommandListToggleAutoPlay_{ns}]"] = ["$auto_play_enabled = 1 - $auto_play_enabled"]
 
         present_additions.append("post $ui_active = 0")
         present_additions.append("if $help == 1 && $ui_active == 1")
@@ -1507,9 +1546,9 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             present_additions.append(f"            if $btn_pressed{i} == 1")
             present_additions.append(f"                if cursor_x > $btn_x{i} && cursor_x < $btn_x{i} + $btn_width{i} && cursor_y > $btn_y{i} && cursor_y < $btn_y{i} + $btn_height{i}")
             if multi_group_mode and gid is not None and gid in group_ids:
-                present_additions.append(f"                    run = CommandListToggleAutoPlayGroup{gid}")
+                present_additions.append(f"                    run = CommandListToggleAutoPlayGroup{gid}_{ns}")
             else:
-                present_additions.append(f"                    run = CommandListToggleAutoPlay")
+                present_additions.append(f"                    run = CommandListToggleAutoPlay_{ns}")
             present_additions.append(f"                endif")
             present_additions.append(f"                $btn_pressed{i} = 0")
             present_additions.append(f"            endif")
@@ -1903,9 +1942,10 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         if self.create_cumulative_backup:
             self._create_cumulative_backup(target_ini_file, mod_export_path)
 
-        sections = self._read_ini_to_ordered_dict(target_ini_file)
-        if not sections:
+        result = self._read_ini_to_ordered_dict(target_ini_file)
+        if result is None or not result[0]:
             return False
+        sections, preserved_tail_content, preserved_driver_content = result
 
         if _in_place:
             self._remove_owned_config(sections, ns)
@@ -2030,7 +2070,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             )
 
         auto_play_key = self.auto_play_toggle_key.strip() or "space"
-        key_section = "[KeyToggleAutoPlay]"
+        key_section = f"[KeyToggleAutoPlay_{ns}]"
         if key_section not in sections:
             condition = ""
             if not self.auto_play_key_global: condition = "condition = $help == 1 && $ui_active == 1\n"
@@ -2039,16 +2079,16 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             sections[key_section].append(f"key = {auto_play_key}")
             sections[key_section].append("type = press")
             toggle_lines = [f"$auto_play_enabled_group{g} = 1 - $auto_play_enabled_group{g}" for g in all_groups]
-            sections[key_section].append("run = CommandListToggleAutoPlay")
-            cmd_section = "[CommandListToggleAutoPlay]"
+            sections[key_section].append(f"run = CommandListToggleAutoPlay_{ns}")
+            cmd_section = f"[CommandListToggleAutoPlay_{ns}]"
             if cmd_section not in sections: sections[cmd_section] = toggle_lines
             for g in all_groups:
-                cmd_g = f"[CommandListToggleAutoPlayGroup{g}]"
+                cmd_g = f"[CommandListToggleAutoPlayGroup{g}_{ns}]"
                 if cmd_g not in sections: sections[cmd_g] = [f"$auto_play_enabled_group{g} = 1 - $auto_play_enabled_group{g}"]
         # 【已合并】滑块面板-自定义
         if self.use_slider_panel:
             self._apply_slider_panel(mod_export_path, target_ini_file, sections)
-        self._write_ordered_dict_to_ini(sections, target_ini_file)
+        self._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content, preserved_driver_content)
         print(f"形态键扩展配置已{'原地更新' if _in_place else '合并到'}: {os.path.basename(target_ini_file)}")
         return True
 
