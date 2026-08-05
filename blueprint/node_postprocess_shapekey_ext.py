@@ -350,9 +350,9 @@ class SSMT_OT_OpenGroupSettings(bpy.types.Operator):
     prop_use_remark_as_icon: bpy.props.BoolProperty(name="用备注生成图标", default=True)
     prop_remark_font_family: bpy.props.EnumProperty(name="字体", items=[('msyh.ttc', "微软雅黑", ""), ('simsun.ttc', "宋体", ""), ('simhei.ttf', "黑体", ""), ('arial.ttf', "Arial", "")], default='msyh.ttc')
     prop_remark_font_size: bpy.props.IntProperty(name="字号大小", default=36, min=10, max=300)
-    prop_remark_text_color: bpy.props.FloatVectorProperty(name="文字颜色", subtype='COLOR', size=3, default=(1.0, 1.0, 1.0))
+    prop_remark_text_color: bpy.props.FloatVectorProperty(name="文字颜色", subtype='COLOR', size=3, default=(1.0, 1.0, 1.0), min=0.0, max=1.0, soft_min=0.0, soft_max=1.0)
     prop_remark_stroke_width: bpy.props.IntProperty(name="描边宽度", default=4, min=0, max=20)
-    prop_remark_stroke_color: bpy.props.FloatVectorProperty(name="描边颜色", subtype='COLOR', size=3, default=(0.0, 0.0, 0.0))
+    prop_remark_stroke_color: bpy.props.FloatVectorProperty(name="描边颜色", subtype='COLOR', size=3, default=(0.0, 0.0, 0.0), min=0.0, max=1.0, soft_min=0.0, soft_max=1.0)
     prop_button_icon_image: bpy.props.StringProperty(name="按钮图标", subtype='FILE_PATH', default="")
 
     def invoke(self, context, event):
