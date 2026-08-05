@@ -43,6 +43,7 @@ SHADER_FILES = (
     "rzm_gs_probe.hlsl",
     "rzm_object_detect.hlsl",
     "rzm_pin_detected.hlsl",
+    "rzm_ui_pin_readback.hlsl",
     "rzm_jiggle_screen_state.hlsl",
     "rzm_jiggle_interaction.hlsl",
 )
@@ -747,6 +748,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         for pattern, replacement in replacements:
             block = re.sub(pattern, lambda _m: replacement, block)
         block = re.sub(r"\$model_drag_prev_lmb\s*==\s*0\s*&&\s*", "", block)
+        for var in (ui_detected_var, ui_zone_var):
+            block = re.sub(
+                re.escape(var) + r"\s*>=\s*0",
+                f"{var} != -1 && {var} != 4294967295",
+                block,
+            )
         text = text[:start] + block + text[end_index:]
         return self._inject_virtual_model_drag_cursor(text, ns)
 
@@ -1894,6 +1901,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"[ResourceDragPinnedZone_{ns}]": [
                 "type = StructuredBuffer", "stride = 4", "array = 1", "data = R32_FLOAT -1",
             ],
+            f"[ResourceDragUIPinnedDetectID_{ns}]": [
+                "type = StructuredBuffer", "stride = 4", "array = 1", "data = R32_UINT 4294967295",
+            ],
+            f"[ResourceDragUIPinnedZone_{ns}]": [
+                "type = StructuredBuffer", "stride = 4", "array = 1", "data = R32_UINT 4294967295",
+            ],
             f"[ResourceDragJiggleScreenState_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
             f"[ResourceDragPathProgressState_{ns}]": [
                 "type = RWBuffer", "format = R32_FLOAT",
@@ -1954,6 +1967,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
         # ---- 全局 Pin / UpdateScreenJiggle / CommandList 段 ----
         self._emit_pin_detected_section(sections, ns)
+        self._emit_ui_pin_readback_section(sections, ns)
         self._emit_update_screen_jiggle_section(sections, ns)
         self._emit_command_lists(sections, components, ns)
 
@@ -2207,6 +2221,19 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     # ---- UpdateScreenJiggle（y72=1.0 非 mult_radius，照原作不对称）----
 
+    def _emit_ui_pin_readback_section(self, sections, ns):
+        sec = f"[CustomShaderDragUIPinReadback_{ns}]"
+        if sec in sections:
+            return
+        sections[sec] = [
+            f"cs = {RES_SHADER_DIR}/rzm_ui_pin_readback.hlsl",
+            f"cs-t0 = ResourceDragPinnedDetectInfo_{ns}",
+            f"cs-u0 = ResourceDragUIPinnedDetectID_{ns}",
+            f"cs-u1 = ResourceDragUIPinnedZone_{ns}",
+            "dispatch = 1, 1, 1",
+            "post cs-t0 = null", "post cs-u0 = null", "post cs-u1 = null",
+        ]
+
     def _emit_update_screen_jiggle_section(self, sections, ns):
         sec = f"[CustomShaderDragUpdateScreenJiggle_{ns}]"
         if sec in sections:
@@ -2274,6 +2301,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tclear = ResourceDragPinnedDetectID_{ns}",
                 f"\tclear = ResourceDragPinnedDetectInfo_{ns}",
                 f"\tclear = ResourceDragPinnedZone_{ns}",
+                f"\tclear = ResourceDragUIPinnedDetectID_{ns}",
+                f"\tclear = ResourceDragUIPinnedZone_{ns}",
                 f"\tclear = ResourceDragJiggleScreenState_{ns} 0.0",
                 f"\tclear = ResourceDragPathProgressState_{ns} 0.0",
                 f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
@@ -2787,14 +2816,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         present_lines = sections.setdefault(present_sec, [])
         ui_bridge_lines = [
             "\t; --- DRAG UI BRIDGE BEGIN ---",
-            # PinnedDetectInfo[7].w 是区域索引；按 float 标量索引即 7*4+3 = 31。
-            # store 读取上一份已完成的 GPU 数据，允许 UI 侧以一帧延迟稳定消费。
+            # 专用回读着色器先把 float 命中结果转换成 uint，避免 store 读到浮点位模式。
+            # 命中写入物体 ID/区域编号，未命中写 0xFFFFFFFF；UI 侧兼容 -1/4294967295。
             # 目标未绘制时必须主动失效，避免消费上一帧/上一个角色的残留命中。
             f"if {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_booted_{ns} == 1",
-            f"\tstore = {ui_detected_var}, ref ResourceDragPinnedDetectID_{ns}, 0",
-            f"\tif {ui_detected_var} >= 0",
-            f"\t\tstore = {ui_zone_var}, ref ResourceDragPinnedZone_{ns}, 0",
+            f"\trun = CustomShaderDragUIPinReadback_{ns}",
+            f"\tstore = {ui_detected_var}, ref ResourceDragUIPinnedDetectID_{ns}, 0",
+            f"\tif {ui_detected_var} != -1 && {ui_detected_var} != 4294967295",
+            f"\t\tstore = {ui_zone_var}, ref ResourceDragUIPinnedZone_{ns}, 0",
             "\telse",
+            f"\t\t{ui_detected_var} = -1",
             f"\t\t{ui_zone_var} = -1",
             "\tendif",
             "else",
@@ -2829,6 +2860,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"\tclear = ResourceDragPinnedDetectID_{ns}",
             f"\tclear = ResourceDragPinnedDetectInfo_{ns}",
             f"\tclear = ResourceDragPinnedZone_{ns}",
+            f"\tclear = ResourceDragUIPinnedDetectID_{ns}",
+            f"\tclear = ResourceDragUIPinnedZone_{ns}",
         ])
         for comp in components:
             cn = comp['comp_name']
