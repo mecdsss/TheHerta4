@@ -599,13 +599,6 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
                 target_sections.get("Present", [])
             )
         drag_present_block = body_drag_block or _removed_drag_block
-        if drag_present_block and not panel_has_model_marker:
-            present_lines = target_sections.setdefault("Present", [])
-            if not any(self.DRAG_PRESENT_BEGIN_MARKER in line for line in present_lines):
-                present_lines.extend(
-                    str(line).rstrip("\r\n") for line in drag_present_block
-                )
-            drag_present_block = None
 
         append_order, warnings = self._merge_panel_sections(target_sections, panel_sections)
         for warning in warnings:
@@ -630,6 +623,12 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
                     new_block, target_sections
                 )
                 self._inject_drag_present_into_panel_block(drag_present_block, new_block)
+            else:
+                present_lines = target_sections.setdefault("Present", [])
+                if not any(self.DRAG_PRESENT_BEGIN_MARKER in line for line in present_lines):
+                    present_lines.extend(
+                        str(line).rstrip("\r\n") for line in drag_present_block
+                    )
 
         content_parts = []
         if driver_block:
