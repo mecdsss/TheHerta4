@@ -617,7 +617,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
             end = len(remaining)
             search_from = start + len(DRAG_TAIL_MARKER)
-            for marker in cls.AUTO_APPENDED_SECTION_MARKERS:
+            for marker in (cls.AUTO_APPENDED_SECTION_MARKERS +
+                           cls.AUTO_APPENDED_SECTION_MARKER_PREFIXES):
                 marker_position = remaining.find(marker, search_from)
                 if marker_position != -1:
                     end = min(end, marker_position)
@@ -2810,8 +2811,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         block.extend([
             # 执行序列
             f"if {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1",
-            f"\trun = CommandListDragPinDetected_{ns}",
             f"\trun = CommandListDragCursorUpdate_{ns}",
+            f"\trun = CommandListDragPinDetected_{ns}",
             "endif",
         ])
         ui_readback_sec = f"[CommandListDragUIReadback_{ns}]"

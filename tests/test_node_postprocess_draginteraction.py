@@ -413,6 +413,38 @@ class DragNodeLocateTests(unittest.TestCase):
         self.assertIn("; --- AUTO-APPENDED HEALTH DETECTION MODULE ---", preserved_tail)
         self.assertIn("[ResourceHealth]", preserved_tail)
 
+    def test_read_removes_drag_tail_before_ui_panel_tail(self):
+        import tempfile
+
+        node = _make_node(self.mod)
+        content = "\n".join([
+            "[TextureOverride_Test]",
+            "hash = abc123",
+            "drawindexed = 3, 0, 0",
+            self.mod.DRAG_TAIL_MARKER,
+            "[ResourceOldDrag]",
+            "type = Buffer",
+            "; --- AUTO-APPENDED UI PANEL UIPanel ---",
+            "[Constants]",
+            "global $active = 0",
+            "[Present]",
+            "    ; --- MODEL DRAG BINDING BEGIN ---",
+            "    if $mouse_clicked == 1 && $ssmtdrag_ui_detected_A >= 0",
+            "        $is_dragging = 9",
+            "    endif",
+            "    ; --- MODEL DRAG BINDING END ---",
+        ])
+
+        with tempfile.TemporaryDirectory() as td:
+            ini_path = Path(td) / "test.ini"
+            ini_path.write_text(content, encoding="utf-8")
+            _sections, preserved_tail, _preserved_driver = node._read_ini_to_ordered_dict(str(ini_path))
+
+        self.assertNotIn(self.mod.DRAG_TAIL_MARKER, preserved_tail)
+        self.assertNotIn("[ResourceOldDrag]", preserved_tail)
+        self.assertIn("; --- AUTO-APPENDED UI PANEL UIPanel ---", preserved_tail)
+        self.assertIn("MODEL DRAG BINDING BEGIN", preserved_tail)
+
 
     def test_read_and_write_preserve_anim_driver_top_block(self):
         import tempfile

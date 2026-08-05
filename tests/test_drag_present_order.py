@@ -32,6 +32,10 @@ class DragPresentOrderTests(unittest.TestCase):
         present = "\n".join(sections["[Present]"])
         self.assertLess(present.index("DRAG PRESENT BEGIN"), present.index("MODEL DRAG BINDING BEGIN"))
         self.assertLess(present.index("run = CommandListDragPinDetected_testns"), present.index("MODEL DRAG BINDING BEGIN"))
+        self.assertLess(
+            present.index("run = CommandListDragCursorUpdate_testns"),
+            present.index("run = CommandListDragPinDetected_testns"),
+        )
 
         node._emit_present_and_constants(sections, comps, "testns")
         present = "\n".join(sections["[Present]"])
