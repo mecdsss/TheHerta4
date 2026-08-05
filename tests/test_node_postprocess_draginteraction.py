@@ -848,7 +848,7 @@ class DragNodeEmitTests(unittest.TestCase):
             readback,
         )
         self.assertIn(
-            "store = $ssmtdrag_ui_zone_testns, ref ResourceDragPinnedDetectInfo_testns, 31",
+            "store = $ssmtdrag_ui_zone_testns, ref ResourceDragPinnedZone_testns, 0",
             readback,
         )
         self.assertIn("if $ssmtdrag_ui_detected_testns >= 0", readback)
@@ -858,6 +858,15 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("stride = 4", sections["[ResourceDragPinnedDetectID_testns]"])
         self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedDetectInfo_testns]"])
         self.assertIn("stride = 16", sections["[ResourceDragPinnedDetectInfo_testns]"])
+        self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedZone_testns]"])
+        self.assertIn("stride = 4", sections["[ResourceDragPinnedZone_testns]"])
+        pin = "\n".join(sections["[CustomShaderDragPinDetected_testns]"])
+        component_pin = "\n".join(sections["[CustomShaderDragPinComponentabc123_43191_testns]"])
+        self.assertIn("cs-u3 = ResourceDragPinnedZone_testns", pin)
+        self.assertIn("cs-u3 = ResourceDragPinnedComponentZone_abc123_43191_testns", component_pin)
+        self.assertNotIn("cs-u3 = ResourceDragPinnedZone_testns", component_pin)
+        self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedComponentZone_abc123_43191_testns]"])
+        self.assertIn("stride = 4", sections["[ResourceDragPinnedComponentZone_abc123_43191_testns]"])
 
         # 旧版 Present 已存在时仍可幂等补齐桥接，而不是被提前 return 跳过。
         legacy_sections = _base_sections()
@@ -913,7 +922,7 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("if $custom_drag_mode >= 1", hook)
         self.assertIn("if $custom_drag_mode >= 2", hook)
         self.assertIn("store = $custom_hit_id, ref ResourceDragPinnedDetectID_testns, 0", readback)
-        self.assertIn("store = $custom_zone_id, ref ResourceDragPinnedDetectInfo_testns, 31", readback)
+        self.assertIn("store = $custom_zone_id, ref ResourceDragPinnedZone_testns, 0", readback)
 
     def test_drag_runtime_switch_defaults_on_and_upgrades_legacy_present(self):
         node, sections, comps = self._emit()
@@ -931,7 +940,7 @@ class DragNodeEmitTests(unittest.TestCase):
         present = "\n".join(sections["[Present]"])
         self.assertIn("global persist $ssmtdrag_drag_enabled_testns = 2", constants)
         self.assertEqual(present.count("DRAG INTERACTION GATE BEGIN"), 1)
-        self.assertLess(present.index("DRAG INTERACTION GATE BEGIN"), present.index("pre run = CommandListDragPinDetected_testns"))
+        self.assertLess(present.index("DRAG INTERACTION GATE BEGIN"), present.index("run = CommandListDragPinDetected_testns"))
         node._emit_present_and_constants(sections, comps, "testns")
         self.assertEqual("\n".join(sections["[Present]"]).count("DRAG INTERACTION GATE BEGIN"), 1)
 
