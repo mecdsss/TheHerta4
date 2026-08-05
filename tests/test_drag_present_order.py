@@ -31,12 +31,12 @@ class DragPresentOrderTests(unittest.TestCase):
         node._emit_present_and_constants(sections, comps, "testns")
         present = "\n".join(sections["[Present]"])
         self.assertLess(present.index("DRAG PRESENT BEGIN"), present.index("MODEL DRAG BINDING BEGIN"))
-        self.assertLess(present.index("run = CommandListDragPinDetected_testns"), present.index("MODEL DRAG BINDING BEGIN"))
+        self.assertLess(present.index("pre run = CommandListDragPinDetected_testns"), present.index("MODEL DRAG BINDING BEGIN"))
 
         node._emit_present_and_constants(sections, comps, "testns")
         present = "\n".join(sections["[Present]"])
         self.assertEqual(present.count("DRAG PRESENT BEGIN"), 1)
-        self.assertLess(present.index("run = CommandListDragPinDetected_testns"), present.index("MODEL DRAG BINDING BEGIN"))
+        self.assertLess(present.index("pre run = CommandListDragPinDetected_testns"), present.index("MODEL DRAG BINDING BEGIN"))
 
     def test_drag_present_uses_legacy_binding_line_without_marker(self):
         node, sections, comps = self._emit()
@@ -102,7 +102,7 @@ class DragPresentOrderTests(unittest.TestCase):
         self.assertIn("store = $ssmtdrag_ui_zone_testns", readback)
 
         present = "\n".join(sections["[Present]"])
-        self.assertLess(present.index("run = CommandListDragUIReadback_testns"),
+        self.assertLess(present.index("post run = CommandListDragUIReadback_testns"),
                         present.index("post $ssmtdrag_drawn_testns = 0"))
 
     def test_drag_present_is_relocated_into_ui_tail_before_binding_marker(self):
@@ -119,33 +119,8 @@ class DragPresentOrderTests(unittest.TestCase):
         normalized_tail = node._relocate_drag_present_into_ui_tail(sections, tail)
         self.assertIn("DRAG PRESENT BEGIN", normalized_tail)
         self.assertLess(normalized_tail.index("DRAG PRESENT BEGIN"), normalized_tail.index("MODEL DRAG BINDING BEGIN"))
-        self.assertLess(normalized_tail.index("run = CommandListDragPinDetected_testns"), normalized_tail.index("MODEL DRAG BINDING BEGIN"))
+        self.assertLess(normalized_tail.index("pre run = CommandListDragPinDetected_testns"), normalized_tail.index("MODEL DRAG BINDING BEGIN"))
         self.assertNotIn("DRAG PRESENT BEGIN", "\n".join(sections["[Present]"]))
-
-    def test_ui_tail_deduplicates_old_binding_blocks_and_removes_prev_lmb_latch(self):
-        node, _, _ = self._emit()
-        tail = (
-            "    ; --- MODEL DRAG BINDING BEGIN ---\n"
-            "    if $mouse_clicked == 1 && $model_drag_prev_lmb == 0 && $is_dragging == 0 && $help == 1\n"
-            "        if $ssmtdrag_ui_detected_A >= 0 && $ssmtdrag_ui_zone_A == 1\n"
-            "            $is_dragging = 9\n"
-            "        endif\n"
-            "    endif\n"
-            "    ; --- MODEL DRAG BINDING END ---\n"
-            "    $model_drag_prev_lmb = $mouse_clicked\n"
-            "    ; --- MODEL DRAG BINDING BEGIN ---\n"
-            "    if $mouse_clicked == 1 && $model_drag_prev_lmb == 0 && $is_dragging == 0 && $help == 1\n"
-            "        if $ssmtdrag_ui_detected_A >= 0 && $ssmtdrag_ui_zone_A == 2\n"
-            "            $is_dragging = 9\n"
-            "        endif\n"
-            "    endif\n"
-            "    ; --- MODEL DRAG BINDING END ---\n"
-        )
-        normalized = node._normalize_ui_drag_references(tail, "testns")
-        self.assertEqual(normalized.count("MODEL DRAG BINDING BEGIN"), 1)
-        self.assertIn("$ssmtdrag_ui_detected_testns >= 0", normalized)
-        self.assertIn("$ssmtdrag_ui_zone_testns == 1", normalized)
-        self.assertNotIn("$model_drag_prev_lmb == 0", normalized)
 
 
 if __name__ == "__main__":

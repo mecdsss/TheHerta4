@@ -720,7 +720,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         tail while making the UI read the same globals that this node declares.
         """
         text = str(tail_content or "")
-        text = self._dedupe_model_drag_binding_blocks(text)
         marker = "; --- MODEL DRAG BINDING BEGIN ---"
         marker_index = text.find(marker)
         if marker_index < 0:
@@ -744,38 +743,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         ]
         for pattern, replacement in replacements:
             block = re.sub(pattern, lambda _m: replacement, block)
-        block = re.sub(r"\$model_drag_prev_lmb\s*==\s*0\s*&&\s*", "", block)
         return text[:start] + block + text[end_index:]
-
-    @staticmethod
-    def _dedupe_model_drag_binding_blocks(text):
-        """Keep only the first UI model-drag binding block in a preserved tail."""
-        begin_marker = "; --- MODEL DRAG BINDING BEGIN ---"
-        end_marker = "; --- MODEL DRAG BINDING END ---"
-        spans = []
-        search = 0
-        while True:
-            start = str(text).find(begin_marker, search)
-            if start < 0:
-                break
-            end = str(text).find(end_marker, start)
-            if end < 0:
-                end = len(str(text))
-            else:
-                end += len(end_marker)
-            spans.append((start, end))
-            search = end
-        if len(spans) <= 1:
-            return text
-
-        keep_end = spans[0][1]
-        out = str(text)[:keep_end]
-        cursor = keep_end
-        for start, end in spans[1:]:
-            out += str(text)[cursor:start]
-            cursor = end
-        out += str(text)[cursor:]
-        return out
 
     @staticmethod
     def _extract_drag_present_block(present_lines):
@@ -1740,7 +1708,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"[ResourceDragDetectID_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
             f"[ResourceDragPinnedDetectID_{ns}]": ["type = StructuredBuffer", "stride = 4", "array = 1"],
             f"[ResourceDragPinnedDetectInfo_{ns}]": ["type = StructuredBuffer", "stride = 16", "array = 15"],
-            f"[ResourceDragPinnedZone_{ns}]": ["type = StructuredBuffer", "stride = 4", "array = 1"],
             f"[ResourceDragJiggleScreenState_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
             f"[ResourceDragPathProgressState_{ns}]": [
                 "type = RWBuffer", "format = R32_FLOAT",
@@ -1826,7 +1793,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"[ResourceDragComponentDetect_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
             f"[ResourceDragPinnedComponentID_{cn}_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
             f"[ResourceDragPinnedComponentInfo_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
-            f"[ResourceDragPinnedComponentZone_{cn}_{ns}]": ["type = StructuredBuffer", "stride = 4", "array = 1"],
             f"[ResourceDragJiggleState_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 10"],
             # TempVB0：空声明段（type=RWBuffer，无 format/array），copy 往返后换绑
             f"[ResourceDragJiggleTempVB0_{cn}_{ns}]": ["type = RWBuffer"],
@@ -2028,9 +1994,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"cs-u0 = ResourceDragComponentDetect_{cn}_{ns}",
             f"cs-u1 = ResourceDragPinnedComponentID_{cn}_{ns}",
             f"cs-u2 = ResourceDragPinnedComponentInfo_{cn}_{ns}",
-            f"cs-u3 = ResourceDragPinnedComponentZone_{cn}_{ns}",
             "dispatch = 1, 1, 1",
-            "post cs-u0 = null", "post cs-u1 = null", "post cs-u2 = null", "post cs-u3 = null",
+            "post cs-u0 = null", "post cs-u1 = null", "post cs-u2 = null",
         ]
 
     # ---- 全局 Pin（槽 10 注入光标 x24..w24）----
@@ -2045,9 +2010,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"cs-u0 = ResourceDragDetectID_{ns}",
             f"cs-u1 = ResourceDragPinnedDetectID_{ns}",
             f"cs-u2 = ResourceDragPinnedDetectInfo_{ns}",
-            f"cs-u3 = ResourceDragPinnedZone_{ns}",
             "dispatch = 1, 1, 1",
-            "post cs-u0 = null", "post cs-u1 = null", "post cs-u2 = null", "post cs-u3 = null",
+            "post cs-u0 = null", "post cs-u1 = null", "post cs-u2 = null",
         ]
 
     # ---- UpdateScreenJiggle（y72=1.0 非 mult_radius，照原作不对称）----
@@ -2118,7 +2082,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tclear = ResourceDragDetectID_{ns} 0.0",
                 f"\tclear = ResourceDragPinnedDetectID_{ns}",
                 f"\tclear = ResourceDragPinnedDetectInfo_{ns}",
-                f"\tclear = ResourceDragPinnedZone_{ns}",
                 f"\tclear = ResourceDragJiggleScreenState_{ns} 0.0",
                 f"\tclear = ResourceDragPathProgressState_{ns} 0.0",
                 f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
@@ -2131,7 +2094,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     f"\tclear = ResourceDragComponentDetect_{cn}_{ns} 0.0",
                     f"\tclear = ResourceDragPinnedComponentID_{cn}_{ns} 0.0",
                     f"\tclear = ResourceDragPinnedComponentInfo_{cn}_{ns} 0.0",
-                    f"\tclear = ResourceDragPinnedComponentZone_{cn}_{ns}",
                     f"\tclear = ResourceDragJiggleState_{cn}_{ns} 0.0",
                 ])
             lines.extend([
@@ -2638,7 +2600,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"if {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_booted_{ns} == 1",
             f"\tstore = {ui_detected_var}, ref ResourceDragPinnedDetectID_{ns}, 0",
             f"\tif {ui_detected_var} >= 0",
-            f"\t\tstore = {ui_zone_var}, ref ResourceDragPinnedZone_{ns}, 0",
+            f"\t\tstore = {ui_zone_var}, ref ResourceDragPinnedDetectInfo_{ns}, 31",
             "\telse",
             f"\t\t{ui_zone_var} = -1",
             "\tendif",
@@ -2673,7 +2635,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"\tclear = ResourceDragDetectID_{ns} 0.0",
             f"\tclear = ResourceDragPinnedDetectID_{ns}",
             f"\tclear = ResourceDragPinnedDetectInfo_{ns}",
-            f"\tclear = ResourceDragPinnedZone_{ns}",
         ])
         for comp in components:
             cn = comp['comp_name']
@@ -2681,7 +2642,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tclear = ResourceDragComponentDetect_{cn}_{ns} 0.0",
                 f"\tclear = ResourceDragPinnedComponentID_{cn}_{ns} 0.0",
                 f"\tclear = ResourceDragPinnedComponentInfo_{cn}_{ns} 0.0",
-                f"\tclear = ResourceDragPinnedComponentZone_{cn}_{ns}",
             ])
         interaction_gate_lines.extend([
             "endif",
@@ -2810,7 +2770,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         block.extend([
             # 执行序列
             f"if {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1",
-            f"\trun = CommandListDragPinDetected_{ns}",
+            f"\tpre run = CommandListDragPinDetected_{ns}",
             f"\trun = CommandListDragCursorUpdate_{ns}",
             "endif",
         ])
@@ -2839,7 +2799,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "endif",
             ])
         block.extend([
-            f"run = CommandListDragUIReadback_{ns}",
+            f"post run = CommandListDragUIReadback_{ns}",
             f"post $ssmtdrag_drawn_{ns} = 0",
             "\t; --- DRAG PRESENT END ---",
         ])

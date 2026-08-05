@@ -6,7 +6,6 @@
 //   cs-u0 = ResourceRZMDetectID,         RWBuffer<float4> (frame accumulator)
 //   cs-u1 = ResourceRZMPinnedDetectID,   RWStructuredBuffer<float>  (legacy pinned R32_FLOAT)
 //   cs-u2 = ResourceRZMPinnedDetectInfo, RWStructuredBuffer<float4> (pinned extended info)
-//   cs-u3 = ResourceRZMPinnedZone,       RWStructuredBuffer<float>  (pinned zone ID)
 //
 // Accumulator/pinned info layout:
 //   [0] legacy ABI, do not reorder:
@@ -26,7 +25,6 @@
 // After running:
 //   ResourceRZMPinnedDetectID[0]   = best.x (used by INI store -> $Detected)
 //   ResourceRZMPinnedDetectInfo[*] = copied extended info, or miss/reset payload
-//   ResourceRZMPinnedZone[0]       = [7].w stable zone ID, or -1 on miss
 //   ResourceRZMDetectID[*]         = reset for next frame
 
 // [14] clip-depth payload: x = 1-z/w, y = clip w, z = clip z, w = valid.
@@ -35,7 +33,6 @@
 RWBuffer<float4> gAccumulated : register(u0);
 RWStructuredBuffer<float>  gPinnedID    : register(u1);
 RWStructuredBuffer<float4> gPinnedInfo  : register(u2);
-RWStructuredBuffer<float>  gPinnedZone  : register(u3);
 Texture1D<float4> IniParams   : register(t120);
 
 #define CURSOR_PARAMS IniParams[24]
@@ -51,7 +48,6 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     bool   invalid = best.x < 0.0f || best.y > 1e30f;
 
     gPinnedID[0] = invalid ? -1.0f : best.x;
-    gPinnedZone[0] = invalid ? -1.0f : gAccumulated[7u].w;
 
     [unroll]
     for (uint slot = 0u; slot < RZM_DETECT_SLOTS; slot++)
