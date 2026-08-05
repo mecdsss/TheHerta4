@@ -58,10 +58,6 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
         "CustomShaderFx",
     })
 
-    DRAG_PRESENT_BEGIN_MARKER = "; --- DRAG PRESENT BEGIN ---"
-    DRAG_PRESENT_END_MARKER = "; --- DRAG PRESENT END ---"
-    MODEL_DRAG_BINDING_MARKER = "; --- MODEL DRAG BINDING BEGIN ---"
-
     panel_name: bpy.props.StringProperty(
         name="面板名称",
         default="UIPanel",
@@ -280,95 +276,6 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
         cleaned.append(end_marker)
         target_lines[:] = cleaned
 
-    @classmethod
-    def _extract_drag_present_block_from_lines(cls, lines):
-        start = next(
-            (i for i, line in enumerate(lines) if cls.DRAG_PRESENT_BEGIN_MARKER in line),
-            None,
-        )
-        if start is None:
-            return None
-        end = next(
-            (i for i in range(start + 1, len(lines))
-             if cls.DRAG_PRESENT_END_MARKER in lines[i]),
-            None,
-        )
-        if end is None:
-            return None
-        block = lines[start:end + 1]
-        del lines[start:end + 1]
-        return block
-
-    @classmethod
-    def _extract_drag_present_block_from_text(cls, text):
-        lines = str(text or "").splitlines(keepends=True)
-        block = cls._extract_drag_present_block_from_lines(lines)
-        if block is None:
-            return None, text
-        return block, "".join(lines)
-
-    @classmethod
-    def _normalize_drag_present_variables(cls, block_lines, target_sections):
-        detected_suffix = cls._ui_variable_suffix(block_lines, "detected")
-        zone_suffix = cls._ui_variable_suffix(block_lines, "zone")
-        detected_candidates = []
-        zone_candidates = []
-        for line in target_sections.get("Constants", []):
-            match = re.match(r'^\s*global\s+(?:persist\s+)?(\$[A-Za-z0-9_]+)\s*=', line)
-            if not match:
-                continue
-            var = match.group(1)
-            if var.startswith("$ssmtdrag_ui_detected_"):
-                detected_candidates.append((var[len("$ssmtdrag_ui_detected_"):], var))
-            elif var.startswith("$ssmtdrag_ui_zone_"):
-                zone_candidates.append((var[len("$ssmtdrag_ui_zone_"):], var))
-
-        detected_var = next(
-            (var for suffix, var in detected_candidates if suffix == detected_suffix),
-            detected_candidates[0][1] if detected_candidates else None,
-        )
-        zone_var = next(
-            (var for suffix, var in zone_candidates if suffix == zone_suffix),
-            zone_candidates[0][1] if zone_candidates else None,
-        )
-
-        normalized = list(block_lines)
-        if detected_var:
-            normalized = [
-                re.sub(r'\$ssmtdrag_ui_detected_[A-Za-z0-9_]+', lambda _m: detected_var, line)
-                for line in normalized
-            ]
-        if zone_var:
-            normalized = [
-                re.sub(r'\$ssmtdrag_ui_zone_[A-Za-z0-9_]+', lambda _m: zone_var, line)
-                for line in normalized
-            ]
-        return normalized
-
-    @staticmethod
-    def _ui_variable_suffix(lines, base):
-        pattern = re.compile(r'\$ssmtdrag_ui_' + re.escape(base) + r'_([A-Za-z0-9_]+)')
-        for line in lines:
-            match = pattern.search(line)
-            if match:
-                return match.group(1)
-        return None
-
-    @classmethod
-    def _inject_drag_present_into_panel_block(cls, block_lines, panel_lines):
-        if any(cls.DRAG_PRESENT_BEGIN_MARKER in line for line in panel_lines):
-            return
-        marker_index = next(
-            (i for i, line in enumerate(panel_lines)
-             if cls.MODEL_DRAG_BINDING_MARKER in line),
-            None,
-        )
-        if marker_index is None:
-            return
-        panel_lines[marker_index:marker_index] = [
-            str(line).rstrip("\r\n") for line in block_lines
-        ]
-
     # 匹配 global 声明中的变量名，如 "global persist $active = 1" 中的 "$active"
     _GLOBAL_DECLARATION_PATTERN = re.compile(
         r'^\s*global\s+(?:persist\s+)?(\$[A-Za-z0-9_]+)', re.IGNORECASE
@@ -580,25 +487,10 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
         with open(target_ini_file, 'r', encoding='utf-8-sig') as f:
             target_text = f.read()
         kept_text, _removed = self._split_own_block(target_text)
-        _removed_drag_block = None
-        if _removed:
-            _removed_drag_block, _removed = self._extract_drag_present_block_from_text(_removed)
         driver_block, kept_after_driver = self.split_anim_driver_block_content(kept_text)
         base_text, preserved_tail = self._split_appended_tail(kept_after_driver)
         target_preamble = self._extract_preamble(base_text)
         target_sections = self.parse_sections(base_text)
-
-        panel_has_model_marker = any(
-            self.MODEL_DRAG_BINDING_MARKER in line
-            for section_lines in panel_sections.values()
-            for line in section_lines
-        )
-        body_drag_block = None
-        if panel_has_model_marker:
-            body_drag_block = self._extract_drag_present_block_from_lines(
-                target_sections.get("Present", [])
-            )
-        drag_present_block = body_drag_block or _removed_drag_block
 
         append_order, warnings = self._merge_panel_sections(target_sections, panel_sections)
         for warning in warnings:
@@ -614,21 +506,6 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
             rebuilt_lines.append("")
 
         new_block = self._build_appended_block(panel_sections, append_order)
-        if drag_present_block:
-            drag_present_block = self._normalize_drag_present_variables(
-                drag_present_block, target_sections
-            )
-            if panel_has_model_marker:
-                new_block = self._normalize_drag_present_variables(
-                    new_block, target_sections
-                )
-                self._inject_drag_present_into_panel_block(drag_present_block, new_block)
-            else:
-                present_lines = target_sections.setdefault("Present", [])
-                if not any(self.DRAG_PRESENT_BEGIN_MARKER in line for line in present_lines):
-                    present_lines.extend(
-                        str(line).rstrip("\r\n") for line in drag_present_block
-                    )
 
         content_parts = []
         if driver_block:

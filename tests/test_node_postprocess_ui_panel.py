@@ -132,35 +132,6 @@ blend=ADD SRC_ALPHA ONE
 """
 
 
-PANEL_DRAG_INI = """[Present]
-    ; --- MODEL DRAG BINDING BEGIN ---
-    if $mouse_clicked == 1 && $is_dragging == 0
-        if $ssmtdrag_ui_detected_fserfrse >= 0 && $ssmtdrag_ui_zone_fserfrse == 0
-            $is_dragging = 9
-        endif
-    endif
-    ; --- MODEL DRAG BINDING END ---
-"""
-
-
-DRAG_TARGET_INI = """[Constants]
-global $active = 0
-global $ssmtdrag_ui_detected_A = -1
-global $ssmtdrag_ui_zone_A = -1
-
-[TextureOverride_drawhash]
-hash = drawhash
-match_first_index = 56
-drawindexed = 12,34,0
-
-[Present]
-post $active = 0
-; --- DRAG PRESENT BEGIN ---
-run = CommandListDragUIReadback_A
-; --- DRAG PRESENT END ---
-"""
-
-
 def _write_panel_folder(root: Path) -> Path:
     panel_dir = root / "panel"
     (panel_dir / "res").mkdir(parents=True)
@@ -168,13 +139,6 @@ def _write_panel_folder(root: Path) -> Path:
     (panel_dir / "res" / "draw_2d.hlsl").write_text("shader", encoding="utf-8")
     (panel_dir / "res" / "draw_2d_fx.hlsl").write_text("shader-fx", encoding="utf-8")
     (panel_dir / "ui_config_c209c22b_123.txt").write_text(PANEL_INI, encoding="utf-8")
-    return panel_dir
-
-
-def _write_panel_folder_text(root: Path, panel_text: str) -> Path:
-    panel_dir = root / "panel"
-    panel_dir.mkdir(parents=True)
-    (panel_dir / "ui_config_c209c22b_123.txt").write_text(panel_text, encoding="utf-8")
     return panel_dir
 
 
@@ -297,50 +261,6 @@ class NodePostprocessUIPanelTests(unittest.TestCase):
         self.assertEqual(result_text.count("[CustomShaderDraw]"), 1)
         self.assertEqual(result_text.count("[CustomShaderFx]"), 1)
         self.assertGreater(result_text.index(marker), result_text.index("[Present]"))
-
-    def test_moves_existing_drag_present_into_panel_present_before_binding(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            panel_dir = _write_panel_folder_text(root, PANEL_DRAG_INI)
-            mod_dir = root / "mod"
-            mod_dir.mkdir()
-            ini_path = mod_dir / "character.ini"
-            ini_path.write_text(DRAG_TARGET_INI, encoding="utf-8")
-
-            node = _make_node(str(panel_dir))
-            node.execute_postprocess(str(mod_dir))
-            result_text = ini_path.read_text(encoding="utf-8")
-
-        self.assertEqual(result_text.count("DRAG PRESENT BEGIN"), 1)
-        self.assertNotIn("fserfrse", result_text)
-        self.assertIn("$ssmtdrag_ui_detected_A", result_text)
-        ui_block = result_text[result_text.index("; --- AUTO-APPENDED UI PANEL UIPanel ---"):]
-        self.assertLess(
-            ui_block.index("DRAG PRESENT BEGIN"),
-            ui_block.index("MODEL DRAG BINDING BEGIN"),
-        )
-
-    def test_rerun_preserves_relocated_drag_present_block(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            panel_dir = _write_panel_folder_text(root, PANEL_DRAG_INI)
-            mod_dir = root / "mod"
-            mod_dir.mkdir()
-            ini_path = mod_dir / "character.ini"
-            ini_path.write_text(DRAG_TARGET_INI, encoding="utf-8")
-
-            first_node = _make_node(str(panel_dir))
-            first_node.execute_postprocess(str(mod_dir))
-            second_node = _make_node(str(panel_dir))
-            second_node.execute_postprocess(str(mod_dir))
-            result_text = ini_path.read_text(encoding="utf-8")
-
-        self.assertEqual(result_text.count("DRAG PRESENT BEGIN"), 1)
-        ui_block = result_text[result_text.index("; --- AUTO-APPENDED UI PANEL UIPanel ---"):]
-        self.assertLess(
-            ui_block.index("DRAG PRESENT BEGIN"),
-            ui_block.index("MODEL DRAG BINDING BEGIN"),
-        )
 
     def test_preserves_namespace_and_comments_before_first_section(self):
         target = (
