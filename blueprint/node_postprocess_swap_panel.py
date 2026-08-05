@@ -919,7 +919,6 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                                 btn_w_i = btn_h * (w / h) * SCREEN_RATIO_CORRECTION
                     except Exception:
                         pass
-                btn_w_i = max(btn_w_i, btn_h * 1.5 * SCREEN_RATIO_CORRECTION)  # 最小 1.5:1 可点击宽度
                 btn_w_list.append(btn_w_i)
                 if btn_w_i > max_btn_w:
                     max_btn_w = btn_w_i
