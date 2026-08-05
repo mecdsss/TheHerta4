@@ -618,6 +618,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
 
     slider_height: bpy.props.FloatProperty(name="滑块高度", default=0.042, min=0.001, max=1.0, precision=4)
     button_height: bpy.props.FloatProperty(name="按钮高度", default=0.045, min=0.001, max=1.0, precision=4)
+    panel_min_height: bpy.props.FloatProperty(name="面板最小高度", default=0.75, min=0.01, max=1.0, precision=4)
 
     def _update_target_object(self, context):
         self._update_from_object()
@@ -1328,6 +1329,8 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         total_slider_height = num_sliders * child_height
         total_spacing_height = max(0, (num_sliders - 1) * spacing)
         parent_height = total_slider_height + total_spacing_height + (top_bottom_padding * 2)
+        # 面板最小高度：自动计算高度过小时使用设置值
+        parent_height = max(parent_height, self.panel_min_height)
 
         # 背景尺寸：宽 = 自动计算高度 × 背景图片宽高比 × 屏幕校正（保持图片比例）
         bg_aspect = self._measure_image_aspect(dest_res_dir, "0.png")
@@ -1872,6 +1875,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         col.separator()
         col.prop(self, "slider_height", text="滑块高度")
         col.prop(self, "button_height", text="按钮高度")
+        col.prop(self, "panel_min_height", text="面板最小高度")
         col.label(text="背景/滑块/按钮宽度按高度×图片比例自动计算", icon='INFO')
 
         box = layout.box()
