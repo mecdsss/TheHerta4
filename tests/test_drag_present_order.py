@@ -151,6 +151,128 @@ class DragPresentOrderTests(unittest.TestCase):
         self.assertIn("$ssmtdrag_ui_zone_testns == 1", normalized)
         self.assertNotIn("$model_drag_prev_lmb == 0", normalized)
 
+    def test_old_ui_tail_gets_virtual_model_drag_cursor_bridge(self):
+        node, _, _ = self._emit()
+        tail = (
+            "global $prev_cursor_x\n"
+            "global $prev_cursor_y\n"
+            "global $cursor_delta_x\n"
+            "global $cursor_delta_y\n"
+            "[CustomShaderDraw]\n"
+            "    if cursor_x > $d3\n"
+            "[Present]\n"
+            "    $dx = (cursor_x - $cx) * $aspect\n"
+            "    $dy = cursor_y - $cy\n"
+            "    ; --- MODEL DRAG BINDING BEGIN ---\n"
+            "    if $mouse_clicked == 1 && $is_dragging == 0 && $help == 1\n"
+            "        if $ssmtdrag_ui_detected_A >= 0 && ($ssmtdrag_ui_zone_A == 1)\n"
+            "            $is_dragging = 9\n"
+            "            $drag_action = 2\n"
+            "            $model_drag_capture = 1\n"
+            "            $drag_dx = 0\n"
+            "            $drag_dy = 0\n"
+            "        endif\n"
+            "    endif\n"
+            "    ; --- MODEL DRAG BINDING END ---\n"
+            "    $prev_cursor_x = cursor_x\n"
+            "    $prev_cursor_y = cursor_y\n"
+        )
+        normalized = node._normalize_ui_drag_references(tail, "testns")
+        self.assertIn("global $model_drag_cursor_x = 0", normalized)
+        self.assertIn("$model_drag_cursor_x = cursor_x", normalized)
+        self.assertIn("$dx = ($model_drag_cursor_x - $cx)", normalized)
+        self.assertIn("$prev_cursor_x = $model_drag_cursor_x", normalized)
+        self.assertIn("$model_drag_anchor_x = cursor_x", normalized)
+        self.assertIn("$model_drag_ref_x = ($abs_x_8 + $abs_w_8*0.5)", normalized)
+        self.assertIn("$prev_cursor_x = ($abs_x_8 + $abs_w_8*0.5)", normalized)
+        self.assertIn("$ssmtdrag_ui_detected_testns >= 0", normalized)
+        self.assertIn("if cursor_x > $d3", normalized)
+
+    def test_old_ui_tail_virtual_cursor_uses_handle_reference(self):
+        node, _, _ = self._emit()
+        tail = (
+            "global $prev_cursor_x\n"
+            "global $prev_cursor_y\n"
+            "global $cursor_delta_y\n"
+            "global $hs_8\n"
+            "global $hh_8\n"
+            "global $anim_handle_scale_8\n"
+            "global $r_hdl_8_x\n"
+            "global $r_hdl_8_y\n"
+            "[Present]\n"
+            "    ; --- MODEL DRAG BINDING BEGIN ---\n"
+            "    if $mouse_clicked == 1 && $is_dragging == 0 && $help == 1\n"
+            "        if $ssmtdrag_ui_detected_A >= 0 && ($ssmtdrag_ui_zone_A == 1)\n"
+            "            $is_dragging = 9\n"
+            "            $drag_action = 2\n"
+            "            $model_drag_capture = 1\n"
+            "            $drag_dx = 0\n"
+            "            $drag_dy = 0\n"
+            "        endif\n"
+            "    endif\n"
+            "    ; --- MODEL DRAG BINDING END ---\n"
+            "    $prev_cursor_x = cursor_x\n"
+            "    $prev_cursor_y = cursor_y\n"
+        )
+        normalized = node._normalize_ui_drag_references(tail, "testns")
+        self.assertIn("$model_drag_ref_x = ($r_hdl_8_x + ($hs_8*$zoom_global*$anim_handle_scale_8)*0.5)", normalized)
+        self.assertIn("$model_drag_ref_y = ($r_hdl_8_y + ($hh_8*$zoom_global*$anim_handle_scale_8)*0.5)", normalized)
+        self.assertIn("$prev_cursor_x = ($r_hdl_8_x + ($hs_8*$zoom_global*$anim_handle_scale_8)*0.5)", normalized)
+        self.assertIn("$prev_cursor_y = ($r_hdl_8_y + ($hh_8*$zoom_global*$anim_handle_scale_8)*0.5)", normalized)
+
+    def test_old_ui_tail_removes_legacy_model_hit_test_block(self):
+        node, _, _ = self._emit()
+        tail = (
+            "    ; --- MODEL HIT TEST BEGIN ---\n"
+            "    if $ssmtdrag_ui_detected_A >= 0 && ($ssmtdrag_ui_zone_A == 1)\n"
+            "        $val_8_x = 0\n"
+            "        $val_8_y = 0.8\n"
+            "    endif\n"
+            "    ; --- MODEL HIT TEST END ---\n"
+            "    ; --- MODEL DRAG BINDING BEGIN ---\n"
+            "    if $ssmtdrag_ui_detected_A >= 0\n"
+            "        $is_dragging = 9\n"
+            "    endif\n"
+            "    ; --- MODEL DRAG BINDING END ---\n"
+        )
+        normalized = node._normalize_ui_drag_references(tail, "testns")
+        self.assertNotIn("MODEL HIT TEST", normalized)
+        self.assertNotIn("$val_8_x = 0", normalized)
+        self.assertIn("MODEL DRAG BINDING BEGIN", normalized)
+
+    def test_virtual_cursor_injection_is_idempotent(self):
+        node, _, _ = self._emit()
+        tail = (
+            "global $prev_cursor_x\n"
+            "global $prev_cursor_y\n"
+            "global $cursor_delta_y\n"
+            "global $hs_8\n"
+            "global $hh_8\n"
+            "global $anim_handle_scale_8\n"
+            "global $r_hdl_8_x\n"
+            "global $r_hdl_8_y\n"
+            "[Present]\n"
+            "    ; --- MODEL DRAG BINDING BEGIN ---\n"
+            "    if $mouse_clicked == 1 && $is_dragging == 0 && $help == 1\n"
+            "        if $ssmtdrag_ui_detected_A >= 0 && ($ssmtdrag_ui_zone_A == 1)\n"
+            "            $is_dragging = 9\n"
+            "            $drag_action = 2\n"
+            "            $model_drag_capture = 1\n"
+            "            $drag_dx = 0\n"
+            "            $drag_dy = 0\n"
+            "        endif\n"
+            "    endif\n"
+            "    ; --- MODEL DRAG BINDING END ---\n"
+            "    $prev_cursor_x = cursor_x\n"
+            "    $prev_cursor_y = cursor_y\n"
+        )
+        once = node._normalize_ui_drag_references(tail, "testns")
+        twice = node._normalize_ui_drag_references(once, "testns")
+        self.assertEqual(twice, once)
+        self.assertEqual(once.count("global $model_drag_cursor_x = 0"), 1)
+        self.assertEqual(once.count("$model_drag_anchor_x = cursor_x"), 1)
+        self.assertEqual(once.count("$prev_cursor_x = ($r_hdl_8_x + ($hs_8*$zoom_global*$anim_handle_scale_8)*0.5)"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

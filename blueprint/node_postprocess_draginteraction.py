@@ -722,6 +722,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         """
         text = str(tail_content or "")
         text = self._dedupe_model_drag_binding_blocks(text)
+        text = self._strip_legacy_model_hit_test_blocks(text)
         marker = "; --- MODEL DRAG BINDING BEGIN ---"
         marker_index = text.find(marker)
         if marker_index < 0:
@@ -746,7 +747,154 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         for pattern, replacement in replacements:
             block = re.sub(pattern, lambda _m: replacement, block)
         block = re.sub(r"\$model_drag_prev_lmb\s*==\s*0\s*&&\s*", "", block)
-        return text[:start] + block + text[end_index:]
+        text = text[:start] + block + text[end_index:]
+        return self._inject_virtual_model_drag_cursor(text, ns)
+
+    @staticmethod
+    def _virtual_model_drag_ref(text, idx, axis):
+        if axis == 'x' and f'global $hs_{idx}' in text and f'global $r_hdl_{idx}_x' in text:
+            return f'($r_hdl_{idx}_x + ($hs_{idx}*$zoom_global*$anim_handle_scale_{idx})*0.5)'
+        if axis == 'y' and f'global $hh_{idx}' in text and f'global $r_hdl_{idx}_y' in text:
+            return f'($r_hdl_{idx}_y + ($hh_{idx}*$zoom_global*$anim_handle_scale_{idx})*0.5)'
+        if axis == 'x':
+            return f'($abs_x_{idx} + $abs_w_{idx}*0.5)'
+        return f'($abs_y_{idx} + $abs_h_{idx}*0.5)'
+
+    @classmethod
+    def _inject_virtual_model_drag_cursor(cls, text, ns):
+        """让旧版 UI 尾部在面板侧复用模型命中区域作为虚拟手柄光标。"""
+        text = str(text or '')
+        marker = '; --- MODEL DRAG BINDING BEGIN ---'
+        if marker not in text:
+            return text
+        if (
+            'global $model_drag_cursor_x = 0' in text and
+            'global $model_drag_anchor_x = 0' in text and
+            '$model_drag_ref_x' in text and
+            re.search(r'^\s*\$prev_cursor_x\s*=\s*\(\$', text, re.M)
+        ):
+            return text
+
+        eol = '\r\n' if '\r\n' in text else '\n'
+        lines = text.splitlines(keepends=True)
+        normalized = []
+        in_present = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('['):
+                in_present = stripped.startswith('[Present]')
+            if not in_present:
+                normalized.append(line)
+                continue
+            line = re.sub(r'(?<![A-Za-z0-9_$])cursor_x(?![A-Za-z0-9_])', '$model_drag_cursor_x', line)
+            line = re.sub(r'(?<![A-Za-z0-9_$])cursor_y(?![A-Za-z0-9_])', '$model_drag_cursor_y', line)
+            normalized.append(line)
+        text = ''.join(normalized)
+
+        if 'global $cursor_delta_y' in text and 'global $model_drag_cursor_x = 0' not in text:
+            text = text.replace(
+                'global $cursor_delta_y',
+                'global $cursor_delta_y' + eol +
+                'global $model_drag_cursor_x = 0' + eol +
+                'global $model_drag_cursor_y = 0' + eol +
+                'global $model_drag_anchor_x = 0' + eol +
+                'global $model_drag_anchor_y = 0' + eol +
+                'global $model_drag_ref_x = 0' + eol +
+                'global $model_drag_ref_y = 0',
+                1,
+            )
+
+        binding_indices = []
+        inside_block = False
+        for line in text.splitlines():
+            if marker in line:
+                inside_block = True
+                continue
+            if 'MODEL DRAG BINDING END' in line:
+                inside_block = False
+                continue
+            if inside_block:
+                match = re.search(r'\$is_dragging\s*=\s*(\d+)', line)
+                if match:
+                    binding_indices.append(int(match.group(1)) - 1)
+
+        setup_lines = [
+            '    $model_drag_cursor_x = cursor_x',
+            '    $model_drag_cursor_y = cursor_y',
+            '    if $model_drag_capture == 1',
+        ]
+        for idx in binding_indices:
+            setup_lines.extend([
+                f'        if $is_dragging == {idx + 1}',
+                '            $model_drag_cursor_x = $model_drag_ref_x + (cursor_x - $model_drag_anchor_x)',
+                '            $model_drag_cursor_y = $model_drag_ref_y + (cursor_y - $model_drag_anchor_y)',
+                '        endif',
+            ])
+        setup_lines.append('    endif')
+        setup = eol.join(setup_lines) + eol + eol
+        marker_index = text.find(marker)
+        line_start = text.rfind(eol, 0, marker_index)
+        line_start = 0 if line_start < 0 else line_start + len(eol)
+        if '$model_drag_cursor_x = cursor_x' not in text:
+            text = text[:line_start] + setup + text[line_start:]
+
+        lines = text.splitlines(keepends=True)
+        out = []
+        inside_block = False
+        current_idx = None
+        for line in lines:
+            out.append(line)
+            if marker in line:
+                inside_block = True
+                current_idx = None
+                continue
+            if 'MODEL DRAG BINDING END' in line:
+                inside_block = False
+                current_idx = None
+                continue
+            if not inside_block:
+                continue
+            match = re.search(r'\$is_dragging\s*=\s*(\d+)', line)
+            if match:
+                current_idx = int(match.group(1)) - 1
+            if '$model_drag_capture = 1' in line and current_idx is not None:
+                ref_x = cls._virtual_model_drag_ref(text, current_idx, 'x')
+                ref_y = cls._virtual_model_drag_ref(text, current_idx, 'y')
+                if '            $model_drag_ref_x = ' in text or '$model_drag_anchor_x = cursor_x' in text:
+                    if not re.search(r'^\s*\$prev_cursor_x\s*=\s*\(\$', text, re.M):
+                        out.extend([
+                            f'            $prev_cursor_x = {ref_x}' + eol,
+                            f'            $prev_cursor_y = {ref_y}' + eol,
+                        ])
+                else:
+                    out.extend([
+                    '            $model_drag_anchor_x = cursor_x' + eol,
+                    '            $model_drag_anchor_y = cursor_y' + eol,
+                    f'            $model_drag_ref_x = {ref_x}' + eol,
+                    f'            $model_drag_ref_y = {ref_y}' + eol,
+                    f'            $model_drag_cursor_x = {ref_x}' + eol,
+                    f'            $model_drag_cursor_y = {ref_y}' + eol,
+                    f'            $prev_cursor_x = {ref_x}' + eol,
+                    f'            $prev_cursor_y = {ref_y}' + eol,
+                    ])
+        return ''.join(out)
+
+    @staticmethod
+    def _strip_legacy_model_hit_test_blocks(text):
+        """Remove the temporary UI hit-test block from older exported tails."""
+        lines = str(text or "").splitlines(keepends=True)
+        out = []
+        inside = False
+        for line in lines:
+            if "; --- MODEL HIT TEST BEGIN ---" in line:
+                inside = True
+                continue
+            if "; --- MODEL HIT TEST END ---" in line:
+                inside = False
+                continue
+            if not inside:
+                out.append(line)
+        return "".join(out)
 
     @staticmethod
     def _dedupe_model_drag_binding_blocks(text):
