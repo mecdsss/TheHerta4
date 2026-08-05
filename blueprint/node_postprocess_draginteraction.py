@@ -1739,13 +1739,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # ---- 全局共享资源 ----
         global_resources = {
             f"[ResourceDragDetectID_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
-            f"[ResourceDragPinnedDetectID_{ns}]": [
-                "type = StructuredBuffer", "stride = 4", "array = 1", "data = R32_FLOAT -1",
-            ],
+            f"[ResourceDragPinnedDetectID_{ns}]": ["type = StructuredBuffer", "stride = 4", "array = 1"],
             f"[ResourceDragPinnedDetectInfo_{ns}]": ["type = StructuredBuffer", "stride = 16", "array = 15"],
-            f"[ResourceDragPinnedZone_{ns}]": [
-                "type = StructuredBuffer", "stride = 4", "array = 1", "data = R32_FLOAT -1",
-            ],
+            f"[ResourceDragPinnedZone_{ns}]": ["type = StructuredBuffer", "stride = 4", "array = 1"],
             f"[ResourceDragJiggleScreenState_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
             f"[ResourceDragPathProgressState_{ns}]": [
                 "type = RWBuffer", "format = R32_FLOAT",
@@ -1831,9 +1827,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"[ResourceDragComponentDetect_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
             f"[ResourceDragPinnedComponentID_{cn}_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
             f"[ResourceDragPinnedComponentInfo_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
-            f"[ResourceDragPinnedComponentZone_{cn}_{ns}]": [
-                "type = StructuredBuffer", "stride = 4", "array = 1", "data = R32_FLOAT -1",
-            ],
+            f"[ResourceDragPinnedComponentZone_{cn}_{ns}]": ["type = StructuredBuffer", "stride = 4", "array = 1"],
             f"[ResourceDragJiggleState_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 10"],
             # TempVB0：空声明段（type=RWBuffer，无 format/array），copy 往返后换绑
             f"[ResourceDragJiggleTempVB0_{cn}_{ns}]": ["type = RWBuffer"],
