@@ -145,6 +145,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     drag_key: bpy.props.StringProperty(name="拖拽键", default="VK_LBUTTON")
 
     button_height: bpy.props.FloatProperty(name="按钮高度", default=0.05, min=0.001, max=1.0, precision=4)
+    panel_min_height: bpy.props.FloatProperty(name="面板最小高度", default=0.75, min=0.01, max=1.0, precision=4)
 
     panel_default_scale: bpy.props.FloatProperty(
         name="面板默认缩放",
@@ -317,6 +318,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         col.prop(self, "panel_default_scale", text="面板默认缩放")
         col.separator()
         col.prop(self, "button_height", text="按钮高度")
+        col.prop(self, "panel_min_height", text="面板最小高度")
         col.label(text="按钮/面板背景尺寸按图片比例自动计算", icon='INFO')
 
         box = col_left.box()
@@ -946,6 +948,8 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         total_button_height = num_buttons * btn_h
         total_spacing_height = max(0, (num_buttons - 1) * spacing)
         parent_height = total_button_height + total_spacing_height + (top_bottom_padding * 2)
+        # 面板最小高度：自动计算高度过小时使用设置值
+        parent_height = max(parent_height, self.panel_min_height)
 
         # 面板背景尺寸：高度 = 按钮堆叠高度；宽度 = 面板高度 × 实际背景图宽高比（严格按所选图片自动计算）
         # 若无法读取背景图比例，则退化为仅包住最宽按钮（不采用任何固定比例）
