@@ -344,16 +344,6 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
                 re.sub(r'\$ssmtdrag_ui_zone_[A-Za-z0-9_]+', lambda _m: zone_var, line)
                 for line in normalized
             ]
-        for var in (detected_var, zone_var):
-            if var:
-                normalized = [
-                    re.sub(
-                        re.escape(var) + r'\s*>=\s*0',
-                        f'{var} != -1 && {var} != 4294967295',
-                        line,
-                    )
-                    for line in normalized
-                ]
         return normalized
 
     @staticmethod

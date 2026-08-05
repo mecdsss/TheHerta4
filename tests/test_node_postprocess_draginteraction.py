@@ -545,7 +545,6 @@ class DragNodeEmitTests(unittest.TestCase):
             f"[CustomShaderDragDetect{cn}_testns]",
             f"[CustomShaderDragJiggle{cn}_testns]",
             f"[CustomShaderDragPinDetected_testns]",
-            f"[CustomShaderDragUIPinReadback_testns]",
             f"[CustomShaderDragUpdateScreenJiggle_testns]",
             f"[CustomShaderDragPinComponent{cn}_testns]",
             f"[CommandListDragPinDetected_testns]",
@@ -876,49 +875,28 @@ class DragNodeEmitTests(unittest.TestCase):
         readback = "\n".join(sections.get("[CommandListDragUIReadback_testns]", []))
         self.assertIn("global $ssmtdrag_ui_detected_testns = -1", constants)
         self.assertIn("global $ssmtdrag_ui_zone_testns = -1", constants)
-        self.assertIn("run = CustomShaderDragUIPinReadback_testns", readback)
         self.assertIn(
-            "store = $ssmtdrag_ui_detected_testns, ref ResourceDragUIPinnedDetectID_testns, 0",
+            "store = $ssmtdrag_ui_detected_testns, ref ResourceDragPinnedDetectID_testns, 0",
             readback,
         )
         self.assertIn(
-            "store = $ssmtdrag_ui_zone_testns, ref ResourceDragUIPinnedZone_testns, 0",
+            "store = $ssmtdrag_ui_zone_testns, ref ResourceDragPinnedZone_testns, 0",
             readback,
         )
-        self.assertIn(
-            "if $ssmtdrag_ui_detected_testns != -1 && $ssmtdrag_ui_detected_testns != 4294967295",
-            readback,
-        )
+        self.assertIn("if $ssmtdrag_ui_detected_testns >= 0", readback)
         self.assertIn("$ssmtdrag_ui_detected_testns = -1", readback)
         self.assertIn("$ssmtdrag_ui_zone_testns = -1", readback)
         self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedDetectID_testns]"])
         self.assertIn("stride = 4", sections["[ResourceDragPinnedDetectID_testns]"])
         self.assertIn("data = R32_FLOAT -1", sections["[ResourceDragPinnedDetectID_testns]"])
-        ui_detect_res = sections["[ResourceDragUIPinnedDetectID_testns]"]
-        ui_zone_res = sections["[ResourceDragUIPinnedZone_testns]"]
-        self.assertIn("type = StructuredBuffer", ui_detect_res)
-        self.assertIn("stride = 4", ui_detect_res)
-        self.assertIn("data = R32_UINT 4294967295", ui_detect_res)
-        self.assertIn("type = StructuredBuffer", ui_zone_res)
-        self.assertIn("stride = 4", ui_zone_res)
-        self.assertIn("data = R32_UINT 4294967295", ui_zone_res)
         self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedDetectInfo_testns]"])
         self.assertIn("stride = 16", sections["[ResourceDragPinnedDetectInfo_testns]"])
         self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedZone_testns]"])
         self.assertIn("stride = 4", sections["[ResourceDragPinnedZone_testns]"])
         self.assertIn("data = R32_FLOAT -1", sections["[ResourceDragPinnedZone_testns]"])
         pin = "\n".join(sections["[CustomShaderDragPinDetected_testns]"])
-        pin_command = "\n".join(sections["[CommandListDragPinDetected_testns]"])
         component_pin = "\n".join(sections["[CustomShaderDragPinComponentabc123_43191_testns]"])
         self.assertIn("cs-u3 = ResourceDragPinnedZone_testns", pin)
-        self.assertIn("clear = ResourceDragUIPinnedDetectID_testns", pin_command)
-        self.assertIn("clear = ResourceDragUIPinnedZone_testns", pin_command)
-        pin_readback = "\n".join(sections["[CustomShaderDragUIPinReadback_testns]"])
-        self.assertIn("cs-t0 = ResourceDragPinnedDetectInfo_testns", pin_readback)
-        self.assertIn("cs-u0 = ResourceDragUIPinnedDetectID_testns", pin_readback)
-        self.assertIn("cs-u1 = ResourceDragUIPinnedZone_testns", pin_readback)
-        self.assertIn("clear = ResourceDragUIPinnedDetectID_testns", present)
-        self.assertIn("clear = ResourceDragUIPinnedZone_testns", present)
         self.assertIn("cs-u3 = ResourceDragPinnedComponentZone_abc123_43191_testns", component_pin)
         self.assertNotIn("cs-u3 = ResourceDragPinnedZone_testns", component_pin)
         self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedComponentZone_abc123_43191_testns]"])
@@ -978,9 +956,8 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("if $custom_drag_mode >= 1", pin)
         self.assertIn("if $custom_drag_mode >= 1", hook)
         self.assertIn("if $custom_drag_mode >= 2", hook)
-        self.assertIn("run = CustomShaderDragUIPinReadback_testns", readback)
-        self.assertIn("store = $custom_hit_id, ref ResourceDragUIPinnedDetectID_testns, 0", readback)
-        self.assertIn("store = $custom_zone_id, ref ResourceDragUIPinnedZone_testns, 0", readback)
+        self.assertIn("store = $custom_hit_id, ref ResourceDragPinnedDetectID_testns, 0", readback)
+        self.assertIn("store = $custom_zone_id, ref ResourceDragPinnedZone_testns, 0", readback)
 
     def test_drag_runtime_switch_defaults_on_and_upgrades_legacy_present(self):
         node, sections, comps = self._emit()

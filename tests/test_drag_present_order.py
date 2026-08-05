@@ -102,7 +102,6 @@ class DragPresentOrderTests(unittest.TestCase):
         node._emit_present_and_constants(sections, comps, "testns")
         readback = "\n".join(sections.get("[CommandListDragUIReadback_testns]", []))
         self.assertIn("DRAG UI BRIDGE BEGIN", readback)
-        self.assertIn("run = CustomShaderDragUIPinReadback_testns", readback)
         self.assertIn("store = $ssmtdrag_ui_detected_testns", readback)
         self.assertIn("store = $ssmtdrag_ui_zone_testns", readback)
 
@@ -148,30 +147,9 @@ class DragPresentOrderTests(unittest.TestCase):
         )
         normalized = node._normalize_ui_drag_references(tail, "testns")
         self.assertEqual(normalized.count("MODEL DRAG BINDING BEGIN"), 1)
-        self.assertIn(
-            "$ssmtdrag_ui_detected_testns != -1 && $ssmtdrag_ui_detected_testns != 4294967295",
-            normalized,
-        )
+        self.assertIn("$ssmtdrag_ui_detected_testns >= 0", normalized)
         self.assertIn("$ssmtdrag_ui_zone_testns == 1", normalized)
         self.assertNotIn("$model_drag_prev_lmb == 0", normalized)
-
-    def test_ui_tail_normalizes_any_zone_check_to_uint_sentinel_and_is_idempotent(self):
-        node, _, _ = self._emit()
-        tail = (
-            "    ; --- MODEL DRAG BINDING BEGIN ---\n"
-            "    if $ssmtdrag_ui_detected_A >= 0 && ($ssmtdrag_ui_zone_A >= 0)\n"
-            "        $is_dragging = 9\n"
-            "    endif\n"
-            "    ; --- MODEL DRAG BINDING END ---\n"
-        )
-        once = node._normalize_ui_drag_references(tail, "testns")
-        self.assertIn(
-            "$ssmtdrag_ui_zone_testns != -1 && $ssmtdrag_ui_zone_testns != 4294967295",
-            once,
-        )
-        self.assertNotIn("$ssmtdrag_ui_zone_testns >= 0", once)
-        twice = node._normalize_ui_drag_references(once, "testns")
-        self.assertEqual(twice, once)
 
     def test_old_ui_tail_gets_virtual_model_drag_cursor_bridge(self):
         node, _, _ = self._emit()
@@ -207,10 +185,7 @@ class DragPresentOrderTests(unittest.TestCase):
         self.assertIn("$model_drag_anchor_x = cursor_x", normalized)
         self.assertIn("$model_drag_ref_x = ($abs_x_8 + $abs_w_8*0.5)", normalized)
         self.assertIn("$prev_cursor_x = ($abs_x_8 + $abs_w_8*0.5)", normalized)
-        self.assertIn(
-            "$ssmtdrag_ui_detected_testns != -1 && $ssmtdrag_ui_detected_testns != 4294967295",
-            normalized,
-        )
+        self.assertIn("$ssmtdrag_ui_detected_testns >= 0", normalized)
         self.assertIn("if cursor_x > $d3", normalized)
 
     def test_old_ui_tail_virtual_cursor_uses_handle_reference(self):

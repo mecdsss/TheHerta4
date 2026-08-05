@@ -314,10 +314,6 @@ class NodePostprocessUIPanelTests(unittest.TestCase):
         self.assertEqual(result_text.count("DRAG PRESENT BEGIN"), 1)
         self.assertNotIn("fserfrse", result_text)
         self.assertIn("$ssmtdrag_ui_detected_A", result_text)
-        self.assertIn(
-            "$ssmtdrag_ui_detected_A != -1 && $ssmtdrag_ui_detected_A != 4294967295",
-            result_text,
-        )
         ui_block = result_text[result_text.index("; --- AUTO-APPENDED UI PANEL UIPanel ---"):]
         self.assertLess(
             ui_block.index("DRAG PRESENT BEGIN"),
@@ -346,10 +342,6 @@ class NodePostprocessUIPanelTests(unittest.TestCase):
         self.assertIn("$ssmtdrag_mode_A = $ssmtdrag_modifier_down_A", joined)
         self.assertNotIn("if $help == 1", joined)
         self.assertNotIn("$ssmtdrag_ui_detected_fserfrse", joined)
-        self.assertIn(
-            "$ssmtdrag_ui_detected_A != -1 && $ssmtdrag_ui_detected_A != 4294967295",
-            joined,
-        )
 
     def test_rerun_preserves_relocated_drag_present_block(self):
         with tempfile.TemporaryDirectory() as temp_dir:
