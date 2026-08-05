@@ -56,6 +56,7 @@ _install_module(
         "_FakePostProcessBase",
         (object,),
         {
+            "split_anim_driver_block_content": staticmethod(lambda content: ("", content)),
             "split_auto_appended_tail_content": staticmethod(
                 lambda content: (content, "")
             ),
@@ -361,11 +362,11 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
                 b"namespace = Example\\Mod\n; header\n\n[Constants]\nglobal $x = 1\n"
             )
 
-            sections, tail = node._read_ini_to_ordered_dict(str(ini_path))
+            sections, tail, _driver = node._read_ini_to_ordered_dict(str(ini_path))
             node._write_ordered_dict_to_ini(sections, str(ini_path), tail)
 
             first_output = ini_path.read_bytes()
-            sections, tail = node._read_ini_to_ordered_dict(str(ini_path))
+            sections, tail, _driver = node._read_ini_to_ordered_dict(str(ini_path))
             node._write_ordered_dict_to_ini(sections, str(ini_path), tail)
 
             output = ini_path.read_bytes()

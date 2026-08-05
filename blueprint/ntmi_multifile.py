@@ -64,7 +64,7 @@ class NTMIDirectMultiFileGenerator(DirectMultiFileGenerator):
             raise MultiFileDirectExportError("NTMI MultiFile: no ini file was found in the output directory.")
 
         self.target_ini_file = ini_files[0]
-        self.sections, self.preserved_tail_content = self.config_node._read_ini_to_ordered_dict(self.target_ini_file)
+        self.sections, self.preserved_tail_content, self.preserved_driver_content = self.config_node._read_ini_to_ordered_dict(self.target_ini_file)
         self.part_layouts = parse_ntmi_part_layouts(
             self.sections,
             output_dir=mod_export_path,
@@ -545,7 +545,7 @@ class NTMIDirectMultiFileGenerator(DirectMultiFileGenerator):
 
             sections[section_name] = patched_lines
 
-    def _update_ini_sections(self, sections, preserved_tail_content, target_ini_file, runtime_infos, generated_states):
+    def _update_ini_sections(self, sections, preserved_tail_content, target_ini_file, runtime_infos, generated_states, preserved_driver_content=""):
         dest_res_dir = os.path.join(self.mod_export_path, "res")
         os.makedirs(dest_res_dir, exist_ok=True)
 
@@ -634,7 +634,7 @@ class NTMIDirectMultiFileGenerator(DirectMultiFileGenerator):
         sections[constants_section] = constants_lines
         for section_name, lines in generated_sections.items():
             sections[section_name] = lines
-        self.config_node._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content)
+        self.config_node._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content, preserved_driver_content)
 
     def generate(self):
         self.config_node._create_cumulative_backup(self.target_ini_file, self.mod_export_path)
@@ -654,6 +654,7 @@ class NTMIDirectMultiFileGenerator(DirectMultiFileGenerator):
         self._update_ini_sections(
             sections=self.sections,
             preserved_tail_content=self.preserved_tail_content,
+            preserved_driver_content=self.preserved_driver_content,
             target_ini_file=self.target_ini_file,
             runtime_infos=runtime_infos,
             generated_states=generated_states,

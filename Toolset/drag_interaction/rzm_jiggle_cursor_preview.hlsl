@@ -4,7 +4,7 @@
 // deliberately a stable snapshot until a separately synchronised reprojection
 // pass is introduced.
 Buffer<float4> JiggleScreenState : register(t67);
-Buffer<float4> PinnedDetectInfo : register(t68);
+StructuredBuffer<float4> PinnedDetectInfo : register(t68);
 RWBuffer<float4> CursorPreview : register(u0);
 Texture1D<float4> IniParams : register(t120);
 

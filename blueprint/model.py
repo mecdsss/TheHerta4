@@ -488,11 +488,12 @@ class BluePrintModel:
 
     def _collect_postprocess_nodes(self, output_node: bpy.types.Node):
         self.postprocess_nodes = []
+        visited = set()
 
         for output_socket in output_node.outputs:
             if output_socket.bl_idname == 'SSMTSocketPostProcess' and output_socket.is_linked:
                 for link in output_socket.links:
-                    self._traverse_postprocess_chain(link.to_node)
+                    self._traverse_postprocess_chain(link.to_node, visited=visited)
 
         if self.postprocess_nodes:
             LOG.info(f"   🔧 收集到 {len(self.postprocess_nodes)} 个后处理节点")
@@ -504,6 +505,7 @@ class BluePrintModel:
             return
         existing_pp_keys = {_get_node_unique_key(n) for n in self.postprocess_nodes}
         nested_pp_count = 0
+        visited = set()
 
         for nested_tree in self.nested_blueprint_trees:
             nested_output = BlueprintExportHelper.get_node_from_bl_idname(nested_tree, _NODE_TYPE_RESULT_OUTPUT)
@@ -515,7 +517,11 @@ class BluePrintModel:
             for output_socket in nested_output.outputs:
                 if output_socket.bl_idname == 'SSMTSocketPostProcess' and output_socket.is_linked:
                     for link in output_socket.links:
-                        self._traverse_postprocess_chain(link.to_node, existing_keys=existing_pp_keys)
+                        self._traverse_postprocess_chain(
+                            link.to_node,
+                            visited=visited,
+                            existing_keys=existing_pp_keys,
+                        )
 
             if not any(_get_node_unique_key(n) in existing_pp_keys for n in nested_tree.nodes if _is_postprocess_node(n.bl_idname)):
                 for input_socket in nested_output.inputs:
@@ -524,7 +530,11 @@ class BluePrintModel:
                     for link in input_socket.links:
                         source = link.from_node
                         if _is_postprocess_node(source.bl_idname):
-                            self._traverse_postprocess_chain(source, existing_keys=existing_pp_keys)
+                            self._traverse_postprocess_chain(
+                                source,
+                                visited=visited,
+                                existing_keys=existing_pp_keys,
+                            )
 
             nested_in_tree = len(self.postprocess_nodes) - previous_postprocess_count
             existing_pp_keys.update(_get_node_unique_key(n) for n in self.postprocess_nodes)

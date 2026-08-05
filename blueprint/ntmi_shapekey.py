@@ -144,8 +144,8 @@ class NTMIShapeKeyNodeAdapter:
     def _read_ini_to_ordered_dict(self, ini_file_path):
         return self.original_node._read_ini_to_ordered_dict(ini_file_path)
 
-    def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content=""):
-        return self.original_node._write_ordered_dict_to_ini(sections, ini_file_path, preserved_tail_content)
+    def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content="", preserved_driver_content=""):
+        return self.original_node._write_ordered_dict_to_ini(sections, ini_file_path, preserved_tail_content, preserved_driver_content)
 
     def _calculate_vertex_range(self, ib_path, draw_params):
         normalized_ib_path = os.path.normcase(os.path.normpath(str(ib_path or "")))
@@ -488,7 +488,7 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
 
         self.original_node = node
         self.target_ini_file = ini_files[0]
-        sections, preserved_tail_content = node._read_ini_to_ordered_dict(self.target_ini_file)
+        sections, preserved_tail_content, preserved_driver_content = node._read_ini_to_ordered_dict(self.target_ini_file)
 
         adapter_node = NTMIShapeKeyNodeAdapter(
             original_node=node,
@@ -499,6 +499,7 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
         self.adapter_node = adapter_node
         self._sections = sections
         self._preserved_tail_content = preserved_tail_content
+        self._preserved_driver_content = preserved_driver_content
         self.mod_importer_root = str(getattr(exporter, "mod_importer_root", "") or "").strip()
         self._modimp_exporter_module = _load_ntmi_exporter_module(self.mod_importer_root)
         self._position_converter = _load_ntmi_position_converter(mod_export_path, self.mod_importer_root)
@@ -795,6 +796,7 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
         use_delta,
         use_optimized,
         merge_slot_files,
+        preserved_driver_content="",
     ):
         del slot_to_name_to_objects, all_unique_objects, hash_to_base_resources
 
@@ -958,7 +960,7 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
             sections[section_name] = lines
         for section_name, lines in compute_sections.items():
             sections[section_name] = lines
-        self.original_node._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content)
+        self.original_node._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content, preserved_driver_content)
 
 
 def execute_ntmi_shapekey_postprocess(node, output_dir: str, blueprint_model, exporter):

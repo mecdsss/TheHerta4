@@ -154,8 +154,12 @@ def _make_node(mod, **props):
     """实例化节点类并注入属性默认值（绕过 bpy 属性系统）。"""
     node = mod.SSMTNode_PostProcess_DragInteraction.__new__(mod.SSMTNode_PostProcess_DragInteraction)
     defaults = dict(
-        hash_values="", mod_namespace="", grab_key="ALT", grab_gesture="LMB",
+        hash_values="", mod_namespace="", grab_key="ALT", grab_gesture="LMB", poke_gesture="RMB",
         enable_poke=True, enable_hand_cursor=False, enable_viewport_probe=True,
+        drag_system_mode_default=2, drag_mode_initialized=True,
+        drag_mode_variable_name="ssmtdrag_drag_enabled",
+        ui_detected_variable_name="ssmtdrag_ui_detected",
+        ui_zone_variable_name="ssmtdrag_ui_zone",
         phys_grab_damping=0.86, phys_grab_spring=0.176,
         phys_release_damping=0.96, phys_release_spring=0.055,
         phys_release_kick=0.12, phys_target_follow=1.10,
@@ -397,7 +401,7 @@ class DragNodeLocateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             ini_path = Path(td) / "test.ini"
             ini_path.write_text(content, encoding="utf-8")
-            sections, preserved_tail = node._read_ini_to_ordered_dict(str(ini_path))
+            sections, preserved_tail, _preserved_driver = node._read_ini_to_ordered_dict(str(ini_path))
 
         self.assertIn("[Constants]", sections)
         self.assertIn("drawindexed = 3, 0, 0", sections["[TextureOverride_Test]"])
@@ -409,6 +413,40 @@ class DragNodeLocateTests(unittest.TestCase):
         self.assertIn("; --- AUTO-APPENDED HEALTH DETECTION MODULE ---", preserved_tail)
         self.assertIn("[ResourceHealth]", preserved_tail)
 
+
+    def test_read_and_write_preserve_anim_driver_top_block(self):
+        import tempfile
+
+        node = _make_node(self.mod)
+        driver_block = (
+            "; --- ANIMATION DRIVER SECTION ---\n"
+            "[Constants]\n"
+            "global $driver_state = 0\n"
+            "[Present]\n"
+            "post $driver_state = 0\n"
+            "; --- END ANIMATION DRIVER SECTION ---\n"
+        )
+        body = (
+            "[Constants]\n"
+            "global $body_state = 0\n"
+            "[TextureOverride_Test]\n"
+            "hash = abc123\n"
+            "ib = ResourceTestIB\n"
+            "drawindexed = 3, 0, 0\n"
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            ini_path = Path(td) / "test.ini"
+            ini_path.write_text(driver_block + "\n" + body, encoding="utf-8")
+            sections, preserved_tail, preserved_driver = node._read_ini_to_ordered_dict(str(ini_path))
+            node._write_ordered_dict_to_ini(sections, str(ini_path), preserved_tail, preserved_driver)
+            written = ini_path.read_text(encoding="utf-8")
+
+        self.assertIn("; --- ANIMATION DRIVER SECTION ---", written)
+        self.assertIn("; --- END ANIMATION DRIVER SECTION ---", written)
+        self.assertIn("global $driver_state = 0", written)
+        self.assertIn("global $body_state = 0", written)
+        self.assertNotIn("global $driver_state", sections["[Constants]"])
 
 class DragNodeObjectMapTests(unittest.TestCase):
     @classmethod
@@ -727,6 +765,45 @@ class DragNodeEmitTests(unittest.TestCase):
             present_text = "\n".join(sections["[Present]"])
             self.assertIn(expect, present_text, f"手势模式 {gesture} 的判定行缺失")
 
+    def test_default_rmb_poke_pushes_into_mesh(self):
+        node = _make_node(self.mod, grab_gesture='LMB', poke_gesture='RMB')
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_present_and_constants(sections, comps, "testns")
+        present = "\n".join(sections["[Present]"])
+
+        self.assertIn(
+            "if $ssmtdrag_rmb_prev_testns == 1 && $ssmtdrag_rmb_down_testns == 0\n"
+            "\t\t$ssmtdrag_poke_sign_testns = -1",
+            present,
+        )
+        self.assertNotIn(
+            "if $ssmtdrag_lmb_prev_testns == 1 && $ssmtdrag_lmb_down_testns == 0\n"
+            "\t\t$ssmtdrag_poke_sign_testns = 1",
+            present,
+        )
+
+    def test_poke_gesture_can_select_lmb_or_both_buttons_and_always_pushes_inward(self):
+        for gesture, expect_lmb, expect_rmb in (
+            ('LMB', True, False),
+            ('BOTH', True, True),
+        ):
+            node = _make_node(self.mod, grab_gesture='COMBO', poke_gesture=gesture)
+            sections = _base_sections()
+            comps = node._locate_components(sections, ["abc123"])
+            node._emit_present_and_constants(sections, comps, "testns")
+            present = "\n".join(sections["[Present]"])
+            lmb_release = (
+                "if $ssmtdrag_lmb_prev_testns == 1 && $ssmtdrag_lmb_down_testns == 0\n"
+                "\t\t$ssmtdrag_poke_sign_testns = -1"
+            )
+            rmb_release = (
+                "if $ssmtdrag_rmb_prev_testns == 1 && $ssmtdrag_rmb_down_testns == 0\n"
+                "\t\t$ssmtdrag_poke_sign_testns = -1"
+            )
+            self.assertEqual(lmb_release in present, expect_lmb, gesture)
+            self.assertEqual(rmb_release in present, expect_rmb, gesture)
+
     def test_bake_rt_matches_original(self):
         """BakeRT 必须与原作 ResourceLLBakeRT 一致（bind_flags/mode/mips/format 全齐）。"""
         _, sections, _ = self._emit()
@@ -763,18 +840,24 @@ class DragNodeEmitTests(unittest.TestCase):
 
         constants = "\n".join(sections["[Constants]"])
         present = "\n".join(sections["[Present]"])
+        readback = "\n".join(sections.get("[CommandListDragUIReadback_testns]", []))
         self.assertIn("global $ssmtdrag_ui_detected_testns = -1", constants)
         self.assertIn("global $ssmtdrag_ui_zone_testns = -1", constants)
         self.assertIn(
             "store = $ssmtdrag_ui_detected_testns, ref ResourceDragPinnedDetectID_testns, 0",
-            present,
+            readback,
         )
         self.assertIn(
             "store = $ssmtdrag_ui_zone_testns, ref ResourceDragPinnedDetectInfo_testns, 31",
-            present,
+            readback,
         )
-        self.assertIn("$ssmtdrag_ui_detected_testns = -1", present)
-        self.assertIn("$ssmtdrag_ui_zone_testns = -1", present)
+        self.assertIn("if $ssmtdrag_ui_detected_testns >= 0", readback)
+        self.assertIn("$ssmtdrag_ui_detected_testns = -1", readback)
+        self.assertIn("$ssmtdrag_ui_zone_testns = -1", readback)
+        self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedDetectID_testns]"])
+        self.assertIn("stride = 4", sections["[ResourceDragPinnedDetectID_testns]"])
+        self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedDetectInfo_testns]"])
+        self.assertIn("stride = 16", sections["[ResourceDragPinnedDetectInfo_testns]"])
 
         # 旧版 Present 已存在时仍可幂等补齐桥接，而不是被提前 return 跳过。
         legacy_sections = _base_sections()
@@ -784,26 +867,53 @@ class DragNodeEmitTests(unittest.TestCase):
             "; --- DRAG PRESENT END ---",
         ]
         node._emit_present_and_constants(legacy_sections, comps, "testns")
-        upgraded = "\n".join(legacy_sections["[Present]"])
-        self.assertEqual(upgraded.count("DRAG UI BRIDGE BEGIN"), 1)
+        readback = "\n".join(legacy_sections.get("[CommandListDragUIReadback_testns]", []))
+        self.assertEqual(readback.count("DRAG UI BRIDGE BEGIN"), 1)
         node._emit_present_and_constants(legacy_sections, comps, "testns")
-        self.assertEqual("\n".join(legacy_sections["[Present]"]).count("DRAG UI BRIDGE BEGIN"), 1)
+        self.assertEqual(readback.count("DRAG UI BRIDGE BEGIN"), 1)
 
-    def test_drag_runtime_switch_gates_interaction_but_not_detection(self):
-        node, sections, comps = self._emit(drag_enabled_default=False, enable_hand_cursor=True)
+    def test_drag_runtime_mode_one_keeps_detection_but_disables_deformation(self):
+        node, sections, comps = self._emit(drag_system_mode_default=1, enable_hand_cursor=True)
         node._emit_present_and_constants(sections, comps, "testns")
 
         constants = "\n".join(sections["[Constants]"])
         present = "\n".join(sections["[Present]"])
         pin = "\n".join(sections["[CommandListDragPinDetected_testns]"])
-        self.assertIn("global persist $ssmtdrag_drag_enabled_testns = 0", constants)
-        self.assertIn("if $ssmtdrag_drag_enabled_testns == 0", present)
+        hook = "\n".join(node._build_hook_block(comps[0], 0, "testns"))
+        self.assertIn("global persist $ssmtdrag_drag_enabled_testns = 1", constants)
+        self.assertIn("if $ssmtdrag_drag_enabled_testns < 2", present)
         self.assertIn("$isMouseButtonDown = 0", present)
         self.assertIn("$ssmtdrag_poke_sign_testns = 0", present)
         self.assertIn("$ssmtdrag_rmb_lone_hold_testns = 0", present)
-        # 开关不得参与检测调度，否则关闭后 UI 区域桥接也会失去命中。
-        self.assertNotIn("ssmtdrag_drag_enabled", pin)
+        self.assertIn("$ssmtdrag_drag_enabled_testns >= 1", pin)
         self.assertIn("run = CustomShaderDragPinDetected_testns", pin)
+        self.assertIn("$ssmtdrag_drag_enabled_testns >= 1", hook)
+        self.assertIn("$ssmtdrag_drag_enabled_testns >= 2", hook)
+
+    def test_drag_runtime_mode_zero_and_custom_variables_disable_entire_system(self):
+        node, sections, comps = self._emit(
+            drag_system_mode_default=0,
+            drag_mode_variable_name="$custom_drag_mode",
+            ui_detected_variable_name="$custom_hit_id",
+            ui_zone_variable_name="$custom_zone_id",
+        )
+        node._emit_present_and_constants(sections, comps, "testns")
+
+        constants = "\n".join(sections["[Constants]"])
+        present = "\n".join(sections["[Present]"])
+        readback = "\n".join(sections.get("[CommandListDragUIReadback_testns]", []))
+        pin = "\n".join(sections["[CommandListDragPinDetected_testns]"])
+        hook = "\n".join(node._build_hook_block(comps[0], 0, "testns"))
+        self.assertIn("global persist $custom_drag_mode = 0", constants)
+        self.assertIn("global $custom_hit_id = -1", constants)
+        self.assertIn("global $custom_zone_id = -1", constants)
+        self.assertNotIn("global persist $ssmtdrag_drag_enabled_testns", constants)
+        self.assertIn("if $custom_drag_mode < 1", present)
+        self.assertIn("if $custom_drag_mode >= 1", pin)
+        self.assertIn("if $custom_drag_mode >= 1", hook)
+        self.assertIn("if $custom_drag_mode >= 2", hook)
+        self.assertIn("store = $custom_hit_id, ref ResourceDragPinnedDetectID_testns, 0", readback)
+        self.assertIn("store = $custom_zone_id, ref ResourceDragPinnedDetectInfo_testns, 31", readback)
 
     def test_drag_runtime_switch_defaults_on_and_upgrades_legacy_present(self):
         node, sections, comps = self._emit()
@@ -819,11 +929,32 @@ class DragNodeEmitTests(unittest.TestCase):
         node._emit_present_and_constants(sections, comps, "testns")
         constants = "\n".join(sections["[Constants]"])
         present = "\n".join(sections["[Present]"])
-        self.assertIn("global persist $ssmtdrag_drag_enabled_testns = 1", constants)
+        self.assertIn("global persist $ssmtdrag_drag_enabled_testns = 2", constants)
         self.assertEqual(present.count("DRAG INTERACTION GATE BEGIN"), 1)
         self.assertLess(present.index("DRAG INTERACTION GATE BEGIN"), present.index("pre run = CommandListDragPinDetected_testns"))
         node._emit_present_and_constants(sections, comps, "testns")
         self.assertEqual("\n".join(sections["[Present]"]).count("DRAG INTERACTION GATE BEGIN"), 1)
+
+    def test_legacy_boolean_drag_enabled_migrates_to_three_level_mode(self):
+        mod = self.mod
+        legacy_off = _make_node(
+            mod,
+            drag_enabled_default=False,
+            drag_system_mode_default=2,
+            drag_mode_initialized=False,
+        )
+        self.assertEqual(legacy_off._default_drag_system_mode(), 1)
+        self.assertEqual(legacy_off.drag_system_mode_default, 1)
+        self.assertTrue(legacy_off.drag_mode_initialized)
+
+        legacy_on = _make_node(
+            mod,
+            drag_enabled_default=True,
+            drag_system_mode_default=0,
+            drag_mode_initialized=False,
+        )
+        self.assertEqual(legacy_on._default_drag_system_mode(), 2)
+        self.assertEqual(legacy_on.drag_system_mode_default, 2)
 
     def test_no_zone_fallback_zone0_remains_grabbable(self):
         import tempfile
@@ -940,7 +1071,7 @@ class DragNodeInjectTests(unittest.TestCase):
             node._write_ordered_dict_to_ini(initial_sections, str(ini_path))
 
             for _generation in range(2):
-                sections, preserved_tail = node._read_ini_to_ordered_dict(str(ini_path))
+                sections, preserved_tail, _preserved_driver = node._read_ini_to_ordered_dict(str(ini_path))
                 comps = node._locate_components(sections, ["abc123"])
                 node._emit_sections(sections, comps, "testns")
                 for comp in comps:

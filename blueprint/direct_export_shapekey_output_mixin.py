@@ -411,6 +411,7 @@ class DirectShapeKeyOutputMixin:
         use_delta,
         use_optimized,
         merge_slot_files,
+        preserved_driver_content="",
     ):
         if '[Constants]' not in sections:
             sections['[Constants]'] = []
@@ -733,4 +734,4 @@ class DirectShapeKeyOutputMixin:
                 )
 
         sections.update(compute_blocks_to_add)
-        self.node._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content)
+        self.node._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content, preserved_driver_content)

@@ -166,7 +166,7 @@ class DirectShapeKeyGenerator(
 
         target_ini_file = ini_files[0]
         self.node._create_cumulative_backup(target_ini_file, self.mod_export_path)
-        sections, preserved_tail_content = self.node._read_ini_to_ordered_dict(target_ini_file)
+        sections, preserved_tail_content, preserved_driver_content = self.node._read_ini_to_ordered_dict(target_ini_file)
 
         slot_to_name_to_objects, unique_hashes, hash_to_objects, all_objects = self.node._parse_classification_text_final(
             classification_text_obj.as_string()
@@ -422,6 +422,7 @@ class DirectShapeKeyGenerator(
         self._update_ini_sections(
             sections=sections,
             preserved_tail_content=preserved_tail_content,
+            preserved_driver_content=preserved_driver_content,
             target_ini_file=target_ini_file,
             slot_to_name_to_objects=slot_to_name_to_objects,
             unique_hashes=processed_hashes,

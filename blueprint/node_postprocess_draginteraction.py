@@ -14,6 +14,7 @@ except ImportError:
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 from . import deform_chain
+from .variable_registry import normalize_variable_name
 from ..common.object_prefix_helper import ObjectPrefixHelper
 from ..common.mod_path_compat import (
     find_base_position_resource_name,
@@ -275,13 +276,47 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         default='LMB',
     )
     enable_poke: bpy.props.BoolProperty(name="启用戳", default=True)
+    poke_gesture: bpy.props.EnumProperty(
+        name="戳按键",
+        description="选择释放时触发向内戳击的鼠标按键；与抓取手势使用同一按键时，抓取优先",
+        items=[
+            ('RMB', "右键", "右键点击释放后沿表面法线向内戳"),
+            ('LMB', "左键", "左键点击释放后沿表面法线向内戳"),
+            ('BOTH', "左右键", "左键或右键点击释放后均向内戳"),
+        ],
+        default='RMB',
+    )
     drag_enabled_default: bpy.props.BoolProperty(
-        name="默认启用模型拖拽",
+        name="旧版默认拖拽开关",
         default=True,
-        description=(
-            "生成运行时变量 $ssmtdrag_drag_enabled_<后缀> 的默认值。"
-            "关闭该变量时仍执行鼠标命中检测并更新命中 ID/区域，仅停止抓取、戳击和模型形变输入"
-        ),
+        options={'HIDDEN'},
+    )
+    drag_system_mode_default: bpy.props.IntProperty(
+        name="默认运行模式",
+        description="0=完全关闭，1=仅命中检测，2=命中检测并允许模型变形",
+        default=2,
+        min=0,
+        max=2,
+    )
+    drag_mode_initialized: bpy.props.BoolProperty(
+        name="运行模式已迁移",
+        default=False,
+        options={'HIDDEN'},
+    )
+    drag_mode_variable_name: bpy.props.StringProperty(
+        name="运行模式变量",
+        description="预分配运行模式变量；保留默认名时自动附加命名空间后缀，也可输入自定义全局变量名",
+        default="ssmtdrag_drag_enabled",
+    )
+    ui_detected_variable_name: bpy.props.StringProperty(
+        name="命中绘制 ID 变量",
+        description="预分配鼠标当前命中绘制 ID 的只读联动变量；未命中时为 -1",
+        default="ssmtdrag_ui_detected",
+    )
+    ui_zone_variable_name: bpy.props.StringProperty(
+        name="命中区域 ID 变量",
+        description="预分配鼠标当前命中稳定区域 ID 的只读联动变量；编号与节点区域 ID 完全一致",
+        default="ssmtdrag_ui_zone",
     )
     enable_hand_cursor: bpy.props.BoolProperty(
         name="启用手型光标",
@@ -349,6 +384,41 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         poll=lambda self, obj: obj.type == 'MESH',
     )
 
+    _RUNTIME_VARIABLE_DEFAULTS = {
+        "drag_mode_variable_name": "ssmtdrag_drag_enabled",
+        "ui_detected_variable_name": "ssmtdrag_ui_detected",
+        "ui_zone_variable_name": "ssmtdrag_ui_zone",
+    }
+
+    def init(self, context):
+        super().init(context)
+        self.drag_system_mode_default = 2 if self.drag_enabled_default else 1
+        self.drag_mode_initialized = True
+
+    def _default_drag_system_mode(self):
+        if not getattr(self, "drag_mode_initialized", False):
+            mode = 2 if getattr(self, "drag_enabled_default", True) else 1
+            try:
+                self.drag_system_mode_default = mode
+                self.drag_mode_initialized = True
+            except Exception:
+                pass
+            return mode
+        return min(max(int(getattr(self, "drag_system_mode_default", 2)), 0), 2)
+
+    def _runtime_variable_name(self, property_name, ns):
+        default_base = self._RUNTIME_VARIABLE_DEFAULTS[property_name]
+        raw_name = normalize_variable_name(getattr(self, property_name, ""))
+        resolved = f"{default_base}_{ns}" if not raw_name or raw_name == default_base else raw_name
+        return f"${resolved}"
+
+    def _runtime_variable_names(self, ns):
+        return (
+            self._runtime_variable_name("drag_mode_variable_name", ns),
+            self._runtime_variable_name("ui_detected_variable_name", ns),
+            self._runtime_variable_name("ui_zone_variable_name", ns),
+        )
+
     # =======================================================================
     # UI
     # =======================================================================
@@ -361,8 +431,22 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         row.prop(self, "grab_gesture")
         row = layout.row(align=True)
         row.prop(self, "enable_poke")
-        row.prop(self, "enable_hand_cursor")
-        layout.prop(self, "drag_enabled_default")
+        poke_row = row.row(align=True)
+        poke_row.enabled = self.enable_poke
+        poke_row.prop(self, "poke_gesture")
+        layout.prop(self, "enable_hand_cursor")
+
+        runtime_box = layout.box()
+        runtime_box.label(text="运行时联动变量", icon='DRIVER')
+        row = runtime_box.row(align=True)
+        row.prop(self, "drag_system_mode_default", text="默认模式")
+        row.prop(self, "drag_mode_variable_name", text="")
+        row = runtime_box.row(align=True)
+        row.label(text="命中绘制 ID")
+        row.prop(self, "ui_detected_variable_name", text="")
+        row = runtime_box.row(align=True)
+        row.label(text="命中区域 ID")
+        row.prop(self, "ui_zone_variable_name", text="")
 
         box = layout.box()
         box.label(text="全局物理档案（弹簧常数）", icon='PHYSICS')
@@ -569,9 +653,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         sections = OrderedDict()
         current_section = None
         preserved_tail_content = ""
+        preserved_driver_content = ""
         try:
             with open(ini_file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
+            preserved_driver_content, content = self.split_anim_driver_block_content(content)
             content, preserved_tail_content = self.split_auto_appended_tail_content(content)
             preserved_tail_content = self._remove_existing_drag_tail_block(preserved_tail_content)
             for line in content.splitlines():
@@ -583,11 +669,153 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     sections[current_section].append(line)
             self._remove_existing_draw_hooks(sections)
         except FileNotFoundError:
-            return None, ""
-        return sections, preserved_tail_content
+            return None, "", ""
+        return sections, preserved_tail_content, preserved_driver_content
 
-    def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content=""):
+    @staticmethod
+    def _strip_legacy_help_mode_block(text):
+        """Remove every old help-gated drag-mode override from UI tails."""
+        lines = str(text or "").splitlines(keepends=True)
+        changed = True
+        while changed:
+            changed = False
+            for index, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped != "if $help == 1":
+                    continue
+                body_parts = "".join(lines[index:index + 4]).lower()
+                if "$ssmtdrag_mode_" not in body_parts:
+                    continue
+                depth = 1
+                end = None
+                for j in range(index + 1, len(lines)):
+                    current = lines[j].strip()
+                    if current.startswith("if "):
+                        depth += 1
+                    elif current == "endif":
+                        depth -= 1
+                        if depth == 0:
+                            end = j
+                            break
+                if end is None:
+                    continue
+                body = "".join(lines[index:end + 1])
+                if "$ssmtdrag_mode_" not in body:
+                    continue
+                del lines[index:end + 1]
+                if index < len(lines) and lines[index].strip() == "":
+                    del lines[index]
+                elif index > 0 and lines[index - 1].strip() == "":
+                    del lines[index - 1]
+                changed = True
+                break
+        return "".join(lines)
+
+    def _normalize_ui_drag_references(self, tail_content, ns):
+        """Align UI-generated model-drag variables with this node's actual namespace.
+
+        The UI panel is kept as an auto-appended tail block, so it can be exported
+        before the drag node suffix is known. Rewriting only the small block around
+        the model-drag binding marker avoids touching other drag modules in the same
+        tail while making the UI read the same globals that this node declares.
+        """
+        text = str(tail_content or "")
+        marker = "; --- MODEL DRAG BINDING BEGIN ---"
+        marker_index = text.find(marker)
+        if marker_index < 0:
+            return text
+
+        text = self._strip_legacy_help_mode_block(text[:marker_index]) + text[marker_index:]
+        marker_index = text.find(marker)
+        end_marker = "; --- MODEL DRAG BINDING END ---"
+        end_index = text.find(end_marker, marker_index)
+        if end_index < 0:
+            end_index = len(text)
+        else:
+            end_index += len(end_marker)
+
+        start = text.rfind("\n", 0, marker_index) + 1
+        block = text[start:end_index]
+        _drag_mode_var, ui_detected_var, ui_zone_var = self._runtime_variable_names(ns)
+        replacements = [
+            (r"\$ssmtdrag_ui_detected_([A-Za-z0-9_]+)", ui_detected_var),
+            (r"\$ssmtdrag_ui_zone_([A-Za-z0-9_]+)", ui_zone_var),
+        ]
+        for pattern, replacement in replacements:
+            block = re.sub(pattern, lambda _m: replacement, block)
+        return text[:start] + block + text[end_index:]
+
+    @staticmethod
+    def _extract_drag_present_block(present_lines):
+        start = next(
+            (i for i, line in enumerate(present_lines) if "; --- DRAG PRESENT BEGIN ---" in line),
+            None,
+        )
+        if start is None:
+            return None
+        end = next(
+            (i for i in range(start + 1, len(present_lines))
+             if "; --- DRAG PRESENT END ---" in present_lines[i]),
+            None,
+        )
+        if end is None:
+            return None
+        block = present_lines[start:end + 1]
+        del present_lines[start:end + 1]
+        return block
+
+    def _relocate_drag_present_into_ui_tail(self, sections, tail_content):
+        """Put the drag Present block in the same [Present] as the UI binding.
+
+        The UI panel is preserved as an auto-appended tail with its own
+        [Present] section. Moving the generated drag block in front of the UI
+        model-drag marker removes any dependence on duplicate [Present] order
+        and makes the bridge variables available on the exact binding frame.
+        """
+        text = str(tail_content or "")
+        if "; --- MODEL DRAG BINDING BEGIN ---" not in text:
+            return text
+
+        lines = text.splitlines(keepends=True)
+        tail_block = None
+        begin = next(
+            (i for i, line in enumerate(lines) if "; --- DRAG PRESENT BEGIN ---" in line),
+            None,
+        )
+        if begin is not None:
+            end = next(
+                (i for i in range(begin + 1, len(lines)) if "; --- DRAG PRESENT END ---" in lines[i]),
+                None,
+            )
+            if end is not None:
+                tail_block = lines[begin:end + 1]
+                del lines[begin:end + 1]
+
+        block = self._extract_drag_present_block(sections.get("[Present]", []))
+        if block is None:
+            block = tail_block
+        if block is None:
+            return "".join(lines)
+        marker_idx = next(
+            (i for i, line in enumerate(lines) if "; --- MODEL DRAG BINDING BEGIN ---" in line),
+            None,
+        )
+        if marker_idx is None:
+            return "".join(lines)
+        block_text = "\n".join(block) + "\n"
+        lines[marker_idx:marker_idx] = block_text.splitlines(keepends=True)
+        return "".join(lines)
+
+    def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content="", preserved_driver_content="", ns=None):
+        if ns:
+            preserved_tail_content = self._relocate_drag_present_into_ui_tail(sections, preserved_tail_content)
+            preserved_tail_content = self._normalize_ui_drag_references(preserved_tail_content, ns)
         with open(ini_file_path, 'w', encoding='utf-8') as f:
+            if preserved_driver_content:
+                f.write(preserved_driver_content)
+                if not preserved_driver_content.endswith(chr(10)):
+                    f.write(chr(10))
+                f.write(chr(10))
             for section_name, lines in sections.items():
                 f.write(f"{section_name}\n")
                 for line in lines:
@@ -618,7 +846,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     def _resolve_namespace(self, ini_file_path):
         if self.mod_namespace.strip():
-            return re.sub(r'\W+', '_', self.mod_namespace.strip()).lower()
+            return re.sub(r'\W+', '_', self.mod_namespace.strip())
         base = os.path.splitext(os.path.basename(ini_file_path))[0]
         return re.sub(r'\W+', '_', base).lower()
 
@@ -670,7 +898,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
         for ini_file in ini_files:
             ini_path = os.path.join(mod_export_path, ini_file)
-            sections, preserved_tail = self._read_ini_to_ordered_dict(ini_path)
+            sections, preserved_tail, preserved_driver = self._read_ini_to_ordered_dict(ini_path)
             if not sections:
                 continue
 
@@ -700,7 +928,13 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # 5) 变形接力终态规整（幂等，含多文件/形态键条件锚定）
             deform_chain.finalize_deform_chain(sections)
 
-            self._write_ordered_dict_to_ini(sections, ini_path, preserved_tail)
+            self._write_ordered_dict_to_ini(
+                sections,
+                ini_path,
+                preserved_tail,
+                preserved_driver,
+                ns,
+            )
             print(f"[DragInteraction] 已注入 {len(components)} 个组件到 {ini_file}")
 
         print("[DragInteraction] 完成")
@@ -1472,8 +1706,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # ---- 全局共享资源 ----
         global_resources = {
             f"[ResourceDragDetectID_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
-            f"[ResourceDragPinnedDetectID_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
-            f"[ResourceDragPinnedDetectInfo_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
+            f"[ResourceDragPinnedDetectID_{ns}]": ["type = StructuredBuffer", "stride = 4", "array = 1"],
+            f"[ResourceDragPinnedDetectInfo_{ns}]": ["type = StructuredBuffer", "stride = 16", "array = 15"],
             f"[ResourceDragJiggleScreenState_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
             f"[ResourceDragPathProgressState_{ns}]": [
                 "type = RWBuffer", "format = R32_FLOAT",
@@ -1838,6 +2072,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # ---- CommandList：PinDetected（boot-clear + dt 钳制 + 门槛）/ Viewport / Cursor ----
 
     def _emit_command_lists(self, sections, components, ns):
+        drag_mode_var, _ui_detected_var, _ui_zone_var = self._runtime_variable_names(ns)
         # PinDetected
         pin_sec = f"[CommandListDragPinDetected_{ns}]"
         if pin_sec not in sections:
@@ -1845,8 +2080,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 # boot-clear：RWBuffer 初始内容未定义，首帧垃圾会假命中/假位移
                 f"if $ssmtdrag_booted_{ns} == 0",
                 f"\tclear = ResourceDragDetectID_{ns} 0.0",
-                f"\tclear = ResourceDragPinnedDetectID_{ns} 0.0",
-                f"\tclear = ResourceDragPinnedDetectInfo_{ns} 0.0",
+                f"\tclear = ResourceDragPinnedDetectID_{ns}",
+                f"\tclear = ResourceDragPinnedDetectInfo_{ns}",
                 f"\tclear = ResourceDragJiggleScreenState_{ns} 0.0",
                 f"\tclear = ResourceDragPathProgressState_{ns} 0.0",
                 f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
@@ -1884,7 +2119,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "\t$ssmtdrag_detect_next_time = time",
                 "endif",
                 "",
-                f"if $inputMode == 0 && $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1",
+                f"if {drag_mode_var} >= 1 && $inputMode == 0 && $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1",
                 f"\t$ObjectDetectAllowed_{ns} = 1",
                 f"\trun = CustomShaderDragPinDetected_{ns}",
             ])
@@ -2187,6 +2422,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         return ib_idx + 1
 
     def _build_hook_block(self, comp, p_idx, ns):
+        drag_mode_var, _ui_detected_var, _ui_zone_var = self._runtime_variable_names(ns)
         cn = comp["comp_name"]
         part_tag = f"{cn}P{p_idx}"
         temp_vb0 = f"ResourceDragJiggleTempVB0_{cn}_{ns}"
@@ -2195,17 +2431,17 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if self.enable_viewport_probe:
             # 视口探针快照：armed 且尚无快照时，抓本帧角色渲染 RT 供探针分析视口矩形
             lines.extend([
-                f"\tif $ssmtdrag_viewport_probe_armed_{ns} == 1 && ResourceDragViewportSource_{ns} === null",
+                f"\tif {drag_mode_var} >= 1 && $ssmtdrag_viewport_probe_armed_{ns} == 1 && ResourceDragViewportSource_{ns} === null",
                 f"\t\tResourceDragViewportSource_{ns} = copy o0 unless_null",
                 "\tendif",
             ])
         lines.extend([
             f"\t$ssmtdrag_drawn_{ns} = 1",
-            f"\tif $ObjectDetectAllowed_{ns} == 1",
+            f"\tif {drag_mode_var} >= 1 && $ObjectDetectAllowed_{ns} == 1",
             f"\t\trun = CustomShaderDragBake{part_tag}_{ns}",
             f"\t\trun = CustomShaderDragDetect{cn}_{ns}",
             "\tendif",
-            f"\tif $ssmtdrag_mode_{ns} == 1",
+            f"\tif {drag_mode_var} >= 2 && $ssmtdrag_mode_{ns} == 1",
             f"\t\tif time != {last_dispatch}",
             f"\t\t\trun = CustomShaderDragJiggle{cn}_{ns}",
             f"\t\t\t{last_dispatch} = time",
@@ -2220,13 +2456,53 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # Present 块 + Constants globals
     # =======================================================================
 
+    @staticmethod
+    def _place_drag_present_block(present_lines, block):
+        """Position the generated Present block before the UI binding marker."""
+        start = None
+        end = None
+        for i, line in enumerate(present_lines):
+            if start is None and "; --- DRAG PRESENT BEGIN ---" in line:
+                start = i
+            if start is not None and "; --- DRAG PRESENT END ---" in line:
+                end = i
+                break
+        if start is not None:
+            if end is None:
+                del present_lines[start:]
+            else:
+                del present_lines[start:end + 1]
+
+        marker_idx = next(
+            (i for i, line in enumerate(present_lines) if "; --- MODEL DRAG BINDING BEGIN ---" in line),
+            None,
+        )
+        if marker_idx is not None:
+            present_lines[marker_idx:marker_idx] = block
+            return
+        binding_idx = next(
+            (i for i, line in enumerate(present_lines)
+             if "if $mouse_clicked == 1" in line
+             and "$is_dragging == 0" in line),
+            None,
+        )
+        if binding_idx is not None:
+            present_lines[binding_idx:binding_idx] = block
+            return
+        if present_lines and present_lines[-1] != "":
+            present_lines.append("")
+        present_lines.extend(block)
+
     def _emit_present_and_constants(self, sections, components, ns):
+        drag_mode_var, ui_detected_var, ui_zone_var = self._runtime_variable_names(ns)
+        default_drag_mode = self._default_drag_system_mode()
         # ---- Constants globals ----
         const_sec = "[Constants]"
         const_lines = sections.setdefault(const_sec, [])
         globals_to_add = [
             f"global $ssmtdrag_mode_{ns} = 0",
-            f"global persist $ssmtdrag_drag_enabled_{ns} = {1 if getattr(self, 'drag_enabled_default', True) else 0}",
+            "global $help = 0",
+            f"global persist {drag_mode_var} = {default_drag_mode}",
             f"global $ssmtdrag_drawn_{ns} = 0",
             f"global $ssmtdrag_booted_{ns} = 0",
             f"global $ssmtdrag_lmb_down_{ns} = 0",
@@ -2264,8 +2540,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"global $ssmtdrag_viewport_valid = 0",
             # UI 构造器桥接：把 GPU 检测结果回读成可跨 INI 命名空间引用的只读全局量。
             # detected < 0 表示未命中；zone 仅在 detected >= 0 时有效。
-            f"global $ssmtdrag_ui_detected_{ns} = -1",
-            f"global $ssmtdrag_ui_zone_{ns} = -1",
+            f"global {ui_detected_var} = -1",
+            f"global {ui_zone_var} = -1",
         ]
         if self.enable_viewport_probe:
             globals_to_add.extend([
@@ -2321,22 +2597,31 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # PinnedDetectInfo[7].w 是区域索引；按 float 标量索引即 7*4+3 = 31。
             # store 读取上一份已完成的 GPU 数据，允许 UI 侧以一帧延迟稳定消费。
             # 目标未绘制时必须主动失效，避免消费上一帧/上一个角色的残留命中。
-            f"if $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_booted_{ns} == 1",
-            f"\tstore = $ssmtdrag_ui_detected_{ns}, ref ResourceDragPinnedDetectID_{ns}, 0",
-            f"\tstore = $ssmtdrag_ui_zone_{ns}, ref ResourceDragPinnedDetectInfo_{ns}, 31",
+            f"if {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_booted_{ns} == 1",
+            f"\tstore = {ui_detected_var}, ref ResourceDragPinnedDetectID_{ns}, 0",
+            f"\tif {ui_detected_var} >= 0",
+            f"\t\tstore = {ui_zone_var}, ref ResourceDragPinnedDetectInfo_{ns}, 31",
+            "\telse",
+            f"\t\t{ui_zone_var} = -1",
+            "\tendif",
             "else",
-            f"\t$ssmtdrag_ui_detected_{ns} = -1",
-            f"\t$ssmtdrag_ui_zone_{ns} = -1",
+            f"\t{ui_detected_var} = -1",
+            f"\t{ui_zone_var} = -1",
             "endif",
             "\t; --- DRAG UI BRIDGE END ---",
         ]
         interaction_gate_lines = [
             "\t; --- DRAG INTERACTION GATE BEGIN ---",
-            f"if $ssmtdrag_drag_enabled_{ns} == 0",
+            f"if {drag_mode_var} < 2",
             "\t$isMouseButtonDown = 0",
             f"\t$ssmtdrag_poke_sign_{ns} = 0",
             f"\t$ssmtdrag_combo_active_{ns} = 0",
+            f"\tclear = ResourceDragJiggleScreenState_{ns} 0.0",
+            f"\tclear = ResourceDragPathProgressState_{ns} 0.0",
         ]
+        for comp in components:
+            interaction_gate_lines.append(
+                f"\tclear = ResourceDragJiggleState_{comp['comp_name']}_{ns} 0.0")
         if self.enable_hand_cursor:
             interaction_gate_lines.extend([
                 f"\t$ssmtdrag_lmb_hold_fraction_{ns} = 0",
@@ -2345,31 +2630,23 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ])
         interaction_gate_lines.extend([
             "endif",
+            f"if {drag_mode_var} < 1",
+            f"\t$ObjectDetectAllowed_{ns} = 0",
+            f"\tclear = ResourceDragDetectID_{ns} 0.0",
+            f"\tclear = ResourceDragPinnedDetectID_{ns}",
+            f"\tclear = ResourceDragPinnedDetectInfo_{ns}",
+        ])
+        for comp in components:
+            cn = comp['comp_name']
+            interaction_gate_lines.extend([
+                f"\tclear = ResourceDragComponentDetect_{cn}_{ns} 0.0",
+                f"\tclear = ResourceDragPinnedComponentID_{cn}_{ns} 0.0",
+                f"\tclear = ResourceDragPinnedComponentInfo_{cn}_{ns} 0.0",
+            ])
+        interaction_gate_lines.extend([
+            "endif",
             "\t; --- DRAG INTERACTION GATE END ---",
         ])
-        if any("DRAG PRESENT BEGIN" in line for line in present_lines):
-            if not any("DRAG UI BRIDGE BEGIN" in line for line in present_lines):
-                insert_at = next(
-                    (i for i, line in enumerate(present_lines) if f"post $ssmtdrag_drawn_{ns} = 0" in line),
-                    len(present_lines),
-                )
-                present_lines[insert_at:insert_at] = ui_bridge_lines
-            if not any("DRAG INTERACTION GATE BEGIN" in line for line in present_lines):
-                pin_run_at = next(
-                    (i for i, line in enumerate(present_lines) if f"pre run = CommandListDragPinDetected_{ns}" in line),
-                    -1,
-                )
-                if pin_run_at >= 0:
-                    insert_at = pin_run_at
-                    if pin_run_at > 0 and present_lines[pin_run_at - 1].strip() == f"if $ssmtdrag_mode_{ns} == 1":
-                        insert_at -= 1
-                else:
-                    insert_at = next(
-                        (i for i, line in enumerate(present_lines) if f"post $ssmtdrag_drawn_{ns} = 0" in line),
-                        len(present_lines),
-                    )
-                present_lines[insert_at:insert_at] = interaction_gate_lines
-            return
         # 抓取手势条件（原作默认 左右键同按/X；可选 左键/右键 单键抓取）
         if self.grab_gesture == 'RMB':
             grab_cond = f"$ssmtdrag_rmb_down_{ns} == 1 || $ssmtdrag_x_down_{ns} == 1"
@@ -2377,10 +2654,29 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             grab_cond = f"($ssmtdrag_lmb_down_{ns} == 1 && $ssmtdrag_rmb_down_{ns} == 1) || $ssmtdrag_x_down_{ns} == 1"
         else:  # LMB（默认，最直觉）
             grab_cond = f"$ssmtdrag_lmb_down_{ns} == 1 || $ssmtdrag_x_down_{ns} == 1"
+        poke_gesture = getattr(self, "poke_gesture", 'RMB')
+        poke_release_lines = []
+        if poke_gesture in {'LMB', 'BOTH'}:
+            poke_release_lines.extend([
+                f"\tif $ssmtdrag_lmb_prev_{ns} == 1 && $ssmtdrag_lmb_down_{ns} == 0",
+                f"\t\t$ssmtdrag_poke_sign_{ns} = -1",
+                f"\t\t$ssmtdrag_poke_hold_mult_{ns} = time - $ssmtdrag_lmb_press_time_{ns}",
+            ])
+        if poke_gesture in {'RMB', 'BOTH'}:
+            branch = "elif" if poke_release_lines else "if"
+            poke_release_lines.extend([
+                f"\t{branch} $ssmtdrag_rmb_prev_{ns} == 1 && $ssmtdrag_rmb_down_{ns} == 0",
+                f"\t\t$ssmtdrag_poke_sign_{ns} = -1",
+                f"\t\t$ssmtdrag_poke_hold_mult_{ns} = time - $ssmtdrag_rmb_press_time_{ns}",
+            ])
+        if poke_release_lines:
+            poke_release_lines.append("\tendif")
         block = [
             "\t; --- DRAG PRESENT BEGIN ---",
             "$isMouseButtonDown = 0",
             f"$ssmtdrag_poke_sign_{ns} = 0",
+            (f"$ssmtdrag_mode_{ns} = $ssmtdrag_modifier_down_{ns}"
+             if self.grab_key == 'ALT' else f"$ssmtdrag_mode_{ns} = 1"),
             # NONE 模式无常驻修饰键 → 常开；ALT 模式 = modifier_down
             (f"$ssmtdrag_modifier_ok_{ns} = $ssmtdrag_modifier_down_{ns}" if self.grab_key == 'ALT'
              else f"$ssmtdrag_modifier_ok_{ns} = 1"),
@@ -2394,13 +2690,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "endif",
             # 戳脉冲
             f"if $ssmtdrag_modifier_ok_{ns} == 1 && $ssmtdrag_combo_active_{ns} == 0",
-            f"\tif $ssmtdrag_lmb_prev_{ns} == 1 && $ssmtdrag_lmb_down_{ns} == 0",
-            f"\t\t$ssmtdrag_poke_sign_{ns} = -1",
-            f"\t\t$ssmtdrag_poke_hold_mult_{ns} = time - $ssmtdrag_lmb_press_time_{ns}",
-            f"\telif $ssmtdrag_rmb_prev_{ns} == 1 && $ssmtdrag_rmb_down_{ns} == 0",
-            f"\t\t$ssmtdrag_poke_sign_{ns} = 1",
-            f"\t\t$ssmtdrag_poke_hold_mult_{ns} = time - $ssmtdrag_rmb_press_time_{ns}",
-            "\tendif",
+            *poke_release_lines,
             "endif",
             f"if $ssmtdrag_poke_sign_{ns} != 0",
             f"\tif $ssmtdrag_poke_hold_mult_{ns} < $ssmtdrag_poke_min_strength_{ns}",
@@ -2463,10 +2753,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # 视口探针：有快照则解码出视口矩形（供 Detect 的 FrameAPI 光标映射）；
             # 到节流间隔则清旧快照+FrameAPI 并武装下一代（低频节流，非逐帧拷贝）
             block.extend([
-                f"if $ssmtdrag_viewport_probe_armed_{ns} == 1 && ResourceDragViewportSource_{ns} !== null",
+                f"if {drag_mode_var} >= 1 && $ssmtdrag_viewport_probe_armed_{ns} == 1 && ResourceDragViewportSource_{ns} !== null",
                 f"\trun = CustomShaderDragViewportLayoutDecode_{ns}",
                 "endif",
-                f"if $ssmtdrag_viewport_probe_enabled_{ns} == 1 && time >= $ssmtdrag_viewport_probe_next_time_{ns}",
+                f"if {drag_mode_var} >= 1 && $ssmtdrag_viewport_probe_enabled_{ns} == 1 && time >= $ssmtdrag_viewport_probe_next_time_{ns}",
                 f"\tResourceDragViewportSource_{ns} = null",
                 f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
                 f"\t$ssmtdrag_viewport_probe_armed_{ns} = 1",
@@ -2479,17 +2769,20 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         block.extend(interaction_gate_lines)
         block.extend([
             # 执行序列
-            f"if $ssmtdrag_mode_{ns} == 1",
+            f"if {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1",
             f"\tpre run = CommandListDragPinDetected_{ns}",
+            f"\trun = CommandListDragCursorUpdate_{ns}",
             "endif",
-            f"run = CommandListDragCursorUpdate_{ns}",
         ])
-        block.extend(ui_bridge_lines)
+        ui_readback_sec = f"[CommandListDragUIReadback_{ns}]"
+        if ui_readback_sec not in sections:
+            sections[ui_readback_sec] = list(ui_bridge_lines)
+
         if self.enable_hand_cursor:
             # S8 手型光标：先更新手部屏幕位置，描边先画垫底（只露轮廓边）、填充后画；
             # 抓取中或 RMB 独按蓄力时用 Action 网格（握拳），否则 NoAction（张开）
             block.extend([
-                f"if $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_mode_{ns} == 1",
+                f"if {drag_mode_var} >= 1 && $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_mode_{ns} == 1",
                 f"\trun = CustomShaderDragUpdateJiggleCursorPreview_{ns}",
                 f"\tif $ssmtdrag_hand_debug_{ns} == 2",
                 f"\t\trun = CustomShaderDragJiggleCursor_{ns}",
@@ -2506,12 +2799,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "endif",
             ])
         block.extend([
+            f"post run = CommandListDragUIReadback_{ns}",
             f"post $ssmtdrag_drawn_{ns} = 0",
             "\t; --- DRAG PRESENT END ---",
         ])
-        if present_lines:
-            present_lines.append("")
-        present_lines.extend(block)
+        self._place_drag_present_block(present_lines, block)
 
 
 # ---------------------------------------------------------------------------

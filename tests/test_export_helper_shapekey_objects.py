@@ -312,5 +312,42 @@ class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
         self.assertEqual([(slot_index, shape_key_name) for slot_index, shape_key_name, _ in result], [(1, "Smile")])
 
 
+    def test_collect_postprocess_nodes_preserves_chain_order(self):
+        b_input = _FakeSocket(linked=True, bl_idname="SSMTSocketPostProcess")
+        b = _FakeNode("B", "SSMTNode_PostProcess_B", inputs=[b_input])
+        a_output = _FakeSocket(linked=True, bl_idname="SSMTSocketPostProcess")
+        a = _FakeNode("A", "SSMTNode_PostProcess_A", outputs=[a_output])
+        out_output = _FakeSocket(linked=True, bl_idname="SSMTSocketPostProcess")
+        out = _FakeNode("Output", "SSMTNode_Result_Output", outputs=[out_output])
+        out_output.links.append(types.SimpleNamespace(from_node=out, to_node=a))
+        a_output.links.append(types.SimpleNamespace(from_node=a, to_node=b))
+        tree = _make_tree("Chain", out, a, b)
+
+        result = export_helper.BlueprintExportHelper._collect_postprocess_nodes(tree)
+
+        self.assertEqual([node.name for node in result], ["A", "B"])
+
+    def test_collect_postprocess_nodes_follows_reroute(self):
+        reroute_input = _FakeSocket(linked=True, bl_idname="SSMTSocketPostProcess")
+        reroute_output = _FakeSocket(linked=True, bl_idname="SSMTSocketPostProcess")
+        reroute = _FakeNode(
+            "Reroute",
+            "NodeReroute",
+            inputs=[reroute_input],
+            outputs=[reroute_output],
+        )
+        a_input = _FakeSocket(linked=True, bl_idname="SSMTSocketPostProcess")
+        a = _FakeNode("A", "SSMTNode_PostProcess_A", inputs=[a_input])
+        out_output = _FakeSocket(linked=True, bl_idname="SSMTSocketPostProcess")
+        out = _FakeNode("Output", "SSMTNode_Result_Output", outputs=[out_output])
+        out_output.links.append(types.SimpleNamespace(from_node=out, to_node=reroute))
+        reroute_output.links.append(types.SimpleNamespace(from_node=reroute, to_node=a))
+        tree = _make_tree("RerouteChain", out, reroute, a)
+
+        result = export_helper.BlueprintExportHelper._collect_postprocess_nodes(tree)
+
+        self.assertEqual([node.name for node in result], ["A"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -309,11 +309,13 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
         sections = OrderedDict()
         current_section = None
         preserved_tail_content = ""
+        preserved_driver_content = ""
 
         try:
             with open(ini_file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
+            preserved_driver_content, content = self.split_anim_driver_block_content(content)
             content, preserved_tail_content = self.split_auto_appended_tail_content(content)
             if preserved_tail_content:
                 print("[MultiFile] 检测到自动追加尾块，将保留")
@@ -326,11 +328,16 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                 elif current_section is not None:
                     sections[current_section].append(line)
         except FileNotFoundError:
-            return None, ""
-        return sections, preserved_tail_content
+            return None, "", ""
+        return sections, preserved_tail_content, preserved_driver_content
 
-    def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content=""):
+    def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content="", preserved_driver_content=""):
         with open(ini_file_path, 'w', encoding='utf-8') as f:
+            if preserved_driver_content:
+                f.write(preserved_driver_content)
+                if not preserved_driver_content.endswith(chr(10)):
+                    f.write(chr(10))
+                f.write(chr(10))
             for section_name, lines in sections.items():
                 f.write(f"{section_name}\n")
                 for line in lines:
@@ -385,7 +392,7 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
             for ini_file in ini_files:
                 ini_file_path = os.path.join(mod_export_path, ini_file)
                 self._create_cumulative_backup(ini_file_path, mod_export_path)
-                sections, preserved_tail_content = self._read_ini_to_ordered_dict(ini_file_path)
+                sections, preserved_tail_content, preserved_driver_content = self._read_ini_to_ordered_dict(ini_file_path)
                 if not sections:
                     continue
 
@@ -624,7 +631,7 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                 # 终态规整（幂等）：形态键条件锚定、接力块排序、复位行去重、_mf 声明
                 deform_chain.finalize_deform_chain(sections)
 
-                self._write_ordered_dict_to_ini(sections, ini_file_path, preserved_tail_content)
+                self._write_ordered_dict_to_ini(sections, ini_file_path, preserved_tail_content, preserved_driver_content)
 
             print("MultiFile postprocess completed.")
         except Exception as e:

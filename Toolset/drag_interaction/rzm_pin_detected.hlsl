@@ -4,8 +4,8 @@
 //
 // Expected bindings:
 //   cs-u0 = ResourceRZMDetectID,         RWBuffer<float4> (frame accumulator)
-//   cs-u1 = ResourceRZMPinnedDetectID,   RWBuffer<float>  (legacy pinned R32_FLOAT)
-//   cs-u2 = ResourceRZMPinnedDetectInfo, RWBuffer<float4> (pinned extended info)
+//   cs-u1 = ResourceRZMPinnedDetectID,   RWStructuredBuffer<float>  (legacy pinned R32_FLOAT)
+//   cs-u2 = ResourceRZMPinnedDetectInfo, RWStructuredBuffer<float4> (pinned extended info)
 //
 // Accumulator/pinned info layout:
 //   [0] legacy ABI, do not reorder:
@@ -31,8 +31,8 @@
 #define RZM_DETECT_SLOTS 15u
 
 RWBuffer<float4> gAccumulated : register(u0);
-RWBuffer<float>  gPinnedID    : register(u1);
-RWBuffer<float4> gPinnedInfo  : register(u2);
+RWStructuredBuffer<float>  gPinnedID    : register(u1);
+RWStructuredBuffer<float4> gPinnedInfo  : register(u2);
 Texture1D<float4> IniParams   : register(t120);
 
 #define CURSOR_PARAMS IniParams[24]

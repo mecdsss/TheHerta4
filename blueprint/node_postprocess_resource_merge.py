@@ -64,6 +64,8 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         with open(ini_file, 'r', encoding='utf-8') as f:
             content = f.read()
 
+        preserved_driver_content = ""
+        preserved_driver_content, content = self.split_anim_driver_block_content(content)
         preserved_tail_content = ""
         content, preserved_tail_content = self.split_auto_appended_tail_content(content)
         if preserved_tail_content:
@@ -140,6 +142,9 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         if modified:
             print(f"[ResourceMerge] ini文件已修改，正在写入...")
             new_content = []
+            if preserved_driver_content:
+                new_content.append(preserved_driver_content.rstrip())
+                new_content.append('')
             for section_name, lines in sections.items():
                 new_content.append(section_name)
                 new_content.extend(lines)

@@ -173,18 +173,35 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
         return blueprint, ""
 
     @staticmethod
+    def _has_incomplete_anim_driver_section(content: str) -> bool:
+        text = str(content or "")
+        search_from = 0
+        while True:
+            start_idx = text.find(_ANIM_DRIVER_SECTION_MARKER_START, search_from)
+            if start_idx == -1:
+                return False
+            end_idx = text.find(
+                _ANIM_DRIVER_SECTION_MARKER_END,
+                start_idx + len(_ANIM_DRIVER_SECTION_MARKER_START),
+            )
+            if end_idx == -1:
+                return True
+            search_from = end_idx + len(_ANIM_DRIVER_SECTION_MARKER_END)
+
+    @staticmethod
     def _strip_existing_anim_driver_section(content: str):
-        if _ANIM_DRIVER_SECTION_MARKER_START not in content:
-            return content, False
-
-        start_idx = content.find(_ANIM_DRIVER_SECTION_MARKER_START)
-        end_idx = content.find(_ANIM_DRIVER_SECTION_MARKER_END, start_idx)
-        if end_idx == -1:
-            return content[:start_idx], True
-
-        end_idx += len(_ANIM_DRIVER_SECTION_MARKER_END)
-        remaining = content[:start_idx] + content[end_idx:]
-        return remaining, True
+        removed = False
+        remaining = str(content or "")
+        while True:
+            start_idx = remaining.find(_ANIM_DRIVER_SECTION_MARKER_START)
+            if start_idx == -1:
+                return remaining, removed
+            end_idx = remaining.find(_ANIM_DRIVER_SECTION_MARKER_END, start_idx)
+            if end_idx == -1:
+                return remaining, removed
+            end_idx += len(_ANIM_DRIVER_SECTION_MARKER_END)
+            remaining = remaining[:start_idx] + remaining[end_idx:]
+            removed = True
 
     def _collect_ini_paragraphs(self, blueprint):
         # 在 execute 上下文中修正所有驱动节点的 auto_index
@@ -272,6 +289,9 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
                 original_content = f.read()
         except Exception as e:
             return False, f"读取目标INI文件失败: {e}"
+
+        if self._has_incomplete_anim_driver_section(original_content):
+            return False, "检测到旧的动画驱动段缺少结束标记，已停止刷新以避免误删其他配置；请手动删除该段后重试"
 
         new_content = self._compose_updated_ini_content(original_content, ini_content)
         if new_content == original_content:

@@ -1336,11 +1336,13 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         sections = OrderedDict([(self.INI_PREAMBLE_KEY, [])])
         current_section = None
         preserved_tail_content = ""
+        preserved_driver_content = ""
 
         try:
             with open(ini_file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
+            preserved_driver_content, content = self.split_anim_driver_block_content(content)
             content, preserved_tail_content = self.split_auto_appended_tail_content(content)
             if preserved_tail_content:
                 print("[ShapeKey] 检测到自动追加尾块，将保留")
@@ -1363,9 +1365,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             raise RuntimeError(f"读取INI文件失败: {e}") from e
         if not sections[self.INI_PREAMBLE_KEY]:
             del sections[self.INI_PREAMBLE_KEY]
-        return sections, preserved_tail_content
+        return sections, preserved_tail_content, preserved_driver_content
 
-    def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content=""):
+    def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content="", preserved_driver_content=""):
         temp_path = None
         file_descriptor = None
         try:
@@ -1379,6 +1381,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             file_object = os.fdopen(file_descriptor, 'w', encoding='utf-8', newline='\n')
             file_descriptor = None
             with file_object as f:
+                if preserved_driver_content:
+                    f.write(preserved_driver_content)
+                    if not preserved_driver_content.endswith(chr(10)):
+                        f.write(chr(10))
+                    f.write(chr(10))
                 for section_name, lines in sections.items():
                     if section_name == self.INI_PREAMBLE_KEY:
                         for line in lines:
@@ -1773,7 +1780,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         self._create_cumulative_backup(target_ini_file, mod_export_path)
 
         try:
-            sections, preserved_tail_content = self._read_ini_to_ordered_dict(target_ini_file)
+            sections, preserved_tail_content, preserved_driver_content = self._read_ini_to_ordered_dict(target_ini_file)
             slot_to_name_to_objects, unique_hashes, hash_to_objects, all_objects = self._parse_classification_text_final(classification_text_obj.as_string())
 
             if not slot_to_name_to_objects:
@@ -2289,7 +2296,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             # 接力块 rank 排序、复位行去重、_mf 声明、post run 移除（接力协议 v3）
             deform_chain.finalize_deform_chain(sections)
 
-            self._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content)
+            self._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content, preserved_driver_content)
 
             mode_str = (
                 f"紧凑:{'是' if use_packed else '否'}, "

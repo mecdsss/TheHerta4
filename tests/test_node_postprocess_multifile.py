@@ -29,7 +29,17 @@ _fake_bpy = types.SimpleNamespace(
     utils=types.SimpleNamespace(register_class=lambda _cls: None, unregister_class=lambda _cls: None),
 )
 _install_module("bpy", **_fake_bpy.__dict__)
-_install_module(f"{PKG}.blueprint.node_postprocess_base", SSMTNode_PostProcess_Base=object)
+_install_module(
+    f"{PKG}.blueprint.node_postprocess_base",
+    SSMTNode_PostProcess_Base=type(
+        "_FakePostProcessBase",
+        (object,),
+        {
+            "split_auto_appended_tail_content": classmethod(lambda cls, content: (content, "")),
+            "split_anim_driver_block_content": classmethod(lambda cls, content: ("", content)),
+        },
+    ),
+)
 
 common_mod_path = Path(__file__).resolve().parents[1] / "common" / "mod_path_compat.py"
 common_spec = importlib.util.spec_from_file_location(f"{PKG}.common.mod_path_compat", common_mod_path)

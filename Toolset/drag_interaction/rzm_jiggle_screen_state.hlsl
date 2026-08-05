@@ -7,7 +7,7 @@ RWBuffer<float4> InteractionState : register(u0);
 // survives frame-to-frame like InteractionState itself does, but resets
 // fresh each game/3DMigoto session rather than being saved to disk.
 RWBuffer<float> PathProgressState : register(u1);
-Buffer<float4> PinnedDetectInfo   : register(t67);
+StructuredBuffer<float4> PinnedDetectInfo   : register(t67);
 Buffer<float4> ZoneParams         : register(t75);
 Texture1D<float4> IniParams       : register(t120);
 
@@ -36,8 +36,8 @@ Texture1D<float4> IniParams       : register(t120);
 //      decays back down (fallback 0.92 — lower decays back to steady-state
 //      faster, higher lingers longer).
 #define RELEASE_BOOST      IniParams[97]
-// POKE_PARAMS.x = poke sign this frame: -1.0 = pull (into mesh, along -normal),
-//                 +1.0 = push (out of mesh, along +normal), 0.0 = no poke.
+// POKE_PARAMS.x = poke sign this frame: -1.0 = push into mesh along -normal,
+//                 +1.0 = reserved outward impulse, 0.0 = no poke.
 //                 Set for exactly one frame by the ini on a lone LMB/RMB
 //                 click-release (not part of the LMB+RMB grab combo).
 // POKE_PARAMS.y = poke strength multiplier, fallback 1.0.

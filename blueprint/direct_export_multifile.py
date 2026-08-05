@@ -43,7 +43,7 @@ class DirectMultiFileGenerator:
 
         target_ini_file = ini_files[0]
         self.config_node._create_cumulative_backup(target_ini_file, self.mod_export_path)
-        sections, preserved_tail_content = self.config_node._read_ini_to_ordered_dict(target_ini_file)
+        sections, preserved_tail_content, preserved_driver_content = self.config_node._read_ini_to_ordered_dict(target_ini_file)
 
         hash_filters = self.config_node._parse_hash_values(self.config_node.hash_values)
         if not hash_filters:
@@ -65,6 +65,7 @@ class DirectMultiFileGenerator:
         self._update_ini_sections(
             sections=sections,
             preserved_tail_content=preserved_tail_content,
+            preserved_driver_content=preserved_driver_content,
             target_ini_file=target_ini_file,
             runtime_infos=runtime_infos,
             generated_states=generated_states,
@@ -614,7 +615,7 @@ class DirectMultiFileGenerator:
         if not ini_files:
             return canonical_name
 
-        sections, _ = self.config_node._read_ini_to_ordered_dict(ini_files[0])
+        sections, _tail, _driver = self.config_node._read_ini_to_ordered_dict(ini_files[0])
         return find_base_position_resource_name(
             sections,
             actual_hash,
@@ -639,7 +640,7 @@ class DirectMultiFileGenerator:
                 return candidate_section_name
         return None
 
-    def _update_ini_sections(self, sections, preserved_tail_content, target_ini_file, runtime_infos, generated_states):
+    def _update_ini_sections(self, sections, preserved_tail_content, target_ini_file, runtime_infos, generated_states, preserved_driver_content=""):
         shader_source_path = self.config_node._get_shader_source_path()
         if not shader_source_path or not os.path.exists(shader_source_path):
             raise MultiFileDirectExportError(f"着色器模板文件未找到: {shader_source_path}")
@@ -801,7 +802,7 @@ class DirectMultiFileGenerator:
         sections[constants_section] = constants_lines
         sections[present_section] = present_lines
         deform_chain.finalize_deform_chain(sections)
-        self.config_node._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content)
+        self.config_node._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content, preserved_driver_content)
 
     def _ensure_present_run_lines(self, present_lines, run_lines):
         if not run_lines:

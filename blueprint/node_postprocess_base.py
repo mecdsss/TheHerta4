@@ -15,6 +15,12 @@ class SSMTNode_PostProcess_Base(SSMTNodeBase):
         "; --- AUTO-APPENDED HEALTH DETECTION MODULE ---",
         "; --- AUTO-APPENDED DRAG INTERACTION MODULE ---",
     )
+    AUTO_APPENDED_SECTION_MARKER_PREFIXES = (
+        "; --- AUTO-APPENDED UI PANEL ",
+    )
+
+    ANIM_DRIVER_SECTION_MARKER_START = "; --- ANIMATION DRIVER SECTION ---"
+    ANIM_DRIVER_SECTION_MARKER_END = "; --- END ANIMATION DRIVER SECTION ---"
 
     def init(self, context):
         self.inputs.new('SSMTSocketPostProcess', "Input")
@@ -45,20 +51,50 @@ class SSMTNode_PostProcess_Base(SSMTNodeBase):
 
     @classmethod
     def split_auto_appended_tail_content(cls, content: str):
-        first_marker_position = None
+        """Recognize all auto-appended markers, including dynamic UI panel markers."""
+        text = str(content or "")
+        offset = 0
+        for line in text.splitlines(keepends=True):
+            if cls.is_known_auto_appended_marker(line):
+                return text[:offset], text[offset:]
+            offset += len(line)
+        return text, ""
 
-        for marker in cls.AUTO_APPENDED_SECTION_MARKERS:
-            marker_position = content.find(marker)
-            if marker_position == -1:
-                continue
+    @classmethod
+    def is_known_auto_appended_marker(cls, line: str) -> bool:
+        stripped = str(line or "").strip()
+        if stripped in cls.AUTO_APPENDED_SECTION_MARKERS:
+            return True
+        return any(stripped.startswith(prefix) for prefix in cls.AUTO_APPENDED_SECTION_MARKER_PREFIXES)
 
-            if first_marker_position is None or marker_position < first_marker_position:
-                first_marker_position = marker_position
+    @classmethod
+    def split_anim_driver_block_content(cls, content: str):
+        # Extract a complete animation-driver block from the top of an INI file.
+        # Other postprocess nodes must not parse its [Constants]/[Present]
+        # together with the main body, otherwise duplicate sections get merged.
+        text = str(content or "")
+        lines = text.splitlines(keepends=True)
+        start_index = next(
+            (index for index, line in enumerate(lines)
+             if cls.ANIM_DRIVER_SECTION_MARKER_START in line),
+            None,
+        )
+        if start_index is None:
+            return "", text
 
-        if first_marker_position is None:
-            return content, ""
+        end_index = next(
+            (index for index in range(start_index + 1, len(lines))
+             if cls.ANIM_DRIVER_SECTION_MARKER_END in lines[index]),
+            None,
+        )
+        if end_index is None:
+            # Incomplete blocks are risky to isolate; keep them in the body so
+            # the animation-driver refresh safety check can handle them.
+            return "", text
 
-        return content[:first_marker_position], content[first_marker_position:]
+        driver_content = "".join(lines[start_index:end_index + 1])
+        remaining_content = "".join(lines[end_index + 1:]).lstrip("\r\n")
+        return driver_content, remaining_content
 
 
 def register():

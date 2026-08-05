@@ -22,7 +22,7 @@ for package_name in (PKG, f"{PKG}.blueprint"):
     package.__path__ = []
 
 _fake_bpy = types.SimpleNamespace(
-    types=types.SimpleNamespace(),
+    types=types.SimpleNamespace(Operator=object),
     props=types.SimpleNamespace(
         StringProperty=lambda **_kwargs: "",
         BoolProperty=lambda **kwargs: kwargs.get("default", False),
@@ -37,6 +37,36 @@ class _Base:
         "; --- AUTO-APPENDED SLIDER CONTROL PANEL ---",
         "; --- AUTO-APPENDED HEALTH DETECTION MODULE ---",
     )
+    ANIM_DRIVER_SECTION_MARKER_START = "; --- ANIMATION DRIVER SECTION ---"
+    ANIM_DRIVER_SECTION_MARKER_END = "; --- END ANIMATION DRIVER SECTION ---"
+
+    @classmethod
+    def is_known_auto_appended_marker(cls, line: str) -> bool:
+        stripped = str(line or "").strip()
+        if stripped in cls.AUTO_APPENDED_SECTION_MARKERS:
+            return True
+        return stripped.startswith("; --- AUTO-APPENDED UI PANEL ")
+
+    @classmethod
+    def split_anim_driver_block_content(cls, content):
+        lines = str(content or "").splitlines(keepends=True)
+        start_index = next(
+            (index for index, line in enumerate(lines)
+             if cls.ANIM_DRIVER_SECTION_MARKER_START in line),
+            None,
+        )
+        if start_index is None:
+            return "", content
+        end_index = next(
+            (index for index in range(start_index + 1, len(lines))
+             if cls.ANIM_DRIVER_SECTION_MARKER_END in lines[index]),
+            None,
+        )
+        if end_index is None:
+            return "", content
+        driver = "".join(lines[start_index:end_index + 1])
+        remaining = "".join(lines[end_index + 1:]).lstrip("\r\n")
+        return driver, remaining
 
 
 _install_module(f"{PKG}.blueprint.node_postprocess_base", SSMTNode_PostProcess_Base=_Base)
@@ -194,34 +224,43 @@ class NodePostprocessUIPanelTests(unittest.TestCase):
         result_text = target_ini_path.read_text(encoding="utf-8")
         return result_text, mod_dir
 
-    def test_appends_panel_sections_and_merges_constants(self):
+    def _refresh(self, target_ini=TARGET_INI, panel_dir=None):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        if panel_dir is None:
+            panel_dir = _write_panel_folder(root)
+        mod_dir = root / "mod"
+        mod_dir.mkdir()
+        target_ini_path = mod_dir / "character.ini"
+        target_ini_path.write_text(target_ini, encoding="utf-8")
+
+        node = _make_node(str(panel_dir))
+        success, message = node.refresh_exported_ui_panel_section(str(mod_dir))
+        return success, message, target_ini_path.read_text(encoding="utf-8"), mod_dir
+
+    def test_appends_panel_sections_as_independent_bottom_block(self):
         result_text, _ = self._run()
 
-        # 面板独有段被追加
+        # Panel-only sections are present in the own bottom block.
         self.assertIn("[TextureOverrideCheckHash]", result_text)
         self.assertIn("hash = c209c22b", result_text)
         self.assertIn("[Resource___glass_panel_png]", result_text)
         self.assertIn("[KeyHelp]", result_text)
         self.assertIn("[CommandListToggleHelp]", result_text)
-        # 追加块带本节点标记
-        self.assertIn("; --- AUTO-APPENDED UI PANEL UIPanel ---", result_text)
-        # 原有模型段保留
+        marker = "; --- AUTO-APPENDED UI PANEL UIPanel ---"
+        self.assertIn(marker, result_text)
         self.assertIn("[TextureOverride_drawhash]", result_text)
 
-        # Constants 合并：面板全局变量并入已有 [Constants]，且只有一个 [Constants]
-        self.assertEqual(result_text.count("[Constants]"), 1)
-        constants = result_text.split("[Constants]")[1].split("[")[0]
-        self.assertIn("global persist $drawhash_ps_replace = 0", constants)
-        self.assertIn("global persist $layout_mode = 0", constants)
-
-        # Present 合并：面板渲染逻辑并入，且只有一个 [Present]
-        self.assertEqual(result_text.count("[Present]"), 1)
-        present = result_text.split("[Present]")[1].split("[")[0]
-        self.assertIn("$time = time", present)
-
-        # 共享着色器段不重复追加（目标没有这些段，所以只出现一次且来自面板）
+        # Base and panel keep their own singleton sections.
+        self.assertEqual(result_text.count("[Constants]"), 2)
+        self.assertEqual(result_text.count("[Present]"), 2)
+        self.assertIn("global persist $drawhash_ps_replace = 0", result_text)
+        self.assertIn("global persist $layout_mode = 0", result_text)
+        self.assertIn("$time = time", result_text)
         self.assertEqual(result_text.count("[CustomShaderDraw]"), 1)
         self.assertEqual(result_text.count("[CustomShaderFx]"), 1)
+        self.assertGreater(result_text.index(marker), result_text.index("[Present]"))
 
     def test_preserves_namespace_and_comments_before_first_section(self):
         target = (
@@ -268,7 +307,7 @@ class NodePostprocessUIPanelTests(unittest.TestCase):
         # 面板块仅更新一次，不会因为二次运行而追加第二份
         self.assertEqual(second_text.count("hash = c209c22b"), 1)
         self.assertEqual(second_text.count("$time = time"), 1)
-        self.assertEqual(second_text.count("SSMT UI PANEL PRESENT"), 2)
+        self.assertEqual(second_text.count("SSMT UI PANEL PRESENT"), 0)
 
     def test_rerun_preserves_following_auto_appended_block_verbatim(self):
         first_text, mod_dir = self._run()
@@ -288,6 +327,100 @@ class NodePostprocessUIPanelTests(unittest.TestCase):
         second_text = ini_path.read_text(encoding="utf-8")
         self.assertIn(following_block, second_text)
         self.assertEqual(second_text.count("[CommandListHealth]"), 1)
+        self.assertGreater(
+            second_text.index("; --- AUTO-APPENDED UI PANEL UIPanel ---"),
+            second_text.index("; --- AUTO-APPENDED HEALTH DETECTION MODULE ---"),
+        )
+
+    def test_refresh_rewrites_only_panel_block_and_preserves_tail(self):
+        stale_panel = (
+            "; --- AUTO-APPENDED UI PANEL UIPanel ---\n"
+            "[TextureOverrideCheckHash]\n"
+            "hash = stalehash\n"
+            "$active = 1\n"
+            "\n"
+            "[KeyHelp]\n"
+            "key = no_ctrl no_alt home\n"
+            "\n"
+        )
+        health_tail = (
+            "; --- AUTO-APPENDED HEALTH DETECTION MODULE ---\n"
+            "[CommandListHealth]\n"
+            "$health = 1\n"
+        )
+        success, message, result_text, _ = self._refresh(
+            TARGET_INI + "\n" + stale_panel + "\n" + health_tail
+        )
+
+        self.assertTrue(success, message)
+        self.assertNotIn("stalehash", result_text)
+        self.assertEqual(result_text.count("[TextureOverrideCheckHash]"), 1)
+        self.assertEqual(result_text.count("[KeyHelp]"), 1)
+        self.assertIn(health_tail, result_text)
+        self.assertEqual(result_text.count("[Constants]"), 2)
+        self.assertEqual(result_text.count("[Present]"), 2)
+        self.assertIn("global persist $drawhash_ps_replace = 0", result_text)
+        self.assertGreater(
+            result_text.index("; --- AUTO-APPENDED UI PANEL UIPanel ---"),
+            result_text.index("; --- AUTO-APPENDED HEALTH DETECTION MODULE ---"),
+        )
+
+    def test_refresh_appends_missing_panel_block_and_preserves_tail(self):
+        health_tail = (
+            "; --- AUTO-APPENDED HEALTH DETECTION MODULE ---\n"
+            "[CommandListHealth]\n"
+            "$health = 1\n"
+        )
+        success, message, result_text, _ = self._refresh(TARGET_INI + "\n" + health_tail)
+
+        self.assertTrue(success, message)
+        self.assertIn("; --- AUTO-APPENDED UI PANEL UIPanel ---", result_text)
+        self.assertIn(health_tail, result_text)
+        self.assertEqual(result_text.count("[TextureOverrideCheckHash]"), 1)
+        self.assertEqual(result_text.count("[Constants]"), 2)
+        self.assertGreater(
+            result_text.index("; --- AUTO-APPENDED UI PANEL UIPanel ---"),
+            result_text.index("; --- AUTO-APPENDED HEALTH DETECTION MODULE ---"),
+        )
+
+    def test_refresh_keeps_anim_driver_block_independent_from_body(self):
+        driver_block = (
+            "; --- ANIMATION DRIVER SECTION ---\n"
+            "[Constants]\n"
+            "global $driver_state = 0\n"
+            "\n"
+            "[Present]\n"
+            "post $driver_state = 0\n"
+            "; --- END ANIMATION DRIVER SECTION ---\n"
+        )
+        health_tail = (
+            "; --- AUTO-APPENDED HEALTH DETECTION MODULE ---\n"
+            "[CommandListHealth]\n"
+            "$health = 1\n"
+        )
+        success, message, result_text, _ = self._refresh(
+            driver_block + "\n" + TARGET_INI + "\n" + health_tail
+        )
+
+        self.assertTrue(success, message)
+        self.assertEqual(result_text.count("[Constants]"), 3)
+        self.assertEqual(result_text.count("[Present]"), 3)
+        self.assertEqual(result_text.count("; --- ANIMATION DRIVER SECTION ---"), 1)
+        self.assertEqual(result_text.count("; --- END ANIMATION DRIVER SECTION ---"), 1)
+        self.assertIn("global $driver_state = 0", result_text)
+        self.assertIn("global persist $drawhash_ps_replace = 0", result_text)
+        self.assertIn("global persist $active", result_text)
+        self.assertLess(
+            result_text.index("; --- ANIMATION DRIVER SECTION ---"),
+            result_text.index("global persist $drawhash_ps_replace = 0"),
+        )
+        self.assertLess(
+            result_text.index("global persist $drawhash_ps_replace = 0"),
+            result_text.index("; --- AUTO-APPENDED HEALTH DETECTION MODULE ---"),
+        )
+
+    def test_refresh_operator_is_in_registered_classes(self):
+        self.assertIn(module.SSMT_OT_RefreshUIPanelExportSection, module.classes)
 
     def test_loose_resource_path_cannot_escape_panel_or_mod_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -308,7 +441,7 @@ class NodePostprocessUIPanelTests(unittest.TestCase):
 
             self.assertFalse((root / "outside-copy.txt").exists())
 
-    def test_shared_shader_sections_not_appended_when_target_already_has_them(self):
+    def test_shared_shader_sections_are_kept_in_independent_bottom_block(self):
         target = TARGET_INI + """[CustomShaderDraw]
 hs=null
 vs=./res/draw_2d.hlsl
@@ -317,31 +450,29 @@ blend=ADD SRC_ALPHA INV_SRC_ALPHA
 
 """
         result_text, _ = self._run(target_ini=target)
-        # 内容相同：不重复追加
-        self.assertEqual(result_text.count("[CustomShaderDraw]"), 1)
+        self.assertEqual(result_text.count("[CustomShaderDraw]"), 2)
 
-    def test_conflicting_non_shared_section_raises(self):
+    def test_conflicting_non_shared_section_keeps_both_blocks(self):
         target = TARGET_INI + """[TextureOverrideCheckHash]
 hash = otherhash
 $active = 1
 
 """
-        with self.assertRaisesRegex(ValueError, "TextureOverrideCheckHash"):
-            self._run(target_ini=target)
+        result_text, _ = self._run(target_ini=target)
+        self.assertEqual(result_text.count("[TextureOverrideCheckHash]"), 2)
+        self.assertIn("hash = otherhash", result_text)
+        self.assertIn("hash = c209c22b", result_text)
 
-    def test_main_table_wins_when_variable_declared_with_different_value(self):
-        # 主配置表已声明同名变量（即使初始值不同），面板声明一律丢弃
+    def test_panel_constants_keep_own_values_in_bottom_block(self):
         target = TARGET_INI.replace(
             "global persist $drawhash_ps_replace = 0",
             "global persist $drawhash_ps_replace = 0\nglobal persist $help = 1",
         )
         result_text, _ = self._run(target_ini=target)
-        constants = result_text.split("[Constants]")[1].split("[")[0]
-        # 主配置表的 $help = 1 保留，面板的 $help = 0 声明被丢弃
-        self.assertIn("global persist $help = 1", constants)
-        self.assertNotIn("global persist $help = 0", constants)
-        # 面板独有变量仍追加
-        self.assertIn("global persist $layout_mode = 0", constants)
+        self.assertEqual(result_text.count("[Constants]"), 2)
+        self.assertIn("global persist $help = 1", result_text)
+        self.assertIn("global persist $help = 0", result_text)
+        self.assertIn("global persist $layout_mode = 0", result_text)
 
     def test_missing_referenced_resource_raises(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -563,11 +694,31 @@ $active = 1
 
         self.assertIn("[TextureOverrideCheckHash]", result_text)
         self.assertIn("; --- AUTO-APPENDED UI PANEL UIPanel ---", result_text)
-        self.assertEqual(result_text.count("[Constants]"), 1)
-        self.assertEqual(result_text.count("[Present]"), 1)
+        self.assertEqual(result_text.count("[Constants]"), 2)
+        self.assertEqual(result_text.count("[Present]"), 2)
         self.assertEqual(result_text.count("[CustomShaderDraw]"), 1)
         self.assertEqual(result_text.count("[CustomShaderFx]"), 1)
 
+
+    def test_multiple_ui_panels_keep_initial_chain_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            panel_dir = _write_panel_folder(root)
+            mod_dir = root / "mod"
+            mod_dir.mkdir()
+            target_ini_path = mod_dir / "character.ini"
+            target_ini_path.write_text(TARGET_INI, encoding="utf-8")
+
+            first = _make_node(str(panel_dir), panel_name="FirstPanel")
+            first.execute_postprocess(str(mod_dir))
+            second = _make_node(str(panel_dir), panel_name="SecondPanel")
+            second.execute_postprocess(str(mod_dir))
+
+            result_text = target_ini_path.read_text(encoding="utf-8")
+            first_marker = "; --- AUTO-APPENDED UI PANEL FirstPanel ---"
+            second_marker = "; --- AUTO-APPENDED UI PANEL SecondPanel ---"
+            self.assertLess(result_text.index(first_marker), result_text.index(second_marker))
+            self.assertGreater(result_text.index(second_marker), result_text.index("[TextureOverride_drawhash]"))
 
 if __name__ == "__main__":
     unittest.main()

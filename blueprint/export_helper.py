@@ -1043,13 +1043,15 @@ class BlueprintExportHelper:
                     ordered_chain.append(node)
 
             for output_socket in node.outputs:
-                if getattr(output_socket, 'bl_idname', '') != 'SSMTSocketPostProcess':
+                if node.bl_idname != 'NodeReroute' and getattr(output_socket, 'bl_idname', '') != 'SSMTSocketPostProcess':
                     continue
                 if not output_socket.is_linked:
                     continue
                 for link in output_socket.links:
                     target = link.to_node
-                    if target.bl_idname.startswith('SSMTNode_PostProcess_'):
+                    if target.bl_idname == 'NodeReroute':
+                        follow_forward(target)
+                    elif target.bl_idname.startswith('SSMTNode_PostProcess_'):
                         follow_forward(target)
 
         def follow_backward(node):
@@ -1059,13 +1061,15 @@ class BlueprintExportHelper:
             visited.add(node_key)
 
             for input_socket in node.inputs:
-                if getattr(input_socket, 'bl_idname', '') != 'SSMTSocketPostProcess':
+                if node.bl_idname != 'NodeReroute' and getattr(input_socket, 'bl_idname', '') != 'SSMTSocketPostProcess':
                     continue
                 if not input_socket.is_linked:
                     continue
                 for link in input_socket.links:
                     source = link.from_node
-                    if source.bl_idname.startswith('SSMTNode_PostProcess_'):
+                    if source.bl_idname == 'NodeReroute':
+                        follow_backward(source)
+                    elif source.bl_idname.startswith('SSMTNode_PostProcess_'):
                         follow_backward(source)
 
             if node.bl_idname.startswith('SSMTNode_PostProcess_') and node not in ordered_chain:

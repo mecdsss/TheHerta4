@@ -333,8 +333,13 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         sections,
         transparency_sections=None,
         preserved_tail_content="",
+        preserved_driver_content="",
     ):
-        new_content = list(preamble_lines or [])
+        new_content = []
+        if preserved_driver_content:
+            new_content.append(preserved_driver_content.rstrip())
+            new_content.append('')
+        new_content.extend(preamble_lines or [])
         if new_content and sections and new_content[-1].strip():
             new_content.append('')
 
@@ -1862,6 +1867,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             with open(ini_file, 'r', encoding='utf-8') as f:
                 content = f.read()
 
+            preserved_driver_content, content = self.split_anim_driver_block_content(content)
             content = self._strip_previous_transparency_sections(content)
             preserved_tail_content = ""
             content, preserved_tail_content = self.split_auto_appended_tail_content(content)
@@ -1895,6 +1901,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 sections,
                 transparency_sections=transparency_sections_to_add,
                 preserved_tail_content=preserved_tail_content,
+                preserved_driver_content=preserved_driver_content,
             )
 
             with open(ini_file, 'w', encoding='utf-8', newline='\n') as f:

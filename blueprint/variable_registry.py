@@ -66,6 +66,14 @@ def _iter_node_variable_names(node):
         yield paused_name
     if driven_name:
         yield driven_name
+    for attr_name in (
+        "drag_mode_variable_name",
+        "ui_detected_variable_name",
+        "ui_zone_variable_name",
+    ):
+        drag_name = normalize_variable_name(getattr(node, attr_name, "") or "")
+        if drag_name:
+            yield drag_name
     for item in getattr(node, "driven_variable_list", []) or []:
         variable_name = normalize_variable_name(getattr(item, "variable_name", "") or "")
         if variable_name:

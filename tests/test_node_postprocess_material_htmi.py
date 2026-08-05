@@ -52,6 +52,8 @@ _install_module(
                 "; --- AUTO-APPENDED SLIDER CONTROL PANEL ---",
                 "; --- AUTO-APPENDED HEALTH DETECTION MODULE ---",
             ),
+            "split_auto_appended_tail_content": classmethod(lambda cls, content: (content, "")),
+            "split_anim_driver_block_content": classmethod(lambda cls, content: ("", content)),
         },
     ),
 )

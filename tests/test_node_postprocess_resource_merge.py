@@ -30,6 +30,7 @@ _install_module(
         {
             "_create_cumulative_backup": lambda self, ini_file_path, mod_export_path: None,
             "split_auto_appended_tail_content": classmethod(lambda cls, content: (content, "")),
+            "split_anim_driver_block_content": classmethod(lambda cls, content: ("", content)),
         },
     ),
 )

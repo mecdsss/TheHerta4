@@ -10,6 +10,41 @@ from collections import OrderedDict
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
 
+class SSMT_OT_RefreshUIPanelExportSection(bpy.types.Operator):
+    bl_idname = "ssmt.refresh_ui_panel_export_section"
+    bl_label = "刷新已导出面板"
+    bl_description = "不重新导出整个Mod，仅按当前面板目录重写已导出INI中的UI面板段"
+    bl_options = {'REGISTER'}
+
+    node_name: bpy.props.StringProperty(
+        name="Node Name",
+        description="关联的UI面板注入节点名称",
+        default="",
+    )
+
+    def execute(self, context):
+        tree = getattr(getattr(context, "space_data", None), "edit_tree", None)
+        if not tree:
+            self.report({'ERROR'}, "未找到当前蓝图编辑上下文")
+            return {'CANCELLED'}
+
+        node = tree.nodes.get(self.node_name) if self.node_name else tree.nodes.active
+        if node is None or getattr(node, "bl_idname", "") != 'SSMTNode_PostProcess_UIPanel':
+            self.report({'ERROR'}, "未找到UI面板注入后处理节点")
+            return {'CANCELLED'}
+
+        from ..common.global_config import GlobalConfig
+        GlobalConfig.read_from_main_json_ssmt4()
+        mod_export_path = str(GlobalConfig.path_generate_mod_folder() or "").strip()
+        if not mod_export_path or not os.path.isdir(mod_export_path):
+            self.report({'ERROR'}, "当前导出目录不存在，请先确认Generate Mod输出路径")
+            return {'CANCELLED'}
+
+        success, message = node.refresh_exported_ui_panel_section(mod_export_path)
+        self.report({'INFO'} if success else {'ERROR'}, message)
+        return {'FINISHED'} if success else {'CANCELLED'}
+
+
 class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
     bl_idname = 'SSMTNode_PostProcess_UIPanel'
     bl_label = 'UI面板注入'
@@ -34,17 +69,16 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
         default="",
         description="网页导出目录：包含 ui_config_*.txt（自动取日期最新的一份）以及 ui_assets_*.zip（自动解压到模组目录）或已解压的 res/、font/ 子目录",
     )
-    merge_constants: bpy.props.BoolProperty(
-        name="合并全局变量",
-        default=True,
-        description="将面板 [Constants] 中的 global 声明合并到配置表；"
-        "配置表已声明的同名变量以配置表为准（初始值不被面板覆盖）",
-    )
-
     def draw_buttons(self, context, layout):
         layout.prop(self, "panel_name")
         layout.prop(self, "panel_folder")
-        layout.prop(self, "merge_constants")
+        refresh_row = layout.row(align=True)
+        refresh_op = refresh_row.operator(
+            "ssmt.refresh_ui_panel_export_section",
+            text="刷新已导出面板",
+            icon='FILE_REFRESH',
+        )
+        refresh_op.node_name = self.name
         layout.separator()
         layout.label(text="自动使用目录中最新的配置文件", icon='FILE_REFRESH')
         layout.label(text="（ui_config_*.txt 按日期取最新）")
@@ -68,7 +102,7 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
         stripped = str(line or "").strip()
         if stripped.startswith(cls.UI_PANEL_MARKER_PREFIX):
             return True
-        return stripped in cls.AUTO_APPENDED_SECTION_MARKERS
+        return SSMTNode_PostProcess_Base.is_known_auto_appended_marker(stripped)
 
     def _split_own_block(self, content: str):
         """按自己的标记切分：返回 (保留内容, 本节点旧块)。
@@ -199,34 +233,8 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
     def _merge_panel_sections(self, target_sections: "OrderedDict[str, list[str]]",
                               panel_sections: "OrderedDict[str, list[str]]",
                               merge_constants: bool = True):
-        """把面板段合并进目标段集合，返回 (追加顺序的段名列表, 警告列表)。"""
-        warnings = []
-        append_order = []
-        for section_name, section_lines in panel_sections.items():
-            if section_name in target_sections:
-                if section_name == "Constants" and merge_constants:
-                    self._merge_global_lines(target_sections["Constants"], section_lines)
-                    continue
-                if section_name in self.SHARED_SECTION_NAMES:
-                    if target_sections[section_name] == section_lines:
-                        warnings.append(f"段 [{section_name}] 已存在且内容相同，跳过重复追加")
-                    else:
-                        warnings.append(
-                            f"段 [{section_name}] 已存在但内容不同，保留配置表中的现有定义"
-                        )
-                    continue
-                if section_name == "Present":
-                    self._replace_present_block(target_sections["Present"], section_lines)
-                    warnings.append("面板 [Present] 逻辑已合并进配置表已有的 [Present]")
-                    continue
-                raise ValueError(
-                    f"UI面板段 [{section_name}] 与配置表已有段重名。"
-                    "同一个网页预设应包含所有面板（组件编号会自动递增）；"
-                    "如需多个独立面板配置，请分别导出并在网页中合并，或修改段名避免冲突。"
-                )
-            target_sections[section_name] = list(section_lines)
-            append_order.append(section_name)
-        return append_order, warnings
+        """Keep every panel section in the node's own bottom block."""
+        return list(panel_sections.keys()), []
 
     def _present_block_markers(self):
         panel_name = str(getattr(self, "panel_name", "") or "UIPanel").strip() or "UIPanel"
@@ -474,6 +482,52 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
                 extracted_count += 1
         return extracted_count
 
+    def _apply_panel_to_ini_file(self, target_ini_file, panel_sections):
+        """Rewrite only this panel's independent bottom block in one INI file."""
+        with open(target_ini_file, 'r', encoding='utf-8-sig') as f:
+            target_text = f.read()
+        kept_text, _removed = self._split_own_block(target_text)
+        driver_block, kept_after_driver = self.split_anim_driver_block_content(kept_text)
+        base_text, preserved_tail = self._split_appended_tail(kept_after_driver)
+        target_preamble = self._extract_preamble(base_text)
+        target_sections = self.parse_sections(base_text)
+
+        append_order, warnings = self._merge_panel_sections(target_sections, panel_sections)
+        for warning in warnings:
+            print(f"  [??] {warning}")
+
+        # Keep the base table as-is and append the whole panel block after any preserved tail.
+        rebuilt_lines = list(target_preamble)
+        if rebuilt_lines and rebuilt_lines[-1].strip():
+            rebuilt_lines.append("")
+        for section_name, section_lines in target_sections.items():
+            rebuilt_lines.append(f"[{section_name}]")
+            rebuilt_lines.extend(section_lines)
+            rebuilt_lines.append("")
+
+        new_block = self._build_appended_block(panel_sections, append_order)
+
+        content_parts = []
+        if driver_block:
+            content_parts.append(driver_block.rstrip())
+
+        rebuilt_body = "\n".join(rebuilt_lines).rstrip()
+        if rebuilt_body:
+            content_parts.append(rebuilt_body)
+
+        if preserved_tail:
+            content_parts.append(preserved_tail.rstrip())
+
+        if new_block:
+            content_parts.append("\n".join(new_block).rstrip())
+
+        final_text = "\n\n".join(content_parts)
+        if final_text:
+            final_text += "\n"
+
+        with open(target_ini_file, 'w', encoding='utf-8') as f:
+            f.write(final_text)
+
     def execute_postprocess(self, mod_export_path):
         print(f"UI面板注入后处理节点开始执行，Mod导出路径: {mod_export_path}")
 
@@ -498,50 +552,42 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
         else:
             self._copy_referenced_files(panel_sections, self._get_panel_folder(), mod_export_path)
 
-        with open(target_ini_file, 'r', encoding='utf-8-sig') as f:
-            target_text = f.read()
-        kept_text, _removed = self._split_own_block(target_text)
-        base_text, preserved_tail = self._split_appended_tail(kept_text)
-        target_preamble = self._extract_preamble(base_text)
-        target_sections = self.parse_sections(base_text)
+        self._apply_panel_to_ini_file(target_ini_file, panel_sections)
 
-        append_order, warnings = self._merge_panel_sections(
-            target_sections, panel_sections,
-            merge_constants=bool(getattr(self, "merge_constants", True)),
-        )
-        for warning in warnings:
-            print(f"  [警告] {warning}")
-
-        # 组装回写内容：保留原样文本 + 追加本节点块
-        # 已合并进 target_sections 的面板段只写一次（统一放在本节点标记块内）
-        appended = set(append_order)
-        rebuilt_lines = list(target_preamble)
-        if rebuilt_lines and rebuilt_lines[-1].strip():
-            rebuilt_lines.append("")
-        for section_name, section_lines in target_sections.items():
-            if section_name in appended:
-                continue
-            rebuilt_lines.append(f"[{section_name}]")
-            rebuilt_lines.extend(section_lines)
-            rebuilt_lines.append("")
-
-        new_block = self._build_appended_block(panel_sections, append_order)
-        final_lines = rebuilt_lines
-        if new_block:
-            final_lines.append("")
-            final_lines.extend(new_block)
-
-        final_text = "\n".join(final_lines)
-        if preserved_tail:
-            if final_text and not final_text.endswith("\n"):
-                final_text += "\n"
-            final_text += preserved_tail
-
-        with open(target_ini_file, 'w', encoding='utf-8') as f:
-            f.write(final_text)
 
         print(f"UI面板配置已追加到: {os.path.basename(target_ini_file)} "
               f"(来源: {config_source}, 段数: {len(panel_sections)})")
+
+    def refresh_exported_ui_panel_section(self, mod_export_path):
+        """Refresh only the exported UI panel block without re-exporting the Mod."""
+        ini_files = glob.glob(os.path.join(mod_export_path, "*.ini"))
+        if not ini_files:
+            return False, "导出目录中未找到任何.ini文件"
+        target_ini_file = ini_files[0]
+
+        try:
+            zip_path = self._find_ui_assets_zip_path()
+            panel_text, config_source = self._load_panel_config_text(zip_path)
+            panel_sections = self.parse_sections(panel_text)
+            if not panel_sections:
+                return False, f"面板INI为空或无法解析: {config_source}"
+
+            if zip_path:
+                self._extract_ui_assets_zip(zip_path, mod_export_path, panel_sections)
+            else:
+                self._copy_referenced_files(panel_sections, self._get_panel_folder(), mod_export_path)
+        except Exception as exc:
+            return False, str(exc)
+
+        try:
+            self._apply_panel_to_ini_file(target_ini_file, panel_sections)
+        except Exception as exc:
+            return False, f"写入UI面板段失败: {exc}"
+
+        return True, (
+            f"已刷新 {os.path.basename(target_ini_file)} 中的UI面板段 "
+            f"(来源: {config_source}, 段数: {len(panel_sections)})"
+        )
 
     def _build_appended_block(self, panel_sections, append_order) -> list:
         marker = self.get_panel_marker()
@@ -581,6 +627,7 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
 
 
 classes = (
+    SSMT_OT_RefreshUIPanelExportSection,
     SSMTNode_PostProcess_UIPanel,
 )
 
