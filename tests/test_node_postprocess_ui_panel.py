@@ -320,6 +320,29 @@ class NodePostprocessUIPanelTests(unittest.TestCase):
             ui_block.index("MODEL DRAG BINDING BEGIN"),
         )
 
+    def test_drag_present_legacy_help_override_replaced_with_alt_gate(self):
+        node = _make_node("")
+        block = [
+            "if $help == 1",
+            "    $ssmtdrag_mode_A = 1",
+            "else",
+            "    $ssmtdrag_mode_A = $ssmtdrag_modifier_down_A",
+            "endif",
+            "if $ssmtdrag_ui_detected_A >= 0 && $ssmtdrag_ui_zone_A == 0",
+            "    $is_dragging = 9",
+            "endif",
+        ]
+        normalized = node._normalize_drag_present_variables(block, {
+            "Constants": [
+                "global $ssmtdrag_ui_detected_A = -1",
+                "global $ssmtdrag_ui_zone_A = -1",
+            ],
+        })
+        joined = "\n".join(normalized)
+        self.assertIn("$ssmtdrag_mode_A = $ssmtdrag_modifier_down_A", joined)
+        self.assertNotIn("if $help == 1", joined)
+        self.assertNotIn("$ssmtdrag_ui_detected_fserfrse", joined)
+
     def test_rerun_preserves_relocated_drag_present_block(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

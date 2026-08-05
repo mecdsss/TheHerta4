@@ -309,6 +309,7 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
 
     @classmethod
     def _normalize_drag_present_variables(cls, block_lines, target_sections):
+        block_lines = cls._strip_legacy_drag_mode_override(block_lines)
         detected_suffix = cls._ui_variable_suffix(block_lines, "detected")
         zone_suffix = cls._ui_variable_suffix(block_lines, "zone")
         detected_candidates = []
@@ -344,6 +345,52 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
                 for line in normalized
             ]
         return normalized
+
+    @staticmethod
+    def _strip_legacy_drag_mode_override(block_lines):
+        """Replace old help-gated drag mode blocks with the current ALT gate."""
+        lines = [str(line).rstrip("\r\n") for line in block_lines]
+        changed = True
+        while changed:
+            changed = False
+            for index, line in enumerate(lines):
+                if line.strip() != "if $help == 1":
+                    continue
+                body_parts = "".join(lines[index:index + 4]).lower()
+                if "$ssmtdrag_mode_" not in body_parts:
+                    continue
+                mode_match = re.search(r'\$ssmtdrag_mode_([A-Za-z0-9_]+)', "\n".join(lines[index:index + 4]))
+                suffix = mode_match.group(1) if mode_match else ""
+                uses_alt = "$ssmtdrag_modifier_down_" in "\n".join(lines[index:index + 8]).lower()
+                replacement = (
+                    f"$ssmtdrag_mode_{suffix} = $ssmtdrag_modifier_down_{suffix}"
+                    if uses_alt and suffix
+                    else f"$ssmtdrag_mode_{suffix} = 1"
+                )
+                depth = 1
+                end = None
+                for j in range(index + 1, len(lines)):
+                    current = lines[j].strip()
+                    if current.startswith("if "):
+                        depth += 1
+                    elif current == "endif":
+                        depth -= 1
+                        if depth == 0:
+                            end = j
+                            break
+                if end is None:
+                    continue
+                body = "\n".join(lines[index:end + 1])
+                if "$ssmtdrag_mode_" not in body:
+                    continue
+                lines[index:end + 1] = [replacement]
+                if index < len(lines) and lines[index].strip() == "":
+                    del lines[index]
+                elif index > 0 and lines[index - 1].strip() == "":
+                    del lines[index - 1]
+                changed = True
+                break
+        return lines
 
     @staticmethod
     def _ui_variable_suffix(lines, base):

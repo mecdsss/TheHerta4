@@ -888,10 +888,12 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("$ssmtdrag_ui_zone_testns = -1", readback)
         self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedDetectID_testns]"])
         self.assertIn("stride = 4", sections["[ResourceDragPinnedDetectID_testns]"])
+        self.assertIn("data = R32_FLOAT -1", sections["[ResourceDragPinnedDetectID_testns]"])
         self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedDetectInfo_testns]"])
         self.assertIn("stride = 16", sections["[ResourceDragPinnedDetectInfo_testns]"])
         self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedZone_testns]"])
         self.assertIn("stride = 4", sections["[ResourceDragPinnedZone_testns]"])
+        self.assertIn("data = R32_FLOAT -1", sections["[ResourceDragPinnedZone_testns]"])
         pin = "\n".join(sections["[CustomShaderDragPinDetected_testns]"])
         component_pin = "\n".join(sections["[CustomShaderDragPinComponentabc123_43191_testns]"])
         self.assertIn("cs-u3 = ResourceDragPinnedZone_testns", pin)
@@ -899,6 +901,7 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertNotIn("cs-u3 = ResourceDragPinnedZone_testns", component_pin)
         self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedComponentZone_abc123_43191_testns]"])
         self.assertIn("stride = 4", sections["[ResourceDragPinnedComponentZone_abc123_43191_testns]"])
+        self.assertIn("data = R32_FLOAT -1", sections["[ResourceDragPinnedComponentZone_abc123_43191_testns]"])
 
         # 旧版 Present 已存在时仍可幂等补齐桥接，而不是被提前 return 跳过。
         legacy_sections = _base_sections()
