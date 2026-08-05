@@ -1385,6 +1385,10 @@ class SSMT_MT_NodeMenu_PostProcess(bpy.types.Menu):
         _add_node_entry(layout, "多文件配置", 'FILE_FOLDER', "SSMTNode_PostProcess_MultiFile")
         _add_node_entry(layout, "拖拽交互", 'MOUSE_MOVE', "SSMTNode_PostProcess_DragInteraction")
         _add_node_entry(layout, "动画驱动蓝图", 'ACTION', "SSMTNode_PostProcess_AnimDriver")
+        _add_node_entry(layout, "形态键扩展配置", 'ACTION', "SSMTNode_PostProcess_ShapeKeyExt")
+        _add_node_entry(layout, "物体切换面板", 'SHADERFX', "SSMTNode_PostProcess_SwapPanel")
+        _add_node_entry(layout, "RabbitFX贴图后处理", 'LIGHT', "SSMTNode_PostProcess_Glow")
+        _add_node_entry(layout, "PS绑定+IB限定", 'SHADERFX', "SSMTNode_PostProcess_PSBinding")
 
 
 class SSMT_OT_AlignNodes(bpy.types.Operator):
