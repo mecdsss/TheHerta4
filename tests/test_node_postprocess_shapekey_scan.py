@@ -157,6 +157,9 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
                 self.shape_key_name = shape_key_name
                 self.assigned_variable_name = assigned_variable_name
                 self.custom_variable_name = custom_variable_name
+                self.drag_zone_id = -1
+                self.drag_click_stage = 1
+                self.drag_dir_id = "-1"
 
         class _FakeCollection(list):
             def add(self):
@@ -193,6 +196,9 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
                 self.shape_key_name = shape_key_name
                 self.assigned_variable_name = assigned_variable_name
                 self.custom_variable_name = custom_variable_name
+                self.drag_zone_id = -1
+                self.drag_click_stage = 1
+                self.drag_dir_id = "-1"
 
         class _FakeCollection(list):
             def add(self):
@@ -220,6 +226,89 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
             [item.shape_key_name for item in node.shapekey_variable_items],
             ["A", "B", "F"],
         )
+
+    def test_ensure_shape_key_variable_map_preserves_drag_drive_settings_on_rebuild(self):
+        """测试重建时保留区域/档位/方向等拖拽设置"""
+        class _FakeItem:
+            def __init__(self, shape_key_name="", assigned_variable_name="", custom_variable_name=""):
+                self.shape_key_name = shape_key_name
+                self.assigned_variable_name = assigned_variable_name
+                self.custom_variable_name = custom_variable_name
+                self.drag_zone_id = -1
+                self.drag_click_stage = 1
+                self.drag_dir_id = "-1"
+
+        class _FakeCollection(list):
+            def add(self):
+                item = _FakeItem()
+                self.append(item)
+                return item
+
+            def remove(self, index):
+                del self[index]
+
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        a = _FakeItem("A", "Freq_A", "Freq_A")
+        a.drag_zone_id = 2
+        a.drag_click_stage = 3
+        a.drag_dir_id = "1"
+        node.shapekey_variable_items = _FakeCollection([
+            a,
+            _FakeItem("B", "Freq_B", "Freq_B"),
+            _FakeItem("C", "Freq_C", "Freq_C"),
+            _FakeItem("D", "Freq_D", "Freq_D"),
+            _FakeItem("E", "Freq_E", "Freq_E"),
+        ])
+
+        # 名称集合变化（D/E 被裁剪，新增 F）触发重建
+        node.ensure_shape_key_variable_map(["A", "B", "C", "F"])
+
+        self.assertEqual(
+            [item.shape_key_name for item in node.shapekey_variable_items],
+            ["A", "B", "C", "F"],
+        )
+        preserved = next(item for item in node.shapekey_variable_items if item.shape_key_name == "A")
+        self.assertEqual(preserved.drag_zone_id, 2)
+        self.assertEqual(preserved.drag_click_stage, 3)
+        self.assertEqual(preserved.drag_dir_id, "1")
+
+    def test_ensure_shape_key_variable_map_no_rebuild_when_names_unchanged(self):
+        """测试形态键集合未变化时（即使顺序不同）不重建，保留拖拽设置"""
+        class _FakeItem:
+            def __init__(self, shape_key_name="", assigned_variable_name="", custom_variable_name=""):
+                self.shape_key_name = shape_key_name
+                self.assigned_variable_name = assigned_variable_name
+                self.custom_variable_name = custom_variable_name
+                self.drag_zone_id = -1
+                self.drag_click_stage = 1
+                self.drag_dir_id = "-1"
+
+        class _FakeCollection(list):
+            def add(self):
+                item = _FakeItem()
+                self.append(item)
+                return item
+
+            def remove(self, index):
+                del self[index]
+
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        a = _FakeItem("A", "Freq_A", "Freq_A")
+        a.drag_zone_id = 5
+        a.drag_click_stage = 2
+        a.drag_dir_id = "3"
+        b = _FakeItem("B", "Freq_B", "Freq_B")
+        node.shapekey_variable_items = _FakeCollection([b, a])  # 顺序 B,A
+
+        # 传入 A,B（名称集合相同，顺序不同）→ 不重建
+        node.ensure_shape_key_variable_map(["A", "B"])
+
+        self.assertEqual(len(node.shapekey_variable_items), 2)
+        self.assertIs(node.shapekey_variable_items[0], b)
+        self.assertIs(node.shapekey_variable_items[1], a)
+        self.assertEqual(a.drag_zone_id, 5)
+        self.assertEqual(a.drag_click_stage, 2)
+        self.assertEqual(a.drag_dir_id, "3")
 
     def test_compute_dispatch_group_count_rounds_up_by_thread_group(self):
         node = module.SSMTNode_PostProcess_ShapeKey()

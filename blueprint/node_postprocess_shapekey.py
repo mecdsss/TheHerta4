@@ -297,18 +297,22 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     backfilled_count += 1
                 rebuilt_items.append(existing)
 
-        if len(rebuilt_items) == len(self.shapekey_variable_items):
-            for index, item in enumerate(rebuilt_items):
-                if self.shapekey_variable_items[index] is not item:
-                    break
-            else:
-                return created_count, backfilled_count
+        # 形态键集合未变化：即使顺序不同也不重建，避免清空区域/档位/方向等拖拽设置
+        existing_names = {
+            str(getattr(item, "shape_key_name", "") or "").strip()
+            for item in self.shapekey_variable_items
+        }
+        if existing_names == set(normalized_names):
+            return created_count, backfilled_count
 
         serialized_items = [
             {
                 "shape_key_name": getattr(item, "shape_key_name", ""),
                 "assigned_variable_name": getattr(item, "assigned_variable_name", ""),
                 "custom_variable_name": getattr(item, "custom_variable_name", ""),
+                "drag_zone_id": getattr(item, "drag_zone_id", -1),
+                "drag_click_stage": getattr(item, "drag_click_stage", 1),
+                "drag_dir_id": getattr(item, "drag_dir_id", "-1"),
             }
             for item in rebuilt_items
         ]
@@ -321,6 +325,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             item.shape_key_name = serialized["shape_key_name"]
             item.assigned_variable_name = serialized["assigned_variable_name"]
             item.custom_variable_name = serialized["custom_variable_name"]
+            item.drag_zone_id = serialized["drag_zone_id"]
+            item.drag_click_stage = serialized["drag_click_stage"]
+            item.drag_dir_id = serialized["drag_dir_id"]
 
         return created_count, backfilled_count
 
