@@ -158,6 +158,7 @@ def _make_node(mod, **props):
         enable_poke=True, enable_hand_cursor=False, enable_viewport_probe=True,
         drag_system_mode_default=2, drag_mode_initialized=True,
         drag_mode_variable_name="ssmtdrag_drag_enabled",
+        mode_toggle_key="f8",
         ui_detected_variable_name="ssmtdrag_ui_detected",
         ui_zone_variable_name="ssmtdrag_ui_zone",
         phys_grab_damping=0.86, phys_grab_spring=0.176,
@@ -564,6 +565,36 @@ class DragNodeEmitTests(unittest.TestCase):
         mode_idx = gate_block.index("if $ssmtdrag_drag_enabled_testns != 1")
         self.assertIn("\tclear = ResourceDragShapeKeyDrive_testns 0.0", gate_block[mode_idx:mode_idx + 4])
         self.assertIn("\tclear = ResourceDragShapeKeyDir_testns 0.0", gate_block[mode_idx:mode_idx + 4])
+
+    def test_mode_toggle_key_generates_cycle_section(self):
+        _, sections, _ = self._emit()
+        key_lines = sections["[KeyDragInputManagerModeToggle_testns]"]
+        self.assertEqual(key_lines, [
+            "key = f8",
+            "type = cycle",
+            "$ssmtdrag_drag_enabled_testns = 0,1,2",
+        ])
+
+    def test_mode_toggle_key_custom_mode_variable(self):
+        _, sections, _ = self._emit(drag_mode_variable_name="$custom_drag_mode")
+        key_lines = sections["[KeyDragInputManagerModeToggle_testns]"]
+        self.assertIn("$custom_drag_mode = 0,1,2", key_lines)
+
+    def test_mode_toggle_key_update_and_disable(self):
+        node = _make_node(self.mod, mode_toggle_key="f9")
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        self.assertEqual(sections["[KeyDragInputManagerModeToggle_testns]"][0], "key = f9")
+
+        # 再次导出保持幂等（不重复、不追加）
+        node._emit_sections(sections, comps, "testns")
+        self.assertEqual(len(sections["[KeyDragInputManagerModeToggle_testns]"]), 3)
+
+        # 清空/填 none 时移除旧段
+        node2 = _make_node(self.mod, mode_toggle_key="none")
+        node2._emit_sections(sections, comps, "testns")
+        self.assertNotIn("[KeyDragInputManagerModeToggle_testns]", sections)
 
     def test_tempvb0_empty_declaration(self):
         _, sections, _ = self._emit()
