@@ -1499,6 +1499,63 @@ class DragNodePreviewTests(unittest.TestCase):
         f_bug = node._shape_field(d_bug, 1.0, 4.6, 0.0)
         self.assertGreater(float(f_bug.max()), 0.0)
 
+    def test_merged_mesh_welds_shared_seam_between_objects(self):
+        """集合预览：共享接缝的两个网格必须被焊接为同一个连续表面。
+        球命中 A 后应沿表面穿过接缝传播到 B；结果必须与手工焊成单个
+        网格计算的场完全一致（即集合 = 一个物体）。"""
+        mod = self.mod
+        node = _make_node(mod)
+        object.__setattr__(node, "surface_propagate", True)
+        object.__setattr__(node, "mask_plateau", 0.0)
+        # 球心 (0.15,0,0) 半径 0.25：A 沿 x（接缝在 x=0.2），B 从接缝沿 y 拐弯
+        empty = self._make_zone_empty(loc=(0.15, 0.0, 0.0), scale=0.25)
+        zones = [(empty, empty.ssmt_drag_zone)]
+        verts_a = np.array([[0.1, 0.0, 0.0], [0.15, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=np.float64)
+        tris_a = np.array([[0, 1, 2]], dtype=np.int64)
+        verts_b = np.array([[0.2, 0.0, 0.0], [0.2, 0.1, 0.0], [0.2, 0.2, 0.0]], dtype=np.float64)
+        tris_b = np.array([[0, 1, 2]], dtype=np.int64)
+
+        fields = mod._preview_merged_mesh(
+            node,
+            [(verts_a, tris_a), (verts_b, tris_b)],
+            zones,
+            0.0,
+        )
+        self.assertEqual(len(fields), 2)
+
+        # 手工焊接成单个网格：B[0] 与 A[2] 共享接缝顶点
+        welded_verts = np.concatenate([verts_a, verts_b[1:]], axis=0)
+        welded_tris = np.array([[0, 1, 2], [2, 3, 4]], dtype=np.int64)
+        ref = mod._preview_target_field(node, welded_verts, welded_tris, zones, 0.0)
+
+        np.testing.assert_allclose(fields[0], ref[:3], atol=1e-12)
+        # B 的接缝顶点与 A 末端同节点 → 权重一致；B 其余顶点按接缝连续传播
+        np.testing.assert_allclose(fields[1], np.concatenate([[ref[2]], ref[3:]]), atol=1e-12)
+
+    def test_merged_mesh_keeps_disconnected_parts_zero(self):
+        """集合预览：不共享接缝（互不相连）的网格不能被沿表面传播到，
+        只有真正被球接触的物体有权重。"""
+        mod = self.mod
+        node = _make_node(mod)
+        object.__setattr__(node, "surface_propagate", True)
+        object.__setattr__(node, "mask_plateau", 0.0)
+        empty = self._make_zone_empty(loc=(0.15, 0.0, 0.0), scale=0.25)
+        zones = [(empty, empty.ssmt_drag_zone)]
+        verts_a = np.array([[0.1, 0.0, 0.0], [0.15, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=np.float64)
+        tris_a = np.array([[0, 1, 2]], dtype=np.int64)
+        # B 平移 z=3，与 A 无共享顶点 → 不连通
+        verts_b = np.array([[0.1, 0.0, 3.0], [0.15, 0.0, 3.0], [0.2, 0.0, 3.0]], dtype=np.float64)
+        tris_b = np.array([[0, 1, 2]], dtype=np.int64)
+
+        fields = mod._preview_merged_mesh(
+            node,
+            [(verts_a, tris_a), (verts_b, tris_b)],
+            zones,
+            0.0,
+        )
+        self.assertGreater(float(fields[0].max()), 0.0)
+        np.testing.assert_array_equal(fields[1], np.zeros(3))
+
 
 class DragNodeMirrorTests(unittest.TestCase):
     """非镜像工作流：区域空物体矩阵 X 镜像补偿（掩码左右颠倒回归）。"""

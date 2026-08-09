@@ -3108,6 +3108,60 @@ def _preview_target_field(node, verts_world, tri, zones, plateau):
     return field
 
 
+def _preview_merged_mesh(node, meshes, zones, plateau, weld_tol=1e-5):
+    """集合预览：把集合内全部网格合并为同一个连续表面再计算沿表面传播。
+    共享接缝的顶点（世界坐标差 < weld_tol）会被焊接为同一拓扑节点，
+    因此球命中任一部件后能沿表面连续传播到相邻部件；各自独立的部分
+    仍保持不连通。返回与 meshes 对齐的逐网格权重数组列表。"""
+    parts = []
+    vertex_offset = 0
+    all_verts = []
+    all_tris = []
+    for verts_world, tri in meshes:
+        n_verts = len(verts_world)
+        parts.append((vertex_offset, n_verts, len(tri)))
+        all_verts.append(verts_world)
+        all_tris.append(tri + vertex_offset)
+        vertex_offset += n_verts
+    if not all_verts:
+        return []
+    all_verts = np.concatenate(all_verts, axis=0)
+    all_tris = np.concatenate(all_tris, axis=0)
+
+    # 焊接：把世界坐标接近的顶点归为同一拓扑节点（量化 + unique）
+    quantized = np.round(np.asarray(all_verts, dtype=np.float64) / float(weld_tol))
+    _, cluster_ids = np.unique(quantized, axis=0, return_inverse=True)
+    cluster_ids = cluster_ids.astype(np.int64, copy=False)
+    cluster_count = int(cluster_ids.max()) + 1
+    cluster_centers = np.zeros((cluster_count, 3), dtype=np.float64)
+    np.add.at(cluster_centers, cluster_ids, all_verts)
+    counts = np.bincount(cluster_ids, minlength=cluster_count).astype(np.float64)
+    cluster_centers /= counts[:, None]
+
+    cluster_tris = cluster_ids[all_tris.reshape(-1)].reshape(-1, 3)
+    # 去除焊接后退化的三角形（三个顶点同节点）
+    cluster_tris = cluster_tris[
+        (cluster_tris[:, 0] != cluster_tris[:, 1])
+        & (cluster_tris[:, 1] != cluster_tris[:, 2])
+        & (cluster_tris[:, 0] != cluster_tris[:, 2])
+    ]
+    edge_verts = gb_core.edges_from_triangles(cluster_tris) if len(cluster_tris) else None
+
+    cluster_field = np.zeros(cluster_count, dtype=np.float64)
+    for empty, s in zones:
+        d = node._zone_distances(cluster_centers, empty.matrix_world, edge_verts)
+        if d is None:
+            continue
+        f = node._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)
+        np.maximum(cluster_field, f, out=cluster_field)
+    field_all = cluster_field[cluster_ids]
+
+    fields = []
+    for vertex_offset, n_verts, _tri_count in parts:
+        fields.append(field_all[vertex_offset:vertex_offset + n_verts])
+    return fields
+
+
 def _rebuild_preview_batches(nodes):
     """重算全部启用节点的热力图批次。"""
     global _preview_batches
@@ -3125,7 +3179,11 @@ def _rebuild_preview_batches(nodes):
                 continue
             zones.append((empty, empty.ssmt_drag_zone))
         use_surface_distance = _preview_uses_surface_distance(n, len(zones))
-        for target in _preview_targets(n):
+        targets = _preview_targets(n)
+        plateau = getattr(n, "mask_plateau", 0.0)
+        # 收集每个目标网格的 world 顶点与三角形
+        mesh_data = []
+        for target in targets:
             mesh = target.data
             if len(mesh.vertices) == 0:
                 continue
@@ -3135,13 +3193,31 @@ def _rebuild_preview_batches(nodes):
             mw = np.array(target.matrix_world, dtype=np.float64)
             verts_world = verts @ mw[:3, :3].T + mw[:3, 3]
             mesh.calc_loop_triangles()
-            tri = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
+            tri = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int64)
             mesh.loop_triangles.foreach_get("vertices", tri)
             tri = tri.reshape(-1, 3)
-            # 集合被视为一个预览目标，但各网格保留自身拓扑，避免跨物体虚构连接边。
-            field = np.zeros(len(verts), dtype=np.float64)
-            plateau = getattr(n, "mask_plateau", 0.0)
-            field = _preview_target_field(n, verts_world, tri, zones, plateau)
+            mesh_data.append((target, verts_world, tri))
+        if not mesh_data:
+            continue
+
+        # 集合预览：所有网格合并为同一连续表面（焊接共享接缝），
+        # 沿表面传播可跨部件连续扩散；单物体直接按自身拓扑计算。
+        collection_mode = getattr(n, "preview_collection", None) is not None
+        if collection_mode:
+            fields = _preview_merged_mesh(
+                n,
+                [(verts_world, tri) for _target, verts_world, tri in mesh_data],
+                zones,
+                plateau,
+            )
+        else:
+            fields = [
+                _preview_target_field(n, verts_world, tri, zones, plateau)
+                for _target, verts_world, tri in mesh_data
+            ]
+
+        for (target, verts_world, tri), field in zip(mesh_data, fields):
+            field = np.asarray(field, dtype=np.float64)
             colors = gb_core.weights_to_colors(field, _PREVIEW_ALPHA).astype(np.float32)
             ghost_colors = np.array(colors, copy=True)
             ghost_colors[:, 3] *= _PREVIEW_GHOST_FACTOR
