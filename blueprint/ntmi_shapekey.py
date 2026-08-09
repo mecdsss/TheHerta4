@@ -181,11 +181,27 @@ class NTMIShapeKeyNodeAdapter:
     def DRAG_DRIVE_REGISTER(self) -> int:
         return int(getattr(self.original_node, "DRAG_DRIVE_REGISTER", 100))
 
+    @property
+    def DRAG_CLICK_COUNT_REGISTER(self) -> int:
+        return int(getattr(self.original_node, "DRAG_CLICK_COUNT_REGISTER", 101))
+
     def _drag_shapekey_drive_resource_name(self, ini_path=None):
         return self.original_node._drag_shapekey_drive_resource_name(ini_path)
 
+    def _drag_shapekey_click_count_resource_name(self, ini_path=None):
+        return self.original_node._drag_shapekey_click_count_resource_name(ini_path)
+
     def _drag_drive_zone_ids(self, unique_names):
         return self.original_node._drag_drive_zone_ids(unique_names)
+
+    def _drag_drive_click_stages(self, unique_names):
+        return self.original_node._drag_drive_click_stages(unique_names)
+
+    def _drag_drive_stage_count(self):
+        return self.original_node._drag_drive_stage_count()
+
+    def _drag_drive_dirs(self, unique_names):
+        return self.original_node._drag_drive_dirs(unique_names)
 
     def _update_shader_file(
         self,
@@ -199,20 +215,36 @@ class NTMIShapeKeyNodeAdapter:
         merge_slot_files=False,
         drag_drive_enabled=False,
         drag_zone_ids=None,
+        drag_click_stages=None,
+        drag_stage_count=1,
+        drag_dirs=None,
     ):
         del unique_objects, use_packed, use_delta, use_optimized, merge_slot_files
         num_slots = max(hash_slot_data.keys()) if hash_slot_data else 0
         zone_ids = list(drag_zone_ids or []) if drag_drive_enabled else []
+        click_stages = list(drag_click_stages or []) if drag_drive_enabled else []
+        dirs = list(drag_dirs or []) if drag_drive_enabled else []
+        stage_count = max(1, int(drag_stage_count or 1))
+        dir_count = 4
         drive_extra_lines = []
         if drag_drive_enabled:
             drive_extra_lines.append(f"Buffer<float> ShapeKeyDrive : register(t{self.DRAG_DRIVE_REGISTER});")
+            drive_extra_lines.append(f"Buffer<uint> ShapeKeyClickCount : register(t{self.DRAG_CLICK_COUNT_REGISTER});")
+            drive_extra_lines.append(f"static const uint SHAPEKEY_STAGE_COUNT = {stage_count}u;")
+            drive_extra_lines.append(f"static const uint SHAPEKEY_DIR_COUNT = {dir_count}u;")
             if any(zone >= 0 for zone in zone_ids):
                 ids_text = ", ".join(str(zone) if zone >= 0 else "0xFFFFFFFFu" for zone in zone_ids)
                 drive_extra_lines.append(f"static const uint SHAPEKEY_ZONE_IDS[{len(zone_ids)}] = {{ {ids_text} }};")
                 drive_extra_lines.append(f"static const uint SHAPEKEY_ZONE_IDS_COUNT = {len(zone_ids)}u;")
+                stage_text = ", ".join(str(stage) if stage >= 1 else "0xFFFFFFFFu" for stage in click_stages)
+                drive_extra_lines.append(f"static const uint SHAPEKEY_STAGE_IDS[{len(click_stages) or len(zone_ids)}] = {{ {stage_text} }};")
+                dir_text = ", ".join(str(d) if d >= 0 else "0xFFFFFFFFu" for d in dirs)
+                drive_extra_lines.append(f"static const uint SHAPEKEY_DIR_IDS[{len(dirs) or len(zone_ids)}] = {{ {dir_text} }};")
             else:
                 drive_extra_lines.append("static const uint SHAPEKEY_ZONE_IDS[1] = { 0xFFFFFFFFu };")
                 drive_extra_lines.append("static const uint SHAPEKEY_ZONE_IDS_COUNT = 1u;")
+                drive_extra_lines.append("static const uint SHAPEKEY_STAGE_IDS[1] = { 0xFFFFFFFFu };")
+                drive_extra_lines.append("static const uint SHAPEKEY_DIR_IDS[1] = { 0xFFFFFFFFu };")
             drive_extra_lines.append("")
         freq_define_lines = []
         for index, name in enumerate(unique_names):
@@ -278,9 +310,9 @@ class NTMIShapeKeyNodeAdapter:
                 "            float weight = IniParams[100u + freq_idx].x;",
                 *(
                     [
-                        "            if (freq_idx < SHAPEKEY_ZONE_IDS_COUNT && SHAPEKEY_ZONE_IDS[freq_idx] != 0xFFFFFFFFu)",
+                        "            if (freq_idx < SHAPEKEY_ZONE_IDS_COUNT && SHAPEKEY_ZONE_IDS[freq_idx] != 0xFFFFFFFFu && ShapeKeyClickCount[SHAPEKEY_ZONE_IDS[freq_idx]] == SHAPEKEY_STAGE_IDS[freq_idx])",
                         "            {",
-                        "                weight = ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx]];",
+                        "                weight = ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx] * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT + (SHAPEKEY_STAGE_IDS[freq_idx] - 1u) * SHAPEKEY_DIR_COUNT + SHAPEKEY_DIR_IDS[freq_idx]];",
                         "            }",
                     ]
                     if drag_drive_enabled
@@ -801,13 +833,21 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
                             if drive_node is not None
                             else int(getattr(self, "DRAG_DRIVE_REGISTER", 100))
                         )
+                        click_register = (
+                            int(getattr(drive_node, "DRAG_CLICK_COUNT_REGISTER", 101))
+                            if drive_node is not None
+                            else int(getattr(self, "DRAG_CLICK_COUNT_REGISTER", 101))
+                        )
                         drive_bind_lines = (
-                            [f"cs-t{drive_register} = {drag_drive_resource}"]
+                            [
+                                f"cs-t{drive_register} = {drag_drive_resource}",
+                                f"cs-t{click_register} = {drive_node._drag_shapekey_click_count_resource_name(getattr(self, 'target_ini_file', getattr(self, 'ini_path', None)))}",
+                            ]
                             if drag_drive_resource
                             else []
                         )
                         drive_unbind_lines = (
-                            [f"cs-t{drive_register} = null"]
+                            [f"cs-t{drive_register} = null", f"cs-t{click_register} = null"]
                             if drag_drive_resource
                             else []
                         )

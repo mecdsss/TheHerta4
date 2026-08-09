@@ -159,6 +159,7 @@ def _make_node(mod, **props):
         drag_system_mode_default=2, drag_mode_initialized=True,
         drag_mode_variable_name="ssmtdrag_drag_enabled",
         mode_toggle_key="f8",
+        shapekey_drive_move_sensitivity=0.02,
         ui_detected_variable_name="ssmtdrag_ui_detected",
         ui_zone_variable_name="ssmtdrag_ui_zone",
         phys_grab_damping=0.86, phys_grab_spring=0.176,
@@ -537,17 +538,27 @@ class DragNodeEmitTests(unittest.TestCase):
 
         self.assertEqual(
             sections["[ResourceDragShapeKeyDrive_testns]"],
-            ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 4"],
         )
-        # 方向缓冲 = 区域容量 + 1（末位槽存上一帧按键状态）
+        # 方向缓冲 = 区域×档位×4方向 + 1（末位槽存上一帧按键状态）
         self.assertEqual(
             sections["[ResourceDragShapeKeyDir_testns]"],
-            ["type = RWBuffer", "format = R32_FLOAT", "array = 2"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 5"],
+        )
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyClickCount_testns]"],
+            ["type = RWBuffer", "format = R32_UINT", "array = 1"],
+        )
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyActiveDir_testns]"],
+            ["type = RWBuffer", "format = R32_UINT", "array = 1"],
         )
 
         cs = sections["[CustomShaderDragShapeKeyDrive_testns]"]
         self.assertIn("cs-u0 = ResourceDragShapeKeyDrive_testns", cs)
         self.assertIn("cs-u1 = ResourceDragShapeKeyDir_testns", cs)
+        self.assertIn("cs-u2 = ResourceDragShapeKeyClickCount_testns", cs)
+        self.assertIn("cs-u3 = ResourceDragShapeKeyActiveDir_testns", cs)
         self.assertIn("post cs-u1 = null", cs)
         self.assertIn("z77 = $ssmtdrag_drag_enabled_testns", cs)
         self.assertIn("w77 = $ssmtdrag_lmb_down_testns", cs)
@@ -565,6 +576,34 @@ class DragNodeEmitTests(unittest.TestCase):
         mode_idx = gate_block.index("if $ssmtdrag_drag_enabled_testns != 1")
         self.assertIn("\tclear = ResourceDragShapeKeyDrive_testns 0.0", gate_block[mode_idx:mode_idx + 4])
         self.assertIn("\tclear = ResourceDragShapeKeyDir_testns 0.0", gate_block[mode_idx:mode_idx + 4])
+
+    def test_shapekey_drive_mouse_displacement_present_lines(self):
+        zone = self._zone_item(0)
+        node, sections, comps = self._emit(
+            enable_shapekey_drive=True,
+            zone_objects=[zone],
+            shapekey_drive_ramp_rate=0.08,
+            shapekey_drive_release_decay=0.0,
+            shapekey_drive_input='MOUSE',
+            shapekey_drive_move_sensitivity=0.02,
+        )
+        node._emit_present_and_constants(sections, comps, "testns")
+
+        present = "\n".join(sections["[Present]"])
+        self.assertIn("$ssmtdrag_shapekey_dy_testns = $cursorY - $ssmtdrag_shapekey_prev_y_testns", present)
+        self.assertIn("$ssmtdrag_shapekey_dx_testns = $cursorX - $ssmtdrag_shapekey_prev_x_testns", present)
+
+        constants = "\n".join(sections["[Constants]"])
+        self.assertIn("global $ssmtdrag_shapekey_dy_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_shapekey_dx_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_shapekey_prev_y_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_shapekey_prev_x_testns = 0", constants)
+
+        cs = sections["[CustomShaderDragShapeKeyDrive_testns]"]
+        self.assertIn("x79 = $ssmtdrag_shapekey_dy_testns", cs)
+        self.assertIn("y79 = $ssmtdrag_shapekey_dx_testns", cs)
+        self.assertIn("w79 = 1", cs)
+        self.assertIn("x80 = 0.02", cs)
 
     def test_mode_toggle_key_generates_cycle_section(self):
         _, sections, _ = self._emit()

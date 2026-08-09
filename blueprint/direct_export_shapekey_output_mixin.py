@@ -614,7 +614,11 @@ class DirectShapeKeyOutputMixin:
             if drag_drive_resource:
                 block_lines.append("\n    ; --- Drag ShapeKey Drive ---")
                 block_lines.append(f"    cs-t{self.node.DRAG_DRIVE_REGISTER} = {drag_drive_resource}")
+                click_resource = self.node._drag_shapekey_click_count_resource_name(target_ini_file)
+                if click_resource:
+                    block_lines.append(f"    cs-t{self.node.DRAG_CLICK_COUNT_REGISTER} = {click_resource}")
                 t_registers_to_null.append(f"cs-t{self.node.DRAG_DRIVE_REGISTER}")
+                t_registers_to_null.append(f"cs-t{self.node.DRAG_CLICK_COUNT_REGISTER}")
 
             block_lines.append(f"    cs = ./res/shapekey_anim_{logical_hash}.hlsl")
             res_to_bind = base_resources if base_resources else [f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"]

@@ -108,12 +108,16 @@ _spec.loader.exec_module(_module)
 class _OriginalNode:
     drag_drive_enabled = True
     DRAG_DRIVE_REGISTER = 100
+    DRAG_CLICK_COUNT_REGISTER = 101
 
     def _create_safe_var_name(self, text, prefix="", existing_names=None):
         return f"{prefix}{str(text or '').replace('-', '_')}"
 
     def _drag_shapekey_drive_resource_name(self, ini_path=None):
         return "ResourceDragShapeKeyDrive_ns"
+
+    def _drag_shapekey_click_count_resource_name(self, ini_path=None):
+        return "ResourceDragShapeKeyClickCount_ns"
 
     def _drag_drive_zone_ids(self, unique_names):
         return [2, 3, -1]
@@ -145,8 +149,9 @@ class NTMIShapeKeyDragDriveTests(unittest.TestCase):
         with open(shader_path, encoding="utf-8") as f:
             content = f.read()
         self.assertIn("Buffer<float> ShapeKeyDrive : register(t100);", content)
+        self.assertIn("Buffer<uint> ShapeKeyClickCount : register(t101);", content)
         self.assertIn("SHAPEKEY_ZONE_IDS", content)
-        self.assertIn("weight = ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx]];", content)
+        self.assertIn("weight = ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx] * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT", content)
         self.assertIn("0xFFFFFFFFu", content)
 
     def test_skin_commandlist_binds_drive(self):
@@ -167,7 +172,9 @@ class NTMIShapeKeyDragDriveTests(unittest.TestCase):
         generator._patch_skin_commandlists(sections, {"abc123"}, {"abc123": 3})
         patched = "\n".join(sections["[CommandList_SkinParts_X]"])
         self.assertIn("cs-t100 = ResourceDragShapeKeyDrive_ns", patched)
+        self.assertIn("cs-t101 = ResourceDragShapeKeyClickCount_ns", patched)
         self.assertIn("cs-t100 = null", patched)
+        self.assertIn("cs-t101 = null", patched)
 
 
 if __name__ == "__main__":

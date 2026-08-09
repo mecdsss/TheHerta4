@@ -56,6 +56,24 @@ class ShapeKeyVariableItem(bpy.types.PropertyGroup):
         min=-1,
         max=255,
     ) # type: ignore
+    drag_click_stage: bpy.props.IntProperty(
+        name="点击档位",
+        description="同区域内点击第 N 次时激活该形态键（1=点击一次，2=点击两次…）；与拖拽节点“点击档位数”配合使用",
+        default=1,
+        min=1,
+        max=16,
+    ) # type: ignore
+    drag_dir_id: bpy.props.EnumProperty(
+        name="驱动方向",
+        description="该形态键由哪个方向的鼠标位移驱动：0=向上 1=向右 2=向下 3=向左",
+        items=[
+            ('0', "向上", "鼠标向上移动时驱动"),
+            ('1', "向右", "鼠标向右移动时驱动"),
+            ('2', "向下", "鼠标向下移动时驱动"),
+            ('3', "向左", "鼠标向左移动时驱动"),
+        ],
+        default='0',
+    ) # type: ignore
 
 
 class SSMT_UL_ShapeKeyVariableMappings(bpy.types.UIList):
@@ -72,6 +90,8 @@ class SSMT_UL_ShapeKeyVariableMappings(bpy.types.UIList):
             value_col.label(text=f"预分配: ${assigned_name}" if assigned_name else "预分配: 未分配", icon='INFO')
             zone_row = row.row(align=True)
             zone_row.prop(item, "drag_zone_id", text="区域")
+            zone_row.prop(item, "drag_click_stage", text="档位")
+            zone_row.prop(item, "drag_dir_id", text="方向")
 
 _name_mapping_cache = {}
 
@@ -93,6 +113,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     # 形态键着色器中 ShapeKeyDrive 缓冲的 SRV 寄存器（同一 dispatch 内避开
     # t50-t54 / t75+ / t99，由 INI 的 cs-t100 绑定）
     DRAG_DRIVE_REGISTER = 100
+    # 点击计数缓冲的 SRV 寄存器（由 INI 的 cs-t101 绑定）
+    DRAG_CLICK_COUNT_REGISTER = 101
 
     shapekey_variable_items: bpy.props.CollectionProperty(type=ShapeKeyVariableItem) # type: ignore
     shapekey_variable_index: bpy.props.IntProperty(default=0) # type: ignore
@@ -341,6 +363,27 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             ns = ""
         return f"ResourceDragShapeKeyDrive_{ns}"
 
+    def _drag_shapekey_click_count_resource_name(self, ini_path=None):
+        """自动从同一节点树中的拖拽交互节点推导点击计数资源名。"""
+        node = self._find_drag_drive_node()
+        if node is None:
+            return None
+        try:
+            ns = node._resolve_namespace(ini_path or "")
+        except Exception:
+            ns = ""
+        return f"ResourceDragShapeKeyClickCount_{ns}"
+
+    def _drag_drive_stage_count(self):
+        """从拖拽节点读取点击档位数（找不到或未配置时回退 1=单档）。"""
+        node = self._find_drag_drive_node()
+        if node is None:
+            return 1
+        try:
+            return max(1, int(getattr(node, "shapekey_drive_stage_count", 1)))
+        except Exception:
+            return 1
+
     def _drag_drive_zone_ids(self, unique_names):
         """返回与 unique_names（FREQ 索引顺序）对齐的区域 ID 列表；-1 表示不绑定。"""
         zone_ids = []
@@ -354,6 +397,44 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 item = self._ensure_shapekey_variable_item(name)
             zone_ids.append(int(getattr(item, "drag_zone_id", -1)))
         return zone_ids
+
+    def _drag_drive_click_stages(self, unique_names):
+        """返回与 unique_names（FREQ 索引顺序）对齐的点击档位列表（未绑定区域时用 0xFFFFFFFF 表示禁用）。"""
+        stages = []
+        for name in unique_names:
+            item = None
+            for candidate in self.shapekey_variable_items:
+                if candidate.shape_key_name == name:
+                    item = candidate
+                    break
+            if item is None:
+                item = self._ensure_shapekey_variable_item(name)
+            zone_id = int(getattr(item, "drag_zone_id", -1))
+            try:
+                stage = int(getattr(item, "drag_click_stage", 1) or 1)
+            except Exception:
+                stage = 1
+            stages.append(stage if zone_id >= 0 else -1)
+        return stages
+
+    def _drag_drive_dirs(self, unique_names):
+        """返回与 unique_names（FREQ 索引顺序）对齐的驱动方向列表（未绑定区域时用 0xFFFFFFFF 表示禁用）。"""
+        dirs = []
+        for name in unique_names:
+            item = None
+            for candidate in self.shapekey_variable_items:
+                if candidate.shape_key_name == name:
+                    item = candidate
+                    break
+            if item is None:
+                item = self._ensure_shapekey_variable_item(name)
+            zone_id = int(getattr(item, "drag_zone_id", -1))
+            try:
+                dir_val = int(getattr(item, "drag_dir_id", "0") or "0")
+            except Exception:
+                dir_val = 0
+            dirs.append(dir_val if zone_id >= 0 else -1)
+        return dirs
 
     def collect_blueprint_shape_key_names(self):
         from .export_helper import BlueprintExportHelper
@@ -397,7 +478,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         drive_box.label(text="拖拽驱动形态键", icon='DRIVER')
         drive_box.prop(self, "drag_drive_enabled")
         if self.drag_drive_enabled:
-            drive_box.label(text="自动识别同树拖拽节点（仅命中模式 + 左键/X 点击切换 0↔1）", icon='INFO')
+            drive_box.label(text="自动识别同树拖拽节点：为各形态键设置 区域 + 点击档位 + 驱动方向", icon='INFO')
 
         if not NUMPY_AVAILABLE:
             layout.label(text="警告: 未安装numpy库，优化功能不可用", icon='ERROR')
@@ -1550,7 +1631,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         return "struct VertexAttributes {\n    float3 position;\n    float3 normal;\n    float4 tangent;\n};"
 
-    def _update_shader_file(self, shader_path, hash_slot_data, use_packed, use_delta, unique_names, unique_objects, use_optimized=False, merge_slot_files=False, drag_drive_enabled=False, drag_zone_ids=None):
+    def _update_shader_file(self, shader_path, hash_slot_data, use_packed, use_delta, unique_names, unique_objects, use_optimized=False, merge_slot_files=False, drag_drive_enabled=False, drag_zone_ids=None, drag_click_stages=None, drag_stage_count=1, drag_dirs=None):
         try:
             with open(shader_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -1563,18 +1644,38 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             obj_to_range_defs = {obj: (f"START{i+1}", f"END{i+1}") for i, obj in enumerate(unique_objects)}
 
             zone_ids = list(drag_zone_ids or []) if drag_drive_enabled else []
+            click_stages = list(drag_click_stages or []) if drag_drive_enabled else []
+            stage_count = max(1, int(drag_stage_count or 1))
+            drag_dirs = list(drag_dirs or []) if drag_drive_enabled else []
+            dir_count = 4
             define_lines = [f"// --- Shared Animation Intensity (per Shape Key Name) ---\n// From index {self.INTENSITY_START_INDEX} onwards"]
             if drag_drive_enabled:
                 define_lines.append(f"Buffer<float> ShapeKeyDrive : register(t{self.DRAG_DRIVE_REGISTER});")
+                define_lines.append(f"Buffer<uint> ShapeKeyClickCount : register(t{self.DRAG_CLICK_COUNT_REGISTER});")
+                define_lines.append(f"static const uint SHAPEKEY_STAGE_COUNT = {stage_count}u;")
+                define_lines.append(f"static const uint SHAPEKEY_DIR_COUNT = {dir_count}u;")
                 if any(zone >= 0 for zone in zone_ids):
                     ids_text = ", ".join(str(zone) if zone >= 0 else "0xFFFFFFFFu" for zone in zone_ids)
                     define_lines.append(f"static const uint SHAPEKEY_ZONE_IDS[{len(zone_ids)}] = {{ {ids_text} }};")
+                    stage_list = list(click_stages) if len(click_stages) == len(zone_ids) else [1] * len(zone_ids)
+                    dir_list = list(drag_dirs) if len(drag_dirs) == len(zone_ids) else [0] * len(zone_ids)
+                    stage_text = ", ".join(str(stage) if stage >= 1 else "0xFFFFFFFFu" for stage in stage_list)
+                    define_lines.append(f"static const uint SHAPEKEY_STAGE_IDS[{len(zone_ids)}] = {{ {stage_text} }};")
+                    dir_text = ", ".join(str(d) if d >= 0 else "0xFFFFFFFFu" for d in dir_list)
+                    define_lines.append(f"static const uint SHAPEKEY_DIR_IDS[{len(zone_ids)}] = {{ {dir_text} }};")
                 else:
                     define_lines.append("static const uint SHAPEKEY_ZONE_IDS[1] = { 0xFFFFFFFFu };")
+                    define_lines.append("static const uint SHAPEKEY_STAGE_IDS[1] = { 0xFFFFFFFFu };")
+                    define_lines.append("static const uint SHAPEKEY_DIR_IDS[1] = { 0xFFFFFFFFu };")
             for i, name in enumerate(unique_names):
                 zone = zone_ids[i] if i < len(zone_ids) else -1
+                stage = click_stages[i] if i < len(click_stages) else 1
+                dir_id = drag_dirs[i] if i < len(drag_dirs) else 0
                 if drag_drive_enabled and zone >= 0:
-                    define_lines.append(f"#define FREQ{i+1} ShapeKeyDrive[SHAPEKEY_ZONE_IDS[{i}]] // {name} (drag zone {zone})")
+                    define_lines.append(
+                        f"#define FREQ{i+1} (SHAPEKEY_ZONE_IDS[{i}] != 0xFFFFFFFFu && ShapeKeyClickCount[SHAPEKEY_ZONE_IDS[{i}]] == SHAPEKEY_STAGE_IDS[{i}]"
+                        f" ? ShapeKeyDrive[SHAPEKEY_ZONE_IDS[{i}] * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT + (SHAPEKEY_STAGE_IDS[{i}] - 1u) * SHAPEKEY_DIR_COUNT + SHAPEKEY_DIR_IDS[{i}]] : 0.0) // {name} (zone {zone}, click {stage}, dir {dir_id})"
+                    )
                 else:
                     define_lines.append(f"#define FREQ{i+1} IniParams[{self.INTENSITY_START_INDEX + i}].x // {name}")
 
@@ -1602,9 +1703,12 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         logic_lines.append("    {")
                         if drag_drive_enabled:
                             logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
-                            logic_lines.append(f"        if (SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}] != 0xFFFFFFFFu)")
+                            logic_lines.append(f"        uint sk_zone_slot{slot_index} = SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}];")
+                            logic_lines.append(f"        uint sk_stage_slot{slot_index} = SHAPEKEY_STAGE_IDS[freq_idx_slot{slot_index}];")
+                            logic_lines.append(f"        uint sk_dir_slot{slot_index} = SHAPEKEY_DIR_IDS[freq_idx_slot{slot_index}];")
+                            logic_lines.append(f"        if (sk_zone_slot{slot_index} != 0xFFFFFFFFu && ShapeKeyClickCount[sk_zone_slot{slot_index}] == sk_stage_slot{slot_index})")
                             logic_lines.append("        {")
-                            logic_lines.append(f"            anim_weight_slot{slot_index} = ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}]];")
+                            logic_lines.append(f"            anim_weight_slot{slot_index} = ShapeKeyDrive[sk_zone_slot{slot_index} * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT + (sk_stage_slot{slot_index} - 1u) * SHAPEKEY_DIR_COUNT + sk_dir_slot{slot_index}];")
                             logic_lines.append("        }")
                         else:
                             logic_lines.append(
@@ -1648,9 +1752,12 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     logic_lines.append("    {")
                     if drag_drive_enabled:
                         logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
-                        logic_lines.append(f"        if (SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}] != 0xFFFFFFFFu)")
+                        logic_lines.append(f"        uint sk_zone_slot{slot_index} = SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}];")
+                        logic_lines.append(f"        uint sk_stage_slot{slot_index} = SHAPEKEY_STAGE_IDS[freq_idx_slot{slot_index}];")
+                        logic_lines.append(f"        uint sk_dir_slot{slot_index} = SHAPEKEY_DIR_IDS[freq_idx_slot{slot_index}];")
+                        logic_lines.append(f"        if (sk_zone_slot{slot_index} != 0xFFFFFFFFu && ShapeKeyClickCount[sk_zone_slot{slot_index}] == sk_stage_slot{slot_index})")
                         logic_lines.append("        {")
-                        logic_lines.append(f"            anim_weight_slot{slot_index} = ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}]];")
+                        logic_lines.append(f"            anim_weight_slot{slot_index} = ShapeKeyDrive[sk_zone_slot{slot_index} * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT + (sk_stage_slot{slot_index} - 1u) * SHAPEKEY_DIR_COUNT + sk_dir_slot{slot_index}];")
                         logic_lines.append("        }")
                     else:
                         logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
@@ -2123,6 +2230,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         merge_slot_files,
                         drag_drive_enabled=drag_drive_enabled,
                         drag_zone_ids=self._drag_drive_zone_ids(hash_unique_names) if drag_drive_enabled else None,
+                        drag_click_stages=self._drag_drive_click_stages(hash_unique_names) if drag_drive_enabled else None,
+                        drag_stage_count=self._drag_drive_stage_count(),
+                        drag_dirs=self._drag_drive_dirs(hash_unique_names) if drag_drive_enabled else None,
                     ):
                         print(f"更新哈希 {hash_val} 的着色器文件失败")
 
@@ -2266,7 +2376,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     if drag_drive_resource:
                         block_lines.append("\n    ; --- Drag ShapeKey Drive ---")
                         block_lines.append(f"    cs-t{self.DRAG_DRIVE_REGISTER} = {drag_drive_resource}")
+                        click_resource = self._drag_shapekey_click_count_resource_name(target_ini_file)
+                        if click_resource:
+                            block_lines.append(f"    cs-t{self.DRAG_CLICK_COUNT_REGISTER} = {click_resource}")
                         t_registers_to_null.append(f"cs-t{self.DRAG_DRIVE_REGISTER}")
+                        t_registers_to_null.append(f"cs-t{self.DRAG_CLICK_COUNT_REGISTER}")
 
                     block_lines.append(f"    cs = ./res/shapekey_anim_{h}.hlsl")
 

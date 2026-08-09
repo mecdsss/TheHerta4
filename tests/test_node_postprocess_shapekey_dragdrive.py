@@ -98,7 +98,7 @@ _TEMPLATES = {
 }
 
 
-def _make_node(zone_map):
+def _make_node(zone_map, stage_map=None, dir_map=None):
     node = _module.SSMTNode_PostProcess_ShapeKey.__new__(_module.SSMTNode_PostProcess_ShapeKey)
     node.name = "SKNode"
     node.inputs = [types.SimpleNamespace(is_linked=False, links=[])]
@@ -112,6 +112,8 @@ def _make_node(zone_map):
         item.assigned_variable_name = f"Freq_{name}"
         item.custom_variable_name = ""
         item.drag_zone_id = zone
+        item.drag_click_stage = (stage_map or {}).get(name, 1)
+        item.drag_dir_id = str((dir_map or {}).get(name, 0))
         node.shapekey_variable_items.append(item)
     return node
 
@@ -150,12 +152,67 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
     def test_zone_ids_alignment(self):
         self.assertEqual(self.node._drag_drive_zone_ids(["Breast_L", "Breast_R", "Hip"]), [2, 3, -1])
 
+    def test_stage_and_dir_helpers(self):
+        node = _make_node(
+            {"A": 0, "B": 0, "C": 1},
+            stage_map={"A": 1, "B": 2, "C": 1},
+            dir_map={"A": 0, "B": 2, "C": 3},
+        )
+        self.assertEqual(node._drag_drive_click_stages(["A", "B", "C"]), [1, 2, 1])
+        self.assertEqual(node._drag_drive_dirs(["A", "B", "C"]), [0, 2, 3])
+
+    def test_multi_stage_and_dir_generate_3d_index(self):
+        node = _make_node(
+            {"A": 0, "B": 0, "C": 1},
+            stage_map={"A": 1, "B": 2, "C": 1},
+            dir_map={"A": 0, "B": 2, "C": 3},
+        )
+        # 模拟同树拖拽节点开启 2 档
+        drag_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_DragInteraction",
+            enable_shapekey_drive=True,
+            shapekey_drive_stage_count=2,
+            _resolve_namespace=lambda ini: "ns",
+        )
+        node.id_data = types.SimpleNamespace(nodes=[drag_node])
+        src = os.path.abspath(os.path.join("Toolset", "shapekey_anim_packed_delta_v5_merged.hlsl"))
+        if not os.path.exists(src):
+            self.skipTest("template missing")
+        dest = os.path.join(self.out_dir, "multi.hlsl")
+        shutil.copy2(src, dest)
+        node._update_shader_file(
+            dest,
+            {1: {"A": ["obj1"], "B": ["obj1"]}, 2: {"C": ["obj2"]}},
+            True,
+            True,
+            ["A", "B", "C"],
+            ["obj1", "obj2"],
+            use_optimized=True,
+            merge_slot_files=True,
+            drag_drive_enabled=True,
+            drag_zone_ids=node._drag_drive_zone_ids(["A", "B", "C"]),
+            drag_click_stages=node._drag_drive_click_stages(["A", "B", "C"]),
+            drag_stage_count=node._drag_drive_stage_count(),
+            drag_dirs=node._drag_drive_dirs(["A", "B", "C"]),
+        )
+        with open(dest, encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("static const uint SHAPEKEY_STAGE_COUNT = 2u;", content)
+        self.assertIn("static const uint SHAPEKEY_DIR_COUNT = 4u;", content)
+        self.assertIn("static const uint SHAPEKEY_STAGE_IDS[3] = { 1, 2, 1 };", content)
+        self.assertIn("static const uint SHAPEKEY_DIR_IDS[3] = { 0, 2, 3 };", content)
+        # B 的档位 2、方向 2：B 由点击第 2 次 + 向下驱动
+        self.assertIn("// B (zone 0, click 2, dir 2)", content)
+
     def test_merged_optimized_generates_drive_read(self):
         content = self._generate("shapekey_anim_packed_delta_v5_merged.hlsl")
         self.assertIn("Buffer<float> ShapeKeyDrive : register(t100);", content)
+        self.assertIn("Buffer<uint> ShapeKeyClickCount : register(t101);", content)
         self.assertIn("SHAPEKEY_ZONE_IDS", content)
-        self.assertIn("ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx_slot0]]", content)
-        self.assertIn("#define FREQ1 ShapeKeyDrive[SHAPEKEY_ZONE_IDS[0]]", content)
+        self.assertIn("SHAPEKEY_DIR_COUNT", content)
+        self.assertIn("ShapeKeyClickCount[sk_zone_slot0] == sk_stage_slot0", content)
+        self.assertIn("ShapeKeyDrive[sk_zone_slot0 * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT", content)
+        self.assertIn("#define FREQ1 (SHAPEKEY_ZONE_IDS[0] != 0xFFFFFFFFu", content)
         # 未绑定形态键保持变量回退
         self.assertIn("#define FREQ3 IniParams[102].x", content)
         # 未绑定守卫：不会访问 ShapeKeyDrive[-1]
@@ -164,13 +221,15 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
     def test_optimized_non_merged_generates_drive_read(self):
         content = self._generate("shapekey_anim_packed_delta_v4_optimized.hlsl")
         self.assertIn("register(t100)", content)
-        self.assertIn("ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx_slot0]]", content)
+        self.assertIn("ShapeKeyClickCount[sk_zone_slot0] == sk_stage_slot0", content)
+        self.assertIn("ShapeKeyDrive[sk_zone_slot0 * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT", content)
 
     def test_all_templates_generate_drive_binding(self):
         for template_name in _TEMPLATES.values():
             content = self._generate(template_name)
             self.assertIn("register(t100)", content, template_name)
-            self.assertIn("ShapeKeyDrive[SHAPEKEY_ZONE_IDS", content, template_name)
+            self.assertIn("SHAPEKEY_DIR_COUNT", content, template_name)
+            self.assertIn("ShapeKeyDrive[SHAPEKEY_ZONE_IDS[0] * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT", content, template_name)
 
     def test_disabled_keeps_original_ini_params_weight(self):
         src = os.path.abspath(os.path.join("Toolset", "shapekey_anim_packed_delta_v5_merged.hlsl"))

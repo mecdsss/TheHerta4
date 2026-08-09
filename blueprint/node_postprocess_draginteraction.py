@@ -344,6 +344,29 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         min=0.0,
         max=1.0,
     )
+    shapekey_drive_input: bpy.props.EnumProperty(
+        name="强度控制方式",
+        description="RAMP=按住时按上升速率渐变；MOUSE=按住时按鼠标上下左右位移控制强度（各方向独立，对向联动）",
+        items=[
+            ('RAMP', "上升速率", "按住时按 ramp 速率积分至 1，可切换 0/1 方向"),
+            ('MOUSE', "鼠标位移", "按住时按鼠标上下左右位移控制 0-1，各方向独立映射形态键"),
+        ],
+        default='RAMP',
+    )
+    shapekey_drive_stage_count: bpy.props.IntProperty(
+        name="点击档位数",
+        description="同区域内点击次数循环档位数：点击 1 次激活档 1、2 次激活档 2…（每档独立强度，绑定不同形态键）；1=保持单档",
+        default=1,
+        min=1,
+        max=16,
+    )
+    shapekey_drive_move_sensitivity: bpy.props.FloatProperty(
+        name="位移灵敏度",
+        description="鼠标位移控制模式：每像素位移对应的强度增量（向上增、向下减），默认 0.02",
+        default=0.02,
+        min=0.0001,
+        max=1.0,
+    )
     enable_hand_cursor: bpy.props.BoolProperty(
         name="启用手型光标",
         default=True,
@@ -470,7 +493,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             row = drive_box.row(align=True)
             row.prop(self, "shapekey_drive_ramp_rate", text="上升速率")
             row.prop(self, "shapekey_drive_release_decay", text="松手衰减")
-            drive_box.label(text="仅命中模式下：命中区域并按住左键或 X，强度在 0↔1 间切换（0 升 1 降）", icon='INFO')
+            drive_box.prop(self, "shapekey_drive_input")
+            if self.shapekey_drive_input == 'MOUSE':
+                drive_box.prop(self, "shapekey_drive_move_sensitivity", text="位移灵敏度")
+            drive_box.prop(self, "shapekey_drive_stage_count", text="点击档位数")
+            drive_box.label(text="仅命中模式：命中区域按住左键/X，按点击档位与移动方向驱动对应形态键强度", icon='INFO')
 
         runtime_box = layout.box()
         runtime_box.label(text="运行时联动变量", icon='DRIVER')
@@ -1779,14 +1806,26 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         }
         if getattr(self, "enable_shapekey_drive", False):
             _drive_capacity = self._zone_capacity(self._collect_enabled_zone_entries())
+            _stage_count = max(1, int(getattr(self, "shapekey_drive_stage_count", 1)))
+            _dir_count = 4  # 上/右/下/左（对齐 UI 构造器方向数量=4）
             global_resources[f"[ResourceDragShapeKeyDrive_{ns}]"] = [
                 "type = RWBuffer", "format = R32_FLOAT",
-                f"array = {_drive_capacity}",
+                f"array = {_drive_capacity * _stage_count * _dir_count}",
             ]
-            # 方向缓冲：每区域 1 个方向槽（0=上升 1=下降）+ 末位 1 个上一帧按键状态槽
+            # 方向缓冲：每区域每档每方向 1 个槽（0=上升 1=下降）+ 末位 1 个上一帧按键状态槽
             global_resources[f"[ResourceDragShapeKeyDir_{ns}]"] = [
                 "type = RWBuffer", "format = R32_FLOAT",
-                f"array = {_drive_capacity + 1}",
+                f"array = {_drive_capacity * _stage_count * _dir_count + 1}",
+            ]
+            # 点击计数缓冲：每区域 1 个点击档位（1..stage_count，0=未点击），供多段切换
+            global_resources[f"[ResourceDragShapeKeyClickCount_{ns}]"] = [
+                "type = RWBuffer", "format = R32_UINT",
+                f"array = {_drive_capacity}",
+            ]
+            # 主导方向缓冲：每区域 1 个当前主导方向（0=上 1=右 2=下 3=左），供“任意方向”绑定读取
+            global_resources[f"[ResourceDragShapeKeyActiveDir_{ns}]"] = [
+                "type = RWBuffer", "format = R32_UINT",
+                f"array = {_drive_capacity}",
             ]
         for sec, lines in global_resources.items():
             sections.setdefault(sec, lines)
@@ -2151,13 +2190,22 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"z77 = {drag_mode_var}",
             f"w77 = $ssmtdrag_lmb_down_{ns}",
             f"x78 = $ssmtdrag_x_down_{ns}",
+            "x79 = $ssmtdrag_shapekey_dy_" + ns,
+            "y79 = $ssmtdrag_shapekey_dx_" + ns,
+            f"z79 = {max(1, int(getattr(self, 'shapekey_drive_stage_count', 1)))}",
+            f"w79 = {1 if getattr(self, 'shapekey_drive_input', 'RAMP') == 'MOUSE' else 0}",
+            "x80 = " + self._fmt(self.shapekey_drive_move_sensitivity),
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
             f"cs-u0 = ResourceDragShapeKeyDrive_{ns}",
             f"cs-u1 = ResourceDragShapeKeyDir_{ns}",
+            f"cs-u2 = ResourceDragShapeKeyClickCount_{ns}",
+            f"cs-u3 = ResourceDragShapeKeyActiveDir_{ns}",
             "dispatch = 1, 1, 1",
             "post cs-t67 = null",
             "post cs-u0 = null",
             "post cs-u1 = null",
+            "post cs-u2 = null",
+            "post cs-u3 = null",
         ]
 
     # ---- CommandList：PinDetected（boot-clear + dt 钳制 + 门槛）/ Viewport / Cursor ----
@@ -2180,6 +2228,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             if getattr(self, "enable_shapekey_drive", False):
                 lines.append(f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0")
                 lines.append(f"\tclear = ResourceDragShapeKeyDir_{ns} 0.0")
+                lines.append(f"\tclear = ResourceDragShapeKeyClickCount_{ns}")
+                lines.append(f"\tclear = ResourceDragShapeKeyActiveDir_{ns}")
             if self.enable_hand_cursor:
                 lines.append(f"\tclear = ResourceDragJiggleCursorPreview_{ns} 0.0")
             for comp in components:
@@ -2617,6 +2667,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"global $ssmtdrag_poke_strength_{ns} = 1.0",
             f"global $ssmtdrag_release_boost_{ns} = 1.05",
             f"global $ssmtdrag_release_decay_{ns} = 0.92",
+            f"global $ssmtdrag_shapekey_dy_{ns} = 0",
+            f"global $ssmtdrag_shapekey_dx_{ns} = 0",
+            f"global $ssmtdrag_shapekey_prev_y_{ns} = 0",
+            f"global $ssmtdrag_shapekey_prev_x_{ns} = 0",
             f"global $ssmtdrag_modifier_ok_{ns} = 0",
             f"global $ssmtdrag_lmb_press_time_{ns} = 0",
             f"global $ssmtdrag_rmb_press_time_{ns} = 0",
@@ -2735,6 +2789,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"if {drag_mode_var} != 1",
                 f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0",
                 f"\tclear = ResourceDragShapeKeyDir_{ns} 0.0",
+                f"\tclear = ResourceDragShapeKeyClickCount_{ns}",
+                f"\tclear = ResourceDragShapeKeyActiveDir_{ns}",
                 "endif",
             ])
         interaction_gate_lines.extend([
@@ -2848,6 +2904,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "else",
                 f"\t$ssmtdrag_rmb_hold_fraction_{ns} = 0",
                 "endif",
+            ])
+        if getattr(self, "enable_shapekey_drive", False):
+            # 鼠标位移控制：帧内计算 Y/X 位移（$cursorY 自下而上，向上移动为增），
+            # 由 CustomShaderDragShapeKeyDrive 段的 x79/y79 写入 IniParams[79] 供驱动 CS 读取
+            block.extend([
+                f"	$ssmtdrag_shapekey_dy_{ns} = $cursorY - $ssmtdrag_shapekey_prev_y_{ns}",
+                f"	$ssmtdrag_shapekey_dx_{ns} = $cursorX - $ssmtdrag_shapekey_prev_x_{ns}",
+                f"	$ssmtdrag_shapekey_prev_y_{ns} = $cursorY",
+                f"	$ssmtdrag_shapekey_prev_x_{ns} = $cursorX",
             ])
         block.extend([
             # prev 更新 + combo 复位
