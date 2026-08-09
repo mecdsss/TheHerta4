@@ -117,11 +117,11 @@ class SSMT_DragZoneSettings(bpy.types.PropertyGroup):
 
 
 def _zone_propagate(settings, node):
-    """球级沿表面扩散开关；旧工程（无 propagate 属性）回退节点级 surface_propagate。"""
+    """球级沿表面扩散开关；旧工程（无 propagate 属性）默认开启（节点级总开关已移除）。"""
     value = getattr(settings, "propagate", None)
     if value is not None:
         return bool(value)
-    return bool(getattr(node, "surface_propagate", True))
+    return True
 
 
 def _zone_allowed_names(settings):
@@ -142,13 +142,17 @@ def _zone_allowed_names(settings):
 
 
 def _zone_allowed_by_target(settings, target_name):
-    """预览单物体：包含列表为空 → 全部允许；否则仅列表内物体名命中。"""
+    """预览单物体：包含列表为空 → 全部允许；否则仅列表内物体名命中。
+    列表项全部无效（物体指针已清空）时同样按全部允许，避免预览被误过滤。"""
     include = getattr(settings, "include_objects", None) or ()
-    if not include:
+    if not include or len(include) == 0:
         return True
     if not target_name:
         return True
-    return str(target_name) in _zone_allowed_names(settings)
+    allowed_names = _zone_allowed_names(settings)
+    if not allowed_names:
+        return True
+    return str(target_name) in allowed_names
 
 
 def _zone_allowed_vertex_mask(settings, vertex_count, triangles, tri_part_names):
@@ -158,7 +162,7 @@ def _zone_allowed_vertex_mask(settings, vertex_count, triangles, tri_part_names)
     三角形按“无法判定归属”处理为允许，避免旧工程无 mesh 注释时权重被清零。
     """
     include = getattr(settings, "include_objects", None) or ()
-    if not include:
+    if not include or len(include) == 0:
         return None
     allowed_names = _zone_allowed_names(settings)
     if not allowed_names or triangles is None or tri_part_names is None:
@@ -521,12 +525,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         description="0=纯高斯（画刷衰减 k 生效）；>0 时球内 d≤平台保持满权重、边缘平滑过渡（此模式下画刷衰减 k 不参与）",
     )
 
-    # ---- 沿表面传播（烘焙 + 预览共用）----
-    surface_propagate: bpy.props.BoolProperty(
-        name="沿表面传播", default=True,
-        description="权重从球与表面的接触点沿网格表面扩散（测地距离），不穿透到球体积覆盖的背面/对侧；关闭回退体积球",
-    )
-
     # ---- 烘焙参考物体（可选手动覆盖）----
     bake_reference_object: bpy.props.PointerProperty(
         name="烘焙参考物体（可选）",
@@ -702,7 +700,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
         layout.prop(self, "bake_reference_object")
         layout.prop(self, "mask_plateau")
-        layout.prop(self, "surface_propagate")
 
         # 权重预览（视口热力图）
         box = layout.box()
@@ -1714,12 +1711,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
         mirror: 非镜像工作流 X 镜像矩阵（(4,4) numpy）或 None。矩阵运算统一走
         numpy（mathutils.Matrix 可被 np.asarray 转换），便于无 Blender 环境测试。
-        edge_verts: 网格边拓扑 (E,2)；surface_propagate 开启且提供时走沿表面传播
+        edge_verts: 网格边拓扑 (E,2)；本球沿表面扩散开启且提供时走沿表面传播
         （测地距离，权重不穿透到球体积覆盖的背面/对侧），否则回退体积球欧氏距离。
-        propagate: 本球是否沿表面扩散；None = 跟随节点级 surface_propagate。
+        propagate: 本球是否沿表面扩散；None = 默认开启（球级开关移除后无总开关）。
         allowed_mask: (N,) bool 可选，仅对这些顶点施加权重（包含物体列表过滤）。
         """
         try:
+            if propagate is None:
+                # 直接调用（测试/内部路径）未显式指定时，跟随球级沿表面扩散开关
+                propagate = _zone_propagate(settings, self)
             # 空物体世界坐标 → 模组局部空间（必要时先施加非镜像工作流补偿）
             ball_world = np.asarray(empty.matrix_world, dtype=np.float64).reshape(4, 4)
             if mirror is not None:
@@ -1759,17 +1759,13 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             return None
 
     def _zone_distances(self, positions, ball_matrix, edge_verts, propagate=None, allowed_mask=None):
-        """球局部距离数组：surface_propagate 开启且有拓扑时用沿表面传播距离
+        """球局部距离数组：本球沿表面扩散开启且有拓扑时用沿表面传播距离
         （种子 = 离球心最近的表面顶点/接触点），否则用欧氏距离。矩阵不可逆返回 None。"""
         local = gb_core._to_ball_local(np.asarray(positions, dtype=np.float64), ball_matrix)
         if local is None:
             return None
         d2 = np.einsum("ij,ij->i", local, local)
-        use_propagate = (
-            getattr(self, "surface_propagate", True)
-            if propagate is None
-            else bool(propagate)
-        )
+        use_propagate = True if propagate is None else bool(propagate)
         if use_propagate and edge_verts is not None and len(edge_verts) > 0:
             seeds = np.zeros(local.shape[0], dtype=bool)
             if allowed_mask is None:
@@ -3261,7 +3257,6 @@ def _preview_signature(n):
         n.id_data.name,
         n.name,
         getattr(collection, "name", None),
-        bool(getattr(n, "surface_propagate", True)),
         round(float(getattr(n, "mask_plateau", 0.0) or 0.0), 6),
     ]
     for target in _preview_targets(n):
@@ -3285,13 +3280,6 @@ def _preview_signature(n):
                       s.enabled, round(s.brush_strength, 6), round(s.brush_falloff_k, 6),
                       bool(getattr(s, "propagate", True)), include_names))
     return tuple(parts)
-
-
-def _preview_uses_surface_distance(node, enabled_zone_count):
-    """预览严格跟随“沿表面传播”复选框，与烘焙完全一致：
-    开启即用测地距离沿表面传播，关闭回退体积球；
-    集合/区域数量不影响是否测地。"""
-    return bool(getattr(node, "surface_propagate", True))
 
 
 def _preview_target_field(node, verts_world, tri, zones, plateau, target_name=None):
@@ -3393,14 +3381,10 @@ def _preview_cached_topology(verts_world, tri, weld_tol=None):
 def _preview_zone_distances(node, verts_world, ball_matrix, adjacency, edge_verts,
                             propagate=None, allowed_mask=None):
     """预览沿表面传播距离：均匀缩放球（旋转/平移/等比缩放）复用世界坐标
-    邻接表快速路径；非均匀缩放回退逐球构建。propagate=None 跟随节点级
-    surface_propagate（旧数据）；allowed_mask 可选，仅允许这些顶点（其余 inf）。"""
+    邻接表快速路径；非均匀缩放回退逐球构建。propagate=None 默认开启（球级
+    沿表面扩散开关移除后无总开关）；allowed_mask 可选，仅允许这些顶点（其余 inf）。"""
     m = np.asarray(ball_matrix, dtype=np.float64).reshape(4, 4)
-    use_propagate = (
-        bool(getattr(node, "surface_propagate", True))
-        if propagate is None
-        else bool(propagate)
-    )
+    use_propagate = True if propagate is None else bool(propagate)
     allowed = None if allowed_mask is None else np.asarray(allowed_mask, dtype=bool).reshape(-1)
     linear = m[:3, :3]
     col_norms = np.linalg.norm(linear, axis=0)

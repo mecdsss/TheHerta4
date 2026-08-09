@@ -1455,25 +1455,6 @@ class DragNodePreviewTests(unittest.TestCase):
 
         self.assertEqual(len(rebuilds), 2)
 
-    def test_collection_preview_follows_surface_propagate(self):
-        mod = self.mod
-        collection = types.SimpleNamespace(name="PreviewSet", all_objects=[])
-        node = self._make_preview_node(mod, collection=collection)
-        object.__setattr__(node, "surface_propagate", True)
-        self.assertTrue(mod._preview_uses_surface_distance(node, enabled_zone_count=1))
-        object.__setattr__(node, "surface_propagate", False)
-        self.assertFalse(mod._preview_uses_surface_distance(node, enabled_zone_count=1))
-
-    def test_surface_distance_independent_of_zone_count(self):
-        mod = self.mod
-        node = self._make_preview_node(mod)
-        object.__setattr__(node, "surface_propagate", True)
-        self.assertTrue(mod._preview_uses_surface_distance(node, enabled_zone_count=1))
-        # 区域数量不影响是否测地（与烘焙一致）
-        self.assertTrue(mod._preview_uses_surface_distance(node, enabled_zone_count=100))
-        object.__setattr__(node, "surface_propagate", False)
-        self.assertFalse(mod._preview_uses_surface_distance(node, enabled_zone_count=100))
-
     def test_preview_target_field_uses_scene_space(self):
         """预览基于 Blender 当前场景坐标（所见即所得），不做任何导出期变换：
         非镜像 X 镜像补偿、参考物体逆、导出空间矩阵都只属于导出烘焙。
@@ -1632,16 +1613,16 @@ class DragNodeZoneFilterTests(unittest.TestCase):
             ]
         return settings
 
-    def test_zone_propagate_falls_back_to_node_level(self):
+    def test_zone_propagate_defaults_on(self):
+        """节点级总开关已移除：旧数据无 propagate 属性时默认开启沿表面扩散；
+        球级 propagate 显式关闭时覆盖默认。"""
         mod = self.mod
-        node_off = _make_node(self.mod, surface_propagate=False)
-        node_on = _make_node(self.mod, surface_propagate=True)
+        node = _make_node(self.mod)
         settings = self._settings()  # 旧数据：无 propagate 属性
-        self.assertFalse(mod._zone_propagate(settings, node_off))
-        self.assertTrue(mod._zone_propagate(settings, node_on))
-        # 新数据：球级开关覆盖节点级
-        self.assertTrue(mod._zone_propagate(self._settings(propagate=True), node_off))
-        self.assertFalse(mod._zone_propagate(self._settings(propagate=False), node_on))
+        self.assertTrue(mod._zone_propagate(settings, node))
+        # 球级开关显式控制
+        self.assertTrue(mod._zone_propagate(self._settings(propagate=True), node))
+        self.assertFalse(mod._zone_propagate(self._settings(propagate=False), node))
 
     def test_zone_allowed_by_target(self):
         mod = self.mod
@@ -1652,6 +1633,53 @@ class DragNodeZoneFilterTests(unittest.TestCase):
         # 去重后缀：包含 Body.001 也能命中 Body
         suffix = self._settings(include_names=["Body.001"])
         self.assertTrue(mod._zone_allowed_by_target(suffix, "Body"))
+
+    def test_include_list_with_invalid_entries_defaults_to_all(self):
+        """包含列表项存在但物体指针已失效（如物体被删除）→ 视为无有效过滤，
+        默认作用于全部物体，预览不会被误过滤成空白。"""
+        mod = self.mod
+        settings = self._settings(include_names=["A"])
+        settings.include_objects[0].object = None  # 模拟物体被删除后的残留项
+        self.assertTrue(mod._zone_allowed_by_target(settings, "A"))
+        self.assertTrue(mod._zone_allowed_by_target(settings, "B"))
+        self.assertIsNone(
+            mod._zone_allowed_vertex_mask(settings, 6, np.array([[0, 1, 2]]), np.array(["A"], dtype=object))
+        )
+
+    def test_empty_collection_property_defaults_to_all(self):
+        """模拟 bpy CollectionProperty 边界行为：空列表即使布尔求值为真，
+        也必须按“未添加包含物体 = 全部物体”处理，不能过滤掉任何目标。"""
+        mod = self.mod
+
+        class FakeCollection:
+            """len=0 但 bool 为 True（模拟对 bpy 集合 bool 语义不确定的极端情况）。"""
+            def __len__(self):
+                return 0
+
+            def __bool__(self):
+                return True
+
+            def __iter__(self):
+                return iter(())
+
+        settings = self._settings()
+        settings.include_objects = FakeCollection()
+        self.assertTrue(mod._zone_allowed_by_target(settings, "A"))
+        self.assertTrue(mod._zone_allowed_by_target(settings, "B"))
+        # 预览链路：空列表 → 全部目标都保留，不被过滤成空白
+        node = _make_node(self.mod)
+        object.__setattr__(node, "mask_plateau", 0.0)
+        ball_matrix = np.eye(4)
+        ball_matrix[:3, 3] = (1.0, 0.0, 0.0)
+        empty = types.SimpleNamespace(
+            name="SSMT_DragZone_0", matrix_world=ball_matrix,
+            ssmt_drag_zone=settings,
+        )
+        zones = [(empty, settings)]
+        verts = np.array([[0.9, 0.0, 0.0], [1.0, 0.0, 0.0], [1.1, 0.0, 0.0]], dtype=np.float64)
+        tris = np.array([[0, 1, 2]], dtype=np.int64)
+        field = mod._preview_target_field(node, verts, tris, zones, 0.0, target_name="A")
+        self.assertGreater(float(field.max()), 0.3)
 
     def test_zone_allowed_vertex_mask_filters_by_part_names(self):
         mod = self.mod
@@ -1671,7 +1699,7 @@ class DragNodeZoneFilterTests(unittest.TestCase):
     def test_preview_target_field_include_list_filters_targets(self):
         """预览单物体：未包含在列表里的目标网格即使被球命中也不加权。"""
         mod = self.mod
-        node = _make_node(self.mod, surface_propagate=True)
+        node = _make_node(self.mod)
         object.__setattr__(node, "mask_plateau", 0.0)
         ball_matrix = np.eye(4)
         ball_matrix[:3, 3] = (1.0, 0.0, 0.0)
@@ -1691,7 +1719,7 @@ class DragNodeZoneFilterTests(unittest.TestCase):
     def test_preview_merged_mesh_include_list_blocks_non_included_mesh(self):
         """集合预览：A、B 焊接共享接缝，列表只含 A → 权重不传播进 B。"""
         mod = self.mod
-        node = _make_node(self.mod, surface_propagate=True)
+        node = _make_node(self.mod)
         object.__setattr__(node, "mask_plateau", 0.0)
         empty = types.SimpleNamespace(
             name="SSMT_DragZone_0",
@@ -1877,12 +1905,13 @@ class DragNodeGeodesicTests(unittest.TestCase):
     def _ball(self, radius=0.6):
         m = np.eye(4) * radius
         m[3, 3] = 1.0
-        settings = types.SimpleNamespace(brush_strength=1.0, brush_falloff_k=4.6)
+        settings = types.SimpleNamespace(
+            brush_strength=1.0, brush_falloff_k=4.6, propagate=True
+        )
         return types.SimpleNamespace(name="z", matrix_world=m, ssmt_drag_zone=settings)
 
     def test_surface_mode_kills_back_strip(self):
         node = _make_node(self.mod)
-        object.__setattr__(node, "surface_propagate", True)
         verts, tris = self._mesh()
         edges = self.mod.gb_core.edges_from_triangles(tris)
         empty = self._ball()
@@ -1893,16 +1922,15 @@ class DragNodeGeodesicTests(unittest.TestCase):
 
     def test_volume_mode_paints_back_strip(self):
         node = _make_node(self.mod)
-        object.__setattr__(node, "surface_propagate", False)
         verts, tris = self._mesh()
         edges = self.mod.gb_core.edges_from_triangles(tris)
         empty = self._ball()
+        empty.ssmt_drag_zone.propagate = False  # 球级关闭沿表面扩散
         f = node._evaluate_zone_field(verts, empty, empty.ssmt_drag_zone, None, None, edges)
         self.assertGreater(float(f[7]), 0.0)                     # 体积球穿透到 back
 
     def test_no_topology_falls_back_to_volume(self):
         node = _make_node(self.mod)
-        object.__setattr__(node, "surface_propagate", True)
         verts, _ = self._mesh()
         empty = self._ball()
         f = node._evaluate_zone_field(verts, empty, empty.ssmt_drag_zone, None, None, None)
