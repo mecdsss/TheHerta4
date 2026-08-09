@@ -6,16 +6,17 @@
 // per-click-stage intensities into an RWBuffer. The drive is ONLY active in
 // drag system mode 1 ("仅命中", hit detection only):
 //   - Click stages: each press while hovering the bound zone advances that
-//     zone's click count (1..stageCount, wrapping), enabling a different
-//     shape-key group per click count ("multi-stage switch").
+//     zone's click count in 0..stageCount cycle (0 = inactive/cleared),
+//     enabling a different shape-key group per click count and clearing on
+//     the wrap-around press ("multi-stage switch").
 //   - Directional slots (0=up, 1=right, 2=down, 3=left): while the stage is
 //     active, each direction's intensity follows that direction's net mouse
 //     displacement (opposite direction subtracts): move up -> up grows and
 //     down shrinks, move down -> down grows and up shrinks, etc. Clamped to
 //     0..1, no ramp/decay.
-//   - No-direction slot (4): while the stage is active, clicking directly
-//     toggles the intensity 0 -> 1 (if it was 0) or 1 -> 0 (if it was 1).
-//     No mouse displacement is involved.
+//   - No-direction slot (4): while the stage is active, clicking sets the
+//     intensity to 1 (held until the zone is cleared or another stage is
+//     active). No mouse displacement is involved.
 // Release or leaving the zone holds the current value. In mode 0 (off) and
 // mode 2 (hit + physical drag interaction) all buffers are zeroed.
 //
@@ -128,11 +129,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     hasHit = hasHit && triggerHeld;
     uint hoverZone = ClampZoneID(PinnedDetectInfo[7u].w, zoneCount);
 
-    // 按下瞬间：推进该区域点击档位（1..stageCount 循环）
+    // 按下瞬间：推进该区域点击档位（0..stageCount 循环；0=未激活/清空）
     if (pressed && hasHit)
     {
         uint oldStage = ClickCount[hoverZone];
-        uint newStage = (oldStage % stageCount) + 1u;
+        uint newStage = oldStage >= stageCount ? 0u : oldStage + 1u;
         ClickCount[hoverZone] = newStage;
     }
     ShapeKeyDir[lastSlot] = triggerHeld ? 1.0 : 0.0;
@@ -143,14 +144,14 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         for (uint stage = 1u; stage <= stageCount; ++stage)
         {
             uint stageBase = zone * perZone + (stage - 1u) * slotCount;
-            bool stageActive = (activeStage == stage) && hasHit && zone == hoverZone;
-            // 无方向槽：命中时点击立即 0/1 切换；保持直至下一次点击
+            // 档位激活只看点击计数，与是否按住/命中无关（点击后松手保持当前档位）
+            bool stageActive = (activeStage == stage);
+            // 无方向槽：命中按下该档位时置 1 并保持；非活动/清空时归 0
             uint ndIdx = stageBase + 4u;
             if (stageActive && pressed)
-            {
-                float cur = ShapeKeyDrive[ndIdx];
-                ShapeKeyDrive[ndIdx] = cur > 0.5 ? 0.0 : 1.0;
-            }
+                ShapeKeyDrive[ndIdx] = 1.0;
+            else if (!stageActive)
+                ShapeKeyDrive[ndIdx] = 0.0;
             for (uint dir = 0u; dir < 4u; ++dir)
             {
                 uint idx = stageBase + dir;
@@ -161,7 +162,14 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                     // 位移驱动：该方向净位移（同向 +、对向 -）× 灵敏度，
                     // 向上时“上”增“下”减，向下时反之，左右同理
                     float net = dirWeight[dir] - dirWeight[(dir + 2u) % 4u];
-                    next = clamp(current + net * moveLen * mouseSensitivity, 0.0, 1.0);
+                    if (hasHit && zone == hoverZone)
+                        next = clamp(current + net * moveLen * mouseSensitivity, 0.0, 1.0);
+                    // 松手/离开时保持当前强度（不归零、不积分）
+                }
+                else
+                {
+                    // 非活动档位：切档/清空后归 0，避免上一档残留
+                    next = 0.0;
                 }
                 ShapeKeyDrive[idx] = next;
             }

@@ -16,6 +16,7 @@
 """
 
 import importlib.util
+import os
 import struct
 import sys
 import types
@@ -650,6 +651,22 @@ class DragNodeEmitTests(unittest.TestCase):
         )
         cs = sections["[CustomShaderDragShapeKeyDrive_testns]"]
         self.assertIn("z79 = 2", cs)
+
+    def test_shapekey_drive_shader_stage_cycle_and_no_direction_set(self):
+        shader_path = os.path.join("Toolset", "drag_interaction", "rzm_shapekey_drive.hlsl")
+        if not os.path.exists(shader_path):
+            self.skipTest("shader missing")
+        with open(shader_path, encoding="utf-8") as f:
+            content = f.read()
+        # 点击档位在 0..stageCount 间循环：0=清空，第 N+1 次点击回到 0
+        self.assertIn("uint newStage = oldStage >= stageCount ? 0u : oldStage + 1u;", content)
+        self.assertNotIn("(oldStage % stageCount) + 1u", content)
+        # 无方向槽：命中该档位时置 1，非活动档位归 0（不是翻转）
+        self.assertIn("ShapeKeyDrive[ndIdx] = 1.0;", content)
+        self.assertIn("ShapeKeyDrive[ndIdx] = 0.0;", content)
+        self.assertNotIn("cur > 0.5 ? 0.0 : 1.0", content)
+        # 方向槽：非活动档位归 0，避免切档后上一档残留
+        self.assertIn("next = 0.0;", content)
 
     def test_mode_toggle_key_generates_cycle_section(self):
         _, sections, _ = self._emit()
