@@ -131,7 +131,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     )
     drag_drive_enabled: bpy.props.BoolProperty(
         name="拖拽驱动形态键",
-        description="从拖拽交互节点的 ShapeKeyDrive 缓冲区读取强度（仅命中模式下命中区域并按住左键或 X 时渐变至 1）",
+        description="从拖拽交互节点的 ShapeKeyDrive 缓冲区读取强度（仅命中模式下命中区域并按住左键或 X，强度在 0↔1 间切换）",
         default=False,
     )
 
@@ -397,7 +397,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         drive_box.label(text="拖拽驱动形态键", icon='DRIVER')
         drive_box.prop(self, "drag_drive_enabled")
         if self.drag_drive_enabled:
-            drive_box.label(text="自动识别同树拖拽节点（仅命中模式 + 左键/X 点击生效）", icon='INFO')
+            drive_box.label(text="自动识别同树拖拽节点（仅命中模式 + 左键/X 点击切换 0↔1）", icon='INFO')
 
         if not NUMPY_AVAILABLE:
             layout.label(text="警告: 未安装numpy库，优化功能不可用", icon='ERROR')

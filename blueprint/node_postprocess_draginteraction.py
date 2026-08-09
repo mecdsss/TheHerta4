@@ -322,7 +322,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # ---- 形态键驱动输出（ShapeKeyDrive 缓冲，纯 GPU 无回读）----
     enable_shapekey_drive: bpy.props.BoolProperty(
         name="形态键驱动输出",
-        description="在仅命中模式下，命中区域并按住左键或 X 时把该区域强度渐变写入 ShapeKeyDrive 缓冲区，供形态键节点读取",
+        description="在仅命中模式下，命中区域并按住左键或 X：强度为 0 时升至 1，为 1 时降回 0，渐变写入 ShapeKeyDrive 缓冲区供形态键节点读取",
         default=False,
     )
     shapekey_drive_ramp_rate: bpy.props.FloatProperty(
@@ -465,7 +465,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             row = drive_box.row(align=True)
             row.prop(self, "shapekey_drive_ramp_rate", text="上升速率")
             row.prop(self, "shapekey_drive_release_decay", text="松手衰减")
-            drive_box.label(text="仅命中模式下：命中区域并按住左键或 X 时强度升至 1", icon='INFO')
+            drive_box.label(text="仅命中模式下：命中区域并按住左键或 X，强度在 0↔1 间切换（0 升 1 降）", icon='INFO')
 
         runtime_box = layout.box()
         runtime_box.label(text="运行时联动变量", icon='DRIVER')
@@ -1770,9 +1770,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ],
         }
         if getattr(self, "enable_shapekey_drive", False):
+            _drive_capacity = self._zone_capacity(self._collect_enabled_zone_entries())
             global_resources[f"[ResourceDragShapeKeyDrive_{ns}]"] = [
                 "type = RWBuffer", "format = R32_FLOAT",
-                f"array = {self._zone_capacity(self._collect_enabled_zone_entries())}",
+                f"array = {_drive_capacity}",
+            ]
+            # 方向缓冲：每区域 1 个方向槽（0=上升 1=下降）+ 末位 1 个上一帧按键状态槽
+            global_resources[f"[ResourceDragShapeKeyDir_{ns}]"] = [
+                "type = RWBuffer", "format = R32_FLOAT",
+                f"array = {_drive_capacity + 1}",
             ]
         for sec, lines in global_resources.items():
             sections.setdefault(sec, lines)
@@ -2126,9 +2132,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"x78 = $ssmtdrag_x_down_{ns}",
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
             f"cs-u0 = ResourceDragShapeKeyDrive_{ns}",
+            f"cs-u1 = ResourceDragShapeKeyDir_{ns}",
             "dispatch = 1, 1, 1",
             "post cs-t67 = null",
             "post cs-u0 = null",
+            "post cs-u1 = null",
         ]
 
     # ---- CommandList：PinDetected（boot-clear + dt 钳制 + 门槛）/ Viewport / Cursor ----
@@ -2150,6 +2158,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ]
             if getattr(self, "enable_shapekey_drive", False):
                 lines.append(f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0")
+                lines.append(f"\tclear = ResourceDragShapeKeyDir_{ns} 0.0")
             if self.enable_hand_cursor:
                 lines.append(f"\tclear = ResourceDragJiggleCursorPreview_{ns} 0.0")
             for comp in components:
@@ -2704,6 +2713,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             interaction_gate_lines.extend([
                 f"if {drag_mode_var} != 1",
                 f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0",
+                f"\tclear = ResourceDragShapeKeyDir_{ns} 0.0",
                 "endif",
             ])
         interaction_gate_lines.extend([

@@ -524,6 +524,47 @@ class DragNodeEmitTests(unittest.TestCase):
         for sec in required:
             self.assertIn(sec, sections, f"缺少必需段 {sec}")
 
+    def test_shapekey_drive_dir_resource_and_bindings(self):
+        zone = self._zone_item(0)
+        node, sections, comps = self._emit(
+            enable_shapekey_drive=True,
+            zone_objects=[zone],
+            shapekey_drive_ramp_rate=0.08,
+            shapekey_drive_release_decay=0.0,
+        )
+        node._emit_present_and_constants(sections, comps, "testns")
+
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyDrive_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
+        )
+        # 方向缓冲 = 区域容量 + 1（末位槽存上一帧按键状态）
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyDir_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 2"],
+        )
+
+        cs = sections["[CustomShaderDragShapeKeyDrive_testns]"]
+        self.assertIn("cs-u0 = ResourceDragShapeKeyDrive_testns", cs)
+        self.assertIn("cs-u1 = ResourceDragShapeKeyDir_testns", cs)
+        self.assertIn("post cs-u1 = null", cs)
+        self.assertIn("z77 = $ssmtdrag_drag_enabled_testns", cs)
+        self.assertIn("w77 = $ssmtdrag_lmb_down_testns", cs)
+        self.assertIn("x78 = $ssmtdrag_x_down_testns", cs)
+
+        pin = sections["[CommandListDragPinDetected_testns]"]
+        self.assertIn("\tclear = ResourceDragShapeKeyDrive_testns 0.0", pin)
+        self.assertIn("\tclear = ResourceDragShapeKeyDir_testns 0.0", pin)
+
+        present = sections["[Present]"]
+        gate_idx = next(
+            i for i, line in enumerate(present) if "--- DRAG INTERACTION GATE BEGIN ---" in line
+        )
+        gate_block = present[gate_idx:gate_idx + 80]
+        mode_idx = gate_block.index("if $ssmtdrag_drag_enabled_testns != 1")
+        self.assertIn("\tclear = ResourceDragShapeKeyDrive_testns 0.0", gate_block[mode_idx:mode_idx + 4])
+        self.assertIn("\tclear = ResourceDragShapeKeyDir_testns 0.0", gate_block[mode_idx:mode_idx + 4])
+
     def test_tempvb0_empty_declaration(self):
         _, sections, _ = self._emit()
         lines = sections["[ResourceDragJiggleTempVB0_abc123_43191_testns]"]
