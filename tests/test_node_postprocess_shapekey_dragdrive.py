@@ -113,7 +113,7 @@ def _make_node(zone_map, stage_map=None, dir_map=None):
         item.custom_variable_name = ""
         item.drag_zone_id = zone
         item.drag_click_stage = (stage_map or {}).get(name, 1)
-        item.drag_dir_id = str((dir_map or {}).get(name, 0))
+        item.drag_dir_id = str((dir_map or {}).get(name, -1))
         node.shapekey_variable_items.append(item)
     return node
 
@@ -161,6 +161,17 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
         self.assertEqual(node._drag_drive_click_stages(["A", "B", "C"]), [1, 2, 1])
         self.assertEqual(node._drag_drive_dirs(["A", "B", "C"]), [0, 2, 3])
 
+    def test_default_dir_is_no_direction_mapped_to_slot_4(self):
+        node = _make_node({"A": 0, "B": 2})
+        self.assertEqual(node._drag_drive_dirs(["A", "B"]), [4, 4])
+
+    def test_negative_dir_maps_to_no_direction_slot(self):
+        node = _make_node(
+            {"A": 0, "B": 2},
+            dir_map={"A": -1, "B": 0},
+        )
+        self.assertEqual(node._drag_drive_dirs(["A", "B"]), [4, 0])
+
     def test_multi_stage_and_dir_generate_3d_index(self):
         node = _make_node(
             {"A": 0, "B": 0, "C": 1},
@@ -198,7 +209,7 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
         with open(dest, encoding="utf-8") as f:
             content = f.read()
         self.assertIn("static const uint SHAPEKEY_STAGE_COUNT = 2u;", content)
-        self.assertIn("static const uint SHAPEKEY_DIR_COUNT = 4u;", content)
+        self.assertIn("static const uint SHAPEKEY_DIR_COUNT = 5u;", content)
         self.assertIn("static const uint SHAPEKEY_STAGE_IDS[3] = { 1, 2, 1 };", content)
         self.assertIn("static const uint SHAPEKEY_DIR_IDS[3] = { 0, 2, 3 };", content)
         # B 的档位 2、方向 2：B 由点击第 2 次 + 向下驱动

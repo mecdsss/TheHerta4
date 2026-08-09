@@ -531,19 +531,17 @@ class DragNodeEmitTests(unittest.TestCase):
         node, sections, comps = self._emit(
             enable_shapekey_drive=True,
             zone_objects=[zone],
-            shapekey_drive_ramp_rate=0.08,
-            shapekey_drive_release_decay=0.0,
         )
         node._emit_present_and_constants(sections, comps, "testns")
 
         self.assertEqual(
             sections["[ResourceDragShapeKeyDrive_testns]"],
-            ["type = RWBuffer", "format = R32_FLOAT", "array = 4"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 5"],
         )
-        # 方向缓冲 = 区域×档位×4方向 + 1（末位槽存上一帧按键状态）
+        # 方向缓冲 = 区域×档位×5槽（4方向 + 1无方向）+ 1（末位槽存上一帧按键状态）
         self.assertEqual(
             sections["[ResourceDragShapeKeyDir_testns]"],
-            ["type = RWBuffer", "format = R32_FLOAT", "array = 5"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 6"],
         )
         self.assertEqual(
             sections["[ResourceDragShapeKeyClickCount_testns]"],
@@ -582,9 +580,6 @@ class DragNodeEmitTests(unittest.TestCase):
         node, sections, comps = self._emit(
             enable_shapekey_drive=True,
             zone_objects=[zone],
-            shapekey_drive_ramp_rate=0.08,
-            shapekey_drive_release_decay=0.0,
-            shapekey_drive_input='MOUSE',
             shapekey_drive_move_sensitivity=0.02,
         )
         node._emit_present_and_constants(sections, comps, "testns")
@@ -602,7 +597,9 @@ class DragNodeEmitTests(unittest.TestCase):
         cs = sections["[CustomShaderDragShapeKeyDrive_testns]"]
         self.assertIn("x79 = $ssmtdrag_shapekey_dy_testns", cs)
         self.assertIn("y79 = $ssmtdrag_shapekey_dx_testns", cs)
-        self.assertIn("w79 = 1", cs)
+        self.assertNotIn("w79", cs)
+        self.assertNotIn("x77", cs)
+        self.assertNotIn("y77", cs)
         self.assertIn("x80 = 0.02", cs)
 
     def test_shapekey_drive_stage_count_auto_derived_from_shapekey_nodes(self):
@@ -611,8 +608,6 @@ class DragNodeEmitTests(unittest.TestCase):
             self.mod,
             enable_shapekey_drive=True,
             zone_objects=[zone],
-            shapekey_drive_ramp_rate=0.08,
-            shapekey_drive_release_decay=0.0,
         )
         # 同树形态键节点：A 档位 2、B 档位 1、C 未开启拖拽驱动（档位 3 不应计入）
         sk_a = types.SimpleNamespace(
@@ -644,14 +639,14 @@ class DragNodeEmitTests(unittest.TestCase):
         node._emit_sections(sections, comps, "testns")
         node._emit_present_and_constants(sections, comps, "testns")
 
-        # 区域容量 1 × 档位 2 × 4 方向 = 8
+        # 区域容量 1 × 档位 2 × 5 槽（4 方向 + 1 无方向）= 10
         self.assertEqual(
             sections["[ResourceDragShapeKeyDrive_testns]"],
-            ["type = RWBuffer", "format = R32_FLOAT", "array = 8"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 10"],
         )
         self.assertEqual(
             sections["[ResourceDragShapeKeyDir_testns]"],
-            ["type = RWBuffer", "format = R32_FLOAT", "array = 9"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 11"],
         )
         cs = sections["[CustomShaderDragShapeKeyDrive_testns]"]
         self.assertIn("z79 = 2", cs)

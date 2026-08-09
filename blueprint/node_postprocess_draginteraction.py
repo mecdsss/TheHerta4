@@ -327,35 +327,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # ---- 形态键驱动输出（ShapeKeyDrive 缓冲，纯 GPU 无回读）----
     enable_shapekey_drive: bpy.props.BoolProperty(
         name="形态键驱动输出",
-        description="在仅命中模式下，命中区域并按住左键或 X：强度为 0 时升至 1，为 1 时降回 0，渐变写入 ShapeKeyDrive 缓冲区供形态键节点读取",
+        description="在仅命中模式下，命中区域并按住左键或 X：按鼠标位移驱动方向强度，或按点击档位直接 0/1 开关，写入 ShapeKeyDrive 缓冲区供形态键节点读取",
         default=False,
-    )
-    shapekey_drive_ramp_rate: bpy.props.FloatProperty(
-        name="强度上升速率",
-        description="拖拽期间每帧步进累加值，达到 1.0 后封顶",
-        default=0.08,
-        min=0.001,
-        max=2.0,
-    )
-    shapekey_drive_release_decay: bpy.props.FloatProperty(
-        name="松手衰减保留",
-        description="0=松手保持当前强度；>0 时松手后每帧按该保留系数的步进次幂衰减（如 0.92）",
-        default=0.0,
-        min=0.0,
-        max=1.0,
-    )
-    shapekey_drive_input: bpy.props.EnumProperty(
-        name="强度控制方式",
-        description="RAMP=按住时按上升速率渐变；MOUSE=按住时按鼠标上下左右位移控制强度（各方向独立，对向联动）",
-        items=[
-            ('RAMP', "上升速率", "按住时按 ramp 速率积分至 1，可切换 0/1 方向"),
-            ('MOUSE', "鼠标位移", "按住时按鼠标上下左右位移控制 0-1，各方向独立映射形态键"),
-        ],
-        default='RAMP',
     )
     shapekey_drive_move_sensitivity: bpy.props.FloatProperty(
         name="位移灵敏度",
-        description="鼠标位移控制模式：每像素位移对应的强度增量（向上增、向下减），默认 0.02",
+        description="鼠标位移控制：每像素位移对应的强度增量（向上增、向下减），默认 0.02；无方向形态键不随位移，按点击档位 0/1 开关",
         default=0.02,
         min=0.0001,
         max=1.0,
@@ -483,14 +460,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         drive_box.label(text="形态键驱动输出", icon='SHAPEKEY_DATA')
         drive_box.prop(self, "enable_shapekey_drive")
         if self.enable_shapekey_drive:
-            row = drive_box.row(align=True)
-            row.prop(self, "shapekey_drive_ramp_rate", text="上升速率")
-            row.prop(self, "shapekey_drive_release_decay", text="松手衰减")
-            drive_box.prop(self, "shapekey_drive_input")
-            if self.shapekey_drive_input == 'MOUSE':
-                drive_box.prop(self, "shapekey_drive_move_sensitivity", text="位移灵敏度")
+            drive_box.prop(self, "shapekey_drive_move_sensitivity", text="位移灵敏度")
             drive_box.label(text="点击档位数：由各形态键节点配置的最大点击档位自动推导", icon='INFO')
-            drive_box.label(text="仅命中模式：命中区域按住左键/X，按点击档位与移动方向驱动对应形态键强度", icon='INFO')
+            drive_box.label(text="仅命中模式：命中区域按住左键/X，方向形态键随鼠标位移驱动，无方向形态键按点击档位直接 0/1 开关", icon='INFO')
 
         runtime_box = layout.box()
         runtime_box.label(text="运行时联动变量", icon='DRIVER')
@@ -1820,12 +1792,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if getattr(self, "enable_shapekey_drive", False):
             _drive_capacity = self._zone_capacity(self._collect_enabled_zone_entries())
             _stage_count = self._drag_drive_stage_count()
-            _dir_count = 4  # 上/右/下/左（对齐 UI 构造器方向数量=4）
+            _dir_count = 5  # 0-3 = 上/右/下/左方向，4 = 无方向（点击按档位 0/1 开关）
             global_resources[f"[ResourceDragShapeKeyDrive_{ns}]"] = [
                 "type = RWBuffer", "format = R32_FLOAT",
                 f"array = {_drive_capacity * _stage_count * _dir_count}",
             ]
-            # 方向缓冲：每区域每档每方向 1 个槽（0=上升 1=下降）+ 末位 1 个上一帧按键状态槽
+            # 方向缓冲：与驱动缓冲同构（含无方向槽），末位 1 个上一帧按键状态槽
             global_resources[f"[ResourceDragShapeKeyDir_{ns}]"] = [
                 "type = RWBuffer", "format = R32_FLOAT",
                 f"array = {_drive_capacity * _stage_count * _dir_count + 1}",
@@ -2186,7 +2158,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         ])
         sections[sec] = lines
 
-    # ---- ShapeKeyDrive：把 locked 拖拽区域强度按 ramp 积分写入驱动缓冲 ----
+    # ---- ShapeKeyDrive：仅命中模式下按鼠标位移 / 点击档位写入驱动缓冲 ----
 
     def _emit_shapekey_drive_section(self, sections, ns):
         sec = f"[CustomShaderDragShapeKeyDrive_{ns}]"
@@ -2198,15 +2170,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"x76 = $ssmtdrag_delta_time_{ns}",
             f"y76 = $ssmtdrag_sim_speed_{ns}",
             f"z76 = $ssmtdrag_max_step_{ns}",
-            "x77 = " + self._fmt(self.shapekey_drive_ramp_rate),
-            "y77 = " + self._fmt(self.shapekey_drive_release_decay),
             f"z77 = {drag_mode_var}",
             f"w77 = $ssmtdrag_lmb_down_{ns}",
             f"x78 = $ssmtdrag_x_down_{ns}",
             "x79 = $ssmtdrag_shapekey_dy_" + ns,
             "y79 = $ssmtdrag_shapekey_dx_" + ns,
             f"z79 = {self._drag_drive_stage_count()}",
-            f"w79 = {1 if getattr(self, 'shapekey_drive_input', 'RAMP') == 'MOUSE' else 0}",
             "x80 = " + self._fmt(self.shapekey_drive_move_sensitivity),
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
             f"cs-u0 = ResourceDragShapeKeyDrive_{ns}",

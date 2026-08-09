@@ -65,14 +65,15 @@ class ShapeKeyVariableItem(bpy.types.PropertyGroup):
     ) # type: ignore
     drag_dir_id: bpy.props.EnumProperty(
         name="驱动方向",
-        description="该形态键由哪个方向的鼠标位移驱动：0=向上 1=向右 2=向下 3=向左",
+        description="无方向=点击时按档位直接 0/1 开关，不随鼠标位移；否则由对应方向鼠标位移驱动强度",
         items=[
+            ('-1', "无方向", "点击时按档位直接 0/1 开关，不随鼠标位移"),
             ('0', "向上", "鼠标向上移动时驱动"),
             ('1', "向右", "鼠标向右移动时驱动"),
             ('2', "向下", "鼠标向下移动时驱动"),
             ('3', "向左", "鼠标向左移动时驱动"),
         ],
-        default='0',
+        default='-1',
     ) # type: ignore
 
 
@@ -419,7 +420,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return stages
 
     def _drag_drive_dirs(self, unique_names):
-        """返回与 unique_names（FREQ 索引顺序）对齐的驱动方向列表（未绑定区域时用 0xFFFFFFFF 表示禁用）。"""
+        """返回与 unique_names（FREQ 索引顺序）对齐的驱动方向列表。
+        无方向映射为 4（每档 5 槽：0-3 方向 + 4 无方向）；未绑定区域用 -1（0xFFFFFFFF 禁用）。"""
         dirs = []
         for name in unique_names:
             item = None
@@ -431,10 +433,15 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 item = self._ensure_shapekey_variable_item(name)
             zone_id = int(getattr(item, "drag_zone_id", -1))
             try:
-                dir_val = int(getattr(item, "drag_dir_id", "0") or "0")
+                dir_val = int(getattr(item, "drag_dir_id", "-1") or "-1")
             except Exception:
-                dir_val = 0
-            dirs.append(dir_val if zone_id >= 0 else -1)
+                dir_val = -1
+            if zone_id < 0:
+                dirs.append(-1)
+            elif dir_val < 0:
+                dirs.append(4)  # 无方向槽
+            else:
+                dirs.append(dir_val)
         return dirs
 
     def collect_blueprint_shape_key_names(self):
@@ -1648,7 +1655,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             click_stages = list(drag_click_stages or []) if drag_drive_enabled else []
             stage_count = max(1, int(drag_stage_count or 1))
             drag_dirs = list(drag_dirs or []) if drag_drive_enabled else []
-            dir_count = 4
+            # 每档 5 槽：0-3 = 上/右/下/左方向，4 = 无方向（点击按档位 0/1 开关）
+            dir_count = 5
             define_lines = [f"// --- Shared Animation Intensity (per Shape Key Name) ---\n// From index {self.INTENSITY_START_INDEX} onwards"]
             if drag_drive_enabled:
                 define_lines.append(f"Buffer<float> ShapeKeyDrive : register(t{self.DRAG_DRIVE_REGISTER});")

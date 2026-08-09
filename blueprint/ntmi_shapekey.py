@@ -225,7 +225,8 @@ class NTMIShapeKeyNodeAdapter:
         click_stages = list(drag_click_stages or []) if drag_drive_enabled else []
         dirs = list(drag_dirs or []) if drag_drive_enabled else []
         stage_count = max(1, int(drag_stage_count or 1))
-        dir_count = 4
+        # 每档 5 槽：0-3 = 上/右/下/左方向，4 = 无方向（点击按档位 0/1 开关）
+        dir_count = 5
         drive_extra_lines = []
         if drag_drive_enabled:
             drive_extra_lines.append(f"Buffer<float> ShapeKeyDrive : register(t{self.DRAG_DRIVE_REGISTER});")
