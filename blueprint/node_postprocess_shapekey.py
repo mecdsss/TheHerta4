@@ -131,13 +131,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     )
     drag_drive_enabled: bpy.props.BoolProperty(
         name="拖拽驱动形态键",
-        description="从拖拽交互节点的 ShapeKeyDrive 缓冲区读取强度（命中并拖拽特定区域时渐变至 1）",
+        description="从拖拽交互节点的 ShapeKeyDrive 缓冲区读取强度（仅命中模式下命中区域并按住左键或 X 时渐变至 1）",
         default=False,
-    )
-    drag_drive_resource_override: bpy.props.StringProperty(
-        name="拖拽驱动资源名",
-        description="留空自动从同一节点树中的拖拽交互节点推导；多个拖拽节点时可手动填写 ResourceDragShapeKeyDrive_<ns>",
-        default="",
     )
 
     def apply_name_mapping(self, mapping):
@@ -336,10 +331,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return None
 
     def _drag_shapekey_drive_resource_name(self, ini_path=None):
-        """推导拖拽 ShapeKeyDrive 资源名；优先手动覆盖，其次自动从拖拽节点推导。"""
-        override = str(getattr(self, "drag_drive_resource_override", "") or "").strip()
-        if override:
-            return override
+        """自动从同一节点树中的拖拽交互节点推导 ShapeKeyDrive 资源名。"""
         node = self._find_drag_drive_node()
         if node is None:
             return None
@@ -405,8 +397,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         drive_box.label(text="拖拽驱动形态键", icon='DRIVER')
         drive_box.prop(self, "drag_drive_enabled")
         if self.drag_drive_enabled:
-            drive_box.prop(self, "drag_drive_resource_override")
-            drive_box.label(text="在下方映射列表中为各形态键填写拖拽区域 ID", icon='INFO')
+            drive_box.label(text="自动识别同树拖拽节点（仅命中模式 + 左键/X 点击生效）", icon='INFO')
 
         if not NUMPY_AVAILABLE:
             layout.label(text="警告: 未安装numpy库，优化功能不可用", icon='ERROR')

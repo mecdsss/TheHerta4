@@ -322,7 +322,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # ---- 形态键驱动输出（ShapeKeyDrive 缓冲，纯 GPU 无回读）----
     enable_shapekey_drive: bpy.props.BoolProperty(
         name="形态键驱动输出",
-        description="把命中并拖拽区域的强度渐变写入 ShapeKeyDrive 缓冲区，供形态键节点读取",
+        description="在仅命中模式下，命中区域并按住左键或 X 时把该区域强度渐变写入 ShapeKeyDrive 缓冲区，供形态键节点读取",
         default=False,
     )
     shapekey_drive_ramp_rate: bpy.props.FloatProperty(
@@ -465,7 +465,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             row = drive_box.row(align=True)
             row.prop(self, "shapekey_drive_ramp_rate", text="上升速率")
             row.prop(self, "shapekey_drive_release_decay", text="松手衰减")
-            drive_box.label(text="在形态键节点为各形态键绑定区域 ID 后生效", icon='INFO')
+            drive_box.label(text="仅命中模式下：命中区域并按住左键或 X 时强度升至 1", icon='INFO')
 
         runtime_box = layout.box()
         runtime_box.label(text="运行时联动变量", icon='DRIVER')
@@ -2113,6 +2113,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         sec = f"[CustomShaderDragShapeKeyDrive_{ns}]"
         if sec in sections:
             return
+        drag_mode_var = self._runtime_variable_names(ns)[0]
         sections[sec] = [
             f"cs = {RES_SHADER_DIR}/rzm_shapekey_drive.hlsl",
             f"x76 = $ssmtdrag_delta_time_{ns}",
@@ -2120,10 +2121,13 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"z76 = $ssmtdrag_max_step_{ns}",
             "x77 = " + self._fmt(self.shapekey_drive_ramp_rate),
             "y77 = " + self._fmt(self.shapekey_drive_release_decay),
-            f"cs-t71 = ResourceDragJiggleScreenState_{ns}",
+            f"z77 = {drag_mode_var}",
+            f"w77 = $ssmtdrag_lmb_down_{ns}",
+            f"x78 = $ssmtdrag_x_down_{ns}",
+            f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
             f"cs-u0 = ResourceDragShapeKeyDrive_{ns}",
             "dispatch = 1, 1, 1",
-            "post cs-t71 = null",
+            "post cs-t67 = null",
             "post cs-u0 = null",
         ]
 
@@ -2683,8 +2687,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"\tclear = ResourceDragJiggleScreenState_{ns} 0.0",
             f"\tclear = ResourceDragPathProgressState_{ns} 0.0",
         ]
-        if getattr(self, "enable_shapekey_drive", False):
-            interaction_gate_lines.append(f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0")
         for comp in components:
             interaction_gate_lines.append(
                 f"\tclear = ResourceDragJiggleState_{comp['comp_name']}_{ns} 0.0")
@@ -2696,6 +2698,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ])
         interaction_gate_lines.extend([
             "endif",
+        ])
+        # 形态键驱动只在“仅命中”模式（1）下生效；关闭(0)/命中+拖拽交互(2)时清零缓冲
+        if getattr(self, "enable_shapekey_drive", False):
+            interaction_gate_lines.extend([
+                f"if {drag_mode_var} != 1",
+                f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0",
+                "endif",
+            ])
+        interaction_gate_lines.extend([
             f"if {drag_mode_var} < 1",
             f"\t$ObjectDetectAllowed_{ns} = 0",
             f"\tclear = ResourceDragDetectID_{ns} 0.0",
