@@ -172,17 +172,17 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
         )
         self.assertEqual(node._drag_drive_dirs(["A", "B"]), [4, 0])
 
-    def test_multi_stage_and_dir_generate_3d_index(self):
+    def test_non_directional_stages_and_directional_slot_layout(self):
         node = _make_node(
             {"A": 0, "B": 0, "C": 1},
             stage_map={"A": 1, "B": 2, "C": 1},
-            dir_map={"A": 0, "B": 2, "C": 3},
+            dir_map={"A": -1, "B": -1, "C": 3},
         )
-        # 模拟同树拖拽节点开启 2 档
+        # 模拟同树拖拽节点：区域0 无方向档位1/2（A/B），区域1 方向 C
         drag_node = types.SimpleNamespace(
             bl_idname="SSMTNode_PostProcess_DragInteraction",
             enable_shapekey_drive=True,
-            _drag_drive_stage_count=lambda: 2,
+            _drag_drive_buffer_layout=lambda: (13, [0, 6], [2, 1]),
             _resolve_namespace=lambda ini: "ns",
         )
         node.id_data = types.SimpleNamespace(nodes=[drag_node])
@@ -208,22 +208,24 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
         )
         with open(dest, encoding="utf-8") as f:
             content = f.read()
-        self.assertIn("static const uint SHAPEKEY_STAGE_COUNT = 2u;", content)
-        self.assertIn("static const uint SHAPEKEY_DIR_COUNT = 5u;", content)
-        self.assertIn("static const uint SHAPEKEY_STAGE_IDS[3] = { 1, 2, 1 };", content)
-        self.assertIn("static const uint SHAPEKEY_DIR_IDS[3] = { 0, 2, 3 };", content)
-        # B 的档位 2、方向 2：B 由点击第 2 次 + 向下驱动
-        self.assertIn("// B (zone 0, click 2, dir 2)", content)
+        # 区域0 无方向档位 A=1、B=2；区域1 方向 C=3
+        # 区域0 段 = 4+2 = 6 槽；区域1 基址 = 6；C 槽 = 6+3 = 9
+        self.assertIn("static const uint SHAPEKEY_ND_STAGE_IDS[3] = { 1, 2, 4294967295 };", content)
+        self.assertIn("static const uint SHAPEKEY_SLOT_IDS[3] = { 4, 5, 9 };", content)
+        # A/B 无方向槽读取带档位门控；C 方向槽忽略档位
+        self.assertIn("// A (zone 0, slot 4)", content)
+        self.assertIn("// B (zone 0, slot 5)", content)
+        self.assertIn("// C (zone 1, slot 9)", content)
 
     def test_merged_optimized_generates_drive_read(self):
         content = self._generate("shapekey_anim_packed_delta_v5_merged.hlsl")
         self.assertIn("Buffer<float> ShapeKeyDrive : register(t100);", content)
         self.assertIn("Buffer<uint> ShapeKeyClickCount : register(t101);", content)
         self.assertIn("SHAPEKEY_ZONE_IDS", content)
-        self.assertIn("SHAPEKEY_DIR_COUNT", content)
-        self.assertIn("ShapeKeyClickCount[sk_zone_slot0] == sk_stage_slot0", content)
-        self.assertIn("ShapeKeyDrive[sk_zone_slot0 * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT", content)
-        self.assertIn("#define FREQ1 (SHAPEKEY_ZONE_IDS[0] != 0xFFFFFFFFu", content)
+        self.assertIn("SHAPEKEY_SLOT_IDS", content)
+        self.assertIn("sk_nd_stage_slot0 == 0xFFFFFFFFu || ShapeKeyClickCount[sk_zone_slot0] == sk_nd_stage_slot0", content)
+        self.assertIn("anim_weight_slot0 = ShapeKeyDrive[sk_slot_slot0];", content)
+        self.assertIn("#define FREQ1 (SHAPEKEY_ND_STAGE_IDS[0] == 0xFFFFFFFFu || ShapeKeyClickCount[SHAPEKEY_ZONE_IDS[0]] == SHAPEKEY_ND_STAGE_IDS[0]", content)
         # 未绑定形态键保持变量回退
         self.assertIn("#define FREQ3 IniParams[102].x", content)
         # 未绑定守卫：不会访问 ShapeKeyDrive[-1]
@@ -232,15 +234,16 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
     def test_optimized_non_merged_generates_drive_read(self):
         content = self._generate("shapekey_anim_packed_delta_v4_optimized.hlsl")
         self.assertIn("register(t100)", content)
-        self.assertIn("ShapeKeyClickCount[sk_zone_slot0] == sk_stage_slot0", content)
-        self.assertIn("ShapeKeyDrive[sk_zone_slot0 * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT", content)
+        self.assertIn("sk_nd_stage_slot0 == 0xFFFFFFFFu || ShapeKeyClickCount[sk_zone_slot0] == sk_nd_stage_slot0", content)
+        self.assertIn("anim_weight_slot0 = ShapeKeyDrive[sk_slot_slot0];", content)
 
     def test_all_templates_generate_drive_binding(self):
         for template_name in _TEMPLATES.values():
             content = self._generate(template_name)
             self.assertIn("register(t100)", content, template_name)
-            self.assertIn("SHAPEKEY_DIR_COUNT", content, template_name)
-            self.assertIn("ShapeKeyDrive[SHAPEKEY_ZONE_IDS[0] * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT", content, template_name)
+            self.assertIn("SHAPEKEY_SLOT_IDS", content, template_name)
+            self.assertIn("uint sk_slot_slot0 = SHAPEKEY_SLOT_IDS[freq_idx_slot0];", content, template_name)
+            self.assertIn("ShapeKeyDrive[sk_slot_slot0]", content, template_name)
 
     def test_disabled_keeps_original_ini_params_weight(self):
         src = os.path.abspath(os.path.join("Toolset", "shapekey_anim_packed_delta_v5_merged.hlsl"))

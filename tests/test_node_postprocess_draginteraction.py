@@ -603,54 +603,67 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertNotIn("y77", cs)
         self.assertIn("x80 = 0.02", cs)
 
-    def test_shapekey_drive_stage_count_auto_derived_from_shapekey_nodes(self):
+    def test_shapekey_drive_zone_stage_counts_auto_derived_from_shapekey_nodes(self):
         zone = self._zone_item(0)
         node = _make_node(
             self.mod,
             enable_shapekey_drive=True,
             zone_objects=[zone],
         )
-        # 同树形态键节点：A 档位 2、B 档位 1、C 未开启拖拽驱动（档位 3 不应计入）
+        # 同树形态键节点：A 区域0 档位 2、B 区域0 档位 1、C 方向形态键（不计入档位）、
+        # D 未开启拖拽驱动（档位 3 不应计入）
         sk_a = types.SimpleNamespace(
             bl_idname="SSMTNode_PostProcess_ShapeKey",
             drag_drive_enabled=True,
             shapekey_variable_items=[
-                types.SimpleNamespace(shape_key_name="A", drag_click_stage=2),
+                types.SimpleNamespace(shape_key_name="A", drag_zone_id=0, drag_dir_id="-1", drag_click_stage=2),
             ],
         )
         sk_b = types.SimpleNamespace(
             bl_idname="SSMTNode_PostProcess_ShapeKey",
             drag_drive_enabled=True,
             shapekey_variable_items=[
-                types.SimpleNamespace(shape_key_name="B", drag_click_stage=1),
+                types.SimpleNamespace(shape_key_name="B", drag_zone_id=0, drag_dir_id="-1", drag_click_stage=1),
+            ],
+        )
+        sk_dir = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_ShapeKey",
+            drag_drive_enabled=True,
+            shapekey_variable_items=[
+                types.SimpleNamespace(shape_key_name="C", drag_zone_id=0, drag_dir_id="0", drag_click_stage=3),
             ],
         )
         sk_off = types.SimpleNamespace(
             bl_idname="SSMTNode_PostProcess_ShapeKey",
             drag_drive_enabled=False,
             shapekey_variable_items=[
-                types.SimpleNamespace(shape_key_name="C", drag_click_stage=3),
+                types.SimpleNamespace(shape_key_name="D", drag_zone_id=0, drag_dir_id="-1", drag_click_stage=3),
             ],
         )
-        node.id_data = types.SimpleNamespace(nodes=[sk_a, sk_b, sk_off])
-        self.assertEqual(node._drag_drive_stage_count(), 2)
+        node.id_data = types.SimpleNamespace(nodes=[sk_a, sk_b, sk_dir, sk_off])
+        # 区域 0 无方向档位最大 2；方向形态键档位 3 不计入
+        self.assertEqual(node._drag_drive_zone_stage_counts(), {0: 2})
+        total, bases, counts = node._drag_drive_buffer_layout()
+        self.assertEqual(total, 6)   # 4 方向 + 2 无方向档位
+        self.assertEqual(bases, [0])
+        self.assertEqual(counts, [2])
 
         sections = _base_sections()
         comps = node._locate_components(sections, ["abc123"])
         node._emit_sections(sections, comps, "testns")
         node._emit_present_and_constants(sections, comps, "testns")
 
-        # 区域容量 1 × 档位 2 × 5 槽（4 方向 + 1 无方向）= 10
         self.assertEqual(
             sections["[ResourceDragShapeKeyDrive_testns]"],
-            ["type = RWBuffer", "format = R32_FLOAT", "array = 10"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 6"],
         )
         self.assertEqual(
             sections["[ResourceDragShapeKeyDir_testns]"],
-            ["type = RWBuffer", "format = R32_FLOAT", "array = 11"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 7"],
         )
         cs = sections["[CustomShaderDragShapeKeyDrive_testns]"]
-        self.assertIn("z79 = 2", cs)
+        self.assertIn("cs-t68 = ResourceDragShapeKeyZoneStageCounts_testns", cs)
+        self.assertNotIn("z79", cs)
 
     def test_shapekey_drive_shader_stage_cycle_and_no_direction_set(self):
         shader_path = os.path.join("Toolset", "drag_interaction", "rzm_shapekey_drive.hlsl")
@@ -658,15 +671,18 @@ class DragNodeEmitTests(unittest.TestCase):
             self.skipTest("shader missing")
         with open(shader_path, encoding="utf-8") as f:
             content = f.read()
-        # 点击档位在 0..stageCount 间循环：0=清空，第 N+1 次点击回到 0
-        self.assertIn("uint newStage = oldStage >= stageCount ? 0u : oldStage + 1u;", content)
+        # 点击档位按区域独立（ZoneStageCounts）在 0..N 间循环：0=清空，第 N+1 次点击回到 0
+        self.assertIn("uint zoneStageCount = max(1u, ZoneStageCounts[hoverZone]);", content)
+        self.assertIn("uint newStage = oldStage >= zoneStageCount ? 0u : oldStage + 1u;", content)
         self.assertNotIn("(oldStage % stageCount) + 1u", content)
         # 无方向槽：命中该档位时置 1，非活动档位归 0（不是翻转）
+        self.assertIn("if (activeStage == stage && zonePressed)", content)
         self.assertIn("ShapeKeyDrive[ndIdx] = 1.0;", content)
         self.assertIn("ShapeKeyDrive[ndIdx] = 0.0;", content)
         self.assertNotIn("cur > 0.5 ? 0.0 : 1.0", content)
-        # 方向槽：非活动档位归 0，避免切档后上一档残留
-        self.assertIn("next = 0.0;", content)
+        # 每区域独立段：4 方向槽 + N 无方向槽，运行基址前缀和
+        self.assertIn("runningBase += 4u + zoneStageCount;", content)
+        self.assertIn("Buffer<uint> ZoneStageCounts        : register(t68);", content)
 
     def test_shapekey_drive_shader_zones_are_independent(self):
         shader_path = os.path.join("Toolset", "drag_interaction", "rzm_shapekey_drive.hlsl")
@@ -674,14 +690,14 @@ class DragNodeEmitTests(unittest.TestCase):
             self.skipTest("shader missing")
         with open(shader_path, encoding="utf-8") as f:
             content = f.read()
-        # 档位推进按 hoverZone 独立写入，不循环所有区域
-        self.assertIn("uint oldStage = ClickCount[hoverZone];", content)
-        self.assertIn("ClickCount[hoverZone] = newStage;", content)
+        # 各区域独立段基址 + 独立档位数
+        self.assertIn("uint zoneBase = runningBase;", content)
+        self.assertIn("uint zoneStageCount = max(1u, ZoneStageCounts[zone]);", content)
         # 无方向槽置位必须同时满足“本区域命中按下”（zoneHit && pressed），
         # 防止在其他区域按下时误置本区域槽
         self.assertIn("bool zoneHit = hasHit && zone == hoverZone;", content)
         self.assertIn("bool zonePressed = zoneHit && pressed;", content)
-        self.assertIn("if (stageActive && zonePressed)", content)
+        self.assertIn("if (activeStage == stage && zonePressed)", content)
         # 方向槽位移积分同样只在 zoneHit 时执行，其余区域保持不积分
         self.assertIn("if (zoneHit)", content)
 

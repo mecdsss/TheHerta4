@@ -122,6 +122,10 @@ class _OriginalNode:
     def _drag_drive_zone_ids(self, unique_names):
         return [2, 3, -1]
 
+    def _drag_drive_buffer_layout(self):
+        # 区域 2/3：每区域 4 方向 + 1 档 = 5 槽；区域 2 基址 0，区域 3 基址 5
+        return 11, [0, 0, 0, 5], [1, 1, 1, 1]
+
 
 class NTMIShapeKeyDragDriveTests(unittest.TestCase):
     def setUp(self):
@@ -151,7 +155,8 @@ class NTMIShapeKeyDragDriveTests(unittest.TestCase):
         self.assertIn("Buffer<float> ShapeKeyDrive : register(t100);", content)
         self.assertIn("Buffer<uint> ShapeKeyClickCount : register(t101);", content)
         self.assertIn("SHAPEKEY_ZONE_IDS", content)
-        self.assertIn("weight = ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx] * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT", content)
+        self.assertIn("weight = ShapeKeyDrive[SHAPEKEY_SLOT_IDS[freq_idx]];", content)
+        self.assertIn("SHAPEKEY_ND_STAGE_IDS[freq_idx] == 0xFFFFFFFFu || ShapeKeyClickCount[SHAPEKEY_ZONE_IDS[freq_idx]] == SHAPEKEY_ND_STAGE_IDS[freq_idx]", content)
         self.assertIn("0xFFFFFFFFu", content)
 
     def test_skin_commandlist_binds_drive(self):

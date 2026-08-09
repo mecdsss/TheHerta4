@@ -200,6 +200,9 @@ class NTMIShapeKeyNodeAdapter:
     def _drag_drive_stage_count(self):
         return self.original_node._drag_drive_stage_count()
 
+    def _drag_drive_buffer_layout(self):
+        return self.original_node._drag_drive_buffer_layout()
+
     def _drag_drive_dirs(self, unique_names):
         return self.original_node._drag_drive_dirs(unique_names)
 
@@ -224,28 +227,44 @@ class NTMIShapeKeyNodeAdapter:
         zone_ids = list(drag_zone_ids or []) if drag_drive_enabled else []
         click_stages = list(drag_click_stages or []) if drag_drive_enabled else []
         dirs = list(drag_dirs or []) if drag_drive_enabled else []
-        stage_count = max(1, int(drag_stage_count or 1))
-        # 每档 5 槽：0-3 = 上/右/下/左方向，4 = 无方向（点击按档位 0/1 开关）
-        dir_count = 5
+        # 按区域独立段布局：每区域 4 方向槽 + 该区域档位数 N 个无方向槽
+        _total_slots, _zone_bases, _zone_stage_counts = self._drag_drive_buffer_layout()
+        zone_bases = list(_zone_bases)
+        zone_stage_counts = list(_zone_stage_counts)
         drive_extra_lines = []
         if drag_drive_enabled:
             drive_extra_lines.append(f"Buffer<float> ShapeKeyDrive : register(t{self.DRAG_DRIVE_REGISTER});")
             drive_extra_lines.append(f"Buffer<uint> ShapeKeyClickCount : register(t{self.DRAG_CLICK_COUNT_REGISTER});")
-            drive_extra_lines.append(f"static const uint SHAPEKEY_STAGE_COUNT = {stage_count}u;")
-            drive_extra_lines.append(f"static const uint SHAPEKEY_DIR_COUNT = {dir_count}u;")
             if any(zone >= 0 for zone in zone_ids):
                 ids_text = ", ".join(str(zone) if zone >= 0 else "0xFFFFFFFFu" for zone in zone_ids)
                 drive_extra_lines.append(f"static const uint SHAPEKEY_ZONE_IDS[{len(zone_ids)}] = {{ {ids_text} }};")
                 drive_extra_lines.append(f"static const uint SHAPEKEY_ZONE_IDS_COUNT = {len(zone_ids)}u;")
-                stage_text = ", ".join(str(stage) if stage >= 1 else "0xFFFFFFFFu" for stage in click_stages)
-                drive_extra_lines.append(f"static const uint SHAPEKEY_STAGE_IDS[{len(click_stages) or len(zone_ids)}] = {{ {stage_text} }};")
-                dir_text = ", ".join(str(d) if d >= 0 else "0xFFFFFFFFu" for d in dirs)
-                drive_extra_lines.append(f"static const uint SHAPEKEY_DIR_IDS[{len(dirs) or len(zone_ids)}] = {{ {dir_text} }};")
+                dir_list = list(dirs) if len(dirs) == len(zone_ids) else [4] * len(zone_ids)
+                stage_list = list(click_stages) if len(click_stages) == len(zone_ids) else [1] * len(zone_ids)
+                nd_stage_ids = []
+                slot_ids = []
+                for idx, zone in enumerate(zone_ids):
+                    if zone < 0 or zone >= len(zone_bases):
+                        nd_stage_ids.append(0xFFFFFFFF)
+                        slot_ids.append(0xFFFFFFFF)
+                        continue
+                    d = dir_list[idx] if idx < len(dir_list) else 4
+                    if d >= 0 and d < 4:
+                        nd_stage_ids.append(0xFFFFFFFF)
+                        slot_ids.append(zone_bases[zone] + d)
+                    else:
+                        stage = max(1, stage_list[idx] if idx < len(stage_list) else 1)
+                        nd_stage_ids.append(stage)
+                        slot_ids.append(zone_bases[zone] + 4 + (stage - 1))
+                nd_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in nd_stage_ids)
+                drive_extra_lines.append(f"static const uint SHAPEKEY_ND_STAGE_IDS[{len(zone_ids)}] = {{ {nd_text} }};")
+                slot_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in slot_ids)
+                drive_extra_lines.append(f"static const uint SHAPEKEY_SLOT_IDS[{len(zone_ids)}] = {{ {slot_text} }};")
             else:
                 drive_extra_lines.append("static const uint SHAPEKEY_ZONE_IDS[1] = { 0xFFFFFFFFu };")
                 drive_extra_lines.append("static const uint SHAPEKEY_ZONE_IDS_COUNT = 1u;")
-                drive_extra_lines.append("static const uint SHAPEKEY_STAGE_IDS[1] = { 0xFFFFFFFFu };")
-                drive_extra_lines.append("static const uint SHAPEKEY_DIR_IDS[1] = { 0xFFFFFFFFu };")
+                drive_extra_lines.append("static const uint SHAPEKEY_ND_STAGE_IDS[1] = { 0xFFFFFFFFu };")
+                drive_extra_lines.append("static const uint SHAPEKEY_SLOT_IDS[1] = { 0xFFFFFFFFu };")
             drive_extra_lines.append("")
         freq_define_lines = []
         for index, name in enumerate(unique_names):
@@ -311,9 +330,9 @@ class NTMIShapeKeyNodeAdapter:
                 "            float weight = IniParams[100u + freq_idx].x;",
                 *(
                     [
-                        "            if (freq_idx < SHAPEKEY_ZONE_IDS_COUNT && SHAPEKEY_ZONE_IDS[freq_idx] != 0xFFFFFFFFu && ShapeKeyClickCount[SHAPEKEY_ZONE_IDS[freq_idx]] == SHAPEKEY_STAGE_IDS[freq_idx])",
+                        "            if (freq_idx < SHAPEKEY_ZONE_IDS_COUNT && SHAPEKEY_ZONE_IDS[freq_idx] != 0xFFFFFFFFu && (SHAPEKEY_ND_STAGE_IDS[freq_idx] == 0xFFFFFFFFu || ShapeKeyClickCount[SHAPEKEY_ZONE_IDS[freq_idx]] == SHAPEKEY_ND_STAGE_IDS[freq_idx]))",
                         "            {",
-                        "                weight = ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx] * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT + (SHAPEKEY_STAGE_IDS[freq_idx] - 1u) * SHAPEKEY_DIR_COUNT + SHAPEKEY_DIR_IDS[freq_idx]];",
+                        "                weight = ShapeKeyDrive[SHAPEKEY_SLOT_IDS[freq_idx]];",
                         "            }",
                     ]
                     if drag_drive_enabled

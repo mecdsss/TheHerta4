@@ -384,14 +384,28 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return f"ResourceDragShapeKeyClickCount_{ns}"
 
     def _drag_drive_stage_count(self):
-        """自动推导点击档位数：委托同树拖拽节点扫描各形态键节点的最大点击档位（找不到或未配置时回退 1=单档）。"""
+        """兼容入口：返回各区域档位数之和对应的段槽数中的最大档位（已废弃，仅测试/回退用）。
+        找不到拖拽节点时回退 1=单档。"""
         node = self._find_drag_drive_node()
         if node is None:
             return 1
         try:
-            return max(1, int(node._drag_drive_stage_count()))
+            _total, _bases, counts = node._drag_drive_buffer_layout()
+            return max(1, max(counts or [1]))
         except Exception:
             return 1
+
+    def _drag_drive_buffer_layout(self):
+        """委托同树拖拽节点计算按区域独立档位的缓冲布局。
+        返回 (total_slots, zone_bases, zone_stage_counts)；找不到时回退单区域单档。"""
+        node = self._find_drag_drive_node()
+        if node is None:
+            return 0, [0], [1]
+        try:
+            total, bases, counts = node._drag_drive_buffer_layout()
+            return total, list(bases), list(counts)
+        except Exception:
+            return 0, [0], [1]
 
     def _drag_drive_zone_ids(self, unique_names):
         """返回与 unique_names（FREQ 索引顺序）对齐的区域 ID 列表；-1 表示不绑定。"""
@@ -1660,37 +1674,51 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
             zone_ids = list(drag_zone_ids or []) if drag_drive_enabled else []
             click_stages = list(drag_click_stages or []) if drag_drive_enabled else []
-            stage_count = max(1, int(drag_stage_count or 1))
             drag_dirs = list(drag_dirs or []) if drag_drive_enabled else []
-            # 每档 5 槽：0-3 = 上/右/下/左方向，4 = 无方向（点击按档位 0/1 开关）
-            dir_count = 5
+            # 按区域独立段布局：每区域 4 方向槽 + 该区域档位数 N 个无方向槽；
+            # 每个绑定项直接生成绝对槽位（CPU 前缀和），读取时无需再算全局 stage 索引。
+            _total_slots, _zone_bases, _zone_stage_counts = self._drag_drive_buffer_layout()
+            zone_bases = list(_zone_bases)
             define_lines = [f"// --- Shared Animation Intensity (per Shape Key Name) ---\n// From index {self.INTENSITY_START_INDEX} onwards"]
             if drag_drive_enabled:
                 define_lines.append(f"Buffer<float> ShapeKeyDrive : register(t{self.DRAG_DRIVE_REGISTER});")
                 define_lines.append(f"Buffer<uint> ShapeKeyClickCount : register(t{self.DRAG_CLICK_COUNT_REGISTER});")
-                define_lines.append(f"static const uint SHAPEKEY_STAGE_COUNT = {stage_count}u;")
-                define_lines.append(f"static const uint SHAPEKEY_DIR_COUNT = {dir_count}u;")
                 if any(zone >= 0 for zone in zone_ids):
                     ids_text = ", ".join(str(zone) if zone >= 0 else "0xFFFFFFFFu" for zone in zone_ids)
                     define_lines.append(f"static const uint SHAPEKEY_ZONE_IDS[{len(zone_ids)}] = {{ {ids_text} }};")
                     stage_list = list(click_stages) if len(click_stages) == len(zone_ids) else [1] * len(zone_ids)
-                    dir_list = list(drag_dirs) if len(drag_dirs) == len(zone_ids) else [0] * len(zone_ids)
-                    stage_text = ", ".join(str(stage) if stage >= 1 else "0xFFFFFFFFu" for stage in stage_list)
-                    define_lines.append(f"static const uint SHAPEKEY_STAGE_IDS[{len(zone_ids)}] = {{ {stage_text} }};")
-                    dir_text = ", ".join(str(d) if d >= 0 else "0xFFFFFFFFu" for d in dir_list)
-                    define_lines.append(f"static const uint SHAPEKEY_DIR_IDS[{len(zone_ids)}] = {{ {dir_text} }};")
+                    dir_list = list(drag_dirs) if len(drag_dirs) == len(zone_ids) else [4] * len(zone_ids)
+                    nd_stage_ids = []
+                    slot_ids = []
+                    for idx, zone in enumerate(zone_ids):
+                        if zone < 0 or zone >= len(zone_bases):
+                            nd_stage_ids.append(0xFFFFFFFF)
+                            slot_ids.append(0xFFFFFFFF)
+                            continue
+                        d = dir_list[idx] if idx < len(dir_list) else 4
+                        if d >= 0 and d < 4:
+                            nd_stage_ids.append(0xFFFFFFFF)
+                            slot_ids.append(zone_bases[zone] + d)
+                        else:
+                            stage = max(1, stage_list[idx] if idx < len(stage_list) else 1)
+                            nd_stage_ids.append(stage)
+                            slot_ids.append(zone_bases[zone] + 4 + (stage - 1))
+                    nd_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in nd_stage_ids)
+                    define_lines.append(f"static const uint SHAPEKEY_ND_STAGE_IDS[{len(zone_ids)}] = {{ {nd_text} }};")
+                    slot_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in slot_ids)
+                    define_lines.append(f"static const uint SHAPEKEY_SLOT_IDS[{len(zone_ids)}] = {{ {slot_text} }};")
                 else:
                     define_lines.append("static const uint SHAPEKEY_ZONE_IDS[1] = { 0xFFFFFFFFu };")
-                    define_lines.append("static const uint SHAPEKEY_STAGE_IDS[1] = { 0xFFFFFFFFu };")
-                    define_lines.append("static const uint SHAPEKEY_DIR_IDS[1] = { 0xFFFFFFFFu };")
+                    define_lines.append("static const uint SHAPEKEY_ND_STAGE_IDS[1] = { 0xFFFFFFFFu };")
+                    define_lines.append("static const uint SHAPEKEY_SLOT_IDS[1] = { 0xFFFFFFFFu };")
             for i, name in enumerate(unique_names):
                 zone = zone_ids[i] if i < len(zone_ids) else -1
-                stage = click_stages[i] if i < len(click_stages) else 1
-                dir_id = drag_dirs[i] if i < len(drag_dirs) else 0
                 if drag_drive_enabled and zone >= 0:
+                    nd_stage = nd_stage_ids[i] if i < len(nd_stage_ids) else 0xFFFFFFFF
+                    slot_id = slot_ids[i] if i < len(slot_ids) else 0xFFFFFFFF
                     define_lines.append(
-                        f"#define FREQ{i+1} (SHAPEKEY_ZONE_IDS[{i}] != 0xFFFFFFFFu && ShapeKeyClickCount[SHAPEKEY_ZONE_IDS[{i}]] == SHAPEKEY_STAGE_IDS[{i}]"
-                        f" ? ShapeKeyDrive[SHAPEKEY_ZONE_IDS[{i}] * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT + (SHAPEKEY_STAGE_IDS[{i}] - 1u) * SHAPEKEY_DIR_COUNT + SHAPEKEY_DIR_IDS[{i}]] : 0.0) // {name} (zone {zone}, click {stage}, dir {dir_id})"
+                        f"#define FREQ{i+1} (SHAPEKEY_ND_STAGE_IDS[{i}] == 0xFFFFFFFFu || ShapeKeyClickCount[SHAPEKEY_ZONE_IDS[{i}]] == SHAPEKEY_ND_STAGE_IDS[{i}]"
+                        f" ? ShapeKeyDrive[SHAPEKEY_SLOT_IDS[{i}]] : 0.0) // {name} (zone {zone}, slot {slot_id})"
                     )
                 else:
                     define_lines.append(f"#define FREQ{i+1} IniParams[{self.INTENSITY_START_INDEX + i}].x // {name}")
@@ -1720,11 +1748,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         if drag_drive_enabled:
                             logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
                             logic_lines.append(f"        uint sk_zone_slot{slot_index} = SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}];")
-                            logic_lines.append(f"        uint sk_stage_slot{slot_index} = SHAPEKEY_STAGE_IDS[freq_idx_slot{slot_index}];")
-                            logic_lines.append(f"        uint sk_dir_slot{slot_index} = SHAPEKEY_DIR_IDS[freq_idx_slot{slot_index}];")
-                            logic_lines.append(f"        if (sk_zone_slot{slot_index} != 0xFFFFFFFFu && ShapeKeyClickCount[sk_zone_slot{slot_index}] == sk_stage_slot{slot_index})")
+                            logic_lines.append(f"        uint sk_nd_stage_slot{slot_index} = SHAPEKEY_ND_STAGE_IDS[freq_idx_slot{slot_index}];")
+                            logic_lines.append(f"        uint sk_slot_slot{slot_index} = SHAPEKEY_SLOT_IDS[freq_idx_slot{slot_index}];")
+                            logic_lines.append(f"        if (sk_zone_slot{slot_index} != 0xFFFFFFFFu && (sk_nd_stage_slot{slot_index} == 0xFFFFFFFFu || ShapeKeyClickCount[sk_zone_slot{slot_index}] == sk_nd_stage_slot{slot_index}))")
                             logic_lines.append("        {")
-                            logic_lines.append(f"            anim_weight_slot{slot_index} = ShapeKeyDrive[sk_zone_slot{slot_index} * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT + (sk_stage_slot{slot_index} - 1u) * SHAPEKEY_DIR_COUNT + sk_dir_slot{slot_index}];")
+                            logic_lines.append(f"            anim_weight_slot{slot_index} = ShapeKeyDrive[sk_slot_slot{slot_index}];")
                             logic_lines.append("        }")
                         else:
                             logic_lines.append(
@@ -1769,11 +1797,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     if drag_drive_enabled:
                         logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
                         logic_lines.append(f"        uint sk_zone_slot{slot_index} = SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}];")
-                        logic_lines.append(f"        uint sk_stage_slot{slot_index} = SHAPEKEY_STAGE_IDS[freq_idx_slot{slot_index}];")
-                        logic_lines.append(f"        uint sk_dir_slot{slot_index} = SHAPEKEY_DIR_IDS[freq_idx_slot{slot_index}];")
-                        logic_lines.append(f"        if (sk_zone_slot{slot_index} != 0xFFFFFFFFu && ShapeKeyClickCount[sk_zone_slot{slot_index}] == sk_stage_slot{slot_index})")
+                        logic_lines.append(f"        uint sk_nd_stage_slot{slot_index} = SHAPEKEY_ND_STAGE_IDS[freq_idx_slot{slot_index}];")
+                        logic_lines.append(f"        uint sk_slot_slot{slot_index} = SHAPEKEY_SLOT_IDS[freq_idx_slot{slot_index}];")
+                        logic_lines.append(f"        if (sk_zone_slot{slot_index} != 0xFFFFFFFFu && (sk_nd_stage_slot{slot_index} == 0xFFFFFFFFu || ShapeKeyClickCount[sk_zone_slot{slot_index}] == sk_nd_stage_slot{slot_index}))")
                         logic_lines.append("        {")
-                        logic_lines.append(f"            anim_weight_slot{slot_index} = ShapeKeyDrive[sk_zone_slot{slot_index} * SHAPEKEY_STAGE_COUNT * SHAPEKEY_DIR_COUNT + (sk_stage_slot{slot_index} - 1u) * SHAPEKEY_DIR_COUNT + sk_dir_slot{slot_index}];")
+                        logic_lines.append(f"            anim_weight_slot{slot_index} = ShapeKeyDrive[sk_slot_slot{slot_index}];")
                         logic_lines.append("        }")
                     else:
                         logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")

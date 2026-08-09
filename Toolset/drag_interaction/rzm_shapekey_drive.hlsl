@@ -2,33 +2,33 @@
 // RZMenu / 3DMigoto / XXMI
 //
 // Drives per-zone shape-key intensity from hover hit + left-click hold.
-// Runs once per frame (after rzm_jiggle_screen_state) and writes per-zone /
-// per-click-stage intensities into an RWBuffer. The drive is ONLY active in
-// drag system mode 1 ("仅命中", hit detection only):
-//   - Click stages: each press while hovering the bound zone advances that
-//     zone's click count in 0..stageCount cycle (0 = inactive/cleared),
-//     enabling a different shape-key group per click count and clearing on
-//     the wrap-around press ("multi-stage switch").
-//   - Directional slots (0=up, 1=right, 2=down, 3=left): while the stage is
-//     active, each direction's intensity follows that direction's net mouse
-//     displacement (opposite direction subtracts): move up -> up grows and
-//     down shrinks, move down -> down grows and up shrinks, etc. Clamped to
-//     0..1, no ramp/decay.
-//   - No-direction slot (4): while the stage is active, clicking sets the
-//     intensity to 1 (held until the zone is cleared or another stage is
-//     active). No mouse displacement is involved.
+// Runs once per frame (after rzm_jiggle_screen_state) and writes per-zone
+// intensities into an RWBuffer. The drive is ONLY active in drag system
+// mode 1 ("仅命中", hit detection only):
+//   - Each zone has its own independent segment: 4 directional slots
+//     (0=up, 1=right, 2=down, 3=left) followed by N no-direction stage
+//     slots (N = ZoneStageCounts[zone], per-zone independent).
+//   - Directional slots ignore click stages entirely: while hitting this
+//     zone and holding LMB/X, each direction follows that direction's net
+//     mouse displacement (opposite direction subtracts), clamped to 0..1.
+//   - No-direction stage slots: each press while hovering advances that
+//     zone's click count in 0..N cycle (0 = inactive/cleared); the matching
+//     stage slot is set to 1 and held until cleared or another stage is
+//     active. No mouse displacement is involved.
 // Release or leaving the zone holds the current value. In mode 0 (off) and
 // mode 2 (hit + physical drag interaction) all buffers are zeroed.
 //
 // The shape-key compute shader binds the same buffers as SRVs
 // (Buffer<float> ShapeKeyDrive, Buffer<uint> ClickCount) and uses them as the
-// weight for shape keys bound to (zone, click stage, slot). No CPU
+// weight for shape keys bound to (zone, stage, slot). No CPU
 // readback.
 //
 // Bindings:
 //   t67  = ResourceDragPinnedDetectInfo (hover hit + zone id)
-//   u0   = ResourceDragShapeKeyDrive (R32_FLOAT, array = capacity*stage*5)
-//   u1   = ResourceDragShapeKeyDir   (R32_FLOAT, array = capacity*stage*5+1;
+//   t68  = ResourceDragShapeKeyZoneStageCounts (R32_UINT, array = capacity;
+//          per-zone no-direction stage count)
+//   u0   = ResourceDragShapeKeyDrive (R32_FLOAT, array = sum(4+N per zone))
+//   u1   = ResourceDragShapeKeyDir   (R32_FLOAT, array = sum(4+N per zone)+1;
 //          last = prev press state)
 //   u2   = ResourceDragShapeKeyClickCount (R32_UINT, array = capacity)
 //   u3   = ResourceDragShapeKeyActiveDir (R32_UINT, array = capacity;
@@ -41,7 +41,6 @@
 //   [78].x = X held (from $ssmtdrag_x_down_<ns>; original design treats X as LMB)
 //   [79].x = mouse Y displacement (from $ssmtdrag_shapekey_dy_<ns>, px/frame)
 //   [79].y = mouse X displacement (from $ssmtdrag_shapekey_dx_<ns>, px/frame)
-//   [79].z = click stage count (1 = single stage, backward compatible)
 //   [80].x = mouse displacement sensitivity (per-px strength delta)
 
 RWBuffer<float> ShapeKeyDrive       : register(u0);
@@ -49,6 +48,7 @@ RWBuffer<float> ShapeKeyDir         : register(u1);
 RWBuffer<uint> ClickCount           : register(u2);
 RWBuffer<uint> ActiveDir            : register(u3);
 StructuredBuffer<float4> PinnedDetectInfo : register(t67);
+Buffer<uint> ZoneStageCounts        : register(t68);
 Texture1D<float4> IniParams         : register(t120);
 
 #define DRIVE_PARAMS  IniParams[77]
@@ -69,10 +69,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     ShapeKeyDrive.GetDimensions(driveSlots);
     uint dirSlots;
     ShapeKeyDir.GetDimensions(dirSlots);
-    uint stageCount = max(1u, (uint)round(IniParams[79].z));
-    uint slotCount = 5u; // 0-3 = 上/右/下/左方向，4 = 无方向
-    uint perZone = stageCount * slotCount;
-    uint lastSlot = zoneCount * perZone;
+    // 按区域独立段计算总槽数：每区域 4 方向槽 + 该区域档位数 N 个无方向槽
+    uint lastSlot = 0u;
+    for (uint z = 0u; z < zoneCount; ++z)
+        lastSlot += 4u + max(1u, ZoneStageCounts[z]);
     if (driveSlots < lastSlot || dirSlots < lastSlot + 1u)
         return;
 
@@ -126,55 +126,51 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     hasHit = hasHit && triggerHeld;
     uint hoverZone = ClampZoneID(PinnedDetectInfo[7u].w, zoneCount);
 
-    // 按下瞬间：推进该区域点击档位（0..stageCount 循环；0=未激活/清空）
+    // 按下瞬间：推进该区域点击档位（0..zoneStageCount 循环；0=未激活/清空）
     if (pressed && hasHit)
     {
         uint oldStage = ClickCount[hoverZone];
-        uint newStage = oldStage >= stageCount ? 0u : oldStage + 1u;
+        uint zoneStageCount = max(1u, ZoneStageCounts[hoverZone]);
+        uint newStage = oldStage >= zoneStageCount ? 0u : oldStage + 1u;
         ClickCount[hoverZone] = newStage;
     }
     ShapeKeyDir[lastSlot] = triggerHeld ? 1.0 : 0.0;
 
+    uint runningBase = 0u;
     for (uint zone = 0u; zone < zoneCount; ++zone)
     {
-        uint activeStage = ClickCount[zone];
+        uint zoneStageCount = max(1u, ZoneStageCounts[zone]);
+        uint zoneBase = runningBase;
+        runningBase += 4u + zoneStageCount;
         bool zoneHit = hasHit && zone == hoverZone;
         bool zonePressed = zoneHit && pressed;
-        for (uint stage = 1u; stage <= stageCount; ++stage)
+        uint activeStage = ClickCount[zone];
+        // 方向槽：忽略档位，按住命中该区域时由鼠标位移驱动；否则保持
+        for (uint dir = 0u; dir < 4u; ++dir)
         {
-            uint stageBase = zone * perZone + (stage - 1u) * slotCount;
-            // 档位激活只看点击计数，与是否按住/命中无关（点击后松手保持当前档位）
-            bool stageActive = (activeStage == stage);
-            // 无方向槽：仅当前命中区域按下该档位时置 1 并保持；非活动/清空时归 0。
-            // 必须同时满足 zoneHit，否则在其他区域按下时会误置本区域槽
-            uint ndIdx = stageBase + 4u;
-            if (stageActive && zonePressed)
-                ShapeKeyDrive[ndIdx] = 1.0;
-            else if (!stageActive)
-                ShapeKeyDrive[ndIdx] = 0.0;
-            for (uint dir = 0u; dir < 4u; ++dir)
+            uint idx = zoneBase + dir;
+            float current = ShapeKeyDrive[idx];
+            float next = current;
+            if (zoneHit)
             {
-                uint idx = stageBase + dir;
-                float current = ShapeKeyDrive[idx];
-                float next = current;
-                if (stageActive)
-                {
-                    // 位移驱动：该方向净位移（同向 +、对向 -）× 灵敏度，
-                    // 向上时“上”增“下”减，向下时反之，左右同理
-                    float net = dirWeight[dir] - dirWeight[(dir + 2u) % 4u];
-                    if (zoneHit)
-                        next = clamp(current + net * moveLen * mouseSensitivity, 0.0, 1.0);
-                    // 松手/离开时保持当前强度（不归零、不积分）
-                }
-                else
-                {
-                    // 非活动档位：切档/清空后归 0，避免上一档残留
-                    next = 0.0;
-                }
-                ShapeKeyDrive[idx] = next;
+                // 位移驱动：该方向净位移（同向 +、对向 -）× 灵敏度，
+                // 向上时“上”增“下”减，向下时反之，左右同理
+                float net = dirWeight[dir] - dirWeight[(dir + 2u) % 4u];
+                next = clamp(current + net * moveLen * mouseSensitivity, 0.0, 1.0);
             }
+            ShapeKeyDrive[idx] = next;
         }
-        if (hasHit && zone == hoverZone)
+        // 无方向档位槽：仅当前命中区域按下该档位时置 1 并保持；非活动/清空时归 0。
+        // 必须同时满足 zoneHit，否则在其他区域按下时会误置本区域槽
+        for (uint stage = 1u; stage <= zoneStageCount; ++stage)
+        {
+            uint ndIdx = zoneBase + 4u + (stage - 1u);
+            if (activeStage == stage && zonePressed)
+                ShapeKeyDrive[ndIdx] = 1.0;
+            else if (activeStage != stage)
+                ShapeKeyDrive[ndIdx] = 0.0;
+        }
+        if (zoneHit)
             ActiveDir[zone] = activeDir;
     }
 }

@@ -1283,6 +1283,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         os.makedirs(res_dir, exist_ok=True)
         params.tofile(os.path.join(res_dir, f"ZoneParams_{ns}.buf"))
         paths.tofile(os.path.join(res_dir, f"PathVectors_{ns}.buf"))
+        if getattr(self, "enable_shapekey_drive", False):
+            _total_slots, _zone_bases, _zone_stage_counts = self._drag_drive_buffer_layout()
+            stage_counts = np.array(_zone_stage_counts, dtype=np.uint32)
+            stage_counts.tofile(os.path.join(res_dir, f"ZoneStageCounts_{ns}.buf"))
         legacy_path_vectors = os.path.join(res_dir, "PathVectors.buf")
         if os.path.isfile(legacy_path_vectors):
             os.remove(legacy_path_vectors)
@@ -1723,12 +1727,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     def _zone_capacity(entries):
         return max(1, max((zone_id for zone_id, _ in entries), default=0) + 1)
 
-    def _drag_drive_stage_count(self):
-        """自动推导点击档位数：扫描同树所有开启拖拽驱动的形态键节点，取 drag_click_stage 最大值，最少 1。"""
+    def _drag_drive_zone_stage_counts(self):
+        """按区域统计点击档位数：扫描同树所有开启拖拽驱动的形态键节点，
+        每个区域取该区域无方向形态键 drag_click_stage 最大值（方向形态键忽略档位），最少 1。
+        返回 {zone_id: stage_count}，只含被形态键引用的区域。"""
         tree = getattr(self, "id_data", None)
+        counts = {}
         if tree is None:
-            return 1
-        max_stage = 1
+            return counts
         for node in getattr(tree, "nodes", None) or []:
             if getattr(node, "bl_idname", "") != "SSMTNode_PostProcess_ShapeKey":
                 continue
@@ -1736,12 +1742,39 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 continue
             for item in getattr(node, "shapekey_variable_items", None) or []:
                 try:
+                    zone = int(getattr(item, "drag_zone_id", -1))
+                except Exception:
+                    zone = -1
+                if zone < 0:
+                    continue
+                try:
+                    dir_val = int(getattr(item, "drag_dir_id", "-1") or "-1")
+                except Exception:
+                    dir_val = -1
+                if dir_val >= 0:
+                    # 方向形态键忽略档位，不参与该区域档位统计
+                    continue
+                try:
                     stage = int(getattr(item, "drag_click_stage", 1) or 1)
                 except Exception:
                     stage = 1
-                if stage > max_stage:
-                    max_stage = stage
-        return max_stage
+                counts[zone] = max(counts.get(zone, 1), max(1, stage))
+        return counts
+
+    def _drag_drive_buffer_layout(self):
+        """按区域独立档位计算驱动缓冲布局。
+        返回 (total_slots, zone_bases, zone_stage_counts)：
+        每个区域段 = 4 方向槽 + 该区域档位数 N 个无方向槽；
+        zone_bases[z] = 区域 z 段在缓冲中的起始槽位；total_slots = 所有区域段长之和。"""
+        capacity = self._zone_capacity(self._collect_enabled_zone_entries())
+        zone_counts = self._drag_drive_zone_stage_counts()
+        zone_stage_counts = [max(1, int(zone_counts.get(z, 1))) for z in range(capacity)]
+        zone_bases = []
+        running = 0
+        for stage_count in zone_stage_counts:
+            zone_bases.append(running)
+            running += 4 + stage_count
+        return running, zone_bases, zone_stage_counts
 
     # =======================================================================
     # 段生成（CustomShader / CommandList / Resource）与钩子注入、Present/Constants
@@ -1790,17 +1823,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ],
         }
         if getattr(self, "enable_shapekey_drive", False):
-            _drive_capacity = self._zone_capacity(self._collect_enabled_zone_entries())
-            _stage_count = self._drag_drive_stage_count()
-            _dir_count = 5  # 0-3 = 上/右/下/左方向，4 = 无方向（点击按档位 0/1 开关）
+            _total_slots, _zone_bases, _zone_stage_counts = self._drag_drive_buffer_layout()
+            _drive_capacity = len(_zone_stage_counts)
             global_resources[f"[ResourceDragShapeKeyDrive_{ns}]"] = [
                 "type = RWBuffer", "format = R32_FLOAT",
-                f"array = {_drive_capacity * _stage_count * _dir_count}",
+                f"array = {_total_slots}",
             ]
-            # 方向缓冲：与驱动缓冲同构（含无方向槽），末位 1 个上一帧按键状态槽
+            # 方向缓冲：与驱动缓冲同构，末位 1 个上一帧按键状态槽
             global_resources[f"[ResourceDragShapeKeyDir_{ns}]"] = [
                 "type = RWBuffer", "format = R32_FLOAT",
-                f"array = {_drive_capacity * _stage_count * _dir_count + 1}",
+                f"array = {_total_slots + 1}",
             ]
             # 点击计数缓冲：每区域 1 个点击档位（1..stage_count，0=未点击），供多段切换
             global_resources[f"[ResourceDragShapeKeyClickCount_{ns}]"] = [
@@ -1811,6 +1843,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             global_resources[f"[ResourceDragShapeKeyActiveDir_{ns}]"] = [
                 "type = RWBuffer", "format = R32_UINT",
                 f"array = {_drive_capacity}",
+            ]
+            # 每区域档位数缓冲：供驱动着色器按区域独立循环档位
+            global_resources[f"[ResourceDragShapeKeyZoneStageCounts_{ns}]"] = [
+                "type = Buffer", "format = R32_UINT",
+                f"filename = {res}/ZoneStageCounts_{ns}.buf",
             ]
         for sec, lines in global_resources.items():
             sections.setdefault(sec, lines)
@@ -2175,15 +2212,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"x78 = $ssmtdrag_x_down_{ns}",
             "x79 = $ssmtdrag_shapekey_dy_" + ns,
             "y79 = $ssmtdrag_shapekey_dx_" + ns,
-            f"z79 = {self._drag_drive_stage_count()}",
             "x80 = " + self._fmt(self.shapekey_drive_move_sensitivity),
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
+            f"cs-t68 = ResourceDragShapeKeyZoneStageCounts_{ns}",
             f"cs-u0 = ResourceDragShapeKeyDrive_{ns}",
             f"cs-u1 = ResourceDragShapeKeyDir_{ns}",
             f"cs-u2 = ResourceDragShapeKeyClickCount_{ns}",
             f"cs-u3 = ResourceDragShapeKeyActiveDir_{ns}",
             "dispatch = 1, 1, 1",
             "post cs-t67 = null",
+            "post cs-t68 = null",
             "post cs-u0 = null",
             "post cs-u1 = null",
             "post cs-u2 = null",
