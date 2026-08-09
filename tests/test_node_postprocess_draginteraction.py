@@ -1556,6 +1556,52 @@ class DragNodePreviewTests(unittest.TestCase):
         self.assertGreater(float(fields[0].max()), 0.0)
         np.testing.assert_array_equal(fields[1], np.zeros(3))
 
+    def test_topology_cache_reuses_unchanged_mesh(self):
+        """焊接/边拓扑按网格数据缓存：网格未变时返回同一拓扑对象，
+        避免每次预览重建重算 np.unique 焊接与邻接表。"""
+        mod = self.mod
+        verts = np.array([[0.1, 0.0, 0.0], [0.15, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=np.float64)
+        tris = np.array([[0, 1, 2]], dtype=np.int64)
+        topo1 = mod._preview_cached_topology(verts, tris)
+        topo2 = mod._preview_cached_topology(verts.copy(), tris.copy())
+        self.assertIs(topo1, topo2)
+        self.assertIsNotNone(topo1["adjacency"])
+        # 顶点变化 → 不同拓扑
+        moved = verts + 1e-2
+        topo3 = mod._preview_cached_topology(moved, tris)
+        self.assertIsNot(topo1, topo3)
+        # 集合焊接模式同样命中缓存
+        topo_m1 = mod._preview_cached_topology(verts, tris, weld_tol=1e-5)
+        topo_m2 = mod._preview_cached_topology(verts.copy(), tris.copy(), weld_tol=1e-5)
+        self.assertIs(topo_m1, topo_m2)
+
+    def test_uniform_scale_zone_fast_path_matches_slow_path(self):
+        """均匀缩放球预览快速路径（复用世界邻接表）必须与逐球局部构建一致。"""
+        mod = self.mod
+        node = _make_node(mod)
+        object.__setattr__(node, "surface_propagate", True)
+        verts = np.array(
+            [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.2, 0.0, 0.0], [0.3, 0.0, 0.0]],
+            dtype=np.float64,
+        )
+        tris = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int64)
+        edges = mod.gb_core.edges_from_triangles(tris)
+        topo = mod._preview_cached_topology(verts, tris)
+        # 旋转 + 平移 + 等比缩放的球
+        theta = 0.5
+        m = np.eye(4)
+        m[:3, :3] = np.array([
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta), np.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ]) * 0.5
+        m[:3, 3] = (0.12, 0.02, 0.0)
+        d_fast = mod._preview_zone_distances(
+            node, verts, m, topo["adjacency"], topo["edge_verts"]
+        )
+        d_slow = node._zone_distances(verts, m, edges)
+        np.testing.assert_allclose(d_fast, d_slow, atol=1e-12)
+
 
 class DragNodeMirrorTests(unittest.TestCase):
     """非镜像工作流：区域空物体矩阵 X 镜像补偿（掩码左右颠倒回归）。"""

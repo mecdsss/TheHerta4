@@ -504,6 +504,57 @@ class GeodesicFieldTests(unittest.TestCase):
         self.assertGreater(float(g_vol[5]), 0.0)   # 体积球穿透到 back[5]
         self.assertEqual(float(g_geo[5]), 0.0)     # 测地：绕行距离 > 1 → 0
 
+    def test_prebuilt_adjacency_matches_internal_build(self):
+        verts, edges = self._two_strips()
+        ball = _matrix(loc=(0.2, 0.0, 0.0), scale=(0.6, 0.6, 0.6))
+        local = gb_core._to_ball_local(verts, ball)
+        seeds = np.zeros(10, dtype=bool)
+        seeds[2] = True
+        d_internal = gb_core.surface_distances(local, edges, seeds)
+        adj = gb_core.build_surface_adjacency(local, edges)
+        d_reused = gb_core.surface_distances(local, edges, seeds, adjacency=adj)
+        np.testing.assert_allclose(d_reused, d_internal, atol=1e-12)
+        # 多次调用复用同一邻接表结果一致（邻接表构建只发生一次）
+        d_reused2 = gb_core.surface_distances(local, edges, seeds, adjacency=adj)
+        np.testing.assert_allclose(d_reused2, d_internal, atol=1e-12)
+
+    def test_uniform_scale_fast_path_matches_per_ball(self):
+        """均匀缩放球（旋转/平移/等比缩放）快速路径复用世界坐标邻接表，
+        结果必须与逐球局部构建完全一致。"""
+        verts, edges = self._two_strips()
+        # 球带旋转 + 平移 + 等比缩放
+        theta = 0.7
+        rot = np.array([
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta), np.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        m = np.eye(4)
+        m[:3, :3] = rot * 0.6
+        m[:3, 3] = (0.2, 0.1, 0.0)
+        center = m[:3, 3]
+        scale = 0.6
+
+        local = gb_core._to_ball_local(verts, m)
+        seeds = np.zeros(len(verts), dtype=bool)
+        seeds[int(np.argmin(np.einsum("ij,ij->i", local, local)))] = True
+        d_ref = gb_core.surface_distances(local, edges, seeds)
+
+        adj_world = gb_core.build_surface_adjacency(verts, edges)
+        d_fast = gb_core.surface_distances_uniform_scale(adj_world, verts, center, scale)
+        np.testing.assert_allclose(d_fast, d_ref, atol=1e-12)
+
+    def test_uniform_scale_fast_path_respects_cutoff(self):
+        """快速路径按 scale 截断：球外表面距离归一后 ≥1 → 权重 0。"""
+        verts, edges = self._two_strips()
+        m = np.eye(4) * 0.25
+        m[3, 3] = 1.0
+        adj_world = gb_core.build_surface_adjacency(verts, edges)
+        d = gb_core.surface_distances_uniform_scale(adj_world, verts, np.zeros(3), 0.25)
+        # 种子最近顶点距离 < 0.25 有权重，远端沿表面距离 / 0.25 > 1 归 0
+        self.assertLess(float(np.nanmin(d)), 1.0)
+        self.assertGreaterEqual(float(np.nanmax(d)), 1.0)
+
     def test_degenerate_inputs(self):
         verts, edges = self._two_strips()
         ball = self._ball()

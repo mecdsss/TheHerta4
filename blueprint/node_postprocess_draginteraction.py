@@ -3094,13 +3094,129 @@ def _preview_target_field(node, verts_world, tri, zones, plateau):
     预览直接使用网格 world 顶点与空物体 world 矩阵，不做任何导出期变换
     （非镜像 X 镜像补偿、参考物体逆、导出空间矩阵）——那些只属于导出烘焙；
     否则球会被翻到另一侧，沿表面扩散到非当前物体。"""
-    use_surface_distance = _preview_uses_surface_distance(node, len(zones))
-    edge_verts = None
-    if use_surface_distance:
-        edge_verts = gb_core.edges_from_triangles(tri)
-    field = np.zeros(len(verts_world), dtype=np.float64)
+    verts_world = np.asarray(verts_world, dtype=np.float64).reshape(-1, 3)
+    if not _preview_uses_surface_distance(node, len(zones)):
+        field = np.zeros(len(verts_world), dtype=np.float64)
+        for empty, s in zones:
+            d = node._zone_distances(verts_world, empty.matrix_world, None)
+            if d is None:
+                continue
+            f = node._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)
+            np.maximum(field, f, out=field)
+        return field
+    topo = _preview_cached_topology(verts_world, tri, weld_tol=None)
+    return _preview_field_from_topology(node, topo, zones, plateau)
+
+
+_PREVIEW_TOPOLOGY_CACHE = {}
+_PREVIEW_TOPOLOGY_ORDER = []
+_PREVIEW_TOPOLOGY_CACHE_MAX = 16
+
+
+def _preview_topology_key(verts_world, tri, weld_tol=None):
+    """网格数据签名：世界顶点 + 三角形 + 焊接容差，内容变化即失效。"""
+    import hashlib
+    h = hashlib.blake2b(digest_size=16)
+    h.update(np.ascontiguousarray(np.asarray(verts_world, dtype=np.float64)).tobytes())
+    h.update(np.ascontiguousarray(np.asarray(tri, dtype=np.int64)).tobytes())
+    h.update(str(weld_tol).encode("ascii"))
+    return h.hexdigest()
+
+
+def _preview_cached_topology(verts_world, tri, weld_tol=None):
+    """焊接 + 边拓扑 + 世界坐标邻接表，按网格数据签名缓存。
+    网格未变时复用（例如拖动空物体触发预览重建时不再重算
+    np.unique 三维焊接与邻接表）；球只移动/缩放时各区域共享同一邻接表。
+    Returns:
+        dict(world_pts, edge_verts, adjacency, cluster_ids)。
+    """
+    verts_world = np.asarray(verts_world, dtype=np.float64).reshape(-1, 3)
+    tri = np.asarray(tri, dtype=np.int64).reshape(-1, 3)
+    key = _preview_topology_key(verts_world, tri, weld_tol)
+    cached = _PREVIEW_TOPOLOGY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if weld_tol is not None:
+        quantized = np.round(verts_world / float(weld_tol))
+        _, cluster_ids = np.unique(quantized, axis=0, return_inverse=True)
+        cluster_ids = cluster_ids.astype(np.int64, copy=False)
+        cluster_count = int(cluster_ids.max()) + 1
+        cluster_centers = np.zeros((cluster_count, 3), dtype=np.float64)
+        np.add.at(cluster_centers, cluster_ids, verts_world)
+        counts = np.bincount(cluster_ids, minlength=cluster_count).astype(np.float64)
+        cluster_centers /= counts[:, None]
+        cluster_tris = cluster_ids[tri.reshape(-1)].reshape(-1, 3)
+        cluster_tris = cluster_tris[
+            (cluster_tris[:, 0] != cluster_tris[:, 1])
+            & (cluster_tris[:, 1] != cluster_tris[:, 2])
+            & (cluster_tris[:, 0] != cluster_tris[:, 2])
+        ]
+        world_pts = cluster_centers
+        ids_out = cluster_ids
+    else:
+        world_pts = verts_world
+        cluster_tris = tri
+        ids_out = None
+    edge_verts = (
+        gb_core.edges_from_triangles(cluster_tris)
+        if len(cluster_tris) else np.zeros((0, 2), dtype=np.int64)
+    )
+    adjacency = (
+        gb_core.build_surface_adjacency(world_pts, edge_verts)
+        if len(edge_verts) else None
+    )
+    value = {
+        "world_pts": world_pts,
+        "edge_verts": edge_verts,
+        "adjacency": adjacency,
+        "cluster_ids": ids_out,
+    }
+    if key not in _PREVIEW_TOPOLOGY_ORDER:
+        _PREVIEW_TOPOLOGY_ORDER.append(key)
+    if len(_PREVIEW_TOPOLOGY_ORDER) > _PREVIEW_TOPOLOGY_CACHE_MAX:
+        old = _PREVIEW_TOPOLOGY_ORDER.pop(0)
+        _PREVIEW_TOPOLOGY_CACHE.pop(old, None)
+    _PREVIEW_TOPOLOGY_CACHE[key] = value
+    return value
+
+
+def _preview_zone_distances(node, verts_world, ball_matrix, adjacency, edge_verts):
+    """预览沿表面传播距离：均匀缩放球（旋转/平移/等比缩放）复用世界坐标
+    邻接表快速路径；非均匀缩放回退逐球构建。返回球局部距离或 None。"""
+    m = np.asarray(ball_matrix, dtype=np.float64).reshape(4, 4)
+    linear = m[:3, :3]
+    col_norms = np.linalg.norm(linear, axis=0)
+    scale = float(np.mean(col_norms))
+    uniform = (
+        scale > 1e-9
+        and np.allclose(col_norms, scale)
+        and np.allclose(linear @ linear.T, scale * scale * np.eye(3), atol=1e-4)
+    )
+    if uniform and adjacency is not None:
+        return gb_core.surface_distances_uniform_scale(
+            adjacency, verts_world, m[:3, 3], scale
+        )
+    local = gb_core._to_ball_local(verts_world, ball_matrix)
+    if local is None:
+        return None
+    d2 = np.einsum("ij,ij->i", local, local)
+    if adjacency is None or len(edge_verts) == 0:
+        return np.sqrt(np.maximum(d2, 0.0))
+    seeds = np.zeros(local.shape[0], dtype=bool)
+    seeds[int(np.argmin(d2))] = True
+    return gb_core.surface_distances(local, edge_verts, seeds)
+
+
+def _preview_field_from_topology(node, topo, zones, plateau):
+    """对缓存拓扑的顶点集逐区域合并权重：所有区域共享同一邻接表。"""
+    world_pts = topo["world_pts"]
+    edge_verts = topo["edge_verts"]
+    adjacency = topo["adjacency"]
+    field = np.zeros(len(world_pts), dtype=np.float64)
     for empty, s in zones:
-        d = node._zone_distances(verts_world, empty.matrix_world, edge_verts)
+        d = _preview_zone_distances(
+            node, world_pts, empty.matrix_world, adjacency, edge_verts
+        )
         if d is None:
             continue
         f = node._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)
@@ -3119,47 +3235,18 @@ def _preview_merged_mesh(node, meshes, zones, plateau, weld_tol=1e-5):
     all_tris = []
     for verts_world, tri in meshes:
         n_verts = len(verts_world)
-        parts.append((vertex_offset, n_verts, len(tri)))
-        all_verts.append(verts_world)
-        all_tris.append(tri + vertex_offset)
+        parts.append((vertex_offset, n_verts))
+        all_verts.append(np.asarray(verts_world, dtype=np.float64).reshape(-1, 3))
+        all_tris.append(np.asarray(tri, dtype=np.int64).reshape(-1, 3) + vertex_offset)
         vertex_offset += n_verts
     if not all_verts:
         return []
     all_verts = np.concatenate(all_verts, axis=0)
     all_tris = np.concatenate(all_tris, axis=0)
-
-    # 焊接：把世界坐标接近的顶点归为同一拓扑节点（量化 + unique）
-    quantized = np.round(np.asarray(all_verts, dtype=np.float64) / float(weld_tol))
-    _, cluster_ids = np.unique(quantized, axis=0, return_inverse=True)
-    cluster_ids = cluster_ids.astype(np.int64, copy=False)
-    cluster_count = int(cluster_ids.max()) + 1
-    cluster_centers = np.zeros((cluster_count, 3), dtype=np.float64)
-    np.add.at(cluster_centers, cluster_ids, all_verts)
-    counts = np.bincount(cluster_ids, minlength=cluster_count).astype(np.float64)
-    cluster_centers /= counts[:, None]
-
-    cluster_tris = cluster_ids[all_tris.reshape(-1)].reshape(-1, 3)
-    # 去除焊接后退化的三角形（三个顶点同节点）
-    cluster_tris = cluster_tris[
-        (cluster_tris[:, 0] != cluster_tris[:, 1])
-        & (cluster_tris[:, 1] != cluster_tris[:, 2])
-        & (cluster_tris[:, 0] != cluster_tris[:, 2])
-    ]
-    edge_verts = gb_core.edges_from_triangles(cluster_tris) if len(cluster_tris) else None
-
-    cluster_field = np.zeros(cluster_count, dtype=np.float64)
-    for empty, s in zones:
-        d = node._zone_distances(cluster_centers, empty.matrix_world, edge_verts)
-        if d is None:
-            continue
-        f = node._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)
-        np.maximum(cluster_field, f, out=cluster_field)
-    field_all = cluster_field[cluster_ids]
-
-    fields = []
-    for vertex_offset, n_verts, _tri_count in parts:
-        fields.append(field_all[vertex_offset:vertex_offset + n_verts])
-    return fields
+    topo = _preview_cached_topology(all_verts, all_tris, weld_tol=weld_tol)
+    cluster_field = _preview_field_from_topology(node, topo, zones, plateau)
+    field_all = cluster_field[topo["cluster_ids"]]
+    return [field_all[offset:offset + n] for offset, n in parts]
 
 
 def _rebuild_preview_batches(nodes):
@@ -3279,6 +3366,8 @@ def _remove_preview_handler():
             pass
         _preview_handler = None
     _preview_batches = {}
+    _PREVIEW_TOPOLOGY_CACHE.clear()
+    _PREVIEW_TOPOLOGY_ORDER.clear()
 
 
 def _preview_tick():
