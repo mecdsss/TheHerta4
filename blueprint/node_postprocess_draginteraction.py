@@ -3022,9 +3022,6 @@ _PREVIEW_ALPHA = 0.85
 _PREVIEW_GHOST_FACTOR = 0.3
 _PREVIEW_TICK = 0.2
 _PREVIEW_DEBOUNCE = 0.6
-_PREVIEW_GEODESIC_ZONE_LIMIT = 16
-
-
 def _preview_now():
     return time.monotonic()
 
@@ -3060,7 +3057,13 @@ def _preview_targets(node):
 def _preview_signature(n):
     """矩阵/参数签名：集合成员、网格变换和区域参数变化都会触发重算。"""
     collection = getattr(n, "preview_collection", None)
-    parts = [n.id_data.name, n.name, getattr(collection, "name", None)]
+    parts = [
+        n.id_data.name,
+        n.name,
+        getattr(collection, "name", None),
+        bool(getattr(n, "surface_propagate", True)),
+        round(float(getattr(n, "mask_plateau", 0.0) or 0.0), 6),
+    ]
     for target in _preview_targets(n):
         parts.append((
             target.name,
@@ -3080,10 +3083,10 @@ def _preview_signature(n):
 
 
 def _preview_uses_surface_distance(node, enabled_zone_count):
-    """小规模单物体预览保留测地精度；集合/大量区域优先保证交互流畅。"""
-    return (getattr(node, "surface_propagate", True)
-            and getattr(node, "preview_collection", None) is None
-            and enabled_zone_count <= _PREVIEW_GEODESIC_ZONE_LIMIT)
+    """预览严格跟随“沿表面传播”复选框，与烘焙完全一致：
+    开启即用测地距离沿表面传播，关闭回退体积球；
+    集合/区域数量不影响是否测地。"""
+    return bool(getattr(node, "surface_propagate", True))
 
 
 def _rebuild_preview_batches(nodes):
@@ -3120,10 +3123,31 @@ def _rebuild_preview_batches(nodes):
             edge_verts = None
             if use_surface_distance:
                 edge_verts = gb_core.edges_from_triangles(tri)
+            # 与导出烘焙同空间链：参考物体逆 → 导出坐标矩阵；
+            # 非镜像工作流 X 补偿只作用于球（网格导入时已被 X 镜像）。
+            ref_inv = n._get_reference_matrix_inv(None)
+            export_m = n._get_export_space_matrix()
+            mirror = n._get_non_mirror_mirror()
+            verts_bake = verts_world
+            if ref_inv is not None or export_m is not None:
+                ones = np.ones((len(verts_world), 1))
+                verts_h = np.concatenate([verts_world, ones], axis=1)
+                if ref_inv is not None:
+                    verts_h = verts_h @ np.asarray(ref_inv, dtype=np.float64).reshape(4, 4).T
+                if export_m is not None:
+                    verts_h = verts_h @ np.asarray(export_m, dtype=np.float64).reshape(4, 4).T
+                verts_bake = verts_h[:, :3]
             field = np.zeros(len(verts), dtype=np.float64)
             plateau = getattr(n, "mask_plateau", 0.0)
             for empty, s in zones:
-                d = n._zone_distances(verts_world, empty.matrix_world, edge_verts)
+                ball = np.asarray(empty.matrix_world, dtype=np.float64).reshape(4, 4)
+                if mirror is not None:
+                    ball = np.asarray(mirror, dtype=np.float64).reshape(4, 4) @ ball
+                if ref_inv is not None:
+                    ball = np.asarray(ref_inv, dtype=np.float64).reshape(4, 4) @ ball
+                if export_m is not None:
+                    ball = np.asarray(export_m, dtype=np.float64).reshape(4, 4) @ ball
+                d = n._zone_distances(verts_bake, ball, edge_verts)
                 if d is None:
                     continue
                 f = n._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)

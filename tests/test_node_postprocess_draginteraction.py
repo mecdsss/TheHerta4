@@ -1454,20 +1454,24 @@ class DragNodePreviewTests(unittest.TestCase):
 
         self.assertEqual(len(rebuilds), 2)
 
-    def test_collection_preview_uses_fast_volumetric_distance(self):
+    def test_collection_preview_follows_surface_propagate(self):
         mod = self.mod
         collection = types.SimpleNamespace(name="PreviewSet", all_objects=[])
         node = self._make_preview_node(mod, collection=collection)
+        object.__setattr__(node, "surface_propagate", True)
+        self.assertTrue(mod._preview_uses_surface_distance(node, enabled_zone_count=1))
+        object.__setattr__(node, "surface_propagate", False)
         self.assertFalse(mod._preview_uses_surface_distance(node, enabled_zone_count=1))
 
-    def test_single_target_preview_keeps_surface_distance_for_small_zone_count(self):
+    def test_surface_distance_independent_of_zone_count(self):
         mod = self.mod
         node = self._make_preview_node(mod)
         object.__setattr__(node, "surface_propagate", True)
         self.assertTrue(mod._preview_uses_surface_distance(node, enabled_zone_count=1))
-        self.assertFalse(
-            mod._preview_uses_surface_distance(
-                node, enabled_zone_count=mod._PREVIEW_GEODESIC_ZONE_LIMIT + 1))
+        # 区域数量不影响是否测地（与烘焙一致）
+        self.assertTrue(mod._preview_uses_surface_distance(node, enabled_zone_count=100))
+        object.__setattr__(node, "surface_propagate", False)
+        self.assertFalse(mod._preview_uses_surface_distance(node, enabled_zone_count=100))
 
 
 class DragNodeMirrorTests(unittest.TestCase):
