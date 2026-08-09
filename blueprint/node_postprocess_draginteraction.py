@@ -311,7 +311,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     )
     mode_toggle_key: bpy.props.StringProperty(
         name="模式切换快捷键",
-        description="按下循环切换运行模式：0=关闭 → 1=仅命中 → 2=命中+拖拽（type=cycle）；留空或填 none 则不生成切换键",
+        description="按下循环切换运行模式：0=关闭 → 1=仅命中 → 2=命中+拖拽（type=cycle），始终生成切换键",
         default="f8",
     )
     ui_detected_variable_name: bpy.props.StringProperty(
@@ -1811,18 +1811,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # ---- 运行模式切换热键（type=cycle，每次按键循环 0→1→2→0）----
         mode_toggle_sec = f"[KeyDragInputManagerModeToggle_{ns}]"
         mode_toggle_key = str(getattr(self, "mode_toggle_key", "") or "").strip()
-        if mode_toggle_key and mode_toggle_key.lower() not in ("none", "0", "off"):
-            drag_mode_var = self._runtime_variable_names(ns)[0]
-            toggle_lines = [
-                f"key = {mode_toggle_key}",
-                "type = cycle",
-                f"{drag_mode_var} = 0,1,2",
-            ]
-            # 快捷键可修改后重新导出：段已存在时也按当前值覆盖（保持幂等）
-            if sections.get(mode_toggle_sec) != toggle_lines:
-                sections[mode_toggle_sec] = toggle_lines
-        else:
-            sections.pop(mode_toggle_sec, None)
+        drag_mode_var = self._runtime_variable_names(ns)[0]
+        toggle_lines = [
+            f"key = {mode_toggle_key}",
+            "type = cycle",
+            f"{drag_mode_var} = 0,1,2",
+        ]
+        # 快捷键可修改后重新导出：段已存在时也按当前值覆盖（保持幂等）
+        if sections.get(mode_toggle_sec) != toggle_lines:
+            sections[mode_toggle_sec] = toggle_lines
 
         # ---- 每组件资源 + Detect / Bake×8 / Jiggle / PinComponent 段 ----
         for comp in components:

@@ -580,7 +580,7 @@ class DragNodeEmitTests(unittest.TestCase):
         key_lines = sections["[KeyDragInputManagerModeToggle_testns]"]
         self.assertIn("$custom_drag_mode = 0,1,2", key_lines)
 
-    def test_mode_toggle_key_update_and_disable(self):
+    def test_mode_toggle_key_update_and_always_generate(self):
         node = _make_node(self.mod, mode_toggle_key="f9")
         sections = _base_sections()
         comps = node._locate_components(sections, ["abc123"])
@@ -591,10 +591,15 @@ class DragNodeEmitTests(unittest.TestCase):
         node._emit_sections(sections, comps, "testns")
         self.assertEqual(len(sections["[KeyDragInputManagerModeToggle_testns]"]), 3)
 
-        # 清空/填 none 时移除旧段
-        node2 = _make_node(self.mod, mode_toggle_key="none")
+        # 清空时也始终生成（键名直接用字段内容）
+        node2 = _make_node(self.mod, mode_toggle_key="")
         node2._emit_sections(sections, comps, "testns")
-        self.assertNotIn("[KeyDragInputManagerModeToggle_testns]", sections)
+        key_lines = sections["[KeyDragInputManagerModeToggle_testns]"]
+        self.assertEqual(key_lines, [
+            "key = ",
+            "type = cycle",
+            "$ssmtdrag_drag_enabled_testns = 0,1,2",
+        ])
 
     def test_tempvb0_empty_declaration(self):
         _, sections, _ = self._emit()
