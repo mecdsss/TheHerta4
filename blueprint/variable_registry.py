@@ -8,6 +8,7 @@ import bpy
 OBJECT_SWAP_PREFIX = "swapkey"
 SHAPEKEY_PREFIX = "Freq_"
 CONTINUOUS_SHAPEKEY_INDEX_PREFIX = "continuous_shapekey_frame"
+UV_OFFSET_PREFIX = "uv_offset"
 
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_]")
 
@@ -89,6 +90,15 @@ def _iter_shapekey_item_variable_names(item):
         yield assigned_name
 
 
+def _iter_uv_offset_item_variable_names(item):
+    custom_name = normalize_variable_name(getattr(item, "custom_variable_name", "") or "")
+    assigned_name = normalize_variable_name(getattr(item, "assigned_variable_name", "") or "")
+    if custom_name:
+        yield custom_name
+    if assigned_name:
+        yield assigned_name
+
+
 def _collect_used_variable_name_counts(context=None) -> Counter:
     counts = Counter()
 
@@ -97,6 +107,11 @@ def _collect_used_variable_name_counts(context=None) -> Counter:
         if bl_idname == "SSMTNode_PostProcess_ShapeKey":
             for item in getattr(node, "shapekey_variable_items", []):
                 counts.update(_iter_shapekey_item_variable_names(item))
+            continue
+
+        if bl_idname == "SSMTNode_PostProcess_UVOffset":
+            for item in getattr(node, "uv_offset_variable_items", []):
+                counts.update(_iter_uv_offset_item_variable_names(item))
             continue
 
         node_variable_names = tuple(_iter_node_variable_names(node))
@@ -234,4 +249,32 @@ def allocate_continuous_shapekey_index_variable_name(
         candidate = f"{CONTINUOUS_SHAPEKEY_INDEX_PREFIX}{suffix}"
         if not _is_name_used_by_other_owner(candidate, used_counts, owned_counts):
             return candidate
+        suffix += 1
+
+
+def allocate_uv_offset_variable_name(
+    axis: str,
+    *,
+    preferred: Optional[str] = None,
+    context=None,
+    owned_names: Optional[Iterable[str]] = None,
+) -> str:
+    preferred_normalized = normalize_variable_name(preferred or "")
+    used_counts = _collect_used_variable_name_counts(context)
+    owned_counts = _normalize_owned_counts(owned_names)
+
+    if preferred_normalized:
+        if not _is_name_used_by_other_owner(preferred_normalized, used_counts, owned_counts):
+            return preferred_normalized
+
+    base_name = _sanitize_name(axis, fallback="axis")
+    candidate = f"{UV_OFFSET_PREFIX}_{base_name}"
+    if not _is_name_used_by_other_owner(candidate, used_counts, owned_counts):
+        return candidate
+
+    suffix = 1
+    while True:
+        indexed = f"{candidate}_{suffix}"
+        if not _is_name_used_by_other_owner(indexed, used_counts, owned_counts):
+            return indexed
         suffix += 1

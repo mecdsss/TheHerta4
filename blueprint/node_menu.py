@@ -1376,6 +1376,8 @@ class SSMT_MT_NodeMenu_PostProcess(bpy.types.Menu):
         layout = self.layout
         _add_node_entry(layout, "顶点属性定义", 'PROPERTIES', "SSMTNode_PostProcess_VertexAttrs")
         _add_node_entry(layout, "形态键配置", 'SHAPEKEY_DATA', "SSMTNode_PostProcess_ShapeKey")
+        _add_node_entry(layout, "UV属性定义", 'UV', "SSMTNode_PostProcess_UVAttrs")
+        _add_node_entry(layout, "UV偏移", 'DRIVER', "SSMTNode_PostProcess_UVOffset")
         _add_node_entry(layout, "材质转资源", 'MATERIAL', "SSMTNode_PostProcess_Material")
         _add_node_entry(layout, "血量检测", 'HEART', "SSMTNode_PostProcess_HealthDetection")
         _add_node_entry(layout, "滑块面板", 'GRIP', "SSMTNode_PostProcess_SliderPanel")

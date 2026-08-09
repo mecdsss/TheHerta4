@@ -432,6 +432,11 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         description="如果资源已存在，则覆盖它",
         default=False
     )
+    fx_to_ttl: bpy.props.BoolProperty(
+        name="FX>>>TTL",
+        description="FXMap 材质作为 TTL 透明遮罩，并接管 _透明N 物体的透明代码生成",
+        default=False
+    )
     material_switch_var: bpy.props.StringProperty(
         name="材质切换变量",
         description="用于材质切换的起始变量名(会自动递增)",
@@ -474,6 +479,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "material_to_resource_override")
+        layout.prop(self, "fx_to_ttl")
         layout.prop(self, "material_switch_var")
 
         name_mapping = self._get_name_mapping()
@@ -680,6 +686,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             base_name = match.group(1)
             transparency_value = match.group(2)
             shader_name = f"CustomShaderTransparencyCloth{base_name.replace('-', '_').replace('.', '_')}_透明{transparency_value}"
+            shader_name = SSMTNode_PostProcess_Material._replace_non_ascii_runs(shader_name)
             return shader_name, transparency_value
         return None, None
 
@@ -1552,6 +1559,269 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
         return cleaned_lines
 
+    @staticmethod
+    def _extract_transparency_value_from_mesh_name(mesh_name):
+        match = re.search(r'_透明(\d+(\.\d+)?)', str(mesh_name or ""))
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _ttl_parse_drawindexed(line):
+        match = re.match(
+            r'^\s*drawindexed(?:instanced)?\s*=\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
+            str(line or "").strip(),
+            re.IGNORECASE,
+        )
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        return None
+
+    def _ttl_first_drawindexed(self, block_lines):
+        for line in block_lines:
+            draw = self._ttl_parse_drawindexed(line)
+            if draw is not None:
+                return draw
+        return None
+
+    @classmethod
+    def _ttl_find_block_start(cls, lines, anchor):
+        start = anchor
+        i = anchor - 1
+        while i >= 0:
+            if re.search(r'\[mesh:([^\]]+)\]', str(lines[i] or "")) is not None:
+                break
+            stripped = str(lines[i]).strip()
+            if re.match(r'^(?:if\s+)', stripped, re.IGNORECASE) or stripped.casefold() == 'else':
+                start = i
+                i -= 1
+                continue
+            break
+        return start
+
+    def _build_ttl_draw_lines(self, block_lines):
+        ttl_lines = []
+        found = False
+        i = 0
+        n = len(block_lines)
+        while i < n:
+            stripped = str(block_lines[i]).strip()
+            if re.match(r'^if\s+', stripped, re.IGNORECASE):
+                depth = 0
+                j = i
+                else_index = -1
+                while j < n:
+                    current = str(block_lines[j]).strip()
+                    if re.match(r'^if\s+', current, re.IGNORECASE):
+                        depth += 1
+                    elif current.casefold() == 'endif':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    elif current.casefold() == 'else' and depth == 1 and else_index == -1:
+                        else_index = j
+                    j += 1
+                if j >= n or depth != 0:
+                    break
+                head = block_lines[i]
+                tail = block_lines[j]
+                branch1_end = else_index if else_index != -1 else j
+                branch1 = block_lines[i + 1:branch1_end]
+                branch2 = block_lines[else_index + 1:j] if else_index != -1 else []
+                draw1 = self._ttl_first_drawindexed(branch1)
+                draw2 = self._ttl_first_drawindexed(branch2) if else_index != -1 else None
+                if draw1 is None and draw2 is None:
+                    i = j + 1
+                    continue
+                found = True
+                ttl_lines.append(head)
+                if draw1 is not None:
+                    ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw1[0]))
+                    ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw1[1]))
+                    ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
+                if else_index != -1:
+                    ttl_lines.append(block_lines[else_index])
+                    if draw2 is not None:
+                        ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw2[0]))
+                        ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw2[1]))
+                        ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
+                ttl_lines.append(tail)
+                i = j + 1
+            else:
+                draw = self._ttl_parse_drawindexed(stripped)
+                if draw is not None:
+                    found = True
+                    ttl_lines.append("${}TTL{}_1 = {}".format(chr(92), chr(92), draw[0]))
+                    ttl_lines.append("${}TTL{}_2 = {}".format(chr(92), chr(92), draw[1]))
+                    ttl_lines.append("run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
+                i += 1
+        return ttl_lines, found
+
+    def _ttl_section_name(self, mesh_name, all_sections, generated_names):
+        cleaned = self._replace_non_ascii_runs(str(mesh_name or "").strip())
+        cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", cleaned).strip("_")
+        base = f"TextureOverride{cleaned}" if cleaned else "TextureOverride"
+        existing = {str(name or "").strip().strip('[]').casefold() for name in all_sections}
+        candidate = base
+        suffix = 2
+        while candidate.casefold() in existing or candidate.casefold() in generated_names:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        generated_names.add(candidate.casefold())
+        return candidate
+
+    def _process_ttl_sections(self, section_name, lines, all_sections, material_group_to_swapkey,
+                              swap_key_prefix, next_swap_key_num, used_swap_keys, texture_folder):
+        from ..utils.log_utils import LOG as _LOG
+        mesh_lines_info = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
+        if not mesh_lines_info:
+            return next_swap_key_num
+
+        first_mesh_index = mesh_lines_info[0][0]
+        first_block_start = self._ttl_find_block_start(lines, first_mesh_index)
+        header_lines = lines[:first_block_start]
+
+        generated_section_names = set()
+        ttl_sections_to_add = OrderedDict()
+
+        if_stack = []
+        if_endif_map = {}
+        mesh_cond = {}
+        for i, line in enumerate(lines):
+            stripped = str(line).strip()
+            if re.match(r'^if\s+', stripped, re.IGNORECASE):
+                if_stack.append((i, line))
+            elif stripped.casefold() == 'endif' and if_stack:
+                if_idx, _if_line = if_stack.pop()
+                if_endif_map[if_idx] = (i, line)
+            mesh_name = self.extract_mesh_name(line)
+            if mesh_name:
+                mesh_cond[i] = [if_idx for if_idx, _ in if_stack]
+
+        for mesh_index, mesh_name in reversed(mesh_lines_info):
+            transparency_value = self._extract_transparency_value_from_mesh_name(mesh_name)
+            obj = self.find_object_by_mesh_name(mesh_name)
+            fx_materials = self.find_matching_materials(obj, "FXMap") if obj is not None else []
+            if not transparency_value and not fx_materials:
+                continue
+
+            cond_if_indexes = mesh_cond.get(mesh_index, [])
+            innermost_endif = None
+            if cond_if_indexes:
+                innermost_endif = if_endif_map.get(cond_if_indexes[-1], (None, None))[0]
+            block_start = mesh_index
+            block_end = len(lines)
+            for i in range(mesh_index + 1, len(lines)):
+                if self.extract_mesh_name(lines[i]):
+                    block_end = i
+                    break
+            if innermost_endif is not None and innermost_endif < block_end:
+                block_end = innermost_endif
+            block_lines = lines[block_start:block_end]
+            ttl_draw_lines, draw_found = self._build_ttl_draw_lines(block_lines)
+            if not draw_found:
+                _LOG.info(f"      TTL: 跳过 '{mesh_name}'（块内无 drawindexed）")
+                continue
+
+            new_lines = []
+            object_to_diffuse_swapkey = {}
+            for header_line in header_lines:
+                stripped = str(header_line).strip()
+                if not stripped:
+                    continue
+                resource_match = re.match(
+                    r'^(ps-t\d+|Resource\\[^\s=]+)\s*=\s*(?:ref\s+)?(.*)$',
+                    stripped,
+                    re.IGNORECASE,
+                )
+                if resource_match:
+                    param_name = resource_match.group(1).strip()
+                    texture_type = self.extract_texture_type_from_resource(resource_match.group(2).strip())
+                    if texture_type:
+                        matching_materials = self.find_matching_materials(obj, texture_type) if obj is not None else []
+                        if matching_materials:
+                            generated_lines, next_swap_key_num = self.generate_material_lines(
+                                matching_materials, param_name, texture_type, obj, texture_folder, all_sections,
+                                object_to_diffuse_swapkey, material_group_to_swapkey,
+                                swap_key_prefix, next_swap_key_num, used_swap_keys)
+                            new_lines.extend(generated_lines)
+                            continue
+                new_lines.append(header_line)
+
+            anchor_line = str(lines[mesh_index])
+            if anchor_line.lstrip().startswith(';'):
+                new_lines.append(anchor_line)
+            else:
+                new_lines.append(f"; {mesh_name}")
+
+            if fx_materials:
+                fx_lines, next_swap_key_num = self.generate_material_lines(
+                    fx_materials, r"Resource\TTL\TransparencyTex", "FXMap", obj, texture_folder, all_sections,
+                    {}, material_group_to_swapkey, swap_key_prefix, next_swap_key_num, used_swap_keys)
+                new_lines.extend(fx_lines)
+
+            alpha_value = transparency_value if transparency_value else "1.0"
+            new_lines.append("${}TTL{}alpha = {}".format(chr(92), chr(92), alpha_value))
+
+            if cond_if_indexes:
+                cond_block = []
+                for if_idx in cond_if_indexes:
+                    cond_block.append(lines[if_idx])
+                indent = "    " * len(cond_if_indexes)
+                for ttl_line in ttl_draw_lines:
+                    if str(ttl_line).strip():
+                        cond_block.append(indent + str(ttl_line))
+                    else:
+                        cond_block.append(ttl_line)
+                for if_idx in reversed(cond_if_indexes):
+                    _end_idx, end_line = if_endif_map.get(if_idx, (None, None))
+                    if end_line is not None:
+                        cond_block.append(end_line)
+                new_lines.extend(cond_block)
+            else:
+                new_lines.extend(ttl_draw_lines)
+
+            new_section_name = self._ttl_section_name(mesh_name, all_sections, generated_section_names)
+            ttl_sections_to_add[new_section_name] = new_lines
+            del lines[block_start:block_end]
+
+        self._cleanup_empty_if_blocks(lines)
+
+        for new_section_name, new_section_lines in ttl_sections_to_add.items():
+            all_sections[f"[{new_section_name}]"] = new_section_lines
+
+        if not any(self.extract_mesh_name(line) for line in lines) and not any('drawindexed' in line for line in lines):
+            all_sections.pop(section_name, None)
+
+        return next_swap_key_num
+
+    @staticmethod
+    def _cleanup_empty_if_blocks(lines):
+        changed = True
+        while changed:
+            changed = False
+            i = 0
+            while i < len(lines):
+                stripped = str(lines[i]).strip()
+                if re.match(r'^if\s+', stripped, re.IGNORECASE):
+                    depth = 0
+                    j = i
+                    empty = True
+                    while j < len(lines):
+                        cur = str(lines[j]).strip()
+                        if re.match(r'^if\s+', cur, re.IGNORECASE):
+                            depth += 1
+                        elif cur.casefold() == 'endif':
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        elif cur and not cur.startswith(';'):
+                            empty = False
+                        j += 1
+                    if depth == 0 and empty:
+                        del lines[i:j + 1]
+                        changed = True
+                        continue
+                i += 1
+
     def process_texture_override_section(self, section_name, all_sections,
                                           material_group_to_swapkey, swap_key_prefix=None, next_swap_key_num=None,
                                           used_swap_keys=None, transparency_sections_to_add=None):
@@ -1573,6 +1843,8 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             next_swap_key_num = int(match.group(2)) if match else 0
 
         lines = all_sections[section_name]
+        if getattr(self, "fx_to_ttl", False) and any("CommandList\\TTL\\Draw" in str(line) for line in lines):
+            return next_swap_key_num
         mesh_line = next((line for line in lines if self.extract_mesh_name(line)), "")
         section_mesh_name = self.extract_mesh_name(mesh_line) or ""
         section_obj = self.find_object_by_mesh_name(section_mesh_name) if section_mesh_name else None
@@ -1722,7 +1994,8 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     matched_types.append("DiffuseMap->ps-t2")
 
             fxmap_lines = []
-            for texture_type in ['Glowmap', 'FXMap']:
+            fxmap_texture_types = ['Glowmap'] if getattr(self, "fx_to_ttl", False) else ['Glowmap', 'FXMap']
+            for texture_type in fxmap_texture_types:
                 matching_materials = self.find_matching_materials(obj, texture_type)
                 if matching_materials:
                     matched_types.append(texture_type)
@@ -1738,7 +2011,10 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     fxmap_lines.append(f"run = CommandList\\{fx_namespace}\\Run")
 
             ntemifx_lines = []
-            ntemifx_texture_slots = self._collect_ntemifx_texture_slots(obj, workspace_resource_by_slot)
+            if getattr(self, "fx_to_ttl", False):
+                ntemifx_texture_slots = {}
+            else:
+                ntemifx_texture_slots = self._collect_ntemifx_texture_slots(obj, workspace_resource_by_slot)
             for slot_label, resource_name in ntemifx_texture_slots.items():
                 ntemifx_lines.append(f"Resource\\NTEMIFX\\FXMap = ref {resource_name}")
                 ntemifx_lines.append("run = CommandList\\NTEMIFX\\Run")
@@ -1777,6 +2053,12 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 reset_insert_idx = self._find_mesh_block_reset_insert_index(lines, insert_index)
                 if reset_insert_idx != -1:
                     lines[reset_insert_idx:reset_insert_idx] = reset_lines
+        if getattr(self, "fx_to_ttl", False):
+            next_swap_key_num = self._process_ttl_sections(
+                section_name, lines, all_sections, material_group_to_swapkey,
+                swap_key_prefix, next_swap_key_num, used_swap_keys, texture_folder)
+            return next_swap_key_num
+
         mesh_lines_info_phase2 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
         for mesh_index, mesh_name in reversed(mesh_lines_info_phase2):
             transparency_shader_name, transparency_value = self.extract_transparency_info_from_mesh_name(mesh_name)
