@@ -865,7 +865,7 @@ class DragNodeEmitTests(unittest.TestCase):
         import tempfile
         zone_ids = [0, 1, 2, 3, 4, 255]
         items = [self._zone_item(zone_id, weight=(index + 1) / 10.0) for index, zone_id in enumerate(zone_ids)]
-        node = _make_node(self.mod, zone_objects=items, surface_propagate=False)
+        node = _make_node(self.mod, zone_objects=items)
         node._check_zone_radius_scale = lambda zones: False
         node._read_position_buf = lambda *args: np.zeros((3, 3), dtype=np.float32)
         node._get_reference_matrix_inv = lambda comp: None
@@ -892,7 +892,7 @@ class DragNodeEmitTests(unittest.TestCase):
             self.assertAlmostEqual(kept[255], 0.6, places=6)
 
     def test_zone_field_applies_export_space_matrix_to_empty(self):
-        node = _make_node(self.mod, surface_propagate=False)
+        node = _make_node(self.mod)
         settings = types.SimpleNamespace(brush_strength=1.0, brush_falloff_k=4.6)
         empty_matrix = np.eye(4)
         empty_matrix[:3, 3] = [0.069, -0.139, 1.143]
@@ -919,7 +919,7 @@ class DragNodeEmitTests(unittest.TestCase):
     def test_sparse_bake_rejects_all_zero_configured_zones(self):
         import tempfile
         item = self._zone_item(0)
-        node = _make_node(self.mod, zone_objects=[item], surface_propagate=False)
+        node = _make_node(self.mod, zone_objects=[item])
         node._check_zone_radius_scale = lambda zones: False
         node._read_position_buf = lambda *args: np.zeros((3, 3), dtype=np.float32)
         node._get_reference_matrix_inv = lambda comp: None
@@ -1583,6 +1583,92 @@ class DragNodePreviewTests(unittest.TestCase):
         )
         d_slow = node._zone_distances(verts, m, edges)
         np.testing.assert_allclose(d_fast, d_slow, atol=1e-12)
+
+    def test_zone_field_cache_reuses_unchanged_ball(self):
+        """逐球权重场缓存：同一拓扑 + 同一球参数再次求场直接命中，
+        只重算变化的球（大量区域下拖动单球不再全量 Dijkstra）。"""
+        mod = self.mod
+        node = _make_node(mod)
+        object.__setattr__(node, "mask_plateau", 0.0)
+        mod._PREVIEW_ZONE_FIELD_CACHE.clear()
+        verts = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=np.float64)
+        tris = np.array([[0, 1, 2]], dtype=np.int64)
+        topo_key = mod._preview_topology_key(verts, tris, None)
+        topo = mod._preview_cached_topology(verts, tris, key=topo_key)
+        empty = self._make_zone_empty(loc=(0.05, 0.0, 0.0), scale=0.25)
+        s = empty.ssmt_drag_zone
+        f1 = mod._preview_zone_field(node, topo, topo_key, empty, s, 0.0)
+        self.assertGreater(float(f1.max()), 0.0)
+        # 同参数再次调用 → 命中缓存，不再调用 _preview_zone_distances
+        calls = []
+        original = mod._preview_zone_distances
+        mod._preview_zone_distances = lambda *a, **k: calls.append(1) or original(*a, **k)
+        try:
+            f2 = mod._preview_zone_field(node, topo, topo_key, empty, s, 0.0)
+        finally:
+            mod._preview_zone_distances = original
+        np.testing.assert_array_equal(f1, f2)
+        self.assertEqual(len(calls), 0)
+        # 移动球 → 重新计算
+        moved = self._make_zone_empty(loc=(0.5, 0.0, 0.0), scale=0.25)
+        f3 = mod._preview_zone_field(node, topo, topo_key, moved, moved.ssmt_drag_zone, 0.0)
+        self.assertFalse(np.array_equal(f1, f3))
+
+    def test_mesh_data_cache_reuses_unchanged_target(self):
+        """网格数据缓存：目标矩阵/顶点/面数未变时复用 verts/tri，
+        不再 foreach_get / calc_loop_triangles（大量区域下预览重建的主要开销）。"""
+        mod = self.mod
+        node = _make_node(mod)
+        mod._PREVIEW_MESH_CACHE.clear()
+
+        class FakeVerts:
+            def __init__(self, n):
+                self._n = n
+
+            def __len__(self):
+                return self._n
+
+            def foreach_get(self, attr, dest):
+                dest[:] = [0.0, 0.0, 0.0] * (len(dest) // 3)
+
+        class FakeMesh:
+            vertices = FakeVerts(3)
+            polygons = [1]
+            class _LoopTriangles:
+                def __len__(self):
+                    return 1
+
+                def foreach_get(self, attr, dest):
+                    dest[:] = [0, 1, 2]
+
+            loop_triangles = _LoopTriangles()
+
+            def calc_loop_triangles(self):
+                pass
+
+        target = types.SimpleNamespace(
+            name="Mesh", matrix_world=np.eye(4), data=FakeMesh()
+        )
+        object.__setattr__(node, "id_data", types.SimpleNamespace(name="Tree"))
+        object.__setattr__(node, "name", "Drag")
+        r1 = mod._preview_mesh_data(node, target)
+        self.assertIsNotNone(r1)
+        # 未变 → 命中缓存（calc_loop_triangles 不再调用）
+        calls = []
+        orig = FakeMesh.calc_loop_triangles
+        FakeMesh.calc_loop_triangles = lambda self: calls.append(1)
+        try:
+            r2 = mod._preview_mesh_data(node, target)
+        finally:
+            FakeMesh.calc_loop_triangles = orig
+        self.assertEqual(len(calls), 0)
+        self.assertIs(r1[0], r2[0])
+        self.assertIs(r1[1], r2[1])
+        # 矩阵变化 → 重新读取
+        target.matrix_world = np.eye(4) * 2.0
+        target.matrix_world[3, 3] = 1.0
+        r3 = mod._preview_mesh_data(node, target)
+        self.assertIsNot(r1[0], r3[0])
 
 
 class DragNodeZoneFilterTests(unittest.TestCase):

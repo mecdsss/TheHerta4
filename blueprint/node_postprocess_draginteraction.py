@@ -3282,33 +3282,49 @@ def _preview_signature(n):
     return tuple(parts)
 
 
-def _preview_target_field(node, verts_world, tri, zones, plateau, target_name=None):
+def _preview_target_field(node, verts_world, tri, zones, plateau, target_name=None,
+                          topo_key=None, mesh_key=None):
     """按 Blender 当前场景坐标计算单个目标网格的逐顶点合并权重（所见即所得）。
     预览直接使用网格 world 顶点与空物体 world 矩阵，不做任何导出期变换
     （非镜像 X 镜像补偿、参考物体逆、导出空间矩阵）——那些只属于导出烘焙；
     否则球会被翻到另一侧，沿表面扩散到非当前物体。
-    包含物体列表过滤：球未包含当前目标网格时跳过；每球独立决定是否沿表面扩散。"""
+    包含物体列表过滤：球未包含当前目标网格时跳过；每球独立决定是否沿表面扩散。
+    topo_key/mesh_key 由调用方传入以命中拓扑/逐球场缓存；缺省时现场计算。"""
     verts_world = np.asarray(verts_world, dtype=np.float64).reshape(-1, 3)
     zones = [z for z in zones if _zone_allowed_by_target(z[1], target_name)]
     if not zones:
         return np.zeros(len(verts_world), dtype=np.float64)
-    if not any(_zone_propagate(s, node) for _empty, s in zones):
-        # 全部体积球：无需拓扑，直接欧氏距离
-        field = np.zeros(len(verts_world), dtype=np.float64)
-        for empty, s in zones:
-            d = node._zone_distances(verts_world, empty.matrix_world, None, propagate=False)
-            if d is None:
-                continue
-            f = node._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)
-            np.maximum(field, f, out=field)
-        return field
-    topo = _preview_cached_topology(verts_world, tri, weld_tol=None)
-    return _preview_field_from_topology(node, topo, zones, plateau)
+    if any(_zone_propagate(s, node) for _empty, s in zones):
+        if topo_key is None:
+            topo_key = _preview_topology_key(verts_world, tri, None)
+        topo = _preview_cached_topology(verts_world, tri, weld_tol=None, key=topo_key)
+        field = _preview_field_from_topology(
+            node, topo, zones, plateau, topo_key=topo_key
+        )
+    else:
+        # 全部体积球：无需拓扑，只保留顶点集（逐球场缓存按 mesh_key 区分）
+        topo = {"world_pts": verts_world, "edge_verts": None, "adjacency": None}
+        topo_key = ("vol", mesh_key, len(verts_world))
+        field = _preview_field_from_topology(
+            node, topo, zones, plateau, topo_key=topo_key
+        )
+    return field
 
 
 _PREVIEW_TOPOLOGY_CACHE = {}
 _PREVIEW_TOPOLOGY_ORDER = []
 _PREVIEW_TOPOLOGY_CACHE_MAX = 16
+
+# 网格数据缓存（按目标矩阵 + 顶点/面数复用 verts_world/tri/topo_key，
+# 避免每次重建都 foreach_get + calc_loop_triangles + 全量哈希）
+_PREVIEW_MESH_CACHE = {}
+_PREVIEW_MESH_CACHE_MAX = 32
+# 集合模式合并网格拓扑缓存（按各目标矩阵/顶点/面数签名复用焊接+邻接表）
+_PREVIEW_MERGED_CACHE = {}
+_PREVIEW_MERGED_CACHE_MAX = 8
+# 逐球权重场缓存：拓扑与球参数未变时直接复用，区域多时只重算变化的球
+_PREVIEW_ZONE_FIELD_CACHE = {}
+_PREVIEW_ZONE_FIELD_CACHE_MAX = 96
 
 
 def _preview_topology_key(verts_world, tri, weld_tol=None):
@@ -3321,7 +3337,24 @@ def _preview_topology_key(verts_world, tri, weld_tol=None):
     return h.hexdigest()
 
 
-def _preview_cached_topology(verts_world, tri, weld_tol=None):
+def _preview_cache_get(cache, key):
+    """LRU 命中：取值并把 key 移到末尾（dict 保序）。"""
+    value = cache.get(key)
+    if value is not None:
+        cache[key] = cache.pop(key)
+    return value
+
+
+def _preview_cache_put(cache, key, value, max_items):
+    """LRU 写入：新项放末尾，超限逐出最旧。"""
+    if key in cache:
+        cache.pop(key)
+    cache[key] = value
+    while len(cache) > max_items:
+        cache.pop(next(iter(cache)))
+
+
+def _preview_cached_topology(verts_world, tri, weld_tol=None, key=None):
     """焊接 + 边拓扑 + 世界坐标邻接表，按网格数据签名缓存。
     网格未变时复用（例如拖动空物体触发预览重建时不再重算
     np.unique 三维焊接与邻接表）；球只移动/缩放时各区域共享同一邻接表。
@@ -3330,7 +3363,8 @@ def _preview_cached_topology(verts_world, tri, weld_tol=None):
     """
     verts_world = np.asarray(verts_world, dtype=np.float64).reshape(-1, 3)
     tri = np.asarray(tri, dtype=np.int64).reshape(-1, 3)
-    key = _preview_topology_key(verts_world, tri, weld_tol)
+    if key is None:
+        key = _preview_topology_key(verts_world, tri, weld_tol)
     cached = _PREVIEW_TOPOLOGY_CACHE.get(key)
     if cached is not None:
         return cached
@@ -3422,35 +3456,103 @@ def _preview_zone_distances(node, verts_world, ball_matrix, adjacency, edge_vert
     return d
 
 
-def _preview_field_from_topology(node, topo, zones, plateau, allowed_by_zone=None):
+def _preview_zone_field(node, topo, topo_key, empty, s, plateau,
+                        allowed=None, allowed_key=None):
+    """单球权重场（含逐球缓存）：拓扑与球矩阵/参数未变时直接复用，
+    区域很多时只重算变化的球，消除整体重建卡顿。"""
+    m = np.asarray(empty.matrix_world, dtype=np.float64).reshape(4, 4)
+    zone_key = (
+        empty.name,
+        tuple(round(v, 6) for v in m.reshape(-1)),
+        bool(getattr(s, "propagate", True)),
+        round(float(s.brush_strength), 6),
+        round(float(s.brush_falloff_k), 6),
+        round(float(plateau or 0.0), 6),
+        allowed_key,
+    )
+    cache_key = (topo_key, zone_key)
+    cached = _preview_cache_get(_PREVIEW_ZONE_FIELD_CACHE, cache_key)
+    if cached is not None:
+        return cached
+    d = _preview_zone_distances(
+        node, topo["world_pts"], m, topo["adjacency"], topo["edge_verts"],
+        propagate=_zone_propagate(s, node), allowed_mask=allowed,
+    )
+    if d is None:
+        field = np.zeros(len(topo["world_pts"]), dtype=np.float64)
+    else:
+        field = np.asarray(
+            node._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau),
+            dtype=np.float64,
+        )
+    _preview_cache_put(_PREVIEW_ZONE_FIELD_CACHE, cache_key, field,
+                       _PREVIEW_ZONE_FIELD_CACHE_MAX)
+    return field
+
+
+def _preview_mesh_data(node, target):
+    """读取并缓存单个目标网格的世界顶点/三角形/拓扑 key。
+    目标矩阵、顶点数、面数均未变时复用（跳过 foreach_get + calc_loop_triangles +
+    拓扑哈希——这些是大量区域下预览重建的主要开销）。网格顶点原地编辑但数量
+    不变时预览可能滞后，关闭再开启预览或移动目标即可刷新。"""
+    key = (node.id_data.name, node.name, target.name)
+    mesh = target.data
+    vcount = len(mesh.vertices)
+    if vcount == 0:
+        return None
+    mw = np.array(target.matrix_world, dtype=np.float64)
+    matrix_sig = tuple(round(v, 6) for v in mw.reshape(-1))
+    pcount = len(mesh.polygons)
+    cached = _preview_cache_get(_PREVIEW_MESH_CACHE, key)
+    if cached is not None:
+        (c_matrix_sig, c_vcount, c_pcount, c_verts_world, c_tri, c_topo_key) = cached
+        if (c_matrix_sig == matrix_sig and c_vcount == vcount and c_pcount == pcount):
+            return (c_verts_world, c_tri, c_topo_key)
+    verts = np.empty(vcount * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", verts)
+    verts = verts.reshape(-1, 3)
+    verts_world = verts @ mw[:3, :3].T + mw[:3, 3]
+    mesh.calc_loop_triangles()
+    tri = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int64)
+    mesh.loop_triangles.foreach_get("vertices", tri)
+    tri = tri.reshape(-1, 3)
+    topo_key = _preview_topology_key(verts_world, tri, None)
+    item = (matrix_sig, vcount, pcount, verts_world, tri, topo_key)
+    _preview_cache_put(_PREVIEW_MESH_CACHE, key, item, _PREVIEW_MESH_CACHE_MAX)
+    return (verts_world, tri, topo_key)
+
+
+def _preview_field_from_topology(node, topo, zones, plateau, allowed_by_zone=None,
+                                 topo_key=None, allowed_keys=None):
     """对缓存拓扑的顶点集逐区域合并权重：所有区域共享同一邻接表。
     allowed_by_zone: 可选，与 zones 对齐的每球 allowed 掩码（拓扑节点级），
-    用于合并预览里包含物体列表过滤。"""
+    用于合并预览里包含物体列表过滤。逐球走 _preview_zone_field 缓存。"""
     world_pts = topo["world_pts"]
-    edge_verts = topo["edge_verts"]
-    adjacency = topo["adjacency"]
+    if topo_key is None:
+        topo_key = ("topology", len(world_pts))
     field = np.zeros(len(world_pts), dtype=np.float64)
     for idx, (empty, s) in enumerate(zones):
         allowed = None if allowed_by_zone is None else allowed_by_zone[idx]
         if allowed is not None and not np.any(allowed):
             continue
-        d = _preview_zone_distances(
-            node, world_pts, empty.matrix_world, adjacency, edge_verts,
-            propagate=_zone_propagate(s, node), allowed_mask=allowed,
+        allowed_key = None if allowed_keys is None else allowed_keys[idx]
+        f = _preview_zone_field(
+            node, topo, topo_key, empty, s, plateau,
+            allowed=allowed, allowed_key=allowed_key,
         )
-        if d is None:
-            continue
-        f = node._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)
         np.maximum(field, f, out=field)
     return field
 
 
-def _preview_merged_mesh(node, meshes, zones, plateau, mesh_names=None, weld_tol=1e-5):
+def _preview_merged_mesh(node, meshes, zones, plateau, mesh_names=None, weld_tol=1e-5,
+                         merged_key=None):
     """集合预览：把集合内全部网格合并为同一个连续表面再计算沿表面传播。
     共享接缝的顶点（世界坐标差 < weld_tol）会被焊接为同一拓扑节点，
     因此球命中任一部件后能沿表面连续传播到相邻部件；各自独立的部分
     仍保持不连通。包含物体列表按 mesh_names 生成每球 allowed 掩码：
     簇内所有顶点都属于列表内网格才允许（阻止沿焊接接缝进入未包含物体）。
+    merged_key 由调用方按各目标签名传入，命中时复用焊接拓扑；逐球走
+    _preview_zone_field 缓存。
     返回与 meshes 对齐的逐网格权重数组列表。"""
     parts = []
     vertex_offset = 0
@@ -3466,10 +3568,25 @@ def _preview_merged_mesh(node, meshes, zones, plateau, mesh_names=None, weld_tol
         return []
     all_verts = np.concatenate(all_verts, axis=0)
     all_tris = np.concatenate(all_tris, axis=0)
-    topo = _preview_cached_topology(all_verts, all_tris, weld_tol=weld_tol)
-    allowed_by_zone = _merged_zone_allowed_masks(zones, mesh_names, parts, topo)
+    if merged_key is None:
+        # 未由调用方传签名（直接调用/测试）时必须用几何哈希，避免不同网格
+        # 因相同顶点/面数命中同一合并拓扑缓存
+        merged_key = _preview_topology_key(all_verts, all_tris, weld_tol)
+    cached_topo = _preview_cache_get(_PREVIEW_MERGED_CACHE, merged_key)
+    if cached_topo is None:
+        topo_key = _preview_topology_key(all_verts, all_tris, weld_tol)
+        topo = _preview_cached_topology(all_verts, all_tris, weld_tol=weld_tol,
+                                        key=topo_key)
+        _preview_cache_put(_PREVIEW_MERGED_CACHE, merged_key, (topo, topo_key),
+                           _PREVIEW_MERGED_CACHE_MAX)
+    else:
+        topo, topo_key = cached_topo
+    allowed_by_zone, allowed_keys = _merged_zone_allowed_masks(
+        zones, mesh_names, parts, topo
+    )
     cluster_field = _preview_field_from_topology(
-        node, topo, zones, plateau, allowed_by_zone=allowed_by_zone
+        node, topo, zones, plateau, allowed_by_zone=allowed_by_zone,
+        topo_key=topo_key, allowed_keys=allowed_keys,
     )
     cluster_ids = topo.get("cluster_ids")
     if cluster_ids is None:
@@ -3481,19 +3598,24 @@ def _preview_merged_mesh(node, meshes, zones, plateau, mesh_names=None, weld_tol
 def _merged_zone_allowed_masks(zones, mesh_names, parts, topo):
     """集合预览：每球生成拓扑节点级 allowed 掩码（长度 = len(topo['world_pts'])）。
     包含列表为空 → None（全部允许）；否则簇内所有顶点都属于列表内网格才允许，
-    防止沿焊接接缝把权重传播进未包含物体。"""
+    防止沿焊接接缝把权重传播进未包含物体。返回 (allowed_list, allowed_keys_list)，
+    allowed_key 由包含名单与网格名决定，供逐球场缓存使用。"""
     cluster_ids = topo.get("cluster_ids")
     if cluster_ids is None:
         cluster_ids = np.arange(sum(n for _offset, n in parts))
     allowed_by_zone = []
+    allowed_keys = []
+    mesh_names_tuple = tuple(str(m) for m in (mesh_names or ()))
     for _empty, s in zones:
         include = getattr(s, "include_objects", None) or ()
         if not include or not mesh_names:
             allowed_by_zone.append(None)
+            allowed_keys.append(("inc", (), mesh_names_tuple))
             continue
         allowed_names = _zone_allowed_names(s)
         if not allowed_names:
             allowed_by_zone.append(None)
+            allowed_keys.append(("inc", (), mesh_names_tuple))
             continue
         vertex_allowed = np.zeros(cluster_ids.shape[0], dtype=bool)
         for (offset, n), mname in zip(parts, mesh_names):
@@ -3502,24 +3624,28 @@ def _merged_zone_allowed_masks(zones, mesh_names, parts, topo):
         if not np.any(vertex_allowed):
             cluster_allowed = np.zeros(int(cluster_ids.max()) + 1, dtype=bool)
             allowed_by_zone.append(cluster_allowed)
+            allowed_keys.append(("inc", tuple(sorted(allowed_names)), mesh_names_tuple))
             continue
         counts = np.bincount(cluster_ids, minlength=int(cluster_ids.max()) + 1)
         allowed_counts = np.bincount(
             cluster_ids, weights=vertex_allowed.astype(np.int64), minlength=int(cluster_ids.max()) + 1
         )
         allowed_by_zone.append(allowed_counts == counts)
-    return allowed_by_zone
+        allowed_keys.append(("inc", tuple(sorted(allowed_names)), mesh_names_tuple))
+    return allowed_by_zone, allowed_keys
 
 
 def _rebuild_preview_batches(nodes):
-    """重算全部启用节点的热力图批次。"""
+    """重算全部启用节点的热力图批次。
+    新批次构建成功后才整体替换（中途失败保留旧预览不黑屏）；网格数据、合并拓扑、
+    逐球权重场均走缓存，拖动单个区域时只重算该球，避免大量区域下反复全量 Dijkstra。"""
     global _preview_batches
     if not GB_CORE_AVAILABLE:
         return
     import gpu
     from gpu_extras.batch import batch_for_shader
     shader = gpu.shader.from_builtin('SMOOTH_COLOR')
-    _preview_batches = {}
+    new_batches = {}
     for n in nodes:
         zones = []
         for item in n.zone_objects:
@@ -3529,22 +3655,15 @@ def _rebuild_preview_batches(nodes):
             zones.append((empty, empty.ssmt_drag_zone))
         targets = _preview_targets(n)
         plateau = getattr(n, "mask_plateau", 0.0)
-        # 收集每个目标网格的 world 顶点与三角形
+        # 收集每个目标网格的 world 顶点与三角形（命中网格缓存时跳过
+        # foreach_get / calc_loop_triangles / 拓扑哈希）
         mesh_data = []
         for target in targets:
-            mesh = target.data
-            if len(mesh.vertices) == 0:
+            result = _preview_mesh_data(n, target)
+            if result is None:
                 continue
-            verts = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
-            mesh.vertices.foreach_get("co", verts)
-            verts = verts.reshape(-1, 3)
-            mw = np.array(target.matrix_world, dtype=np.float64)
-            verts_world = verts @ mw[:3, :3].T + mw[:3, 3]
-            mesh.calc_loop_triangles()
-            tri = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int64)
-            mesh.loop_triangles.foreach_get("vertices", tri)
-            tri = tri.reshape(-1, 3)
-            mesh_data.append((target, verts_world, tri))
+            verts_world, tri, topo_key = result
+            mesh_data.append((target, verts_world, tri, topo_key))
         if not mesh_data:
             continue
 
@@ -3552,33 +3671,41 @@ def _rebuild_preview_batches(nodes):
         # 沿表面传播可跨部件连续扩散；单物体直接按自身拓扑计算。
         collection_mode = getattr(n, "preview_collection", None) is not None
         if collection_mode:
+            merged_key = tuple(
+                (target.name, topo_key, len(verts_world))
+                for target, verts_world, _tri, topo_key in mesh_data
+            )
             fields = _preview_merged_mesh(
                 n,
-                [(verts_world, tri) for _target, verts_world, tri in mesh_data],
+                [(verts_world, tri) for _target, verts_world, tri, _tk in mesh_data],
                 zones,
                 plateau,
-                mesh_names=[target.name for target, _verts_world, _tri in mesh_data],
+                mesh_names=[target.name for target, _verts_world, _tri, _tk in mesh_data],
+                merged_key=merged_key,
             )
         else:
             fields = [
                 _preview_target_field(
-                    n, verts_world, tri, zones, plateau, target_name=target.name
+                    n, verts_world, tri, zones, plateau, target_name=target.name,
+                    topo_key=topo_key, mesh_key=(n.id_data.name, n.name, target.name),
                 )
-                for target, verts_world, tri in mesh_data
+                for target, verts_world, tri, topo_key in mesh_data
             ]
 
-        for (target, verts_world, tri), field in zip(mesh_data, fields):
+        for (target, verts_world, tri, _topo_key), field in zip(mesh_data, fields):
             field = np.asarray(field, dtype=np.float64)
             colors = gb_core.weights_to_colors(field, _PREVIEW_ALPHA).astype(np.float32)
             ghost_colors = np.array(colors, copy=True)
             ghost_colors[:, 3] *= _PREVIEW_GHOST_FACTOR
             pos = verts_world.astype(np.float32)
+            indices = np.asarray(tri, dtype=np.int32)
             key = (n.id_data.name, n.name, target.name)
-            _preview_batches[key] = (
+            new_batches[key] = (
                 target.name,
-                batch_for_shader(shader, 'TRIS', {"pos": pos, "color": colors}, indices=tri),
-                batch_for_shader(shader, 'TRIS', {"pos": pos, "color": ghost_colors}, indices=tri),
+                batch_for_shader(shader, 'TRIS', {"pos": pos, "color": colors}, indices=indices),
+                batch_for_shader(shader, 'TRIS', {"pos": pos, "color": ghost_colors}, indices=indices),
             )
+    _preview_batches = new_batches
 
 
 def _drag_preview_draw():
@@ -3632,6 +3759,9 @@ def _remove_preview_handler():
     _preview_batches = {}
     _PREVIEW_TOPOLOGY_CACHE.clear()
     _PREVIEW_TOPOLOGY_ORDER.clear()
+    _PREVIEW_MESH_CACHE.clear()
+    _PREVIEW_MERGED_CACHE.clear()
+    _PREVIEW_ZONE_FIELD_CACHE.clear()
 
 
 def _preview_tick():
@@ -3667,7 +3797,9 @@ def _preview_tick():
             _preview_pending_signature = None
             _preview_pending_since = None
     except Exception:
-        pass
+        # 重建失败时保留可诊断输出（控制台可见 traceback），避免静默黑屏
+        import traceback
+        traceback.print_exc()
     return _PREVIEW_TICK
 
 
