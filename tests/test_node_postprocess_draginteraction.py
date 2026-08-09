@@ -1473,6 +1473,32 @@ class DragNodePreviewTests(unittest.TestCase):
         object.__setattr__(node, "surface_propagate", False)
         self.assertFalse(mod._preview_uses_surface_distance(node, enabled_zone_count=100))
 
+    def test_preview_target_field_uses_scene_space(self):
+        """预览基于 Blender 当前场景坐标（所见即所得），不做任何导出期变换：
+        非镜像 X 镜像补偿、参考物体逆、导出空间矩阵都只属于导出烘焙。
+        否则球会被翻到另一侧，沿表面扩散到非当前物体。"""
+        mod = self.mod
+        node = _make_node(mod)
+        object.__setattr__(node, "surface_propagate", True)
+        object.__setattr__(node, "mask_plateau", 0.0)
+        # 球心 X+1（半径 1）在 A 上；B 在 X-0.5，距球心 1.5 > 1，场景中不相交
+        empty = self._make_zone_empty(loc=(1.0, 0.0, 0.0), scale=1.0)
+        zones = [(empty, empty.ssmt_drag_zone)]
+        verts_a = np.array([[0.9, 0.0, 0.0], [1.0, 0.0, 0.0], [1.1, 0.0, 0.0]], dtype=np.float64)
+        verts_b = np.array([[-0.5, 0.0, 0.0], [-0.6, 0.0, 0.0], [-0.5, 0.1, 0.0]], dtype=np.float64)
+        tris = np.array([[0, 1, 2]], dtype=np.int64)
+        field_a = mod._preview_target_field(node, verts_a, tris, zones, 0.0)
+        field_b = mod._preview_target_field(node, verts_b, tris, zones, 0.0)
+        self.assertGreater(float(field_a.max()), 0.3)      # A 有沿表面权重
+        np.testing.assert_array_equal(field_b, np.zeros(3))  # B 不被接触/扩散
+
+        # 对照：若错误地在预览中只对球施加 X 镜像（顶点保持场景坐标），
+        # 球会翻到 X- 一侧错误接触 B —— 正是本 bug 的机制
+        ball_mirrored = np.diag([-1.0, 1.0, 1.0, 1.0]) @ np.asarray(empty.matrix_world, dtype=np.float64)
+        d_bug = node._zone_distances(verts_b, ball_mirrored, mod.gb_core.edges_from_triangles(tris))
+        f_bug = node._shape_field(d_bug, 1.0, 4.6, 0.0)
+        self.assertGreater(float(f_bug.max()), 0.0)
+
 
 class DragNodeMirrorTests(unittest.TestCase):
     """非镜像工作流：区域空物体矩阵 X 镜像补偿（掩码左右颠倒回归）。"""

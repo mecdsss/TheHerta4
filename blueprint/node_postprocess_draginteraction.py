@@ -3089,6 +3089,25 @@ def _preview_uses_surface_distance(node, enabled_zone_count):
     return bool(getattr(node, "surface_propagate", True))
 
 
+def _preview_target_field(node, verts_world, tri, zones, plateau):
+    """按 Blender 当前场景坐标计算单个目标网格的逐顶点合并权重（所见即所得）。
+    预览直接使用网格 world 顶点与空物体 world 矩阵，不做任何导出期变换
+    （非镜像 X 镜像补偿、参考物体逆、导出空间矩阵）——那些只属于导出烘焙；
+    否则球会被翻到另一侧，沿表面扩散到非当前物体。"""
+    use_surface_distance = _preview_uses_surface_distance(node, len(zones))
+    edge_verts = None
+    if use_surface_distance:
+        edge_verts = gb_core.edges_from_triangles(tri)
+    field = np.zeros(len(verts_world), dtype=np.float64)
+    for empty, s in zones:
+        d = node._zone_distances(verts_world, empty.matrix_world, edge_verts)
+        if d is None:
+            continue
+        f = node._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)
+        np.maximum(field, f, out=field)
+    return field
+
+
 def _rebuild_preview_batches(nodes):
     """重算全部启用节点的热力图批次。"""
     global _preview_batches
@@ -3120,38 +3139,9 @@ def _rebuild_preview_batches(nodes):
             mesh.loop_triangles.foreach_get("vertices", tri)
             tri = tri.reshape(-1, 3)
             # 集合被视为一个预览目标，但各网格保留自身拓扑，避免跨物体虚构连接边。
-            edge_verts = None
-            if use_surface_distance:
-                edge_verts = gb_core.edges_from_triangles(tri)
-            # 与导出烘焙同空间链：参考物体逆 → 导出坐标矩阵；
-            # 非镜像工作流 X 补偿只作用于球（网格导入时已被 X 镜像）。
-            ref_inv = n._get_reference_matrix_inv(None)
-            export_m = n._get_export_space_matrix()
-            mirror = n._get_non_mirror_mirror()
-            verts_bake = verts_world
-            if ref_inv is not None or export_m is not None:
-                ones = np.ones((len(verts_world), 1))
-                verts_h = np.concatenate([verts_world, ones], axis=1)
-                if ref_inv is not None:
-                    verts_h = verts_h @ np.asarray(ref_inv, dtype=np.float64).reshape(4, 4).T
-                if export_m is not None:
-                    verts_h = verts_h @ np.asarray(export_m, dtype=np.float64).reshape(4, 4).T
-                verts_bake = verts_h[:, :3]
             field = np.zeros(len(verts), dtype=np.float64)
             plateau = getattr(n, "mask_plateau", 0.0)
-            for empty, s in zones:
-                ball = np.asarray(empty.matrix_world, dtype=np.float64).reshape(4, 4)
-                if mirror is not None:
-                    ball = np.asarray(mirror, dtype=np.float64).reshape(4, 4) @ ball
-                if ref_inv is not None:
-                    ball = np.asarray(ref_inv, dtype=np.float64).reshape(4, 4) @ ball
-                if export_m is not None:
-                    ball = np.asarray(export_m, dtype=np.float64).reshape(4, 4) @ ball
-                d = n._zone_distances(verts_bake, ball, edge_verts)
-                if d is None:
-                    continue
-                f = n._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)
-                np.maximum(field, f, out=field)
+            field = _preview_target_field(n, verts_world, tri, zones, plateau)
             colors = gb_core.weights_to_colors(field, _PREVIEW_ALPHA).astype(np.float32)
             ghost_colors = np.array(colors, copy=True)
             ghost_colors[:, 3] *= _PREVIEW_GHOST_FACTOR
