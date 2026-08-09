@@ -36,9 +36,6 @@
 //   t120 = IniParams
 //
 // IniParams:
-//   [76].x = dt (minutes-based delta), .y = sim speed, .z = max step
-//   [77].x = ramp rate per step (default 0.08)
-//   [77].y = release decay retention (0 = hold, >0 = per-step decay)
 //   [77].z = drag system mode (0=off, 1=hit only, 2=hit + drag)
 //   [77].w = LMB held (from $ssmtdrag_lmb_down_<ns>, active in every mode)
 //   [78].x = X held (from $ssmtdrag_x_down_<ns>; original design treats X as LMB)
@@ -141,14 +138,17 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     for (uint zone = 0u; zone < zoneCount; ++zone)
     {
         uint activeStage = ClickCount[zone];
+        bool zoneHit = hasHit && zone == hoverZone;
+        bool zonePressed = zoneHit && pressed;
         for (uint stage = 1u; stage <= stageCount; ++stage)
         {
             uint stageBase = zone * perZone + (stage - 1u) * slotCount;
             // 档位激活只看点击计数，与是否按住/命中无关（点击后松手保持当前档位）
             bool stageActive = (activeStage == stage);
-            // 无方向槽：命中按下该档位时置 1 并保持；非活动/清空时归 0
+            // 无方向槽：仅当前命中区域按下该档位时置 1 并保持；非活动/清空时归 0。
+            // 必须同时满足 zoneHit，否则在其他区域按下时会误置本区域槽
             uint ndIdx = stageBase + 4u;
-            if (stageActive && pressed)
+            if (stageActive && zonePressed)
                 ShapeKeyDrive[ndIdx] = 1.0;
             else if (!stageActive)
                 ShapeKeyDrive[ndIdx] = 0.0;
@@ -162,7 +162,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                     // 位移驱动：该方向净位移（同向 +、对向 -）× 灵敏度，
                     // 向上时“上”增“下”减，向下时反之，左右同理
                     float net = dirWeight[dir] - dirWeight[(dir + 2u) % 4u];
-                    if (hasHit && zone == hoverZone)
+                    if (zoneHit)
                         next = clamp(current + net * moveLen * mouseSensitivity, 0.0, 1.0);
                     // 松手/离开时保持当前强度（不归零、不积分）
                 }

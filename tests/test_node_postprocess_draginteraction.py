@@ -668,6 +668,23 @@ class DragNodeEmitTests(unittest.TestCase):
         # 方向槽：非活动档位归 0，避免切档后上一档残留
         self.assertIn("next = 0.0;", content)
 
+    def test_shapekey_drive_shader_zones_are_independent(self):
+        shader_path = os.path.join("Toolset", "drag_interaction", "rzm_shapekey_drive.hlsl")
+        if not os.path.exists(shader_path):
+            self.skipTest("shader missing")
+        with open(shader_path, encoding="utf-8") as f:
+            content = f.read()
+        # 档位推进按 hoverZone 独立写入，不循环所有区域
+        self.assertIn("uint oldStage = ClickCount[hoverZone];", content)
+        self.assertIn("ClickCount[hoverZone] = newStage;", content)
+        # 无方向槽置位必须同时满足“本区域命中按下”（zoneHit && pressed），
+        # 防止在其他区域按下时误置本区域槽
+        self.assertIn("bool zoneHit = hasHit && zone == hoverZone;", content)
+        self.assertIn("bool zonePressed = zoneHit && pressed;", content)
+        self.assertIn("if (stageActive && zonePressed)", content)
+        # 方向槽位移积分同样只在 zoneHit 时执行，其余区域保持不积分
+        self.assertIn("if (zoneHit)", content)
+
     def test_mode_toggle_key_generates_cycle_section(self):
         _, sections, _ = self._emit()
         key_lines = sections["[KeyDragInputManagerModeToggle_testns]"]
