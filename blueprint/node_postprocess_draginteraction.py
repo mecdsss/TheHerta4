@@ -45,6 +45,7 @@ SHADER_FILES = (
     "rzm_pin_detected.hlsl",
     "rzm_jiggle_screen_state.hlsl",
     "rzm_jiggle_interaction.hlsl",
+    "rzm_shapekey_drive.hlsl",
 )
 HAND_SHADER_FILES = ("rzm_jiggle_cursor_preview.hlsl", "rzm_jiggle_hand.hlsl", "rzm_jiggle_cursor.hlsl")
 # 手部网格/法线资产（二进制，原样复制）
@@ -318,6 +319,26 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         description="预分配鼠标当前命中稳定区域 ID 的只读联动变量；编号与节点区域 ID 完全一致",
         default="ssmtdrag_ui_zone",
     )
+    # ---- 形态键驱动输出（ShapeKeyDrive 缓冲，纯 GPU 无回读）----
+    enable_shapekey_drive: bpy.props.BoolProperty(
+        name="形态键驱动输出",
+        description="把命中并拖拽区域的强度渐变写入 ShapeKeyDrive 缓冲区，供形态键节点读取",
+        default=False,
+    )
+    shapekey_drive_ramp_rate: bpy.props.FloatProperty(
+        name="强度上升速率",
+        description="拖拽期间每帧步进累加值，达到 1.0 后封顶",
+        default=0.08,
+        min=0.001,
+        max=2.0,
+    )
+    shapekey_drive_release_decay: bpy.props.FloatProperty(
+        name="松手衰减保留",
+        description="0=松手保持当前强度；>0 时松手后每帧按该保留系数的步进次幂衰减（如 0.92）",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+    )
     enable_hand_cursor: bpy.props.BoolProperty(
         name="启用手型光标",
         default=True,
@@ -435,6 +456,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         poke_row.enabled = self.enable_poke
         poke_row.prop(self, "poke_gesture")
         layout.prop(self, "enable_hand_cursor")
+
+        # ---- 形态键驱动输出 ----
+        drive_box = layout.box()
+        drive_box.label(text="形态键驱动输出", icon='SHAPEKEY_DATA')
+        drive_box.prop(self, "enable_shapekey_drive")
+        if self.enable_shapekey_drive:
+            row = drive_box.row(align=True)
+            row.prop(self, "shapekey_drive_ramp_rate", text="上升速率")
+            row.prop(self, "shapekey_drive_release_decay", text="松手衰减")
+            drive_box.label(text="在形态键节点为各形态键绑定区域 ID 后生效", icon='INFO')
 
         runtime_box = layout.box()
         runtime_box.label(text="运行时联动变量", icon='DRIVER')
@@ -1738,6 +1769,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "bind_flags = render_target shader_resource",
             ],
         }
+        if getattr(self, "enable_shapekey_drive", False):
+            global_resources[f"[ResourceDragShapeKeyDrive_{ns}]"] = [
+                "type = RWBuffer", "format = R32_FLOAT",
+                f"array = {self._zone_capacity(self._collect_enabled_zone_entries())}",
+            ]
         for sec, lines in global_resources.items():
             sections.setdefault(sec, lines)
 
@@ -1769,6 +1805,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # ---- 全局 Pin / UpdateScreenJiggle / CommandList 段 ----
         self._emit_pin_detected_section(sections, ns)
         self._emit_update_screen_jiggle_section(sections, ns)
+        if getattr(self, "enable_shapekey_drive", False):
+            self._emit_shapekey_drive_section(sections, ns)
         self._emit_command_lists(sections, components, ns)
 
         # ---- 手型光标（S8）：资源 + 绘制段 ----
@@ -2069,6 +2107,26 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         ])
         sections[sec] = lines
 
+    # ---- ShapeKeyDrive：把 locked 拖拽区域强度按 ramp 积分写入驱动缓冲 ----
+
+    def _emit_shapekey_drive_section(self, sections, ns):
+        sec = f"[CustomShaderDragShapeKeyDrive_{ns}]"
+        if sec in sections:
+            return
+        sections[sec] = [
+            f"cs = {RES_SHADER_DIR}/rzm_shapekey_drive.hlsl",
+            f"x76 = $ssmtdrag_delta_time_{ns}",
+            f"y76 = $ssmtdrag_sim_speed_{ns}",
+            f"z76 = $ssmtdrag_max_step_{ns}",
+            "x77 = " + self._fmt(self.shapekey_drive_ramp_rate),
+            "y77 = " + self._fmt(self.shapekey_drive_release_decay),
+            f"cs-t71 = ResourceDragJiggleScreenState_{ns}",
+            f"cs-u0 = ResourceDragShapeKeyDrive_{ns}",
+            "dispatch = 1, 1, 1",
+            "post cs-t71 = null",
+            "post cs-u0 = null",
+        ]
+
     # ---- CommandList：PinDetected（boot-clear + dt 钳制 + 门槛）/ Viewport / Cursor ----
 
     def _emit_command_lists(self, sections, components, ns):
@@ -2086,6 +2144,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tclear = ResourceDragPathProgressState_{ns} 0.0",
                 f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
             ]
+            if getattr(self, "enable_shapekey_drive", False):
+                lines.append(f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0")
             if self.enable_hand_cursor:
                 lines.append(f"\tclear = ResourceDragJiggleCursorPreview_{ns} 0.0")
             for comp in components:
@@ -2127,6 +2187,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 lines.append(f"\trun = CustomShaderDragPinComponent{comp['comp_name']}_{ns}")
             lines.extend([
                 f"\trun = CustomShaderDragUpdateScreenJiggle_{ns}",
+            ])
+            if getattr(self, "enable_shapekey_drive", False):
+                lines.append(f"\trun = CustomShaderDragShapeKeyDrive_{ns}")
+            lines.extend([
                 "else",
                 f"\t$ObjectDetectAllowed_{ns} = 0",
                 "endif",
@@ -2619,6 +2683,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"\tclear = ResourceDragJiggleScreenState_{ns} 0.0",
             f"\tclear = ResourceDragPathProgressState_{ns} 0.0",
         ]
+        if getattr(self, "enable_shapekey_drive", False):
+            interaction_gate_lines.append(f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0")
         for comp in components:
             interaction_gate_lines.append(
                 f"\tclear = ResourceDragJiggleState_{comp['comp_name']}_{ns} 0.0")

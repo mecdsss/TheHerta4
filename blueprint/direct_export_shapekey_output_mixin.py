@@ -412,6 +412,7 @@ class DirectShapeKeyOutputMixin:
         use_optimized,
         merge_slot_files,
         preserved_driver_content="",
+        drag_drive_resource=None,
     ):
         if '[Constants]' not in sections:
             sections['[Constants]'] = []
@@ -609,6 +610,11 @@ class DirectShapeKeyOutputMixin:
                 if use_optimized:
                     block_lines.append(f"    cs-t99 = copy {derive_shapekey_freq_resource_name(primary_base_resource)}")
                     t_registers_to_null.append("cs-t99")
+
+            if drag_drive_resource:
+                block_lines.append("\n    ; --- Drag ShapeKey Drive ---")
+                block_lines.append(f"    cs-t{self.node.DRAG_DRIVE_REGISTER} = {drag_drive_resource}")
+                t_registers_to_null.append(f"cs-t{self.node.DRAG_DRIVE_REGISTER}")
 
             block_lines.append(f"    cs = ./res/shapekey_anim_{logical_hash}.hlsl")
             res_to_bind = base_resources if base_resources else [f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"]

@@ -362,6 +362,16 @@ class DirectShapeKeyGenerator(
         use_delta = self.node.store_deltas
         use_optimized = self.node.use_optimized_lookup
         merge_slot_files = self.node._should_merge_slot_files(use_packed)
+        drag_drive_enabled = bool(getattr(self.node, "drag_drive_enabled", False))
+        drag_drive_resource = None
+        if drag_drive_enabled:
+            drag_drive_resource = self.node._drag_shapekey_drive_resource_name(target_ini_file)
+            if not drag_drive_resource:
+                LOG.warning(
+                    "直出形态键: 已开启拖拽驱动但未找到启用了驱动输出的拖拽节点，"
+                    "本次导出回退到强度变量"
+                )
+                drag_drive_enabled = False
 
         hash_to_shader_paths = {}
         for logical_hash in processed_hashes:
@@ -416,6 +426,8 @@ class DirectShapeKeyGenerator(
                     hash_unique_objects,
                     use_optimized=use_optimized,
                     merge_slot_files=merge_slot_files,
+                    drag_drive_enabled=drag_drive_enabled,
+                    drag_zone_ids=self.node._drag_drive_zone_ids(hash_unique_names) if drag_drive_enabled else None,
                 )
         LOG.info(f"直出形态键: shader/freq 写出完成 {perf_counter() - stage_start:.3f}s")
 
@@ -439,5 +451,6 @@ class DirectShapeKeyGenerator(
             use_delta=use_delta,
             use_optimized=use_optimized,
             merge_slot_files=merge_slot_files,
+            drag_drive_resource=drag_drive_resource,
         )
         LOG.info(f"直出形态键: ini 更新完成 {perf_counter() - stage_start:.3f}s")

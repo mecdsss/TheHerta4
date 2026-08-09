@@ -173,6 +173,20 @@ class NTMIShapeKeyNodeAdapter:
     def get_shape_key_export_variable_name(self, shape_key_name: str) -> str:
         return self.original_node.get_shape_key_export_variable_name(shape_key_name)
 
+    @property
+    def drag_drive_enabled(self) -> bool:
+        return bool(getattr(self.original_node, "drag_drive_enabled", False))
+
+    @property
+    def DRAG_DRIVE_REGISTER(self) -> int:
+        return int(getattr(self.original_node, "DRAG_DRIVE_REGISTER", 100))
+
+    def _drag_shapekey_drive_resource_name(self, ini_path=None):
+        return self.original_node._drag_shapekey_drive_resource_name(ini_path)
+
+    def _drag_drive_zone_ids(self, unique_names):
+        return self.original_node._drag_drive_zone_ids(unique_names)
+
     def _update_shader_file(
         self,
         shader_path,
@@ -183,9 +197,23 @@ class NTMIShapeKeyNodeAdapter:
         unique_objects,
         use_optimized=False,
         merge_slot_files=False,
+        drag_drive_enabled=False,
+        drag_zone_ids=None,
     ):
         del unique_objects, use_packed, use_delta, use_optimized, merge_slot_files
         num_slots = max(hash_slot_data.keys()) if hash_slot_data else 0
+        zone_ids = list(drag_zone_ids or []) if drag_drive_enabled else []
+        drive_extra_lines = []
+        if drag_drive_enabled:
+            drive_extra_lines.append(f"Buffer<float> ShapeKeyDrive : register(t{self.DRAG_DRIVE_REGISTER});")
+            if any(zone >= 0 for zone in zone_ids):
+                ids_text = ", ".join(str(zone) if zone >= 0 else "0xFFFFFFFFu" for zone in zone_ids)
+                drive_extra_lines.append(f"static const uint SHAPEKEY_ZONE_IDS[{len(zone_ids)}] = {{ {ids_text} }};")
+                drive_extra_lines.append(f"static const uint SHAPEKEY_ZONE_IDS_COUNT = {len(zone_ids)}u;")
+            else:
+                drive_extra_lines.append("static const uint SHAPEKEY_ZONE_IDS[1] = { 0xFFFFFFFFu };")
+                drive_extra_lines.append("static const uint SHAPEKEY_ZONE_IDS_COUNT = 1u;")
+            drive_extra_lines.append("")
         freq_define_lines = []
         for index, name in enumerate(unique_names):
             freq_define_lines.append(f"#define FREQ{index + 1} IniParams[{self.INTENSITY_START_INDEX + index}].x // {name}")
@@ -207,6 +235,7 @@ class NTMIShapeKeyNodeAdapter:
                 "Buffer<float> BasePosition : register(t54);",
                 "RWBuffer<float> OutPosition : register(u5);",
                 "Texture1D<float4> IniParams : register(t120);",
+                *drive_extra_lines,
                 "",
                 "// Shape key parameter bindings",
                 *freq_define_lines,
@@ -247,6 +276,16 @@ class NTMIShapeKeyNodeAdapter:
                 "                continue;",
                 "            }",
                 "            float weight = IniParams[100u + freq_idx].x;",
+                *(
+                    [
+                        "            if (freq_idx < SHAPEKEY_ZONE_IDS_COUNT && SHAPEKEY_ZONE_IDS[freq_idx] != 0xFFFFFFFFu)",
+                        "            {",
+                        "                weight = ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx]];",
+                        "            }",
+                    ]
+                    if drag_drive_enabled
+                    else []
+                ),
                 "            if (abs(weight) <= 1.0e-6)",
                 "            {",
                 "                continue;",
@@ -743,6 +782,35 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
                         shader_section_name = self._shapekey_shader_section_name(current_part_token)
                         direct_position_uav = f"ResourcePart_{current_part_token}_DirectShapeKey_Position_UAV"
                         direct_position = f"ResourcePart_{current_part_token}_DirectShapeKey_Position"
+                        drive_node = getattr(self, "node", None)
+                        drive_enabled = bool(
+                            getattr(drive_node, "drag_drive_enabled", False)
+                            if drive_node is not None
+                            else getattr(self, "drag_drive_enabled", False)
+                        )
+                        drag_drive_resource = None
+                        if drive_enabled and drive_node is not None:
+                            try:
+                                drag_drive_resource = drive_node._drag_shapekey_drive_resource_name(
+                                    getattr(self, "target_ini_file", getattr(self, "ini_path", None))
+                                )
+                            except Exception:
+                                drag_drive_resource = None
+                        drive_register = (
+                            int(getattr(drive_node, "DRAG_DRIVE_REGISTER", 100))
+                            if drive_node is not None
+                            else int(getattr(self, "DRAG_DRIVE_REGISTER", 100))
+                        )
+                        drive_bind_lines = (
+                            [f"cs-t{drive_register} = {drag_drive_resource}"]
+                            if drag_drive_resource
+                            else []
+                        )
+                        drive_unbind_lines = (
+                            [f"cs-t{drive_register} = null"]
+                            if drag_drive_resource
+                            else []
+                        )
                         patched_lines.extend(
                             [
                                 f"cs-t51 = {self._shapekey_resource_name(current_part_token, 'Merged_PackedPosDelta')}",
@@ -750,6 +818,7 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
                                 f"cs-t53 = {self._shapekey_resource_name(current_part_token, 'FreqIndices')}",
                                 f"cs-t54 = {current_source_position_resource or part_layout.position_resource}",
                                 f"cs-u5 = {direct_position_uav}",
+                                *drive_bind_lines,
                                 f"run = {shader_section_name}",
                                 f"{direct_position} = copy {direct_position_uav}",
                                 "cs-t51 = null",
@@ -757,6 +826,7 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
                                 "cs-t53 = null",
                                 "cs-t54 = null",
                                 "cs-u5 = null",
+                                *drive_unbind_lines,
                                 f"cs-t68 = {direct_position}",
                             ]
                         )
@@ -797,6 +867,7 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
         use_optimized,
         merge_slot_files,
         preserved_driver_content="",
+        drag_drive_resource=None,
     ):
         del slot_to_name_to_objects, all_unique_objects, hash_to_base_resources
 

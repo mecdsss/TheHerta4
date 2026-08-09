@@ -1,0 +1,199 @@
+import importlib.util
+import os
+import shutil
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+
+
+def _install_module(name, **attrs):
+    module = types.ModuleType(name)
+    module.__path__ = []
+    module.__package__ = name
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    sys.modules[name] = module
+    return module
+
+
+PKG = "_sk_dragdrive_test_pkg"
+for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common"):
+    _install_module(package_name)
+
+_fake_bpy = types.SimpleNamespace(
+    types=types.SimpleNamespace(PropertyGroup=object, Operator=object, UIList=object, Node=object),
+    props=types.SimpleNamespace(
+        StringProperty=lambda **_kw: None,
+        BoolProperty=lambda **_kw: None,
+        IntProperty=lambda **_kw: None,
+        FloatProperty=lambda **_kw: None,
+        EnumProperty=lambda **_kw: None,
+        CollectionProperty=lambda **_kw: None,
+        PointerProperty=lambda **_kw: None,
+    ),
+    data=types.SimpleNamespace(objects={}, texts=[], node_groups=types.SimpleNamespace(nodes=[])),
+)
+_install_module("bpy", **_fake_bpy.__dict__)
+_install_module("bpy.props", **_fake_bpy.props.__dict__)
+_install_module(
+    "bpy.types",
+    PropertyGroup=object,
+    Operator=object,
+    UIList=object,
+    Node=object,
+    NodeSocket=object,
+)
+_install_module("bpy.data", **_fake_bpy.data.__dict__)
+
+_install_module(
+    f"{PKG}.blueprint.node_postprocess_base",
+    SSMTNode_PostProcess_Base=type(
+        "_FakePostProcessBase",
+        (object,),
+        {
+            "split_anim_driver_block_content": staticmethod(lambda content: ("", content)),
+            "split_auto_appended_tail_content": staticmethod(lambda content: (content, "")),
+            "_create_cumulative_backup": lambda self, ini_file_path, mod_export_path: None,
+        },
+    ),
+)
+_install_module(f"{PKG}.blueprint.direct_export", sync_shapekey_direct_mode=lambda self, ctx: None)
+_install_module(f"{PKG}.blueprint.deform_chain")
+_install_module(
+    f"{PKG}.blueprint.variable_registry",
+    allocate_shape_key_variable_name=lambda name, **_kw: f"Freq_{name}",
+    mark_variable_name_used=lambda *_a, **_kw: None,
+    normalize_variable_name=lambda value: str(value or "").strip(),
+)
+_install_module(
+    f"{PKG}.common.mod_path_compat",
+    collect_base_position_resource_map=lambda *_a, **_kw: {},
+    derive_shapekey_base_resource_name=lambda *a: "",
+    derive_shapekey_freq_resource_name=lambda *a: "",
+    derive_shapekey_merged_data_resource_name=lambda *a: "",
+    derive_shapekey_merged_map_resource_name=lambda *a: "",
+    derive_shapekey_slot_map_resource_name=lambda *a: "",
+    derive_shapekey_slot_resource_name=lambda *a: "",
+    ensure_resource_alias_section=lambda *a, **_kw: "",
+    resolve_hash_buffer_candidate=lambda *a, **_kw: None,
+)
+_install_module(
+    f"{PKG}.common.object_prefix_helper",
+    ObjectPrefixHelper=types.SimpleNamespace(resolve_source_object_name=lambda name: name),
+)
+
+_MODULE_PATH = Path(__file__).resolve().parents[1] / "blueprint" / "node_postprocess_shapekey.py"
+_spec = importlib.util.spec_from_file_location(f"{PKG}.blueprint.node_postprocess_shapekey", _MODULE_PATH)
+_module = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _module
+_spec.loader.exec_module(_module)
+
+_TEMPLATES = {
+    "merged_delta": "shapekey_anim_packed_delta_v5_merged.hlsl",
+    "merged_full": "shapekey_anim_packed_v5_merged.hlsl",
+    "opt_delta": "shapekey_anim_packed_delta_v4_optimized.hlsl",
+    "standard": "shapekey_anim_standard.hlsl",
+}
+
+
+def _make_node(zone_map):
+    node = _module.SSMTNode_PostProcess_ShapeKey.__new__(_module.SSMTNode_PostProcess_ShapeKey)
+    node.name = "SKNode"
+    node.inputs = [types.SimpleNamespace(is_linked=False, links=[])]
+    node.outputs = [types.SimpleNamespace(is_linked=False, links=[])]
+    node.shapekey_variable_items = []
+    node.shapekey_variable_index = 0
+    node.id_data = types.SimpleNamespace(nodes=[])
+    for name, zone in zone_map.items():
+        item = _module.ShapeKeyVariableItem()
+        item.shape_key_name = name
+        item.assigned_variable_name = f"Freq_{name}"
+        item.custom_variable_name = ""
+        item.drag_zone_id = zone
+        node.shapekey_variable_items.append(item)
+    return node
+
+
+class ShapeKeyDragDriveTests(unittest.TestCase):
+    ZONE_MAP = {"Breast_L": 2, "Breast_R": 3, "Hip": -1}
+
+    def setUp(self):
+        self.node = _make_node(self.ZONE_MAP)
+        self.out_dir = tempfile.mkdtemp(prefix="sk_dragdrive_test_")
+
+    def tearDown(self):
+        shutil.rmtree(self.out_dir, ignore_errors=True)
+
+    def _generate(self, template_name):
+        src = os.path.abspath(os.path.join("Toolset", template_name))
+        if not os.path.exists(src):
+            self.skipTest(f"template missing: {src}")
+        dest = os.path.join(self.out_dir, template_name)
+        shutil.copy2(src, dest)
+        self.node._update_shader_file(
+            dest,
+            {1: {"Breast_L": ["obj1"], "Breast_R": ["obj2"]}, 2: {"Hip": ["obj3"]}},
+            True,
+            True,
+            ["Breast_L", "Breast_R", "Hip"],
+            ["obj1", "obj2", "obj3"],
+            use_optimized=True,
+            merge_slot_files=(template_name in ("shapekey_anim_packed_delta_v5_merged.hlsl", "shapekey_anim_packed_v5_merged.hlsl")),
+            drag_drive_enabled=True,
+            drag_zone_ids=self.node._drag_drive_zone_ids(["Breast_L", "Breast_R", "Hip"]),
+        )
+        with open(dest, encoding="utf-8") as f:
+            return f.read()
+
+    def test_zone_ids_alignment(self):
+        self.assertEqual(self.node._drag_drive_zone_ids(["Breast_L", "Breast_R", "Hip"]), [2, 3, -1])
+
+    def test_merged_optimized_generates_drive_read(self):
+        content = self._generate("shapekey_anim_packed_delta_v5_merged.hlsl")
+        self.assertIn("Buffer<float> ShapeKeyDrive : register(t100);", content)
+        self.assertIn("SHAPEKEY_ZONE_IDS", content)
+        self.assertIn("ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx_slot0]]", content)
+        self.assertIn("#define FREQ1 ShapeKeyDrive[SHAPEKEY_ZONE_IDS[0]]", content)
+        # 未绑定形态键保持变量回退
+        self.assertIn("#define FREQ3 IniParams[102].x", content)
+        # 未绑定守卫：不会访问 ShapeKeyDrive[-1]
+        self.assertIn("0xFFFFFFFFu", content)
+
+    def test_optimized_non_merged_generates_drive_read(self):
+        content = self._generate("shapekey_anim_packed_delta_v4_optimized.hlsl")
+        self.assertIn("register(t100)", content)
+        self.assertIn("ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx_slot0]]", content)
+
+    def test_all_templates_generate_drive_binding(self):
+        for template_name in _TEMPLATES.values():
+            content = self._generate(template_name)
+            self.assertIn("register(t100)", content, template_name)
+            self.assertIn("ShapeKeyDrive[SHAPEKEY_ZONE_IDS", content, template_name)
+
+    def test_disabled_keeps_original_ini_params_weight(self):
+        src = os.path.abspath(os.path.join("Toolset", "shapekey_anim_packed_delta_v5_merged.hlsl"))
+        if not os.path.exists(src):
+            self.skipTest("template missing")
+        dest = os.path.join(self.out_dir, "disabled.hlsl")
+        shutil.copy2(src, dest)
+        self.node._update_shader_file(
+            dest,
+            {1: {"Breast_L": ["obj1"]}},
+            True,
+            True,
+            ["Breast_L"],
+            ["obj1"],
+            use_optimized=True,
+            merge_slot_files=True,
+            drag_drive_enabled=False,
+        )
+        with open(dest, encoding="utf-8") as f:
+            content = f.read()
+        self.assertNotIn("ShapeKeyDrive", content)
+        self.assertIn("IniParams[100 + freq_idx_slot0].x", content)
+
+
+if __name__ == "__main__":
+    unittest.main()

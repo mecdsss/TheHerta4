@@ -49,6 +49,13 @@ class ShapeKeyVariableItem(bpy.types.PropertyGroup):
         default="",
         update=update_custom_variable_name,
     ) # type: ignore
+    drag_zone_id: bpy.props.IntProperty(
+        name="拖拽区域 ID",
+        description="绑定拖拽交互节点的区域 ID（与该节点区域空物体显示的编号一致）；-1 = 不绑定，沿用强度变量",
+        default=-1,
+        min=-1,
+        max=255,
+    ) # type: ignore
 
 
 class SSMT_UL_ShapeKeyVariableMappings(bpy.types.UIList):
@@ -63,6 +70,8 @@ class SSMT_UL_ShapeKeyVariableMappings(bpy.types.UIList):
             value_col.prop(item, "custom_variable_name", text="导出变量")
             assigned_name = normalize_variable_name(getattr(item, "assigned_variable_name", "") or "")
             value_col.label(text=f"预分配: ${assigned_name}" if assigned_name else "预分配: 未分配", icon='INFO')
+            zone_row = row.row(align=True)
+            zone_row.prop(item, "drag_zone_id", text="区域")
 
 _name_mapping_cache = {}
 
@@ -81,6 +90,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
     INTENSITY_START_INDEX = 100
     VERTEX_RANGE_START_INDEX = 200
+    # 形态键着色器中 ShapeKeyDrive 缓冲的 SRV 寄存器（同一 dispatch 内避开
+    # t50-t54 / t75+ / t99，由 INI 的 cs-t100 绑定）
+    DRAG_DRIVE_REGISTER = 100
 
     shapekey_variable_items: bpy.props.CollectionProperty(type=ShapeKeyVariableItem) # type: ignore
     shapekey_variable_index: bpy.props.IntProperty(default=0) # type: ignore
@@ -116,6 +128,16 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         description="启用后该节点参与直出导出，并与同类节点同步",
         default=False,
         update=sync_shapekey_direct_mode,
+    )
+    drag_drive_enabled: bpy.props.BoolProperty(
+        name="拖拽驱动形态键",
+        description="从拖拽交互节点的 ShapeKeyDrive 缓冲区读取强度（命中并拖拽特定区域时渐变至 1）",
+        default=False,
+    )
+    drag_drive_resource_override: bpy.props.StringProperty(
+        name="拖拽驱动资源名",
+        description="留空自动从同一节点树中的拖拽交互节点推导；多个拖拽节点时可手动填写 ResourceDragShapeKeyDrive_<ns>",
+        default="",
     )
 
     def apply_name_mapping(self, mapping):
@@ -300,6 +322,47 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             item.assigned_variable_name = assigned_name
         return f"${assigned_name}"
 
+    def _find_drag_drive_node(self):
+        """在同一节点树中查找已开启形态键驱动输出的拖拽交互节点。"""
+        tree = getattr(self, "id_data", None)
+        if tree is None:
+            return None
+        for node in tree.nodes:
+            if (
+                getattr(node, "bl_idname", "") == "SSMTNode_PostProcess_DragInteraction"
+                and getattr(node, "enable_shapekey_drive", False)
+            ):
+                return node
+        return None
+
+    def _drag_shapekey_drive_resource_name(self, ini_path=None):
+        """推导拖拽 ShapeKeyDrive 资源名；优先手动覆盖，其次自动从拖拽节点推导。"""
+        override = str(getattr(self, "drag_drive_resource_override", "") or "").strip()
+        if override:
+            return override
+        node = self._find_drag_drive_node()
+        if node is None:
+            return None
+        try:
+            ns = node._resolve_namespace(ini_path or "")
+        except Exception:
+            ns = ""
+        return f"ResourceDragShapeKeyDrive_{ns}"
+
+    def _drag_drive_zone_ids(self, unique_names):
+        """返回与 unique_names（FREQ 索引顺序）对齐的区域 ID 列表；-1 表示不绑定。"""
+        zone_ids = []
+        for name in unique_names:
+            item = None
+            for candidate in self.shapekey_variable_items:
+                if candidate.shape_key_name == name:
+                    item = candidate
+                    break
+            if item is None:
+                item = self._ensure_shapekey_variable_item(name)
+            zone_ids.append(int(getattr(item, "drag_zone_id", -1)))
+        return zone_ids
+
     def collect_blueprint_shape_key_names(self):
         from .export_helper import BlueprintExportHelper
         result = set()
@@ -337,6 +400,13 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         layout.prop(self, "use_optimized_lookup")
         layout.prop(self, "merge_slot_files")
         layout.prop(self, "direct_export_mode")
+
+        drive_box = layout.box()
+        drive_box.label(text="拖拽驱动形态键", icon='DRIVER')
+        drive_box.prop(self, "drag_drive_enabled")
+        if self.drag_drive_enabled:
+            drive_box.prop(self, "drag_drive_resource_override")
+            drive_box.label(text="在下方映射列表中为各形态键填写拖拽区域 ID", icon='INFO')
 
         if not NUMPY_AVAILABLE:
             layout.label(text="警告: 未安装numpy库，优化功能不可用", icon='ERROR')
@@ -1489,7 +1559,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         return "struct VertexAttributes {\n    float3 position;\n    float3 normal;\n    float4 tangent;\n};"
 
-    def _update_shader_file(self, shader_path, hash_slot_data, use_packed, use_delta, unique_names, unique_objects, use_optimized=False, merge_slot_files=False):
+    def _update_shader_file(self, shader_path, hash_slot_data, use_packed, use_delta, unique_names, unique_objects, use_optimized=False, merge_slot_files=False, drag_drive_enabled=False, drag_zone_ids=None):
         try:
             with open(shader_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -1501,9 +1571,21 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             name_to_freq_def = {name: f"FREQ{i+1}" for i, name in enumerate(unique_names)}
             obj_to_range_defs = {obj: (f"START{i+1}", f"END{i+1}") for i, obj in enumerate(unique_objects)}
 
+            zone_ids = list(drag_zone_ids or []) if drag_drive_enabled else []
             define_lines = [f"// --- Shared Animation Intensity (per Shape Key Name) ---\n// From index {self.INTENSITY_START_INDEX} onwards"]
+            if drag_drive_enabled:
+                define_lines.append(f"Buffer<float> ShapeKeyDrive : register(t{self.DRAG_DRIVE_REGISTER});")
+                if any(zone >= 0 for zone in zone_ids):
+                    ids_text = ", ".join(str(zone) if zone >= 0 else "0xFFFFFFFFu" for zone in zone_ids)
+                    define_lines.append(f"static const uint SHAPEKEY_ZONE_IDS[{len(zone_ids)}] = {{ {ids_text} }};")
+                else:
+                    define_lines.append("static const uint SHAPEKEY_ZONE_IDS[1] = { 0xFFFFFFFFu };")
             for i, name in enumerate(unique_names):
-                define_lines.append(f"#define FREQ{i+1} IniParams[{self.INTENSITY_START_INDEX + i}].x // {name}")
+                zone = zone_ids[i] if i < len(zone_ids) else -1
+                if drag_drive_enabled and zone >= 0:
+                    define_lines.append(f"#define FREQ{i+1} ShapeKeyDrive[SHAPEKEY_ZONE_IDS[{i}]] // {name} (drag zone {zone})")
+                else:
+                    define_lines.append(f"#define FREQ{i+1} IniParams[{self.INTENSITY_START_INDEX + i}].x // {name}")
 
             if not use_optimized:
                 define_lines.extend([f"\n// --- Per-Object Vertex Ranges ---\n// From index {self.VERTEX_RANGE_START_INDEX} onwards"])
@@ -1527,9 +1609,16 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         logic_lines.append(f"    uint freq_idx_slot{slot_index} = vertex_freq_indices[packed_idx_slot{slot_index}];")
                         logic_lines.append(f"    if (freq_idx_slot{slot_index} != 255)")
                         logic_lines.append("    {")
-                        logic_lines.append(
-                            f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;"
-                        )
+                        if drag_drive_enabled:
+                            logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
+                            logic_lines.append(f"        if (SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}] != 0xFFFFFFFFu)")
+                            logic_lines.append("        {")
+                            logic_lines.append(f"            anim_weight_slot{slot_index} = ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}]];")
+                            logic_lines.append("        }")
+                        else:
+                            logic_lines.append(
+                                f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;"
+                            )
                     else:
                         is_first_if = True
                         logic_lines.append(f"    float anim_weight_slot{slot_index} = 0.0;")
@@ -1566,7 +1655,14 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     logic_lines.append(f"    uint freq_idx_slot{slot_index} = vertex_freq_indices[packed_idx_slot{slot_index}];")
                     logic_lines.append(f"    if (freq_idx_slot{slot_index} != 255)")
                     logic_lines.append("    {")
-                    logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
+                    if drag_drive_enabled:
+                        logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
+                        logic_lines.append(f"        if (SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}] != 0xFFFFFFFFu)")
+                        logic_lines.append("        {")
+                        logic_lines.append(f"            anim_weight_slot{slot_index} = ShapeKeyDrive[SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}]];")
+                        logic_lines.append("        }")
+                    else:
+                        logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
 
                     if use_packed:
                         logic_lines.extend([f"        int packed_index = shapekey_maps[{slot_index}][i];", "        if (packed_index != -1)", "        {"])
@@ -1990,6 +2086,14 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             dest_res_dir = os.path.join(mod_export_path, "res")
             os.makedirs(dest_res_dir, exist_ok=True)
 
+            drag_drive_enabled = bool(getattr(self, "drag_drive_enabled", False))
+            drag_drive_resource = None
+            if drag_drive_enabled:
+                drag_drive_resource = self._drag_shapekey_drive_resource_name(target_ini_file)
+                if not drag_drive_resource:
+                    print("[ShapeKey] 已开启拖拽驱动但未找到启用了驱动输出的拖拽节点，回退到强度变量")
+                    drag_drive_enabled = False
+
             hash_to_shader_paths = {}
             for hash_val in unique_hashes:
                 shader_dest_path = os.path.join(dest_res_dir, f"shapekey_anim_{hash_val}.hlsl")
@@ -2026,6 +2130,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         hash_unique_objects,
                         use_optimized,
                         merge_slot_files,
+                        drag_drive_enabled=drag_drive_enabled,
+                        drag_zone_ids=self._drag_drive_zone_ids(hash_unique_names) if drag_drive_enabled else None,
                     ):
                         print(f"更新哈希 {hash_val} 的着色器文件失败")
 
@@ -2165,6 +2271,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         if use_optimized:
                             block_lines.append(f"    cs-t99 = copy {derive_shapekey_freq_resource_name(primary_base_resource)}")
                             t_registers_to_null.append("cs-t99")
+
+                    if drag_drive_resource:
+                        block_lines.append("\n    ; --- Drag ShapeKey Drive ---")
+                        block_lines.append(f"    cs-t{self.DRAG_DRIVE_REGISTER} = {drag_drive_resource}")
+                        t_registers_to_null.append(f"cs-t{self.DRAG_DRIVE_REGISTER}")
 
                     block_lines.append(f"    cs = ./res/shapekey_anim_{h}.hlsl")
 
