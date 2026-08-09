@@ -238,7 +238,7 @@ def build_surface_adjacency(local_pts, edge_verts):
     return adj
 
 
-def surface_distances(local_pts, edge_verts, seed_mask, adjacency=None):
+def surface_distances(local_pts, edge_verts, seed_mask, adjacency=None, allowed_mask=None):
     """多源 Dijkstra 表面距离（球局部坐标度量）。
 
     种子顶点初始距离 = 其欧氏 |local|，其余顶点从 ∞ 开始沿网格边松弛。
@@ -252,6 +252,8 @@ def surface_distances(local_pts, edge_verts, seed_mask, adjacency=None):
         seed_mask: (N,) bool，种子（球内顶点）。
         adjacency: 可选，build_surface_adjacency 的预构建结果（与 local_pts 同空间），
             多次调用可复用；为 None 时内部构建。
+        allowed_mask: 可选 (N,) bool，只允许沿这些顶点传播（例如包含物体列表过滤）；
+            None = 全部允许。种子也必须是 allowed。
 
     Returns:
         (N,) float64 表面距离；未与任何种子连通的顶点为 inf。
@@ -259,8 +261,11 @@ def surface_distances(local_pts, edge_verts, seed_mask, adjacency=None):
     n = local_pts.shape[0]
     dist = np.full(n, np.inf)
     adj = adjacency if adjacency is not None else build_surface_adjacency(local_pts, edge_verts)
+    allowed = np.ones(n, dtype=bool) if allowed_mask is None else np.asarray(allowed_mask, dtype=bool).reshape(-1)
     heap = []
     for i in np.nonzero(np.asarray(seed_mask, dtype=bool).reshape(-1))[0]:
+        if not allowed[i]:
+            continue
         d0 = float(np.linalg.norm(local_pts[i]))
         dist[i] = d0
         heapq.heappush(heap, (d0, int(i)))
@@ -269,6 +274,8 @@ def surface_distances(local_pts, edge_verts, seed_mask, adjacency=None):
         if d > dist[u] + 1e-12 or d >= 1.0:
             continue  # 陈旧堆项，或已出球面半径（权重为 0，无需继续传播）
         for v, w in adj[u]:
+            if not allowed[v]:
+                continue
             nd = d + w
             if nd < dist[v] - 1e-12:
                 dist[v] = nd
@@ -276,7 +283,7 @@ def surface_distances(local_pts, edge_verts, seed_mask, adjacency=None):
     return dist
 
 
-def surface_distances_uniform_scale(adjacency, world_pts, center, scale):
+def surface_distances_uniform_scale(adjacency, world_pts, center, scale, allowed_mask=None):
     """沿表面传播快速路径：均匀缩放（旋转/平移/等比缩放）球复用世界坐标邻接表。
     球局部距离 = 世界沿表面距离 / scale（球面 d=1 ⇔ 世界距离 = scale），
     因此用世界边长邻接表跑 Dijkstra、按 scale 截断并归一，结果与逐球构建完全一致。
@@ -286,6 +293,7 @@ def surface_distances_uniform_scale(adjacency, world_pts, center, scale):
         world_pts: (N,3) 世界坐标顶点（与邻接表同索引）。
         center: (3,) 球心世界坐标。
         scale: 球均匀缩放（球半径 = scale）。
+    allowed_mask: 可选 (N,) bool，只允许沿这些顶点传播；None = 全部允许。
     Returns:
         (N,) float64 球局部表面距离；不可达为 inf。
     """
@@ -293,8 +301,12 @@ def surface_distances_uniform_scale(adjacency, world_pts, center, scale):
     center = np.asarray(center, dtype=np.float64).reshape(3)
     n = pts.shape[0]
     d2 = np.einsum("ij,ij->i", pts - center, pts - center)
+    allowed = np.ones(n, dtype=bool) if allowed_mask is None else np.asarray(allowed_mask, dtype=bool).reshape(-1)
     dist = np.full(n, np.inf)
-    seed = int(np.argmin(d2))
+    if not np.any(allowed):
+        return dist
+    valid_d2 = np.where(allowed, d2, np.inf)
+    seed = int(np.argmin(valid_d2))
     d0 = float(np.sqrt(d2[seed]))
     dist[seed] = d0
     heap = [(d0, seed)]
@@ -304,6 +316,8 @@ def surface_distances_uniform_scale(adjacency, world_pts, center, scale):
         if d > dist[u] + 1e-12 or d >= cutoff:
             continue
         for v, w in adjacency[u]:
+            if not allowed[v]:
+                continue
             nd = d + w
             if nd < dist[v] - 1e-12:
                 dist[v] = nd

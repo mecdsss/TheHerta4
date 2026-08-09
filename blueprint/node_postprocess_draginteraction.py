@@ -37,7 +37,7 @@ except Exception:
 MAX_ZONES = 256
 SPARSE_ZONE_SLOTS = 4
 INVALID_ZONE_ID = 0xFFFFFFFF
-ZONES_PER_PAGE = 16
+ZONES_PER_PAGE = 1
 
 SHADER_FILES = (
     "rzm_gs_probe.hlsl",
@@ -79,6 +79,15 @@ RES_SHADER_DIR = "res/drag_interaction"
 # 空物体区域参数 PropertyGroup
 # ---------------------------------------------------------------------------
 
+class SSMT_DragZoneIncludeRef(bpy.types.PropertyGroup):
+    """SSMT_DragZoneSettings.include_objects 里的一项：指向一个 MESH 物体。"""
+    object: bpy.props.PointerProperty(
+        name="物体",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'MESH',
+    )
+
+
 class SSMT_DragZoneSettings(bpy.types.PropertyGroup):
     """挂在一个 Empty 上的区域参数（画刷 + 拖拽物理）。"""
 
@@ -86,6 +95,12 @@ class SSMT_DragZoneSettings(bpy.types.PropertyGroup):
     brush_strength: bpy.props.FloatProperty(name="画刷强度", default=1.0, min=0.0, max=4.0)
     brush_falloff_k: bpy.props.FloatProperty(name="画刷衰减 k", default=4.6, min=0.1, max=50.0)
     enabled: bpy.props.BoolProperty(name="启用", default=True)
+    propagate: bpy.props.BoolProperty(
+        name="沿表面扩散",
+        description="此权重球开启时沿网格表面测地扩散；关闭回退体积球（仅作用于本球）",
+        default=True,
+    )
+    include_objects: bpy.props.CollectionProperty(type=SSMT_DragZoneIncludeRef)
 
     # 拖拽参数（0 = 继承回退到全局）
     radius: bpy.props.FloatProperty(name="影响半径", default=0.0, min=0.0)
@@ -94,6 +109,74 @@ class SSMT_DragZoneSettings(bpy.types.PropertyGroup):
     falloff: bpy.props.FloatProperty(name="衰减", default=0.0, min=0.0)
     damping: bpy.props.FloatProperty(name="阻尼", default=0.0, min=0.0)
     grabbable: bpy.props.BoolProperty(name="可抓取", default=True)
+
+
+# ---------------------------------------------------------------------------
+# 区域 helper：球级沿表面扩散 + 包含物体列表过滤
+# ---------------------------------------------------------------------------
+
+
+def _zone_propagate(settings, node):
+    """球级沿表面扩散开关；旧工程（无 propagate 属性）回退节点级 surface_propagate。"""
+    value = getattr(settings, "propagate", None)
+    if value is not None:
+        return bool(value)
+    return bool(getattr(node, "surface_propagate", True))
+
+
+def _zone_allowed_names(settings):
+    """包含列表内物体的候选名（含去重后缀形式，如 Body.001 → Body）。"""
+    include = getattr(settings, "include_objects", None) or ()
+    names = set()
+    for item in include:
+        obj = getattr(item, "object", None)
+        if obj is None:
+            continue
+        candidates = (getattr(obj, "name", None), getattr(obj, "name_full", None))
+        for candidate in candidates:
+            if not candidate:
+                continue
+            names.add(str(candidate))
+            names.add(str(candidate).rsplit(".", 1)[0])
+    return names
+
+
+def _zone_allowed_by_target(settings, target_name):
+    """预览单物体：包含列表为空 → 全部允许；否则仅列表内物体名命中。"""
+    include = getattr(settings, "include_objects", None) or ()
+    if not include:
+        return True
+    if not target_name:
+        return True
+    return str(target_name) in _zone_allowed_names(settings)
+
+
+def _zone_allowed_vertex_mask(settings, vertex_count, triangles, tri_part_names):
+    """烘焙侧：包含列表 → (N,) bool 只允许列表内部件覆盖的顶点；空列表/无拓扑 → None（全允许）。
+
+    tri_part_names 与 triangles 逐行对齐（object 数组，无注释部件名为 None）。无注释的
+    三角形按“无法判定归属”处理为允许，避免旧工程无 mesh 注释时权重被清零。
+    """
+    include = getattr(settings, "include_objects", None) or ()
+    if not include:
+        return None
+    allowed_names = _zone_allowed_names(settings)
+    if not allowed_names or triangles is None or tri_part_names is None:
+        return None
+    mask = np.zeros(int(vertex_count), dtype=bool)
+    tri_names = np.asarray(tri_part_names)
+    for name in allowed_names:
+        tri_sel = tri_names == name
+        idx = triangles[tri_sel].reshape(-1)
+        idx = idx[idx < int(vertex_count)]
+        mask[idx] = True
+    # 无注释部件按允许处理（无法判定归属，不因列表过滤而清零）
+    none_sel = tri_names == None  # noqa: E711
+    if np.any(none_sel):
+        idx = triangles[none_sel].reshape(-1)
+        idx = idx[idx < int(vertex_count)]
+        mask[idx] = True
+    return mask
 
 
 class SSMT_DragZoneRef(bpy.types.PropertyGroup):
@@ -229,6 +312,55 @@ class SSMT_OT_DragZonePage(bpy.types.Operator):
             return {'CANCELLED'}
         current_page, _page_count = _zone_page_state(node)
         _clamp_zone_page(node, current_page + self.direction)
+        return {'FINISHED'}
+
+
+class SSMT_OT_DragZoneIncludeAdd(bpy.types.Operator):
+    """把当前活动 MESH 物体加入权重球的包含列表。"""
+    bl_idname = "ssmt.drag_zone_include_add"
+    bl_label = "添加包含物体"
+    bl_options = {'INTERNAL'}
+
+    empty_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = getattr(context, "active_object", None)
+        if obj is None or getattr(obj, "type", None) != 'MESH':
+            self.report({'WARNING'}, "请先选中一个网格物体")
+            return {'CANCELLED'}
+        empty = bpy.data.objects.get(self.empty_name) if self.empty_name else None
+        if empty is None or not hasattr(empty, "ssmt_drag_zone"):
+            self.report({'WARNING'}, "权重球不存在")
+            return {'CANCELLED'}
+        settings = empty.ssmt_drag_zone
+        for item in settings.include_objects:
+            if item.object == obj:
+                self.report({'INFO'}, f"{obj.name} 已在包含列表")
+                return {'FINISHED'}
+        item = settings.include_objects.add()
+        item.object = obj
+        self.report({'INFO'}, f"已加入包含物体 {obj.name}")
+        return {'FINISHED'}
+
+
+class SSMT_OT_DragZoneIncludeRemove(bpy.types.Operator):
+    """从权重球包含列表移除一项。"""
+    bl_idname = "ssmt.drag_zone_include_remove"
+    bl_label = "移除包含物体"
+    bl_options = {'INTERNAL'}
+
+    empty_name: bpy.props.StringProperty()
+    index: bpy.props.IntProperty(min=0)
+
+    def execute(self, context):
+        empty = bpy.data.objects.get(self.empty_name) if self.empty_name else None
+        if empty is None or not hasattr(empty, "ssmt_drag_zone"):
+            self.report({'WARNING'}, "权重球不存在")
+            return {'CANCELLED'}
+        settings = empty.ssmt_drag_zone
+        if 0 <= self.index < len(settings.include_objects):
+            settings.include_objects.remove(self.index)
+            self.report({'INFO'}, "已移除包含物体")
         return {'FINISHED'}
 
 
@@ -369,7 +501,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # ---- 区域空物体引用列表 ----
     zone_objects: bpy.props.CollectionProperty(type=SSMT_DragZoneRef)
     zone_page: bpy.props.IntProperty(
-        name="区域页", default=0, min=0, max=(MAX_ZONES // ZONES_PER_PAGE) - 1,
+        name="区域页", default=0, min=0, max=MAX_ZONES - 1,
     )
 
     # ---- 权重预览（视口热力图，仿高斯球预览）----
@@ -541,6 +673,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 sub = box.column(align=True)
                 sub.use_property_split = True
                 sub.prop(obj.ssmt_drag_zone, "enabled")
+                sub.prop(obj.ssmt_drag_zone, "propagate", text="沿表面扩散")
                 sub.prop(obj.ssmt_drag_zone, "brush_strength")
                 sub.prop(obj.ssmt_drag_zone, "brush_falloff_k")
                 sub.prop(obj.ssmt_drag_zone, "radius")
@@ -553,6 +686,18 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 sub.prop(obj.ssmt_drag_zone, "falloff")
                 sub.prop(obj.ssmt_drag_zone, "damping")
                 sub.prop(obj.ssmt_drag_zone, "grabbable")
+                # 包含物体列表（留空 = 全部物体）
+                inc_box = sub.box()
+                inc_box.label(text="包含物体（留空=全部）", icon='OBJECT_DATA')
+                inc_row = inc_box.row(align=True)
+                add_inc = inc_row.operator(SSMT_OT_DragZoneIncludeAdd.bl_idname, text="添加活动物体", icon='ADD')
+                add_inc.empty_name = obj.name
+                for inc_index, inc_item in enumerate(obj.ssmt_drag_zone.include_objects):
+                    inc_item_row = inc_box.row(align=True)
+                    inc_item_row.prop(inc_item, "object", text="")
+                    rm_inc = inc_item_row.operator(SSMT_OT_DragZoneIncludeRemove.bl_idname, text="", icon='X')
+                    rm_inc.empty_name = obj.name
+                    rm_inc.index = inc_index
                 box.separator()
 
         layout.prop(self, "bake_reference_object")
@@ -1337,11 +1482,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # radius 参数与球尺度失配检查（防“整块刚体动”失配，原版实测 ratio 0.3~2.2）
         self._check_zone_radius_scale(zones)
 
-        # 沿表面传播拓扑：IB 读一次三角形 → 去重边，全部 zone 共用
+        # 沿表面传播拓扑：任一启用区域开了球级沿表面扩散（旧数据回退节点级）就读一次
+        # IB 三角形 → 去重边，全部 zone 共用；同时得到逐三角形部件名供包含列表过滤
         edge_verts = None
-        if getattr(self, "surface_propagate", True):
-            triangles = self._read_component_triangles(mod_export_path, sections, comp, vertex_count)
-            if triangles is not None:
+        triangles = None
+        tri_part_names = None
+        if any(_zone_propagate(empty.ssmt_drag_zone, self) for _, empty in entries):
+            result = self._read_component_triangles(mod_export_path, sections, comp, vertex_count)
+            if result is not None:
+                triangles, tri_part_names = result
                 edge_verts = gb_core.edges_from_triangles(triangles)
             else:
                 print(f"[DragInteraction][WARNING] {comp['comp_name']} 无法读取 IB 拓扑，沿表面传播回退体积球")
@@ -1366,6 +1515,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         row_indices = np.arange(vertex_count)
         for zone_id, empty in entries:
             settings = empty.ssmt_drag_zone
+            allowed_mask = _zone_allowed_vertex_mask(
+                settings, len(positions), triangles, tri_part_names
+            )
+            if allowed_mask is not None and not np.any(allowed_mask):
+                # 包含列表存在但该组件没有列表内部件 → 本球对此组件零权重
+                continue
             field = self._evaluate_zone_field(
                 positions,
                 empty,
@@ -1374,6 +1529,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 mirror,
                 edge_verts,
                 export_matrix=export_matrix,
+                propagate=_zone_propagate(settings, self),
+                allowed_mask=allowed_mask,
             )
             if field is None:
                 continue
@@ -1550,6 +1707,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         mirror=None,
         edge_verts=None,
         export_matrix=None,
+        propagate=None,
+        allowed_mask=None,
     ):
         """对单个区域空物体求权重场（0..1），含 bbox sanity check。
 
@@ -1557,6 +1716,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         numpy（mathutils.Matrix 可被 np.asarray 转换），便于无 Blender 环境测试。
         edge_verts: 网格边拓扑 (E,2)；surface_propagate 开启且提供时走沿表面传播
         （测地距离，权重不穿透到球体积覆盖的背面/对侧），否则回退体积球欧氏距离。
+        propagate: 本球是否沿表面扩散；None = 跟随节点级 surface_propagate。
+        allowed_mask: (N,) bool 可选，仅对这些顶点施加权重（包含物体列表过滤）。
         """
         try:
             # 空物体世界坐标 → 模组局部空间（必要时先施加非镜像工作流补偿）
@@ -1570,7 +1731,13 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             if export_matrix is not None:
                 ball_matrix = np.asarray(export_matrix, dtype=np.float64).reshape(4, 4) @ ball_matrix
 
-            d = self._zone_distances(positions, ball_matrix, edge_verts)
+            d = self._zone_distances(
+                positions,
+                ball_matrix,
+                edge_verts,
+                propagate=propagate,
+                allowed_mask=allowed_mask,
+            )
             if d is None:
                 return None
             field = np.asarray(
@@ -1591,17 +1758,35 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             print(f"[DragInteraction][WARNING] 区域 {empty.name} 求场失败: {e}")
             return None
 
-    def _zone_distances(self, positions, ball_matrix, edge_verts):
+    def _zone_distances(self, positions, ball_matrix, edge_verts, propagate=None, allowed_mask=None):
         """球局部距离数组：surface_propagate 开启且有拓扑时用沿表面传播距离
         （种子 = 离球心最近的表面顶点/接触点），否则用欧氏距离。矩阵不可逆返回 None。"""
         local = gb_core._to_ball_local(np.asarray(positions, dtype=np.float64), ball_matrix)
         if local is None:
             return None
         d2 = np.einsum("ij,ij->i", local, local)
-        if getattr(self, "surface_propagate", True) and edge_verts is not None and len(edge_verts) > 0:
+        use_propagate = (
+            getattr(self, "surface_propagate", True)
+            if propagate is None
+            else bool(propagate)
+        )
+        if use_propagate and edge_verts is not None and len(edge_verts) > 0:
             seeds = np.zeros(local.shape[0], dtype=bool)
-            seeds[int(np.argmin(d2))] = True
-            return gb_core.surface_distances(local, edge_verts, seeds)
+            if allowed_mask is None:
+                seeds[int(np.argmin(d2))] = True
+            else:
+                allowed = np.asarray(allowed_mask, dtype=bool).reshape(-1)
+                valid_d2 = np.where(allowed, d2, np.inf)
+                if not np.any(np.isfinite(valid_d2)):
+                    return np.full(local.shape[0], np.inf)
+                seeds[int(np.argmin(valid_d2))] = True
+            return gb_core.surface_distances(
+                local, edge_verts, seeds, allowed_mask=allowed_mask
+            )
+        if allowed_mask is not None:
+            d_euclid = np.sqrt(np.maximum(d2, 0.0))
+            d_euclid[~np.asarray(allowed_mask, dtype=bool).reshape(-1)] = np.inf
+            return d_euclid
         return np.sqrt(np.maximum(d2, 0.0))
 
     def _shape_field(self, d, strength, falloff_k, plateau):
@@ -1631,9 +1816,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         return self._shape_field(d, strength, falloff_k, plateau)
 
     def _read_component_triangles(self, mod_export_path, sections, comp, vertex_count):
-        """从组件各 part 的 IB 资源段 filename 读 R32_UINT 索引 → (M,3) 三角形；
+        """从组件各 part 的 IB 资源段 filename 读 R32_UINT 索引 → (M,3) 三角形，
+        并返回与三角形逐行对齐的部件 mesh 名（object 数组，无注释为 None）；
         读不到返回 None（调用方回退体积球）。"""
         tris = []
+        part_name_counts = []
         for part in comp["parts"]:
             res = part.get("ib_resource")
             lines = sections.get(f"[{res}]", [])
@@ -1649,15 +1836,28 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 continue
             try:
                 idx = np.fromfile(full, dtype=np.uint32)
-                tris.append(idx[: (len(idx) // 3) * 3].reshape(-1, 3))
+                t_part = idx[: (len(idx) // 3) * 3].reshape(-1, 3)
+                tris.append(t_part)
+                # 从 mesh 注释提取部件名（如 ; [mesh:LOD0.xxx-1-2.Owner]），
+                # 供包含物体列表过滤：无注释时归为 None（按全部允许处理）
+                comment = part.get("hook_anchor_comment") or ""
+                mesh_match = MESH_COMMENT_RE.match(comment)
+                name = mesh_match.group("object_name") if mesh_match else None
+                part_name_counts.append((name, len(t_part)))
             except Exception:
                 continue
         if not tris:
             return None
         t = np.concatenate(tris, axis=0)
+        tri_part_names = np.repeat(
+            np.asarray([name for name, _count in part_name_counts], dtype=object),
+            [count for _name, count in part_name_counts],
+        )
         if vertex_count:
-            t = t[(t < int(vertex_count)).all(axis=1)]
-        return t if len(t) else None
+            keep = (t < int(vertex_count)).all(axis=1)
+            t = t[keep]
+            tri_part_names = tri_part_names[keep]
+        return (t, tri_part_names) if len(t) else None
 
     def _check_zone_radius_scale(self, zones):
         """影响半径与球尺度失配检查（导出时警告）。
@@ -3076,9 +3276,14 @@ def _preview_signature(n):
             parts.append(None)
             continue
         s = empty.ssmt_drag_zone
+        include_names = tuple(
+            getattr(getattr(item, "object", None), "name", None)
+            for item in getattr(s, "include_objects", ())
+        )
         parts.append((empty.name,
                       tuple(round(v, 6) for v in np.array(empty.matrix_world, dtype=np.float64).reshape(-1)),
-                      s.enabled, round(s.brush_strength, 6), round(s.brush_falloff_k, 6)))
+                      s.enabled, round(s.brush_strength, 6), round(s.brush_falloff_k, 6),
+                      bool(getattr(s, "propagate", True)), include_names))
     return tuple(parts)
 
 
@@ -3089,16 +3294,21 @@ def _preview_uses_surface_distance(node, enabled_zone_count):
     return bool(getattr(node, "surface_propagate", True))
 
 
-def _preview_target_field(node, verts_world, tri, zones, plateau):
+def _preview_target_field(node, verts_world, tri, zones, plateau, target_name=None):
     """按 Blender 当前场景坐标计算单个目标网格的逐顶点合并权重（所见即所得）。
     预览直接使用网格 world 顶点与空物体 world 矩阵，不做任何导出期变换
     （非镜像 X 镜像补偿、参考物体逆、导出空间矩阵）——那些只属于导出烘焙；
-    否则球会被翻到另一侧，沿表面扩散到非当前物体。"""
+    否则球会被翻到另一侧，沿表面扩散到非当前物体。
+    包含物体列表过滤：球未包含当前目标网格时跳过；每球独立决定是否沿表面扩散。"""
     verts_world = np.asarray(verts_world, dtype=np.float64).reshape(-1, 3)
-    if not _preview_uses_surface_distance(node, len(zones)):
+    zones = [z for z in zones if _zone_allowed_by_target(z[1], target_name)]
+    if not zones:
+        return np.zeros(len(verts_world), dtype=np.float64)
+    if not any(_zone_propagate(s, node) for _empty, s in zones):
+        # 全部体积球：无需拓扑，直接欧氏距离
         field = np.zeros(len(verts_world), dtype=np.float64)
         for empty, s in zones:
-            d = node._zone_distances(verts_world, empty.matrix_world, None)
+            d = node._zone_distances(verts_world, empty.matrix_world, None, propagate=False)
             if d is None:
                 continue
             f = node._shape_field(d, s.brush_strength, s.brush_falloff_k, plateau)
@@ -3180,10 +3390,18 @@ def _preview_cached_topology(verts_world, tri, weld_tol=None):
     return value
 
 
-def _preview_zone_distances(node, verts_world, ball_matrix, adjacency, edge_verts):
+def _preview_zone_distances(node, verts_world, ball_matrix, adjacency, edge_verts,
+                            propagate=None, allowed_mask=None):
     """预览沿表面传播距离：均匀缩放球（旋转/平移/等比缩放）复用世界坐标
-    邻接表快速路径；非均匀缩放回退逐球构建。返回球局部距离或 None。"""
+    邻接表快速路径；非均匀缩放回退逐球构建。propagate=None 跟随节点级
+    surface_propagate（旧数据）；allowed_mask 可选，仅允许这些顶点（其余 inf）。"""
     m = np.asarray(ball_matrix, dtype=np.float64).reshape(4, 4)
+    use_propagate = (
+        bool(getattr(node, "surface_propagate", True))
+        if propagate is None
+        else bool(propagate)
+    )
+    allowed = None if allowed_mask is None else np.asarray(allowed_mask, dtype=bool).reshape(-1)
     linear = m[:3, :3]
     col_norms = np.linalg.norm(linear, axis=0)
     scale = float(np.mean(col_norms))
@@ -3192,30 +3410,49 @@ def _preview_zone_distances(node, verts_world, ball_matrix, adjacency, edge_vert
         and np.allclose(col_norms, scale)
         and np.allclose(linear @ linear.T, scale * scale * np.eye(3), atol=1e-4)
     )
-    if uniform and adjacency is not None:
-        return gb_core.surface_distances_uniform_scale(
-            adjacency, verts_world, m[:3, 3], scale
-        )
+    if use_propagate and adjacency is not None and len(edge_verts) > 0:
+        if uniform:
+            return gb_core.surface_distances_uniform_scale(
+                adjacency, verts_world, m[:3, 3], scale, allowed_mask=allowed
+            )
+        local = gb_core._to_ball_local(verts_world, ball_matrix)
+        if local is None:
+            return None
+        d2 = np.einsum("ij,ij->i", local, local)
+        seeds = np.zeros(local.shape[0], dtype=bool)
+        if allowed is None:
+            seeds[int(np.argmin(d2))] = True
+        else:
+            valid_d2 = np.where(allowed, d2, np.inf)
+            if not np.any(np.isfinite(valid_d2)):
+                return np.full(local.shape[0], np.inf)
+            seeds[int(np.argmin(valid_d2))] = True
+        return gb_core.surface_distances(local, edge_verts, seeds, allowed_mask=allowed)
     local = gb_core._to_ball_local(verts_world, ball_matrix)
     if local is None:
         return None
     d2 = np.einsum("ij,ij->i", local, local)
-    if adjacency is None or len(edge_verts) == 0:
-        return np.sqrt(np.maximum(d2, 0.0))
-    seeds = np.zeros(local.shape[0], dtype=bool)
-    seeds[int(np.argmin(d2))] = True
-    return gb_core.surface_distances(local, edge_verts, seeds)
+    d = np.sqrt(np.maximum(d2, 0.0))
+    if allowed is not None:
+        d = np.where(allowed, d, np.inf)
+    return d
 
 
-def _preview_field_from_topology(node, topo, zones, plateau):
-    """对缓存拓扑的顶点集逐区域合并权重：所有区域共享同一邻接表。"""
+def _preview_field_from_topology(node, topo, zones, plateau, allowed_by_zone=None):
+    """对缓存拓扑的顶点集逐区域合并权重：所有区域共享同一邻接表。
+    allowed_by_zone: 可选，与 zones 对齐的每球 allowed 掩码（拓扑节点级），
+    用于合并预览里包含物体列表过滤。"""
     world_pts = topo["world_pts"]
     edge_verts = topo["edge_verts"]
     adjacency = topo["adjacency"]
     field = np.zeros(len(world_pts), dtype=np.float64)
-    for empty, s in zones:
+    for idx, (empty, s) in enumerate(zones):
+        allowed = None if allowed_by_zone is None else allowed_by_zone[idx]
+        if allowed is not None and not np.any(allowed):
+            continue
         d = _preview_zone_distances(
-            node, world_pts, empty.matrix_world, adjacency, edge_verts
+            node, world_pts, empty.matrix_world, adjacency, edge_verts,
+            propagate=_zone_propagate(s, node), allowed_mask=allowed,
         )
         if d is None:
             continue
@@ -3224,11 +3461,13 @@ def _preview_field_from_topology(node, topo, zones, plateau):
     return field
 
 
-def _preview_merged_mesh(node, meshes, zones, plateau, weld_tol=1e-5):
+def _preview_merged_mesh(node, meshes, zones, plateau, mesh_names=None, weld_tol=1e-5):
     """集合预览：把集合内全部网格合并为同一个连续表面再计算沿表面传播。
     共享接缝的顶点（世界坐标差 < weld_tol）会被焊接为同一拓扑节点，
     因此球命中任一部件后能沿表面连续传播到相邻部件；各自独立的部分
-    仍保持不连通。返回与 meshes 对齐的逐网格权重数组列表。"""
+    仍保持不连通。包含物体列表按 mesh_names 生成每球 allowed 掩码：
+    簇内所有顶点都属于列表内网格才允许（阻止沿焊接接缝进入未包含物体）。
+    返回与 meshes 对齐的逐网格权重数组列表。"""
     parts = []
     vertex_offset = 0
     all_verts = []
@@ -3244,9 +3483,48 @@ def _preview_merged_mesh(node, meshes, zones, plateau, weld_tol=1e-5):
     all_verts = np.concatenate(all_verts, axis=0)
     all_tris = np.concatenate(all_tris, axis=0)
     topo = _preview_cached_topology(all_verts, all_tris, weld_tol=weld_tol)
-    cluster_field = _preview_field_from_topology(node, topo, zones, plateau)
-    field_all = cluster_field[topo["cluster_ids"]]
+    allowed_by_zone = _merged_zone_allowed_masks(zones, mesh_names, parts, topo)
+    cluster_field = _preview_field_from_topology(
+        node, topo, zones, plateau, allowed_by_zone=allowed_by_zone
+    )
+    cluster_ids = topo.get("cluster_ids")
+    if cluster_ids is None:
+        cluster_ids = np.arange(len(all_verts))
+    field_all = cluster_field[cluster_ids]
     return [field_all[offset:offset + n] for offset, n in parts]
+
+
+def _merged_zone_allowed_masks(zones, mesh_names, parts, topo):
+    """集合预览：每球生成拓扑节点级 allowed 掩码（长度 = len(topo['world_pts'])）。
+    包含列表为空 → None（全部允许）；否则簇内所有顶点都属于列表内网格才允许，
+    防止沿焊接接缝把权重传播进未包含物体。"""
+    cluster_ids = topo.get("cluster_ids")
+    if cluster_ids is None:
+        cluster_ids = np.arange(sum(n for _offset, n in parts))
+    allowed_by_zone = []
+    for _empty, s in zones:
+        include = getattr(s, "include_objects", None) or ()
+        if not include or not mesh_names:
+            allowed_by_zone.append(None)
+            continue
+        allowed_names = _zone_allowed_names(s)
+        if not allowed_names:
+            allowed_by_zone.append(None)
+            continue
+        vertex_allowed = np.zeros(cluster_ids.shape[0], dtype=bool)
+        for (offset, n), mname in zip(parts, mesh_names):
+            if mname and str(mname) in allowed_names:
+                vertex_allowed[offset:offset + n] = True
+        if not np.any(vertex_allowed):
+            cluster_allowed = np.zeros(int(cluster_ids.max()) + 1, dtype=bool)
+            allowed_by_zone.append(cluster_allowed)
+            continue
+        counts = np.bincount(cluster_ids, minlength=int(cluster_ids.max()) + 1)
+        allowed_counts = np.bincount(
+            cluster_ids, weights=vertex_allowed.astype(np.int64), minlength=int(cluster_ids.max()) + 1
+        )
+        allowed_by_zone.append(allowed_counts == counts)
+    return allowed_by_zone
 
 
 def _rebuild_preview_batches(nodes):
@@ -3265,7 +3543,6 @@ def _rebuild_preview_batches(nodes):
             if empty is None or not empty.ssmt_drag_zone.enabled:
                 continue
             zones.append((empty, empty.ssmt_drag_zone))
-        use_surface_distance = _preview_uses_surface_distance(n, len(zones))
         targets = _preview_targets(n)
         plateau = getattr(n, "mask_plateau", 0.0)
         # 收集每个目标网格的 world 顶点与三角形
@@ -3296,11 +3573,14 @@ def _rebuild_preview_batches(nodes):
                 [(verts_world, tri) for _target, verts_world, tri in mesh_data],
                 zones,
                 plateau,
+                mesh_names=[target.name for target, _verts_world, _tri in mesh_data],
             )
         else:
             fields = [
-                _preview_target_field(n, verts_world, tri, zones, plateau)
-                for _target, verts_world, tri in mesh_data
+                _preview_target_field(
+                    n, verts_world, tri, zones, plateau, target_name=target.name
+                )
+                for target, verts_world, tri in mesh_data
             ]
 
         for (target, verts_world, tri), field in zip(mesh_data, fields):
@@ -3434,11 +3714,14 @@ def _preview_cleanup():
 
 
 classes = (
+    SSMT_DragZoneIncludeRef,
     SSMT_DragZoneSettings,
     SSMT_DragZoneRef,
     SSMT_OT_DragZoneAdd,
     SSMT_OT_DragZoneRemove,
     SSMT_OT_DragZonePage,
+    SSMT_OT_DragZoneIncludeAdd,
+    SSMT_OT_DragZoneIncludeRemove,
     SSMTNode_PostProcess_DragInteraction,
 )
 

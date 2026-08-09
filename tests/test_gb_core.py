@@ -555,6 +555,45 @@ class GeodesicFieldTests(unittest.TestCase):
         self.assertLess(float(np.nanmin(d)), 1.0)
         self.assertGreaterEqual(float(np.nanmax(d)), 1.0)
 
+    def test_surface_distances_allowed_mask_blocks_propagation(self):
+        """allowed_mask：传播不能越过未允许顶点，种子也必须在 allowed 内。"""
+        verts = np.array(
+            [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.2, 0.0, 0.0], [0.3, 0.0, 0.0]]
+        )
+        edges = np.array([[0, 1], [1, 2], [2, 3]])
+        seeds = np.zeros(4, dtype=bool)
+        seeds[0] = True
+        allowed = np.array([True, True, False, True])  # 顶点 2 被排除 → 0-1 与 3 不连通
+        d = gb_core.surface_distances(verts, edges, seeds, allowed_mask=allowed)
+        self.assertTrue(np.isfinite(d[0]))
+        self.assertTrue(np.isfinite(d[1]))
+        self.assertEqual(d[2], np.inf)
+        self.assertEqual(d[3], np.inf)
+
+    def test_surface_distances_allowed_mask_seed_outside_returns_inf(self):
+        """种子在 allowed 外：无可达顶点 → 全部 inf。"""
+        verts = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]])
+        edges = np.array([[0, 1]])
+        seeds = np.array([True, False])
+        allowed = np.array([False, True])
+        d = gb_core.surface_distances(verts, edges, seeds, allowed_mask=allowed)
+        np.testing.assert_array_equal(d, np.full(2, np.inf))
+
+    def test_uniform_scale_allowed_mask_blocks_propagation(self):
+        """快速路径同样遵守 allowed_mask（包含物体列表过滤）。"""
+        verts = np.array(
+            [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.2, 0.0, 0.0]]
+        )
+        edges = np.array([[0, 1], [1, 2]])
+        adj = gb_core.build_surface_adjacency(verts, edges)
+        allowed = np.array([True, True, False])
+        d = gb_core.surface_distances_uniform_scale(
+            adj, verts, np.zeros(3), 0.5, allowed_mask=allowed
+        )
+        self.assertTrue(np.isfinite(d[0]))
+        self.assertTrue(np.isfinite(d[1]))
+        self.assertEqual(d[2], np.inf)
+
     def test_degenerate_inputs(self):
         verts, edges = self._two_strips()
         ball = self._ball()

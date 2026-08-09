@@ -847,18 +847,19 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertEqual([zone_id for zone_id, _ in all_entries], list(range(256)))
 
     def test_zone_page_is_clamped_after_out_of_range_input_and_removal(self):
+        # ZONES_PER_PAGE = 1：一页一个权重球
         node = _make_node(self.mod, zone_objects=[object() for _ in range(17)])
         object.__setattr__(node, "zone_page", 15)
-        self.assertEqual(self.mod._zone_page_state(node), (1, 2))
+        self.assertEqual(self.mod._zone_page_state(node), (15, 17))
         self.assertEqual(node.zone_page, 15)  # draw 路径只读，不在绘制中改 RNA
-        self.assertEqual(self.mod._clamp_zone_page(node), (1, 2))
-        self.assertEqual(node.zone_page, 1)
+        self.assertEqual(self.mod._clamp_zone_page(node), (15, 17))
+        self.assertEqual(node.zone_page, 15)
 
         node.zone_objects.pop()
-        self.assertEqual(self.mod._clamp_zone_page(node), (0, 1))
-        self.assertEqual(node.zone_page, 0)
+        self.assertEqual(self.mod._clamp_zone_page(node), (15, 16))
+        self.assertEqual(node.zone_page, 15)
 
-        self.assertEqual(self.mod._clamp_zone_page(node, -10), (0, 1))
+        self.assertEqual(self.mod._clamp_zone_page(node, -10), (0, 16))
 
     def test_sparse_bake_keeps_four_strongest_zone_weights(self):
         import tempfile
@@ -1601,6 +1602,116 @@ class DragNodePreviewTests(unittest.TestCase):
         )
         d_slow = node._zone_distances(verts, m, edges)
         np.testing.assert_allclose(d_fast, d_slow, atol=1e-12)
+
+
+class DragNodeZoneFilterTests(unittest.TestCase):
+    """球级沿表面扩散开关 + 包含物体列表过滤（烘焙/预览侧）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    def _settings(self, propagate=None, include_names=()):
+        settings = types.SimpleNamespace(
+            enabled=True,
+            brush_strength=1.0,
+            brush_falloff_k=4.6,
+            radius=0.0,
+            strength=0.0,
+            max_offset=0.0,
+            falloff=0.0,
+            damping=0.0,
+            grabbable=True,
+        )
+        if propagate is not None:
+            settings.propagate = propagate
+        if include_names:
+            settings.include_objects = [
+                types.SimpleNamespace(object=types.SimpleNamespace(name=name))
+                for name in include_names
+            ]
+        return settings
+
+    def test_zone_propagate_falls_back_to_node_level(self):
+        mod = self.mod
+        node_off = _make_node(self.mod, surface_propagate=False)
+        node_on = _make_node(self.mod, surface_propagate=True)
+        settings = self._settings()  # 旧数据：无 propagate 属性
+        self.assertFalse(mod._zone_propagate(settings, node_off))
+        self.assertTrue(mod._zone_propagate(settings, node_on))
+        # 新数据：球级开关覆盖节点级
+        self.assertTrue(mod._zone_propagate(self._settings(propagate=True), node_off))
+        self.assertFalse(mod._zone_propagate(self._settings(propagate=False), node_on))
+
+    def test_zone_allowed_by_target(self):
+        mod = self.mod
+        self.assertTrue(mod._zone_allowed_by_target(self._settings(), "A"))  # 空列表 = 全部允许
+        settings = self._settings(include_names=["A"])
+        self.assertTrue(mod._zone_allowed_by_target(settings, "A"))
+        self.assertFalse(mod._zone_allowed_by_target(settings, "B"))
+        # 去重后缀：包含 Body.001 也能命中 Body
+        suffix = self._settings(include_names=["Body.001"])
+        self.assertTrue(mod._zone_allowed_by_target(suffix, "Body"))
+
+    def test_zone_allowed_vertex_mask_filters_by_part_names(self):
+        mod = self.mod
+        triangles = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+        tri_part_names = np.array(["Body", "Head"], dtype=object)
+        settings = self._settings(include_names=["Body"])
+        mask = mod._zone_allowed_vertex_mask(settings, 6, triangles, tri_part_names)
+        np.testing.assert_array_equal(mask, np.array([True, True, True, False, False, False]))
+        # 无注释部件（None）无法判定归属 → 按允许处理，不被列表清零
+        tri_part_names_none = np.array(["Body", None], dtype=object)
+        mask_none = mod._zone_allowed_vertex_mask(settings, 6, triangles, tri_part_names_none)
+        np.testing.assert_array_equal(mask_none, np.ones(6, dtype=bool))
+        # 空列表 / 无拓扑 → None（全允许）
+        self.assertIsNone(mod._zone_allowed_vertex_mask(self._settings(), 6, triangles, tri_part_names))
+        self.assertIsNone(mod._zone_allowed_vertex_mask(settings, 6, None, None))
+
+    def test_preview_target_field_include_list_filters_targets(self):
+        """预览单物体：未包含在列表里的目标网格即使被球命中也不加权。"""
+        mod = self.mod
+        node = _make_node(self.mod, surface_propagate=True)
+        object.__setattr__(node, "mask_plateau", 0.0)
+        ball_matrix = np.eye(4)
+        ball_matrix[:3, 3] = (1.0, 0.0, 0.0)
+        empty = types.SimpleNamespace(
+            name="SSMT_DragZone_0",
+            matrix_world=ball_matrix,
+            ssmt_drag_zone=self._settings(include_names=["A"]),
+        )
+        zones = [(empty, empty.ssmt_drag_zone)]
+        verts = np.array([[0.9, 0.0, 0.0], [1.0, 0.0, 0.0], [1.1, 0.0, 0.0]], dtype=np.float64)
+        tris = np.array([[0, 1, 2]], dtype=np.int64)
+        field_a = mod._preview_target_field(node, verts, tris, zones, 0.0, target_name="A")
+        field_b = mod._preview_target_field(node, verts, tris, zones, 0.0, target_name="B")
+        self.assertGreater(float(field_a.max()), 0.3)
+        np.testing.assert_array_equal(field_b, np.zeros(3))
+
+    def test_preview_merged_mesh_include_list_blocks_non_included_mesh(self):
+        """集合预览：A、B 焊接共享接缝，列表只含 A → 权重不传播进 B。"""
+        mod = self.mod
+        node = _make_node(self.mod, surface_propagate=True)
+        object.__setattr__(node, "mask_plateau", 0.0)
+        empty = types.SimpleNamespace(
+            name="SSMT_DragZone_0",
+            matrix_world=np.diag([0.25, 0.25, 0.25, 1.0]),
+            ssmt_drag_zone=self._settings(include_names=["A"]),
+        )
+        zones = [(empty, empty.ssmt_drag_zone)]
+        verts_a = np.array([[0.1, 0.0, 0.0], [0.15, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=np.float64)
+        tris_a = np.array([[0, 1, 2]], dtype=np.int64)
+        verts_b = np.array([[0.2, 0.0, 0.0], [0.2, 0.1, 0.0], [0.2, 0.2, 0.0]], dtype=np.float64)
+        tris_b = np.array([[0, 1, 2]], dtype=np.int64)
+        fields = mod._preview_merged_mesh(
+            node,
+            [(verts_a, tris_a), (verts_b, tris_b)],
+            zones,
+            0.0,
+            mesh_names=["A", "B"],
+        )
+        self.assertGreater(float(fields[0].max()), 0.0)   # A 命中
+        np.testing.assert_array_equal(fields[1], np.zeros(3))  # B 不被传播
 
 
 class DragNodeMirrorTests(unittest.TestCase):
