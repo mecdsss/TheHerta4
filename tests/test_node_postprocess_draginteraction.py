@@ -605,6 +605,57 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("w79 = 1", cs)
         self.assertIn("x80 = 0.02", cs)
 
+    def test_shapekey_drive_stage_count_auto_derived_from_shapekey_nodes(self):
+        zone = self._zone_item(0)
+        node = _make_node(
+            self.mod,
+            enable_shapekey_drive=True,
+            zone_objects=[zone],
+            shapekey_drive_ramp_rate=0.08,
+            shapekey_drive_release_decay=0.0,
+        )
+        # 同树形态键节点：A 档位 2、B 档位 1、C 未开启拖拽驱动（档位 3 不应计入）
+        sk_a = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_ShapeKey",
+            drag_drive_enabled=True,
+            shapekey_variable_items=[
+                types.SimpleNamespace(shape_key_name="A", drag_click_stage=2),
+            ],
+        )
+        sk_b = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_ShapeKey",
+            drag_drive_enabled=True,
+            shapekey_variable_items=[
+                types.SimpleNamespace(shape_key_name="B", drag_click_stage=1),
+            ],
+        )
+        sk_off = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_ShapeKey",
+            drag_drive_enabled=False,
+            shapekey_variable_items=[
+                types.SimpleNamespace(shape_key_name="C", drag_click_stage=3),
+            ],
+        )
+        node.id_data = types.SimpleNamespace(nodes=[sk_a, sk_b, sk_off])
+        self.assertEqual(node._drag_drive_stage_count(), 2)
+
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        node._emit_present_and_constants(sections, comps, "testns")
+
+        # 区域容量 1 × 档位 2 × 4 方向 = 8
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyDrive_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 8"],
+        )
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyDir_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 9"],
+        )
+        cs = sections["[CustomShaderDragShapeKeyDrive_testns]"]
+        self.assertIn("z79 = 2", cs)
+
     def test_mode_toggle_key_generates_cycle_section(self):
         _, sections, _ = self._emit()
         key_lines = sections["[KeyDragInputManagerModeToggle_testns]"]

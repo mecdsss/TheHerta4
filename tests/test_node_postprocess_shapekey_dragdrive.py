@@ -171,7 +171,7 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
         drag_node = types.SimpleNamespace(
             bl_idname="SSMTNode_PostProcess_DragInteraction",
             enable_shapekey_drive=True,
-            shapekey_drive_stage_count=2,
+            _drag_drive_stage_count=lambda: 2,
             _resolve_namespace=lambda ini: "ns",
         )
         node.id_data = types.SimpleNamespace(nodes=[drag_node])
@@ -252,6 +252,59 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
             content = f.read()
         self.assertNotIn("ShapeKeyDrive", content)
         self.assertIn("IniParams[100 + freq_idx_slot0].x", content)
+
+    def test_drag_drive_fields_hidden_when_toggle_off(self):
+        node = _make_node({"A": 2})
+        calls = []
+
+        class _FakeRow:
+            def row(self, align=False):
+                return self
+
+            def column(self, align=False):
+                return self
+
+            def label(self, text="", icon=""):
+                pass
+
+            def prop(self, data, prop, **kwargs):
+                calls.append((prop, kwargs.get("text", "")))
+
+        fake_row = _FakeRow()
+
+        class _FakeLayout:
+            def row(self, align=False):
+                return fake_row
+
+            def column(self, align=False):
+                return self
+
+            def label(self, text="", icon=""):
+                pass
+
+        ulist = _module.SSMT_UL_ShapeKeyVariableMappings()
+        ulist.layout_type = "DEFAULT"
+
+        # 开关关闭：不绘制区域/档位/方向
+        node.drag_drive_enabled = False
+        ulist.draw_item(
+            None, _FakeLayout(), node, node.shapekey_variable_items[0],
+            "", None, "", 0,
+        )
+        self.assertNotIn(("drag_zone_id", "区域"), calls)
+        self.assertNotIn(("drag_click_stage", "档位"), calls)
+        self.assertNotIn(("drag_dir_id", "方向"), calls)
+
+        # 开关打开：绘制区域/档位/方向
+        calls.clear()
+        node.drag_drive_enabled = True
+        ulist.draw_item(
+            None, _FakeLayout(), node, node.shapekey_variable_items[0],
+            "", None, "", 0,
+        )
+        self.assertIn(("drag_zone_id", "区域"), calls)
+        self.assertIn(("drag_click_stage", "档位"), calls)
+        self.assertIn(("drag_dir_id", "方向"), calls)
 
 
 if __name__ == "__main__":

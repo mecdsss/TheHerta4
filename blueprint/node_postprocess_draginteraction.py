@@ -353,13 +353,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         ],
         default='RAMP',
     )
-    shapekey_drive_stage_count: bpy.props.IntProperty(
-        name="点击档位数",
-        description="同区域内点击次数循环档位数：点击 1 次激活档 1、2 次激活档 2…（每档独立强度，绑定不同形态键）；1=保持单档",
-        default=1,
-        min=1,
-        max=16,
-    )
     shapekey_drive_move_sensitivity: bpy.props.FloatProperty(
         name="位移灵敏度",
         description="鼠标位移控制模式：每像素位移对应的强度增量（向上增、向下减），默认 0.02",
@@ -496,7 +489,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             drive_box.prop(self, "shapekey_drive_input")
             if self.shapekey_drive_input == 'MOUSE':
                 drive_box.prop(self, "shapekey_drive_move_sensitivity", text="位移灵敏度")
-            drive_box.prop(self, "shapekey_drive_stage_count", text="点击档位数")
+            drive_box.label(text="点击档位数：由各形态键节点配置的最大点击档位自动推导", icon='INFO')
             drive_box.label(text="仅命中模式：命中区域按住左键/X，按点击档位与移动方向驱动对应形态键强度", icon='INFO')
 
         runtime_box = layout.box()
@@ -1758,6 +1751,26 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     def _zone_capacity(entries):
         return max(1, max((zone_id for zone_id, _ in entries), default=0) + 1)
 
+    def _drag_drive_stage_count(self):
+        """自动推导点击档位数：扫描同树所有开启拖拽驱动的形态键节点，取 drag_click_stage 最大值，最少 1。"""
+        tree = getattr(self, "id_data", None)
+        if tree is None:
+            return 1
+        max_stage = 1
+        for node in getattr(tree, "nodes", None) or []:
+            if getattr(node, "bl_idname", "") != "SSMTNode_PostProcess_ShapeKey":
+                continue
+            if not getattr(node, "drag_drive_enabled", False):
+                continue
+            for item in getattr(node, "shapekey_variable_items", None) or []:
+                try:
+                    stage = int(getattr(item, "drag_click_stage", 1) or 1)
+                except Exception:
+                    stage = 1
+                if stage > max_stage:
+                    max_stage = stage
+        return max_stage
+
     # =======================================================================
     # 段生成（CustomShader / CommandList / Resource）与钩子注入、Present/Constants
     # =======================================================================
@@ -1806,7 +1819,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         }
         if getattr(self, "enable_shapekey_drive", False):
             _drive_capacity = self._zone_capacity(self._collect_enabled_zone_entries())
-            _stage_count = max(1, int(getattr(self, "shapekey_drive_stage_count", 1)))
+            _stage_count = self._drag_drive_stage_count()
             _dir_count = 4  # 上/右/下/左（对齐 UI 构造器方向数量=4）
             global_resources[f"[ResourceDragShapeKeyDrive_{ns}]"] = [
                 "type = RWBuffer", "format = R32_FLOAT",
@@ -2192,7 +2205,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"x78 = $ssmtdrag_x_down_{ns}",
             "x79 = $ssmtdrag_shapekey_dy_" + ns,
             "y79 = $ssmtdrag_shapekey_dx_" + ns,
-            f"z79 = {max(1, int(getattr(self, 'shapekey_drive_stage_count', 1)))}",
+            f"z79 = {self._drag_drive_stage_count()}",
             f"w79 = {1 if getattr(self, 'shapekey_drive_input', 'RAMP') == 'MOUSE' else 0}",
             "x80 = " + self._fmt(self.shapekey_drive_move_sensitivity),
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",

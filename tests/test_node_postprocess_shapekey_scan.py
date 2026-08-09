@@ -44,6 +44,7 @@ _fake_bpy = types.SimpleNamespace(
         StringProperty=lambda **_kwargs: None,
         BoolProperty=lambda **_kwargs: None,
         IntProperty=lambda **_kwargs: None,
+        EnumProperty=lambda **_kwargs: None,
         CollectionProperty=lambda **_kwargs: None,
     ),
     data=types.SimpleNamespace(objects={}),
@@ -428,6 +429,7 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
             _FakeItem("B", "Freq_B", "Manual_B"),
         ]
         node.shapekey_variable_index = 0
+        node.drag_drive_enabled = False
 
         calls = []
 
@@ -437,6 +439,9 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
         class _FakeBox:
             def label(self, *args, **kwargs):
                 calls.append(("label", args, kwargs))
+
+            def prop(self, *args, **kwargs):
+                calls.append(("prop", args, kwargs))
 
             def template_list(self, *args, **kwargs):
                 calls.append(("template_list", args, kwargs))
