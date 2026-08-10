@@ -2999,16 +2999,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         interaction_gate_lines.extend([
             "endif",
         ])
-        # 形态键驱动只在“仅命中”模式（1）下生效；关闭(0)/命中+拖拽交互(2)时清零缓冲
-        if getattr(self, "enable_shapekey_drive", False):
-            interaction_gate_lines.extend([
-                f"if {drag_mode_var} != 1",
-                f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0",
-                f"\tclear = ResourceDragShapeKeyDir_{ns} 0.0",
-                f"\tclear = ResourceDragShapeKeyClickCount_{ns}",
-                f"\tclear = ResourceDragShapeKeyActiveDir_{ns}",
-                "endif",
-            ])
+        # 形态键驱动只在“仅命中”模式（1）下生效；其余模式不驱动但保持当前数值
+        # （驱动 CS 内已有 mode != 1 时保持的处理，此处不再清零）
         interaction_gate_lines.extend([
             f"if {drag_mode_var} < 1",
             f"\t$ObjectDetectAllowed_{ns} = 0",

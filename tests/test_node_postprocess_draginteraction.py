@@ -572,9 +572,10 @@ class DragNodeEmitTests(unittest.TestCase):
             i for i, line in enumerate(present) if "--- DRAG INTERACTION GATE BEGIN ---" in line
         )
         gate_block = present[gate_idx:gate_idx + 80]
-        mode_idx = gate_block.index("if $ssmtdrag_drag_enabled_testns != 1")
-        self.assertIn("\tclear = ResourceDragShapeKeyDrive_testns 0.0", gate_block[mode_idx:mode_idx + 4])
-        self.assertIn("\tclear = ResourceDragShapeKeyDir_testns 0.0", gate_block[mode_idx:mode_idx + 4])
+        # 形态键缓冲只在 boot 清零；模式切换不再清零，保证任意模式都保持已调整的数值
+        self.assertNotIn("if $ssmtdrag_drag_enabled_testns != 1", gate_block)
+        self.assertNotIn("clear = ResourceDragShapeKeyDrive_testns 0.0", gate_block)
+        self.assertNotIn("clear = ResourceDragShapeKeyClickCount_testns", gate_block)
 
     def test_shapekey_drive_mouse_displacement_present_lines(self):
         zone = self._zone_item(0)

@@ -15,8 +15,10 @@
 //     zone's click count in 0..N cycle (0 = inactive/cleared); the matching
 //     stage slot is set to 1 and held until cleared or another stage is
 //     active. No mouse displacement is involved.
-// Release or leaving the zone holds the current value. In mode 0 (off) and
-// mode 2 (hit + physical drag interaction) all buffers are zeroed.
+// Release or leaving the zone holds the current value. Buffers are never
+// cleared by mode switches: mode 1 is the only mode that can drive them,
+// and every other mode (0/2) holds the current values so adjusted
+// intensities are inherited when switching back to mode 1.
 //
 // The shape-key compute shader binds the same buffers as SRVs
 // (Buffer<float> ShapeKeyDrive, Buffer<uint> ClickCount) and uses them as the
@@ -101,19 +103,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         if (dirWeight[d] > bestW) { bestW = dirWeight[d]; activeDir = d; }
     }
 
-    // 仅在“仅命中”模式（1）下驱动；其余模式（0/2）清零
+    // 仅“仅命中”模式（1）下驱动；其余模式（0/2）不清零、不驱动，保持当前数值
     if (mode != 1.0)
     {
-        for (uint zeroIdx = 0u; zeroIdx < driveSlots; ++zeroIdx)
-        {
-            ShapeKeyDrive[zeroIdx] = 0.0;
-            ShapeKeyDir[zeroIdx] = 0.0;
-        }
-        for (uint zeroZone = 0u; zeroZone < zoneCount; ++zeroZone)
-        {
-            ClickCount[zeroZone] = 0u;
-            ActiveDir[zeroZone] = 0u;
-        }
+        // 仍更新上一帧按键状态槽，保证切回模式 1 时按下沿检测准确
         ShapeKeyDir[lastSlot] = triggerHeld ? 1.0 : 0.0;
         return;
     }
