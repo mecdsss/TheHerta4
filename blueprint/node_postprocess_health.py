@@ -173,7 +173,7 @@ endif
 
 [Present]
 if $IsTargetOnScreen && $IsCombat
-    store = $TempHealth, ref ResourceHealthBuffer, 45
+    store = $TempHealth, ResourceHealthBuffer, 45
 
     $Health = $TempHealth
 

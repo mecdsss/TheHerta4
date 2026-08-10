@@ -1759,7 +1759,8 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 new_lines.extend(fx_lines)
 
             alpha_value = transparency_value if transparency_value else "1.0"
-            new_lines.append("${}TTL{}alpha = {}".format(chr(92), chr(92), alpha_value))
+            alpha_var = self._ttl_ensure_alpha_variable(alpha_value, all_sections)
+            new_lines.append("${}TTL{}alpha = {}".format(chr(92), chr(92), alpha_var))
 
             if cond_if_indexes:
                 cond_block = []
@@ -1792,6 +1793,30 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             all_sections.pop(section_name, None)
 
         return next_swap_key_num
+
+    @staticmethod
+    def _ttl_normalize_alpha(alpha_value):
+        try:
+            return str(float(str(alpha_value)))
+        except (TypeError, ValueError):
+            return str(alpha_value)
+
+    @classmethod
+    def _ttl_alpha_var_name(cls, alpha_value):
+        normalized = cls._ttl_normalize_alpha(alpha_value)
+        token = normalized.replace(".", "_")
+        return f"$TTLAlpha{token}", normalized
+
+    def _ttl_ensure_alpha_variable(self, alpha_value, all_sections):
+        var_name, normalized = self._ttl_alpha_var_name(alpha_value)
+        constants_key = '[Constants]'
+        if constants_key not in all_sections:
+            all_sections[constants_key] = []
+        definition = f"global {var_name} = {normalized}"
+        existing = {str(line).strip() for line in all_sections[constants_key]}
+        if definition not in existing:
+            all_sections[constants_key].append(definition)
+        return var_name
 
     @staticmethod
     def _cleanup_empty_if_blocks(lines):

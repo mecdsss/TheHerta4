@@ -666,6 +666,235 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("cs-t68 = ResourceDragShapeKeyZoneStageCounts_testns", cs)
         self.assertNotIn("z79", cs)
 
+    @staticmethod
+    def _fake_sk_node(items, enabled=True):
+        return types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_ShapeKey",
+            drag_drive_enabled=enabled,
+            shapekey_variable_items=[
+                types.SimpleNamespace(
+                    shape_key_name=name,
+                    drag_zone_id=zone,
+                    drag_dir_id=dir_id,
+                    drag_click_stage=stage,
+                )
+                for name, zone, dir_id, stage in items
+            ],
+            get_shape_key_export_variable_name=lambda name: f"$Freq_{name}",
+        )
+
+    def test_shapekey_var_sync_bindings_slot_layout(self):
+        zone = self._zone_item(0)
+        node = _make_node(
+            self.mod,
+            enable_shapekey_drive=True,
+            zone_objects=[zone],
+        )
+        # A 无方向档位 2 → 槽 4+(2-1)=5；B 方向 0 → 槽 0；C 未绑定区域跳过；D 节点未开启跳过
+        node.id_data = types.SimpleNamespace(nodes=[
+            self._fake_sk_node([("A", 0, "-1", 2)]),
+            self._fake_sk_node([("B", 0, "0", 3)]),
+            self._fake_sk_node([("C", -1, "-1", 1)]),
+            self._fake_sk_node([("D", 0, "-1", 1)], enabled=False),
+        ])
+        bindings = node._drag_drive_var_sync_bindings()
+        self.assertEqual(bindings, [
+            ("$Freq_A", 5, 0, 2),
+            ("$Freq_B", 0, 0, -1),
+        ])
+
+    def test_shapekey_var_sync_sections_and_present_run(self):
+        zone = self._zone_item(0)
+        node = _make_node(
+            self.mod,
+            enable_shapekey_drive=True,
+            zone_objects=[zone],
+        )
+        node.id_data = types.SimpleNamespace(nodes=[
+            self._fake_sk_node([("A", 0, "-1", 2), ("B", 0, "0", 1)]),
+        ])
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        node._emit_present_and_constants(sections, comps, "testns")
+
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyVarPrev_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 2"],
+        )
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyVarSyncMap_testns]"],
+            ["type = Buffer", "format = R32G32B32A32_UINT",
+             "filename = res/drag_interaction/ShapeKeyVarSyncMap_testns.buf"],
+        )
+        # 拖拽激活标志（每区域）：同步 CS 每帧按命中判定重算，CPU store 直接读取
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyZoneActive_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
+        )
+        # 无镜像/克隆等中间层（store 对任意 D3D11 缓冲成立，直接读源缓冲）
+        self.assertNotIn("[ResourceDragShapeKeyVarReadback_testns]", sections)
+        self.assertNotIn("[ResourceDragShapeKeyVarRBCopy_testns]", sections)
+        self.assertNotIn("[ResourceDragShapeKeyZoneActiveCopy_testns]", sections)
+
+        cs = sections["[CustomShaderDragShapeKeyVarSync_testns]"]
+        self.assertIn("cs = res/drag_interaction/rzm_shapekey_var_sync.hlsl", cs)
+        # 门控输入固定 IniParams[75]（模式/按住/绘制/输入模式）
+        self.assertIn("x75 = $ssmtdrag_drag_enabled_testns", cs)
+        self.assertIn("y75 = $ssmtdrag_skheld_testns", cs)
+        self.assertIn("z75 = $ssmtdrag_drawn_testns", cs)
+        self.assertIn("w75 = $inputMode", cs)
+        # 变量 4 个一组打包进 IniParams[81+]
+        self.assertIn("x81 = $Freq_A", cs)
+        self.assertIn("y81 = $Freq_B", cs)
+        self.assertNotIn("$ssmtdrag_skrb", "\n".join(cs))
+        self.assertIn("cs-t67 = ResourceDragPinnedDetectInfo_testns", cs)
+        self.assertIn("cs-t69 = ResourceDragShapeKeyVarSyncMap_testns", cs)
+        self.assertIn("cs-u0 = ResourceDragShapeKeyDrive_testns", cs)
+        self.assertIn("cs-u1 = ResourceDragShapeKeyClickCount_testns", cs)
+        self.assertIn("cs-u2 = ResourceDragShapeKeyVarPrev_testns", cs)
+        self.assertNotIn("cs-u3", "\n".join(cs))
+        self.assertIn("cs-u4 = ResourceDragShapeKeyZoneActive_testns", cs)
+        self.assertIn("dispatch = 1, 1, 1", cs)
+        self.assertIn("post cs-t67 = null", cs)
+        self.assertIn("post cs-u4 = null", cs)
+
+        pin = sections["[CommandListDragPinDetected_testns]"]
+        self.assertIn("\tclear = ResourceDragShapeKeyVarPrev_testns 0.0", pin)
+        self.assertIn("\tclear = ResourceDragShapeKeyZoneActive_testns 0.0", pin)
+        self.assertNotIn("ResourceDragShapeKeyVarReadback_testns", "\n".join(pin))
+        self.assertNotIn("$ssmtdrag_skcd_testns", "\n".join(pin))
+
+        present = "\n".join(sections["[Present]"])
+        self.assertIn("run = CustomShaderDragShapeKeyVarSync_testns", present)
+        self.assertIn("$ssmtdrag_skheld_testns = 0", present)
+        self.assertIn(
+            "if $ssmtdrag_mode_testns == 1 && ($ssmtdrag_lmb_down_testns == 1 || $ssmtdrag_x_down_testns == 1)",
+            present,
+        )
+        # store 回读放在命名命令列表内、pre run 调用（对齐血量库 hp.ini 形态）
+        self.assertIn("pre run = CommandListDragShapeKeyVarReadback_testns", present)
+
+        rb = "\n".join(sections["[CommandListDragShapeKeyVarReadback_testns]"])
+        # store 直接读源缓冲（无镜像/克隆）
+        self.assertNotIn(" = copy ", rb)
+        # 分时互斥：仅在对应区域拖拽激活（ZoneActive 标志）时才回读
+        self.assertIn("store = $ssmtdrag_skact_testns_0, ResourceDragShapeKeyZoneActive_testns, 0", rb)
+        self.assertIn("if $ssmtdrag_skact_testns_0 >= 1", rb)
+        # A 绑定区域0 档位2 → 驱动槽 4+(2-1)=5
+        self.assertIn("store = $ssmtdrag_skrb_testns_0, ResourceDragShapeKeyDrive_testns, 5", rb)
+        self.assertIn("$Freq_A = $ssmtdrag_skrb_testns_0", rb)
+        self.assertIn("$ssmtdrag_skprev_testns_0 = $ssmtdrag_skrb_testns_0", rb)
+        self.assertIn("$ssmtdrag_skcd_testns_0 = 6", rb)
+        # 释放沉淀：驱动器抢先步进（编辑沿）则立即交还控制权
+        self.assertIn("elif $ssmtdrag_skcd_testns_0 > 0", rb)
+        self.assertIn("if $Freq_A != $ssmtdrag_skprev_testns_0", rb)
+        # B 绑定同属区域 0 → 同一标志索引；方向 0 → 驱动槽 0
+        self.assertIn("store = $ssmtdrag_skact_testns_1, ResourceDragShapeKeyZoneActive_testns, 0", rb)
+        self.assertIn("store = $ssmtdrag_skrb_testns_1, ResourceDragShapeKeyDrive_testns, 0", rb)
+        self.assertIn("$Freq_B = $ssmtdrag_skrb_testns_1", rb)
+        self.assertNotIn("skrbp", rb)
+
+        constants = "\n".join(sections["[Constants]"])
+        self.assertIn("global $ssmtdrag_skheld_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_skact_testns_0 = 0", constants)
+        self.assertIn("global $ssmtdrag_skrb_testns_0 = 0", constants)
+        self.assertIn("global $ssmtdrag_skprev_testns_0 = 0", constants)
+        self.assertIn("global $ssmtdrag_skcd_testns_0 = 0", constants)
+        self.assertIn("global $ssmtdrag_skrb_testns_1 = 0", constants)
+        self.assertNotIn("skrbp", constants)
+
+    def test_shapekey_var_sync_skipped_without_bindings(self):
+        zone = self._zone_item(0)
+        node = _make_node(
+            self.mod,
+            enable_shapekey_drive=True,
+            zone_objects=[zone],
+        )
+        # 同树没有任何形态键节点 → 无绑定，不生成同步资源/段/运行行
+        node.id_data = types.SimpleNamespace(nodes=[])
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        node._emit_present_and_constants(sections, comps, "testns")
+
+        self.assertNotIn("[ResourceDragShapeKeyVarPrev_testns]", sections)
+        self.assertNotIn("[ResourceDragShapeKeyVarSyncMap_testns]", sections)
+        self.assertNotIn("[ResourceDragShapeKeyVarReadback_testns]", sections)
+        self.assertNotIn("[ResourceDragShapeKeyZoneActive_testns]", sections)
+        self.assertNotIn("[ResourceDragShapeKeyVarRBCopy_testns]", sections)
+        self.assertNotIn("[ResourceDragShapeKeyZoneActiveCopy_testns]", sections)
+        self.assertNotIn("[CustomShaderDragShapeKeyVarSync_testns]", sections)
+        self.assertNotIn("[CommandListDragShapeKeyVarReadback_testns]", sections)
+        pin = sections["[CommandListDragPinDetected_testns]"]
+        self.assertNotIn("ResourceDragShapeKeyVarPrev_testns", "\n".join(pin))
+        self.assertNotIn("$ssmtdrag_skcd_testns", "\n".join(pin))
+        present = "\n".join(sections["[Present]"])
+        self.assertNotIn("CustomShaderDragShapeKeyVarSync_testns", present)
+        self.assertNotIn("$ssmtdrag_skrb_testns", present)
+        constants = "\n".join(sections["[Constants]"])
+        self.assertNotIn("$ssmtdrag_skrb_testns", constants)
+        self.assertNotIn("$ssmtdrag_skact_testns", constants)
+        self.assertNotIn("$ssmtdrag_skheld_testns", constants)
+
+    def test_shapekey_var_sync_map_baked_to_buf(self):
+        import tempfile
+        zone = self._zone_item(0)
+        node = _make_node(
+            self.mod,
+            enable_shapekey_drive=True,
+            zone_objects=[zone],
+        )
+        node.id_data = types.SimpleNamespace(nodes=[
+            self._fake_sk_node([("A", 0, "-1", 2), ("B", 0, "0", 1)]),
+        ])
+        out_dir = tempfile.mkdtemp(prefix="drag_var_sync_test_")
+        try:
+            node._write_zone_resources(out_dir, "testns")
+            buf_path = os.path.join(
+                out_dir, "res", "drag_interaction", "ShapeKeyVarSyncMap_testns.buf")
+            self.assertTrue(os.path.isfile(buf_path))
+            data = np.fromfile(buf_path, dtype=np.uint32)
+            # A：槽 5、区域 0、档位 2；B：槽 0、区域 0、方向键档位哨兵 0xFFFFFFFF
+            self.assertEqual(
+                data.tolist(),
+                [5, 0, 2, 0, 0, 0, 0xFFFFFFFF, 0],
+            )
+        finally:
+            import shutil
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+    def test_shapekey_var_sync_shader_structure(self):
+        shader_path = os.path.join("Toolset", "drag_interaction", "rzm_shapekey_var_sync.hlsl")
+        if not os.path.exists(shader_path):
+            self.skipTest("shader missing")
+        with open(shader_path, encoding="utf-8") as f:
+            content = f.read()
+        # 与驱动 CS 共享 ShapeKeyDrive / ClickCount，自带 prev 值缓冲做变更检测，
+        # 激活标志为 RWBuffer（u4）；无镜像缓冲（store 直接读源缓冲）
+        self.assertIn("RWBuffer<float> ShapeKeyDrive       : register(u0);", content)
+        self.assertIn("RWBuffer<uint>  ClickCount          : register(u1);", content)
+        self.assertIn("RWBuffer<float> VarSyncPrev         : register(u2);", content)
+        self.assertIn("RWBuffer<float> ZoneActive          : register(u4);", content)
+        self.assertIn("Buffer<uint4>   VarSyncMap          : register(t69);", content)
+        self.assertIn("StructuredBuffer<float4> PinnedDetectInfo : register(t67);", content)
+        self.assertNotIn("RWBuffer<float> VarReadback", content)
+        # 变量 4 个一组打包：从 IniParams[81] 起（76-80 为驱动 CS 占用）
+        self.assertIn("#define VAR_SYNC_INIPARAM_BASE 81", content)
+        self.assertIn("#define VAR_SYNC_GATE_PARAMS 75", content)
+        self.assertIn("IniParams[VAR_SYNC_INIPARAM_BASE + (i >> 2)][i & 3]", content)
+        # 与驱动 CS 同一命中判定，每帧重算每区域激活标志
+        self.assertIn("ZoneActive[z] = (hasHit && z == hoverZone) ? 1.0 : 0.0;", content)
+        # 仅在变量真实变化时处理（不变则不覆写拖拽结果）
+        self.assertIn("if (abs(raw - VarSyncPrev[i]) <= 1e-6)", content)
+        self.assertIn("VarSyncPrev[i] = raw;", content)
+        # 区域拖拽激活中：变量→缓冲写入挂起（防驱动器中途拽走缓冲）
+        self.assertIn("if (zone < clickSlots && ZoneActive[zone] > 0.5)", content)
+        self.assertIn("ShapeKeyDrive[slot] = v;", content)
+        # 无方向档位：变量非 0 打开对应档位，归 0 时仅清空本档位
+        self.assertIn("ClickCount[zone] = ndStage;", content)
+        self.assertIn("ClickCount[zone] = 0u;", content)
+
     def test_shapekey_drive_shader_stage_cycle_and_no_direction_set(self):
         shader_path = os.path.join("Toolset", "drag_interaction", "rzm_shapekey_drive.hlsl")
         if not os.path.exists(shader_path):
@@ -1058,11 +1287,11 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("global $ssmtdrag_ui_detected_testns = -1", constants)
         self.assertIn("global $ssmtdrag_ui_zone_testns = -1", constants)
         self.assertIn(
-            "store = $ssmtdrag_ui_detected_testns, ref ResourceDragPinnedDetectID_testns, 0",
+            "store = $ssmtdrag_ui_detected_testns, ResourceDragPinnedDetectID_testns, 0",
             readback,
         )
         self.assertIn(
-            "store = $ssmtdrag_ui_zone_testns, ref ResourceDragPinnedDetectInfo_testns, 31",
+            "store = $ssmtdrag_ui_zone_testns, ResourceDragPinnedDetectInfo_testns, 31",
             readback,
         )
         self.assertIn("if $ssmtdrag_ui_detected_testns >= 0", readback)
@@ -1126,8 +1355,8 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("if $custom_drag_mode >= 1", pin)
         self.assertIn("if $custom_drag_mode >= 1", hook)
         self.assertIn("if $custom_drag_mode >= 2", hook)
-        self.assertIn("store = $custom_hit_id, ref ResourceDragPinnedDetectID_testns, 0", readback)
-        self.assertIn("store = $custom_zone_id, ref ResourceDragPinnedDetectInfo_testns, 31", readback)
+        self.assertIn("store = $custom_hit_id, ResourceDragPinnedDetectID_testns, 0", readback)
+        self.assertIn("store = $custom_zone_id, ResourceDragPinnedDetectInfo_testns, 31", readback)
 
     def test_drag_runtime_switch_defaults_on_and_upgrades_legacy_present(self):
         node, sections, comps = self._emit()

@@ -46,6 +46,7 @@ SHADER_FILES = (
     "rzm_jiggle_screen_state.hlsl",
     "rzm_jiggle_interaction.hlsl",
     "rzm_shapekey_drive.hlsl",
+    "rzm_shapekey_var_sync.hlsl",
 )
 HAND_SHADER_FILES = ("rzm_jiggle_cursor_preview.hlsl", "rzm_jiggle_hand.hlsl", "rzm_jiggle_cursor.hlsl")
 # 手部网格/法线资产（二进制，原样复制）
@@ -1429,6 +1430,18 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             _total_slots, _zone_bases, _zone_stage_counts = self._drag_drive_buffer_layout()
             stage_counts = np.array(_zone_stage_counts, dtype=np.uint32)
             stage_counts.tofile(os.path.join(res_dir, f"ZoneStageCounts_{ns}.buf"))
+            sync_bindings = self._drag_drive_var_sync_bindings()
+            if sync_bindings:
+                # 变量同步映射表：每绑定 4×uint32 = (驱动槽位, 区域 ID, 无方向档位, 保留)；
+                # 方向形态键无档位概念，nd_stage 以 0xFFFFFFFF 哨兵表示
+                sync_map = np.array(
+                    [
+                        (slot, zone, 0xFFFFFFFF if nd_stage < 0 else nd_stage, 0)
+                        for _var, slot, zone, nd_stage in sync_bindings
+                    ],
+                    dtype=np.uint32,
+                )
+                sync_map.tofile(os.path.join(res_dir, f"ShapeKeyVarSyncMap_{ns}.buf"))
         legacy_path_vectors = os.path.join(res_dir, "PathVectors.buf")
         if os.path.isfile(legacy_path_vectors):
             os.remove(legacy_path_vectors)
@@ -1972,6 +1985,52 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             running += 4 + stage_count
         return running, zone_bases, zone_stage_counts
 
+    def _drag_drive_var_sync_bindings(self):
+        """扫描同树开启拖拽驱动的形态键节点，收集「导出变量 → 驱动缓冲槽位」同步绑定。
+        返回 [(var_name, slot_id, zone_id, nd_stage), ...]，按节点/项顺序稳定排列：
+        var_name 带 $ 前缀（与形态键节点写入 IniParams 的变量一致，同一分配入口保证同名）；
+        nd_stage 为无方向档位数（>=1），方向形态键为 -1（烘焙时映射为 0xFFFFFFFF）。
+        槽位布局与形态键着色器 SHAPEKEY_SLOT_IDS 的 CPU 前缀和完全一致。"""
+        tree = getattr(self, "id_data", None)
+        if tree is None:
+            return []
+        _total_slots, zone_bases, _zone_stage_counts = self._drag_drive_buffer_layout()
+        bindings = []
+        for node in getattr(tree, "nodes", None) or []:
+            if getattr(node, "bl_idname", "") != "SSMTNode_PostProcess_ShapeKey":
+                continue
+            if not getattr(node, "drag_drive_enabled", False):
+                continue
+            get_var_name = getattr(node, "get_shape_key_export_variable_name", None)
+            if get_var_name is None:
+                continue
+            for item in getattr(node, "shapekey_variable_items", None) or []:
+                try:
+                    zone = int(getattr(item, "drag_zone_id", -1))
+                except Exception:
+                    zone = -1
+                if zone < 0 or zone >= len(zone_bases):
+                    continue
+                try:
+                    dir_val = int(getattr(item, "drag_dir_id", "-1") or "-1")
+                except Exception:
+                    dir_val = -1
+                if 0 <= dir_val < 4:
+                    slot_id = zone_bases[zone] + dir_val
+                    nd_stage = -1
+                else:
+                    try:
+                        stage = int(getattr(item, "drag_click_stage", 1) or 1)
+                    except Exception:
+                        stage = 1
+                    nd_stage = max(1, stage)
+                    slot_id = zone_bases[zone] + 4 + (nd_stage - 1)
+                var_name = get_var_name(getattr(item, "shape_key_name", "") or "")
+                if not var_name:
+                    continue
+                bindings.append((var_name, slot_id, zone, nd_stage))
+        return bindings
+
     # =======================================================================
     # 段生成（CustomShader / CommandList / Resource）与钩子注入、Present/Constants
     # =======================================================================
@@ -2045,6 +2104,29 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "type = Buffer", "format = R32_UINT",
                 f"filename = {res}/ZoneStageCounts_{ns}.buf",
             ]
+            # 变量→驱动缓冲同步（绑定项非空时生成）：prev 值缓冲用于变更检测，
+            # 映射表为导出期烘焙的静态 Buffer（每绑定 4×uint32）
+            sync_bindings = self._drag_drive_var_sync_bindings()
+            if sync_bindings:
+                global_resources[f"[ResourceDragShapeKeyVarPrev_{ns}]"] = [
+                    "type = RWBuffer", "format = R32_FLOAT",
+                    f"array = {len(sync_bindings)}",
+                ]
+                global_resources[f"[ResourceDragShapeKeyVarSyncMap_{ns}]"] = [
+                    "type = Buffer", "format = R32G32B32A32_UINT",
+                    f"filename = {res}/ShapeKeyVarSyncMap_{ns}.buf",
+                ]
+                # 拖拽激活标志（每区域）：同步 CS 每帧按命中判定重算（仅命中模式+绘制+
+                # 按住+命中区域），门控 CPU 回读与变量→缓冲写入，实现两写入方分时互斥。
+                # CPU 经 store 直接读取（store = $var, <资源名>, <float 索引>，
+                # 不能带 ref 关键字——分词器会把 ref 交给 GetTarget 报 Unknown target，
+                # 整条 store 行在加载期被静默丢弃）；
+                # 需要含 StoreCommand 的 ZZMI 构建——旧构建（如 8/4 前）不含该实现，
+                # 此时 store 行在加载期被丢弃，本链路静默失效但其余功能不受影响）
+                global_resources[f"[ResourceDragShapeKeyZoneActive_{ns}]"] = [
+                    "type = RWBuffer", "format = R32_FLOAT",
+                    f"array = {_drive_capacity}",
+                ]
         for sec, lines in global_resources.items():
             sections.setdefault(sec, lines)
 
@@ -2091,6 +2173,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         self._emit_update_screen_jiggle_section(sections, ns)
         if getattr(self, "enable_shapekey_drive", False):
             self._emit_shapekey_drive_section(sections, ns)
+            self._emit_shapekey_var_sync_section(sections, ns)
+            self._emit_shapekey_var_readback_command_list(sections, ns)
         self._emit_command_lists(sections, components, ns)
 
         # ---- 手型光标（S8）：资源 + 绘制段 ----
@@ -2424,6 +2508,94 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "post cs-u3 = null",
         ]
 
+    # ---- ShapeKeyVarSync：变量变化时把当前强度实时写入 ShapeKeyDrive 缓冲 ----
+
+    def _emit_shapekey_var_sync_section(self, sections, ns):
+        bindings = self._drag_drive_var_sync_bindings()
+        if not bindings:
+            return
+        sec = f"[CustomShaderDragShapeKeyVarSync_{ns}]"
+        if sec in sections:
+            return
+        drag_mode_var = self._runtime_variable_names(ns)[0]
+        # IniParams 打包：驱动 CS 用 76-80、形态键动画 CS 用 100+，同步段从 81 起，
+        # 每 float4 装 4 个变量，着色器按 [81 + i/4][i%4] 读取；
+        # 门控输入固定 IniParams[75]（低于驱动 CS 段，不与其他段冲突）
+        lines = [
+            f"cs = {RES_SHADER_DIR}/rzm_shapekey_var_sync.hlsl",
+            f"x75 = {drag_mode_var}",
+            f"y75 = $ssmtdrag_skheld_{ns}",
+            f"z75 = $ssmtdrag_drawn_{ns}",
+            "w75 = $inputMode",
+        ]
+        for i, (var_name, _slot, _zone, _nd_stage) in enumerate(bindings):
+            lines.append(f"{'xyzw'[i % 4]}{81 + i // 4} = {var_name}")
+        lines.extend([
+            f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
+            f"cs-t69 = ResourceDragShapeKeyVarSyncMap_{ns}",
+            f"cs-u0 = ResourceDragShapeKeyDrive_{ns}",
+            f"cs-u1 = ResourceDragShapeKeyClickCount_{ns}",
+            f"cs-u2 = ResourceDragShapeKeyVarPrev_{ns}",
+            f"cs-u4 = ResourceDragShapeKeyZoneActive_{ns}",
+            "dispatch = 1, 1, 1",
+            "post cs-t67 = null",
+            "post cs-t69 = null",
+            "post cs-u0 = null",
+            "post cs-u1 = null",
+            "post cs-u2 = null",
+            "post cs-u4 = null",
+        ])
+        sections[sec] = lines
+
+    # ---- ShapeKeyVarReadback：store 回读命令列表（[Present] pre run、boot 门控）----
+
+    def _emit_shapekey_var_readback_command_list(self, sections, ns):
+        bindings = self._drag_drive_var_sync_bindings()
+        if not bindings:
+            return
+        sec = f"[CommandListDragShapeKeyVarReadback_{ns}]"
+        if sec in sections:
+            return
+        # store 放在命名命令列表内（[Present] 以 pre run 调用、boot 门控）。
+        # 写法：store = $var, <资源名>, <float 索引>——不能带 ref 关键字！
+        # 分词器把 ref 当独立 token 交给 GetTarget，ParseTarget 无此分支 →
+        # Unknown target: ref，整条 store 行在加载期被静默丢弃（GIMI 实证有效
+        # 写法为 store = $health, ps-cb0, 33，裸目标）。
+        # 分时互斥：仅在「对应区域拖拽激活」（同步 CS 每帧重算的 ZoneActive 标志）时
+        # 才回读，变量跟随缓冲、驱动器自然被忽略；区域未激活时完全不回读，
+        # 变量→缓冲单向写入，两边在时间上互斥，无需值模式仲裁。
+        lines = []
+        for i, (var_name, slot, zone, _nd_stage) in enumerate(bindings):
+            act = f"$ssmtdrag_skact_{ns}_{i}"
+            rb = f"$ssmtdrag_skrb_{ns}_{i}"
+            prev = f"$ssmtdrag_skprev_{ns}_{i}"
+            cd = f"$ssmtdrag_skcd_{ns}_{i}"
+            lines.extend([
+                f"store = {act}, ResourceDragShapeKeyZoneActive_{ns}, {zone}",
+                # 对应区域拖拽激活：每帧回读，变量跟随缓冲（驱动器被忽略）
+                f"if {act} >= 1",
+                f"\tstore = {rb}, ResourceDragShapeKeyDrive_{ns}, {slot}",
+                f"\t{var_name} = {rb}",
+                f"\t{prev} = {rb}",
+                f"\t{cd} = 6",
+                # 释放沉淀：store 有数帧延迟，松手后继续采用数帧让最终值完整落进变量；
+                # 期间驱动器抢先步进（编辑沿）则立即交还控制权
+                f"elif {cd} > 0",
+                f"\t{cd} = {cd} - 1",
+                f"\tif {var_name} != {prev}",
+                f"\t\t{prev} = {var_name}",
+                f"\t\t{cd} = 0",
+                "\telse",
+                f"\t\tstore = {rb}, ResourceDragShapeKeyDrive_{ns}, {slot}",
+                f"\t\tif {rb} != {var_name}",
+                f"\t\t\t{var_name} = {rb}",
+                f"\t\t\t{prev} = {rb}",
+                "\t\tendif",
+                "\tendif",
+                "endif",
+            ])
+        sections[sec] = lines
+
     # ---- CommandList：PinDetected（boot-clear + dt 钳制 + 门槛）/ Viewport / Cursor ----
 
     def _emit_command_lists(self, sections, components, ns):
@@ -2446,6 +2618,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 lines.append(f"\tclear = ResourceDragShapeKeyDir_{ns} 0.0")
                 lines.append(f"\tclear = ResourceDragShapeKeyClickCount_{ns}")
                 lines.append(f"\tclear = ResourceDragShapeKeyActiveDir_{ns}")
+                if self._drag_drive_var_sync_bindings():
+                    # prev 值缓冲/激活标志随 boot 一并清零：persist 变量非 0 时首帧即触发同步写入
+                    lines.append(f"\tclear = ResourceDragShapeKeyVarPrev_{ns} 0.0")
+                    lines.append(f"\tclear = ResourceDragShapeKeyZoneActive_{ns} 0.0")
             if self.enable_hand_cursor:
                 lines.append(f"\tclear = ResourceDragJiggleCursorPreview_{ns} 0.0")
             for comp in components:
@@ -2950,6 +3126,18 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"global $ssmtdrag_rmb_hold_fraction_{ns} = 0",
                 f"global $ssmtdrag_rmb_lone_hold_{ns} = 0",
             ])
+        # 变量↔缓冲双向同步辅助变量：激活标志/回读值/变量上一帧/沉淀计数（每绑定一组）
+        if getattr(self, "enable_shapekey_drive", False):
+            _sync_n = len(self._drag_drive_var_sync_bindings())
+            if _sync_n:
+                globals_to_add.append(f"global $ssmtdrag_skheld_{ns} = 0")
+            for i in range(_sync_n):
+                globals_to_add.extend([
+                    f"global $ssmtdrag_skact_{ns}_{i} = 0",
+                    f"global $ssmtdrag_skrb_{ns}_{i} = 0",
+                    f"global $ssmtdrag_skprev_{ns}_{i} = 0",
+                    f"global $ssmtdrag_skcd_{ns}_{i} = 0",
+                ])
         for comp in components:
             globals_to_add.append(f"global $ssmtdrag_last_dispatch_{comp['comp_name']}_{ns} = -1")
         for g in globals_to_add:
@@ -2966,9 +3154,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # store 读取上一份已完成的 GPU 数据，允许 UI 侧以一帧延迟稳定消费。
             # 目标未绘制时必须主动失效，避免消费上一帧/上一个角色的残留命中。
             f"if {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_booted_{ns} == 1",
-            f"\tstore = {ui_detected_var}, ref ResourceDragPinnedDetectID_{ns}, 0",
+            f"\tstore = {ui_detected_var}, ResourceDragPinnedDetectID_{ns}, 0",
             f"\tif {ui_detected_var} >= 0",
-            f"\t\tstore = {ui_zone_var}, ref ResourceDragPinnedDetectInfo_{ns}, 31",
+            f"\t\tstore = {ui_zone_var}, ResourceDragPinnedDetectInfo_{ns}, 31",
             "\telse",
             f"\t\t{ui_zone_var} = -1",
             "\tendif",
@@ -3155,6 +3343,24 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"\trun = CommandListDragCursorUpdate_{ns}",
             "endif",
         ])
+        sync_bindings = (
+            self._drag_drive_var_sync_bindings()
+            if getattr(self, "enable_shapekey_drive", False) else []
+        )
+        if sync_bindings:
+            # 分时互斥：ZoneActive 标志由同步 CS 每帧按命中判定重算；
+            # 回读只在「对应区域拖拽激活」时进行，其余时间变量完全归驱动器/用户所有
+            block.extend([
+                f"$ssmtdrag_skheld_{ns} = 0",
+                f"if $ssmtdrag_mode_{ns} == 1 && ($ssmtdrag_lmb_down_{ns} == 1 || $ssmtdrag_x_down_{ns} == 1)",
+                f"\t$ssmtdrag_skheld_{ns} = 1",
+                "endif",
+                f"if $ssmtdrag_booted_{ns} == 1",
+                f"\tpre run = CommandListDragShapeKeyVarReadback_{ns}",
+                "endif",
+                # 变量→驱动缓冲同步：每帧运行、不受模式门控；排在回读之后让采用结果当帧生效
+                f"run = CustomShaderDragShapeKeyVarSync_{ns}",
+            ])
         ui_readback_sec = f"[CommandListDragUIReadback_{ns}]"
         if ui_readback_sec not in sections:
             sections[ui_readback_sec] = list(ui_bridge_lines)
