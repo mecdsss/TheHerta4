@@ -14,6 +14,7 @@ _name_mapping_cache = {}
 _reverse_name_mapping_cache = {}
 # 资源缓存按“材质内容签名”去重，避免同一套贴图被重复复制/重复生成 Resource。
 _material_resource_cache = {}
+_TTL_MASK_INVERT_PREFIX = "${}TTL{}mask_invert".format(chr(92), chr(92)).casefold()
 
 
 def clear_name_mapping_cache():
@@ -432,9 +433,9 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         description="如果资源已存在，则覆盖它",
         default=False
     )
-    fx_to_ttl: bpy.props.BoolProperty(
-        name="FX>>>TTL",
-        description="FXMap 材质作为 TTL 透明遮罩，并接管 _透明N 物体的透明代码生成",
+    debug_disable_fx_ttl: bpy.props.BoolProperty(
+        name="禁用 FX/TTL (调试)",
+        description="调试用：开启后暂时不生成 FX（FXMap→RabbitFX/NTEMIFX）与 TTL（TTLMap）段落",
         default=False
     )
     material_switch_var: bpy.props.StringProperty(
@@ -479,7 +480,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "material_to_resource_override")
-        layout.prop(self, "fx_to_ttl")
+        layout.prop(self, "debug_disable_fx_ttl")
         layout.prop(self, "material_switch_var")
 
         name_mapping = self._get_name_mapping()
@@ -1700,7 +1701,11 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             transparency_value = self._extract_transparency_value_from_mesh_name(mesh_name)
             obj = self.find_object_by_mesh_name(mesh_name)
             fx_materials = self.find_matching_materials(obj, "FXMap") if obj is not None else []
-            if not transparency_value and not fx_materials:
+            ttl_materials = self.find_matching_materials(obj, "TTLMap") if obj is not None else []
+            if fx_materials and ttl_materials:
+                _LOG.warning(f"      TTL: 跳过 '{mesh_name}'（同一物体不能同时启用 FX 与 TTL）")
+                continue
+            if not ttl_materials:
                 continue
 
             cond_if_indexes = mesh_cond.get(mesh_index, [])
@@ -1727,6 +1732,8 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 stripped = str(header_line).strip()
                 if not stripped:
                     continue
+                if stripped.casefold().startswith(_TTL_MASK_INVERT_PREFIX):
+                    continue
                 resource_match = re.match(
                     r'^(ps-t\d+|Resource\\[^\s=]+)\s*=\s*(?:ref\s+)?(.*)$',
                     stripped,
@@ -1752,11 +1759,14 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             else:
                 new_lines.append(f"; {mesh_name}")
 
-            if fx_materials:
-                fx_lines, next_swap_key_num = self.generate_material_lines(
-                    fx_materials, r"Resource\TTL\TransparencyTex", "FXMap", obj, texture_folder, all_sections,
+            if ttl_materials:
+                ttl_lines_ref, next_swap_key_num = self.generate_material_lines(
+                    ttl_materials, r"Resource\TTL\TransparencyTex", "TTLMap", obj, texture_folder, all_sections,
                     {}, material_group_to_swapkey, swap_key_prefix, next_swap_key_num, used_swap_keys)
-                new_lines.extend(fx_lines)
+                new_lines.extend(ttl_lines_ref)
+
+            if ttl_materials:
+                new_lines.append("${}TTL{}mask_invert = 1".format(chr(92), chr(92)))
 
             alpha_value = transparency_value if transparency_value else "1.0"
             alpha_var = self._ttl_ensure_alpha_variable(alpha_value, all_sections)
@@ -1851,6 +1861,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                                           material_group_to_swapkey, swap_key_prefix=None, next_swap_key_num=None,
                                           used_swap_keys=None, transparency_sections_to_add=None):
         from ..utils.log_utils import LOG as _LOG
+        debug_disable_fx_ttl = bool(getattr(self, "debug_disable_fx_ttl", False))
         if material_group_to_swapkey is None or material_group_to_swapkey is Ellipsis:
             material_group_to_swapkey = {}
         if used_swap_keys is None or used_swap_keys is Ellipsis:
@@ -1868,7 +1879,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             next_swap_key_num = int(match.group(2)) if match else 0
 
         lines = all_sections[section_name]
-        if getattr(self, "fx_to_ttl", False) and any("CommandList\\TTL\\Draw" in str(line) for line in lines):
+        if any("CommandList\\TTL\\Draw" in str(line) for line in lines):
             return next_swap_key_num
         mesh_line = next((line for line in lines if self.extract_mesh_name(line)), "")
         section_mesh_name = self.extract_mesh_name(mesh_line) or ""
@@ -2019,8 +2030,10 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     matched_types.append("DiffuseMap->ps-t2")
 
             fxmap_lines = []
-            fxmap_texture_types = ['Glowmap'] if getattr(self, "fx_to_ttl", False) else ['Glowmap', 'FXMap']
+            fxmap_texture_types = ['Glowmap', 'FXMap']
             for texture_type in fxmap_texture_types:
+                if debug_disable_fx_ttl and texture_type == 'FXMap':
+                    continue
                 matching_materials = self.find_matching_materials(obj, texture_type)
                 if matching_materials:
                     matched_types.append(texture_type)
@@ -2036,10 +2049,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     fxmap_lines.append(f"run = CommandList\\{fx_namespace}\\Run")
 
             ntemifx_lines = []
-            if getattr(self, "fx_to_ttl", False):
-                ntemifx_texture_slots = {}
-            else:
-                ntemifx_texture_slots = self._collect_ntemifx_texture_slots(obj, workspace_resource_by_slot)
+            ntemifx_texture_slots = {} if debug_disable_fx_ttl else self._collect_ntemifx_texture_slots(obj, workspace_resource_by_slot)
             for slot_label, resource_name in ntemifx_texture_slots.items():
                 ntemifx_lines.append(f"Resource\\NTEMIFX\\FXMap = ref {resource_name}")
                 ntemifx_lines.append("run = CommandList\\NTEMIFX\\Run")
@@ -2078,11 +2088,12 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 reset_insert_idx = self._find_mesh_block_reset_insert_index(lines, insert_index)
                 if reset_insert_idx != -1:
                     lines[reset_insert_idx:reset_insert_idx] = reset_lines
-        if getattr(self, "fx_to_ttl", False):
+        if not debug_disable_fx_ttl:
             next_swap_key_num = self._process_ttl_sections(
                 section_name, lines, all_sections, material_group_to_swapkey,
                 swap_key_prefix, next_swap_key_num, used_swap_keys, texture_folder)
-            return next_swap_key_num
+        else:
+            _LOG.info(f"      调试开关已开启，跳过 {section_name} 的 FX/TTL 生成")
 
         mesh_lines_info_phase2 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
         for mesh_index, mesh_name in reversed(mesh_lines_info_phase2):

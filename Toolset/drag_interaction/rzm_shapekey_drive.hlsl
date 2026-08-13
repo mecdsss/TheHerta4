@@ -35,6 +35,8 @@
 //   u2   = ResourceDragShapeKeyClickCount (R32_UINT, array = capacity)
 //   u3   = ResourceDragShapeKeyActiveDir (R32_UINT, array = capacity;
 //          dominant direction per zone 0=up 1=right 2=down 3=left)
+//   u4   = ResourceDragShapeKeyClickCountF (R32_FLOAT, array = capacity;
+//          float mirror of ClickCount for CPU store export)
 //   t120 = IniParams
 //
 // IniParams:
@@ -44,11 +46,16 @@
 //   [79].x = mouse Y displacement (from $ssmtdrag_shapekey_dy_<ns>, px/frame)
 //   [79].y = mouse X displacement (from $ssmtdrag_shapekey_dx_<ns>, px/frame)
 //   [80].x = mouse displacement sensitivity (per-px strength delta)
+//   [80].y = cold-start seed pending flag (1 = seed click counts from
+//          export variables this dispatch; set at boot, cleared after run)
+//   [81].x = seed entry count (0 = no seeding)
+//   [82+i] = seed entry i: x = zone id, y = export variable value
 
 RWBuffer<float> ShapeKeyDrive       : register(u0);
 RWBuffer<float> ShapeKeyDir         : register(u1);
 RWBuffer<uint> ClickCount           : register(u2);
 RWBuffer<uint> ActiveDir            : register(u3);
+RWBuffer<float> ClickCountF         : register(u4);
 StructuredBuffer<float4> PinnedDetectInfo : register(t67);
 Buffer<uint> ZoneStageCounts        : register(t68);
 Texture1D<float4> IniParams         : register(t120);
@@ -103,7 +110,37 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         if (dirWeight[d] > bestW) { bestW = dirWeight[d]; activeDir = d; }
     }
 
-    // 仅“仅命中”模式（1）下驱动；其余模式（0/2）不清零、不驱动，保持当前数值
+    // 冷启动播种：缓冲随游戏关闭销毁、persist 变量仍有上次会话的值。
+    // boot 清零后的首个驱动帧，把导出变量值写回点击计数（含浮点镜像与无方向档位槽），
+    // 使物体切换选项 / 档位形态键以变量为准恢复。
+    uint seedCount = (uint)IniParams[81].x;
+    if (IniParams[80].y > 0.5 && seedCount > 0u)
+    {
+        for (uint s = 0u; s < seedCount; ++s)
+        {
+            float4 seedEntry = IniParams[82u + s];
+            uint seedZone = (uint)max(round(seedEntry.x), 0.0);
+            if (seedZone >= zoneCount)
+                continue;
+            uint zoneStageCap = max(1u, ZoneStageCounts[seedZone]);
+            uint seeded = (uint)clamp(round(seedEntry.y), 0.0, (float)zoneStageCap);
+            ClickCount[seedZone] = seeded;
+            ClickCountF[seedZone] = (float)seeded;
+            if (seeded >= 1u)
+            {
+                // 重算该区域段基址（与主循环同构的前缀和），点亮对应档位 one-hot 槽
+                uint seedBase = 0u;
+                for (uint zz = 0u; zz < seedZone; ++zz)
+                    seedBase += 4u + max(1u, ZoneStageCounts[zz]);
+                uint oneHotIdx = seedBase + 4u + (seeded - 1u);
+                if (oneHotIdx < driveSlots)
+                    ShapeKeyDrive[oneHotIdx] = 1.0;
+            }
+        }
+    }
+
+    // 仅“仅命中”模式（1）下驱动；其余模式（0/2）不清零、不驱动，保持当前数值。
+    // 播种必须在此分支之前完成：默认模式 2 也需要从 persist 变量恢复点击状态。
     if (mode != 1.0)
     {
         // 仍更新上一帧按键状态槽，保证切回模式 1 时按下沿检测准确
@@ -138,6 +175,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         bool zoneHit = hasHit && zone == hoverZone;
         bool zonePressed = zoneHit && pressed;
         uint activeStage = ClickCount[zone];
+        // 浮点镜像：供 CPU store 回读导出点击次数（R32_UINT 直接 store 无格式保证）
+        ClickCountF[zone] = (float)activeStage;
         // 方向槽：忽略档位，按住命中该区域时由鼠标位移驱动；否则保持
         for (uint dir = 0u; dir < 4u; ++dir)
         {

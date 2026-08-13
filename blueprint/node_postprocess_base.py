@@ -93,7 +93,11 @@ class SSMTNode_PostProcess_Base(SSMTNodeBase):
             return "", text
 
         driver_content = "".join(lines[start_index:end_index + 1])
-        remaining_content = "".join(lines[end_index + 1:]).lstrip("\r\n")
+        before_content = "".join(lines[:start_index]).rstrip("\r\n")
+        after_content = "".join(lines[end_index + 1:]).lstrip("\r\n")
+        remaining_content = "\n\n".join(
+            part for part in (before_content, after_content) if part
+        )
         return driver_content, remaining_content
 
 

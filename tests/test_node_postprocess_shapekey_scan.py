@@ -85,7 +85,10 @@ _install_module(
 )
 _install_module(
     f"{PKG}.common.object_prefix_helper",
-    ObjectPrefixHelper=types.SimpleNamespace(resolve_source_object_name=lambda name: name),
+    ObjectPrefixHelper=types.SimpleNamespace(
+        resolve_source_object_name=lambda name: name,
+        extract_prefix_info=lambda name: None,
+    ),
 )
 _install_module(
     f"{PKG}.utils.log_utils",
@@ -309,6 +312,77 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
         self.assertEqual(a.drag_zone_id, 5)
         self.assertEqual(a.drag_click_stage, 2)
         self.assertEqual(a.drag_dir_id, "3")
+
+    def test_ensure_shape_key_variable_map_preserves_export_enabled_on_rebuild(self):
+        """测试重建时保留形态键的导出勾选状态，新增条目默认勾选"""
+        class _FakeItem:
+            def __init__(self, shape_key_name="", assigned_variable_name="", custom_variable_name=""):
+                self.shape_key_name = shape_key_name
+                self.assigned_variable_name = assigned_variable_name
+                self.custom_variable_name = custom_variable_name
+                self.export_enabled = True
+                self.drag_zone_id = -1
+                self.drag_click_stage = 1
+                self.drag_dir_id = "-1"
+
+        class _FakeCollection(list):
+            def add(self):
+                item = _FakeItem()
+                self.append(item)
+                return item
+
+            def remove(self, index):
+                del self[index]
+
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        unchecked = _FakeItem("B", "Freq_B", "Freq_B")
+        unchecked.export_enabled = False
+        node.shapekey_variable_items = _FakeCollection([
+            _FakeItem("A", "Freq_A", "Freq_A"),
+            unchecked,
+            _FakeItem("C", "Freq_C", "Freq_C"),
+        ])
+
+        # 名称集合变化（C 被裁剪，新增 D）触发重建
+        node.ensure_shape_key_variable_map(["A", "B", "D"])
+
+        self.assertEqual(
+            [item.shape_key_name for item in node.shapekey_variable_items],
+            ["A", "B", "D"],
+        )
+        preserved = next(item for item in node.shapekey_variable_items if item.shape_key_name == "B")
+        self.assertFalse(preserved.export_enabled)
+        added = next(item for item in node.shapekey_variable_items if item.shape_key_name == "D")
+        self.assertTrue(added.export_enabled)
+
+    def test_parse_classification_text_final_skips_unchecked_shape_keys(self):
+        """测试解析分类文本时跳过未勾选导出的形态键及其物体行"""
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        node.shapekey_variable_items = [
+            types.SimpleNamespace(shape_key_name="Smile", export_enabled=True),
+            types.SimpleNamespace(shape_key_name="Frown", export_enabled=False),
+        ]
+
+        text = "\n".join([
+            "# 自动化形态键导出 - 分类报告",
+            "槽位 1:",
+            "  - 名称: Smile",
+            "    - 物体: Body",
+            "槽位 2:",
+            "  - 名称: Frown",
+            "    - 物体: Body",
+            "  - 名称: Blink",
+            "    - 物体: Body",
+        ])
+
+        slot_to_name_to_objects, _hashes, _hash_to_objects, all_objects = (
+            node._parse_classification_text_final(text)
+        )
+
+        self.assertEqual(list(slot_to_name_to_objects[1].keys()), ["Smile"])
+        # Frown 未勾选被跳过；Blink 不在映射列表中，默认勾选保留
+        self.assertEqual(list(slot_to_name_to_objects[2].keys()), ["Blink"])
+        self.assertEqual(all_objects, ["Body"])
 
     def test_compute_dispatch_group_count_rounds_up_by_thread_group(self):
         node = module.SSMTNode_PostProcess_ShapeKey()

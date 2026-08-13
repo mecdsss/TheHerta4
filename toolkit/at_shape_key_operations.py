@@ -142,7 +142,7 @@ class ATP_OT_BatchRemoveShapeKey(bpy.types.Operator):
     """为所有选中的物体批量删除一个指定名称的形态键"""
     bl_idname = "atp.batch_remove_shape_key"
     bl_label = "批量删除形态键"
-    bl_description = "从所有选中的网格物体中，删除指定名称的形态键"
+    bl_description = "从所有选中的网格物体中，删除指定名称的形态键；仅当物体没有其他形态键时，才允许删除 Basis"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -158,18 +158,23 @@ class ATP_OT_BatchRemoveShapeKey(bpy.types.Operator):
             self.report({'ERROR'}, "要删除的形态键名称不能为空。")
             return {'CANCELLED'}
         
-        if shape_key_name_to_remove.lower() == 'basis':
-            self.report({'ERROR'}, "不能删除基础形态键 'Basis'。")
-            return {'CANCELLED'}
-
         removed_count = 0
-        processed_objects = 0
-        
+        skipped_with_other_keys = 0
+
         for obj in selected_objects:
             if obj.type == 'MESH' and obj.data and obj.data.shape_keys:
-                key_block_to_remove = obj.data.shape_keys.key_blocks.get(shape_key_name_to_remove)
-                
+                key_blocks = obj.data.shape_keys.key_blocks
+                key_block_to_remove = key_blocks.get(shape_key_name_to_remove)
+                if key_block_to_remove is None and shape_key_name_to_remove.lower() == 'basis':
+                    reference_key = getattr(obj.data.shape_keys, "reference_key", None)
+                    key_block_to_remove = reference_key if reference_key is not None else (key_blocks[0] if key_blocks else None)
+
                 if key_block_to_remove:
+                    is_basis_key = key_block_to_remove == getattr(obj.data.shape_keys, "reference_key", None)
+                    if is_basis_key and len(key_blocks) > 1:
+                        skipped_with_other_keys += 1
+                        self.report({'WARNING'}, f"物体 '{obj.name}' 还有其他形态键，不能单独删除 Basis（请先删除其他形态键）。")
+                        continue
                     try:
                         obj.shape_key_remove(key_block_to_remove)
                         removed_count += 1
@@ -180,6 +185,9 @@ class ATP_OT_BatchRemoveShapeKey(bpy.types.Operator):
             self.report({'INFO'}, f"成功移除了 {removed_count} 个名为 '{shape_key_name_to_remove}' 的形态键。")
         else:
             self.report({'INFO'}, f"在选中的物体中未找到名为 '{shape_key_name_to_remove}' 的形态键。")
+
+        if skipped_with_other_keys > 0:
+            self.report({'WARNING'}, f"跳过了 {skipped_with_other_keys} 个仍包含其他形态键的物体，Basis 仅可在没有其他形态键时单独删除。")
 
         _refresh_shape_key_list_from_context(context)
 

@@ -3,7 +3,7 @@ import numpy as np
 import bmesh
 import math
 from ..utils.color_attribute_utils import read_color_attribute_data, write_color_attribute_data
-from ..utils.vertex_color_utils import build_vertex_color_payload, ensure_color_attribute
+from ..utils.vertex_color_utils import convert_color_srgb_to_linear, ensure_color_attribute
 
 try:
     from bpy.props import FloatProperty
@@ -512,6 +512,139 @@ class BMTP_OT_EnableSubdivisionLimitSurface(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _collect_edit_selection_indices(bm, attr_domain):
+    """在编辑模式下只读收集选中元素，返回 (顶点索引集合, 面索引集合)。
+
+    POINT 域只使用顶点索引；CORNER 域优先使用选中面，未选中面时退回
+    选中顶点（由调用方在对象模式下还原为对应 loop）。
+    """
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    selected_verts = {v.index for v in bm.verts if v.select}
+    selected_faces = set()
+    if attr_domain == 'CORNER':
+        selected_faces = {f.index for f in bm.faces if f.select}
+
+    return selected_verts, selected_faces
+
+
+def _build_element_selection_mask(mesh, attr_domain, element_count, selected_verts, selected_faces):
+    """把编辑模式选中的顶点/面映射为网格颜色数据的布尔掩码。"""
+    mask = np.zeros(element_count, dtype=bool)
+
+    if attr_domain == 'POINT':
+        if selected_verts:
+            indices = np.fromiter(selected_verts, dtype=np.int64, count=len(selected_verts))
+            indices = indices[(indices >= 0) & (indices < element_count)]
+            mask[indices] = True
+        return mask
+
+    # CORNER 域
+    if selected_faces:
+        polygon_count = len(mesh.polygons)
+        if polygon_count:
+            loop_start = np.empty(polygon_count, dtype=np.int32)
+            loop_total = np.empty(polygon_count, dtype=np.int32)
+            mesh.polygons.foreach_get('loop_start', loop_start)
+            mesh.polygons.foreach_get('loop_total', loop_total)
+            for face_index in selected_faces:
+                if 0 <= face_index < polygon_count:
+                    start = int(loop_start[face_index])
+                    total = int(loop_total[face_index])
+                    mask[start:start + total] = True
+        return mask
+
+    if selected_verts:
+        loop_vertex_index = np.empty(element_count, dtype=np.int32)
+        mesh.loops.foreach_get('vertex_index', loop_vertex_index)
+        selected_array = np.fromiter(selected_verts, dtype=np.int64, count=len(selected_verts))
+        mask = np.isin(loop_vertex_index, selected_array)
+
+    return mask
+
+
+def _apply_vertex_color_object_mode(
+    mesh,
+    vc_mode,
+    attr_name,
+    attr_domain,
+    attr_data_type,
+    color_rgba_srgb,
+    selected_verts=None,
+    selected_faces=None,
+):
+    """在对象模式下写入顶点色，只操作 color_attributes，绝不触碰 UV 层。
+
+    selected_verts / selected_faces 任一非 None 表示部分写入（编辑模式）；
+    否则写入整个网格。
+    """
+    is_partial = selected_verts is not None or selected_faces is not None
+
+    if vc_mode == 'FULL_COLOR':
+        # 设计要求：FULL_COLOR 清空原有所有顶点色，只保留本次指定的颜色属性。
+        for old_attr in list(mesh.color_attributes):
+            if mesh.color_attributes.active_color == old_attr:
+                mesh.color_attributes.active_color = None
+            mesh.color_attributes.remove(old_attr)
+
+    color_attr = ensure_color_attribute(
+        color_attributes=mesh.color_attributes,
+        attr_name=attr_name,
+        attr_domain=attr_domain,
+        attr_data_type=attr_data_type,
+    )
+
+    if attr_domain == 'CORNER':
+        element_count = len(mesh.loops)
+    else:
+        element_count = len(mesh.vertices)
+
+    # Blender 5.0 防御：新建/复用后属性数据可能尚未分配（data 长度为 0）。
+    if len(color_attr.data) != element_count:
+        mesh.update()
+        if len(color_attr.data) != element_count:
+            mesh.color_attributes.remove(color_attr)
+            color_attr = ensure_color_attribute(
+                color_attributes=mesh.color_attributes,
+                attr_name=attr_name,
+                attr_domain=attr_domain,
+                attr_data_type=attr_data_type,
+            )
+    if len(color_attr.data) != element_count:
+        raise ValueError(f"颜色属性 '{attr_name}' 数据长度异常，无法写入")
+
+    rgba = np.clip(np.asarray(color_rgba_srgb, dtype=np.float32), 0.0, 1.0)
+    if attr_data_type == 'FLOAT_COLOR':
+        rgba = convert_color_srgb_to_linear(rgba)
+
+    existing = read_color_attribute_data(color_attr, element_count)
+
+    if vc_mode == 'FULL_COLOR':
+        if is_partial:
+            final = np.zeros((element_count, 4), dtype=np.float32)
+            final[:, 3] = 1.0
+            mask = _build_element_selection_mask(
+                mesh, attr_domain, element_count, selected_verts, selected_faces
+            )
+            final[mask] = rgba
+        else:
+            final = np.tile(rgba, (element_count, 1))
+    else:  # ALPHA_ONLY
+        final = existing.copy()
+        if is_partial:
+            mask = _build_element_selection_mask(
+                mesh, attr_domain, element_count, selected_verts, selected_faces
+            )
+            final[mask, 3] = rgba[3]
+        else:
+            final[:, 3] = rgba[3]
+
+    write_color_attribute_data(color_attr, final)
+    mesh.color_attributes.active_color = color_attr
+    mesh.update()
+
+
 class BMTP_OT_SetVertexColor(bpy.types.Operator):
     """为选中网格物体设置顶点色颜色属性"""
     bl_idname = "toolkit.bmtp_set_vertex_color"
@@ -524,48 +657,68 @@ class BMTP_OT_SetVertexColor(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.bmtp_props
-        selected_objects = [o for o in context.selected_objects if o.type == 'MESH']
-        if not selected_objects:
-            self.report({'ERROR'}, "请选择至少一个网格物体")
-            return {'CANCELLED'}
+        is_edit_mode = getattr(context, "mode", "") == 'EDIT_MESH'
+
+        if is_edit_mode:
+            obj = getattr(context, "edit_object", None)
+            if obj is None or obj.type != 'MESH':
+                self.report({'ERROR'}, "请选择至少一个网格物体")
+                return {'CANCELLED'}
+            target_objects = [obj]
+        else:
+            target_objects = [o for o in context.selected_objects if o.type == 'MESH']
+            if not target_objects:
+                self.report({'ERROR'}, "请选择至少一个网格物体")
+                return {'CANCELLED'}
 
         attr_name = props.vc_attr_name.strip() or "COLOR"
         attr_domain = props.vc_attr_domain
         attr_data_type = props.vc_attr_data_type
-        
+        vc_mode = props.vc_mode
         color_rgba_srgb = np.asarray(props.vc_color[:], dtype=np.float32)
-        
-        for obj in selected_objects:
+
+        processed = 0
+        for obj in target_objects:
             mesh = obj.data
-            
-            color_attr = ensure_color_attribute(
-                color_attributes=mesh.color_attributes,
-                attr_name=attr_name,
-                attr_domain=attr_domain,
-                attr_data_type=attr_data_type,
-            )
+            selected_verts = None
+            selected_faces = None
+            switched_to_object = False
 
-            if attr_domain == 'CORNER':
-                element_count = len(mesh.loops)
-            else:
-                element_count = len(mesh.vertices)
+            if is_edit_mode:
+                # 只读收集选中元素，随后切到对象模式写颜色属性，避免在 bmesh 中
+                # 新建颜色层并通过 destructive update 回写导致 UV 层丢失。
+                bm = bmesh.from_edit_mesh(mesh)
+                try:
+                    selected_verts, selected_faces = _collect_edit_selection_indices(bm, attr_domain)
+                finally:
+                    bm.free()
 
-            existing_colors = None
-            if props.vc_mode == 'ALPHA_ONLY':
-                existing_colors = read_color_attribute_data(color_attr, element_count).reshape(-1)
+                if not selected_verts and not selected_faces:
+                    self.report({'WARNING'}, f"对象 '{obj.name}' 没有选中的元素，已跳过")
+                    continue
 
-            color_data = build_vertex_color_payload(
-                num_loops=element_count,
-                color_rgba_srgb=color_rgba_srgb,
-                vc_mode=props.vc_mode,
-                existing_colors=existing_colors,
-                attr_data_type=attr_data_type,
-            )
-            
-            write_color_attribute_data(color_attr, color_data)
-            mesh.update()
-        
-        self.report({'INFO'}, f"顶点色操作完成，处理了 {len(selected_objects)} 个对象")
+                bpy.ops.object.mode_set(mode='OBJECT')
+                switched_to_object = True
+
+            try:
+                _apply_vertex_color_object_mode(
+                    mesh=mesh,
+                    vc_mode=vc_mode,
+                    attr_name=attr_name,
+                    attr_domain=attr_domain,
+                    attr_data_type=attr_data_type,
+                    color_rgba_srgb=color_rgba_srgb,
+                    selected_verts=selected_verts,
+                    selected_faces=selected_faces,
+                )
+                processed += 1
+            except ValueError as exc:
+                self.report({'ERROR'}, str(exc))
+            finally:
+                if switched_to_object:
+                    bpy.ops.object.mode_set(mode='EDIT')
+
+        self.report({'INFO'}, f"顶点色操作完成，处理了 {processed} 个对象")
         return {'FINISHED'}
 
 

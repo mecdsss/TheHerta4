@@ -106,8 +106,50 @@ class TT_OT_merge_duplicate_materials(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class TT_OT_rename_materials_by_fragment(bpy.types.Operator):
+    bl_idname = "toolkit.tt_rename_materials_by_fragment"
+    bl_label = "按片段重命名材质球"
+    bl_description = "批量将选中物体使用的材质球名称中的查找片段替换为指定字符串"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    def execute(self, context):
+        props = context.scene.texture_tools_props
+        search = getattr(props, "mat_rename_search", "") or ""
+        replace = getattr(props, "mat_rename_replace", "") or ""
+
+        if not search:
+            self.report({'ERROR'}, "请先填写要查找的片段")
+            return {'CANCELLED'}
+
+        renamed_count = 0
+        processed_materials = set()
+
+        for obj in context.selected_objects:
+            if not hasattr(obj, "material_slots"):
+                continue
+            for slot in obj.material_slots:
+                material = slot.material
+                if material is None or material in processed_materials:
+                    continue
+                processed_materials.add(material)
+                if search in material.name:
+                    material.name = material.name.replace(search, replace)
+                    renamed_count += 1
+
+        if renamed_count > 0:
+            self.report({'INFO'}, f"已重命名 {renamed_count} 个材质球")
+        else:
+            self.report({'INFO'}, "没有找到名称中包含查找片段的材质球")
+        return {'FINISHED'}
+
+
 tt_material_tools_list = (
     TT_OT_assign_material_to_selected,
     TT_OT_delete_material_from_selected,
     TT_OT_merge_duplicate_materials,
+    TT_OT_rename_materials_by_fragment,
 )

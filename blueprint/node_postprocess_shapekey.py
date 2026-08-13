@@ -35,6 +35,11 @@ from ..common.object_prefix_helper import ObjectPrefixHelper
 class ShapeKeyVariableItem(bpy.types.PropertyGroup):
     shape_key_name: bpy.props.StringProperty(name="Shape Key Name", default="") # type: ignore
     assigned_variable_name: bpy.props.StringProperty(name="Assigned Variable Name", default="") # type: ignore
+    export_enabled: bpy.props.BoolProperty(
+        name="导出该形态键",
+        description="勾选后该形态键才会被导出；未勾选的形态键会被直接无视（不占用槽位、不生成缓冲区与INI变量）",
+        default=True,
+    ) # type: ignore
 
     def update_custom_variable_name(self, context):
         normalized = normalize_variable_name(self.custom_variable_name)
@@ -84,6 +89,7 @@ class SSMT_UL_ShapeKeyVariableMappings(bpy.types.UIList):
         del context, icon, active_data, active_propname, index
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
+            row.prop(item, "export_enabled", text="")
             row.label(text=getattr(item, "shape_key_name", "") or "<未命名>", icon='SHAPEKEY_DATA')
             value_col = row.column(align=True)
             value_col.prop(item, "custom_variable_name", text="导出变量")
@@ -310,6 +316,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 "shape_key_name": getattr(item, "shape_key_name", ""),
                 "assigned_variable_name": getattr(item, "assigned_variable_name", ""),
                 "custom_variable_name": getattr(item, "custom_variable_name", ""),
+                "export_enabled": getattr(item, "export_enabled", True),
                 "drag_zone_id": getattr(item, "drag_zone_id", -1),
                 "drag_click_stage": getattr(item, "drag_click_stage", 1),
                 "drag_dir_id": getattr(item, "drag_dir_id", "-1"),
@@ -325,11 +332,22 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             item.shape_key_name = serialized["shape_key_name"]
             item.assigned_variable_name = serialized["assigned_variable_name"]
             item.custom_variable_name = serialized["custom_variable_name"]
+            item.export_enabled = serialized["export_enabled"]
             item.drag_zone_id = serialized["drag_zone_id"]
             item.drag_click_stage = serialized["drag_click_stage"]
             item.drag_dir_id = serialized["drag_dir_id"]
 
         return created_count, backfilled_count
+
+    def _is_shape_key_export_enabled(self, shape_key_name) -> bool:
+        """形态键未在映射列表中时默认视为勾选；仅显式取消勾选的条目才不导出。"""
+        name = str(shape_key_name or "").strip()
+        if not name:
+            return False
+        for item in getattr(self, "shapekey_variable_items", None) or []:
+            if str(getattr(item, "shape_key_name", "") or "").strip() == name:
+                return bool(getattr(item, "export_enabled", True))
+        return True
 
     def get_shape_key_export_variable_name(self, shape_key_name: str) -> str:
         shape_key_name = str(shape_key_name or "").strip()
@@ -488,8 +506,15 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     def draw_buttons(self, context, layout):
         layout.operator("ssmt.scan_shapekey_variables", text="预分配蓝图形态键变量", icon='FILE_REFRESH').node_name = self.name
         if self.shapekey_variable_items:
+            enabled_count = sum(
+                1 for item in self.shapekey_variable_items
+                if getattr(item, "export_enabled", True)
+            )
             box = layout.box()
-            box.label(text=f"形态键变量映射 ({len(self.shapekey_variable_items)})", icon='SHAPEKEY_DATA')
+            box.label(
+                text=f"形态键变量映射 (导出 {enabled_count}/{len(self.shapekey_variable_items)})",
+                icon='SHAPEKEY_DATA',
+            )
             box.template_list(
                 "SSMT_UL_SHAPEKEY_VARIABLE_MAPPINGS", "",
                 self, "shapekey_variable_items",
@@ -1096,7 +1121,12 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 current_shapekey_name = None; continue
             name_match = re.search(r'名称:\s*(.+)', line)
             if name_match and current_slot is not None:
-                current_shapekey_name = name_match.group(1).strip()
+                candidate_name = name_match.group(1).strip()
+                if not self._is_shape_key_export_enabled(candidate_name):
+                    # 未勾选导出的形态键直接无视：不登记名称，其后的物体行也一并跳过
+                    current_shapekey_name = None
+                    continue
+                current_shapekey_name = candidate_name
                 if current_shapekey_name not in slot_to_name_to_objects[current_slot]: slot_to_name_to_objects[current_slot][current_shapekey_name] = []
                 continue
             obj_match = re.search(r'物体:\s*(.+)', line)

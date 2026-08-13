@@ -49,15 +49,42 @@ class BlueprintExportHelper:
             return False
 
     @staticmethod
+    def get_disabled_shape_key_export_names() -> set:
+        """收集当前蓝图树中形态键配置节点里被取消勾选的形态键名；这些形态键不参与导出。
+        无有效树或节点时返回空集（不过滤）。"""
+        disabled_names = set()
+        try:
+            tree = BlueprintExportHelper.get_current_blueprint_tree()
+        except Exception:
+            tree = None
+        if not tree:
+            return disabled_names
+        try:
+            shapekey_nodes = BlueprintExportHelper.collect_shapekey_postprocess_nodes(tree)
+        except Exception:
+            return disabled_names
+        for node in shapekey_nodes:
+            for item in getattr(node, "shapekey_variable_items", None) or []:
+                if getattr(item, "export_enabled", True):
+                    continue
+                name = str(getattr(item, "shape_key_name", "") or "").strip()
+                if name:
+                    disabled_names.add(name)
+        return disabled_names
+
+    @staticmethod
     def get_exportable_shape_key_infos(obj, slot_limit: int | None = None) -> list[tuple[int, str, object]]:
         if obj is None or not getattr(obj, "data", None):
             return []
 
         ignore_muted = BlueprintExportHelper.should_ignore_muted_shape_keys()
+        disabled_names = BlueprintExportHelper.get_disabled_shape_key_export_names()
         slot_infos = []
         slot_index = 0
         for key_block in ShapeKeyUtils.iter_exportable_shape_keys(obj) or ():
             if ignore_muted and getattr(key_block, "mute", False):
+                continue
+            if disabled_names and str(getattr(key_block, "name", "") or "").strip() in disabled_names:
                 continue
             slot_index += 1
             if slot_limit is not None and slot_index > slot_limit:

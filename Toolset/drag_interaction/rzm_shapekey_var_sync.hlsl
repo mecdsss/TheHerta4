@@ -43,6 +43,8 @@
 //   u1   = ResourceDragShapeKeyClickCount (shared with rzm_shapekey_drive)
 //   u2   = ResourceDragShapeKeyVarPrev (R32_FLOAT, array = binding count;
 //          previous variable values, boot-cleared to 0)
+//   u3   = ResourceDragShapeKeyClickCountF (R32_FLOAT, array = zone capacity;
+//          float mirror kept coherent with ClickCount for CPU store export)
 //   u4   = ResourceDragShapeKeyZoneActive (R32_FLOAT, array = zone capacity;
 //          per-zone drag-active flags, recomputed every frame below)
 //   t120 = IniParams
@@ -57,6 +59,7 @@
 RWBuffer<float> ShapeKeyDrive       : register(u0);
 RWBuffer<uint>  ClickCount          : register(u1);
 RWBuffer<float> VarSyncPrev         : register(u2);
+RWBuffer<float> ClickCountF         : register(u3);
 RWBuffer<float> ZoneActive          : register(u4);
 Buffer<uint4>   VarSyncMap          : register(t69);
 StructuredBuffer<float4> PinnedDetectInfo : register(t67);
@@ -81,9 +84,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     ShapeKeyDrive.GetDimensions(driveSlots);
     uint clickSlots;
     ClickCount.GetDimensions(clickSlots);
+    uint clickFloatSlots;
+    ClickCountF.GetDimensions(clickFloatSlots);
     uint prevSlots;
     VarSyncPrev.GetDimensions(prevSlots);
-    if (clickSlots == 0u || prevSlots < count)
+    if (clickSlots == 0u || clickFloatSlots < clickSlots || prevSlots < count)
         return;
 
     // 拖拽激活标志（每区域，与驱动 CS 同一命中判定）：
@@ -125,6 +130,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 ClickCount[zone] = ndStage;
             else if (ClickCount[zone] == ndStage)
                 ClickCount[zone] = 0u;
+            ClickCountF[zone] = (float)ClickCount[zone];
         }
     }
 }

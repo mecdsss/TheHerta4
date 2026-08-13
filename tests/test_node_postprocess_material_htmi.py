@@ -937,7 +937,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
         self.assertTrue(complex_name.endswith("0.75"))
 
     def test_ttl_transparent_with_zzmi_materials_creates_new_section(self):
-        """FX>>>TTL：_透明0.75 + 四前缀材质生成独立新段，ZZMI 引用改为材质转资源，原段删除"""
+        """TTL：_透明0.75 + 四前缀材质生成独立新段，ZZMI 引用改为材质转资源，原段删除"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
             material_paths = {}
@@ -951,11 +951,15 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                 material_paths[prefix] = path
 
             mesh_name = "LOD0.241deac5-56376-0.中文中文_透明0.75_copy"
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
             obj = _FakeObject(mesh_name, {}, [
                 ("DiffuseMap_衣服", material_paths["DiffuseMap"]),
                 ("NormalMap_腿", material_paths["NormalMap"]),
                 ("LightMap_袖子", material_paths["LightMap"]),
                 ("MaterialMap_身体", material_paths["MaterialMap"]),
+                ("TTLMap_遮罩", ttl_path),
             ])
             _fake_bpy.data.objects[obj.name] = obj
 
@@ -980,7 +984,6 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.name = "MaterialNode"
             node.material_to_resource_override = False
             node.material_switch_var = "$swapkey150"
-            node.fx_to_ttl = True
 
             expected_section = node._ttl_section_name(obj.name, sections, set())
             node.process_texture_override_section(
@@ -1018,10 +1021,15 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertIn("$" + BS + "TTL" + BS + "_1 = 56376", new_lines)
             self.assertIn("$" + BS + "TTL" + BS + "_2 = 0", new_lines)
             self.assertIn("run = CommandList" + BS + "TTL" + BS + "Draw", new_lines)
-            self.assertNotIn("Resource" + BS + "TTL" + BS + "TransparencyTex", new_lines)
+            ttl_ref_line = "Resource" + BS + "TTL" + BS + "TransparencyTex = ref Resource_TTLMap_Rkydfsmefl"
+            self.assertIn(ttl_ref_line, new_lines)
+            mask_line = "$" + BS + "TTL" + BS + "mask_invert = 1"
+            self.assertIn(mask_line, new_lines)
+            self.assertLess(new_lines.index(ttl_ref_line), new_lines.index(mask_line))
+            self.assertLess(new_lines.index(mask_line), new_lines.index("$" + BS + "TTL" + BS + "alpha = $TTLAlpha0_75"))
 
     def test_ttl_if_switch_block_moved_with_condition(self):
-        """FX>>>TTL：if/endif 条件块整体迁入新段并包住 _1/_2/run，原段删除"""
+        """TTL：if/endif 条件块整体迁入新段并包住 _1/_2/run，原段删除"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
             diffuse_path = os.path.join(temp_dir, "diffuse.png")
@@ -1029,7 +1037,10 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                 file_obj.write(b"diffuse")
 
             mesh_name = "LOD0.241deac5-56376-0.中文中文_透明0.75_copy"
-            obj = _FakeObject(mesh_name, {}, [("DiffuseMap_衣服", diffuse_path)])
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+            obj = _FakeObject(mesh_name, {}, [("DiffuseMap_衣服", diffuse_path), ("TTLMap_遮罩", ttl_path)])
             _fake_bpy.data.objects[obj.name] = obj
 
             sections = OrderedDict([
@@ -1052,7 +1063,6 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.name = "MaterialNode"
             node.material_to_resource_override = False
             node.material_switch_var = "$swapkey150"
-            node.fx_to_ttl = True
 
             node.process_texture_override_section(
                 "[TextureOverride_LOD0.241deac5_56376_0]",
@@ -1075,18 +1085,18 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertLess(new_lines.index("$" + BS + "TTL" + BS + "alpha = $TTLAlpha0_75"), new_lines.index("if $swapkey0 == 0 && $swapkey1 == 0"))
 
     def test_ttl_transparent_plus_fxmap_writes_ttl_ref(self):
-        """FX>>>TTL：_透明0.75 且有 FXMap 材质时写 TransparencyTex 引用并生成资源段，无旧 FXMap 流程"""
+        """TTL：_透明0.5 且有 TTLMap 材质时写 TransparencyTex 引用并生成资源段"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
             diffuse_path = os.path.join(temp_dir, "diffuse.png")
-            fxmap_path = os.path.join(temp_dir, "fxmap.png")
-            for path in (diffuse_path, fxmap_path):
+            ttlmap_path = os.path.join(temp_dir, "ttlmap.png")
+            for path in (diffuse_path, ttlmap_path):
                 with open(path, "wb") as file_obj:
                     file_obj.write(os.path.basename(path).encode("ascii"))
 
             obj = _FakeObject("Body_透明0.5", {}, [
                 ("DiffuseMap_衣服", diffuse_path),
-                ("FXMap_遮罩", fxmap_path),
+                ("TTLMap_遮罩", ttlmap_path),
             ])
             _fake_bpy.data.objects[obj.name] = obj
 
@@ -1108,7 +1118,6 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.name = "MaterialNode"
             node.material_to_resource_override = False
             node.material_switch_var = "$swapkey150"
-            node.fx_to_ttl = True
 
             node.process_texture_override_section(
                 "[TextureOverride_Body]",
@@ -1123,23 +1132,70 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             fx_token = node._latin_token_for_text("遮罩")
             new_section = next(key for key in sections if key.startswith("[TextureOverrideBody_"))
             new_lines = sections[new_section]
-            self.assertIn(f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_FXMap_{fx_token}", new_lines)
+            self.assertIn(f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_{fx_token}", new_lines)
             self.assertIn("$" + BS + "TTL" + BS + "alpha = $TTLAlpha0_5", new_lines)
             self.assertIn("global $TTLAlpha0_5 = 0.5", sections["[Constants]"])
-            self.assertIn(f"[Resource_FXMap_{fx_token}]", sections)
-            self.assertIn(f"filename = Textures/FXMap_{fx_token}.png", sections[f"[Resource_FXMap_{fx_token}]"])
+            mask_invert_line = "$" + BS + "TTL" + BS + "mask_invert = 1"
+            self.assertIn(mask_invert_line, new_lines)
+            tex_ref_line = f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_{fx_token}"
+            self.assertLess(new_lines.index(tex_ref_line), new_lines.index(mask_invert_line))
+            self.assertLess(new_lines.index(mask_invert_line), new_lines.index("$" + BS + "TTL" + BS + "alpha = $TTLAlpha0_5"))
+            self.assertIn(f"[Resource_TTLMap_{fx_token}]", sections)
+            self.assertIn(f"filename = Textures/TTLMap_{fx_token}.png", sections[f"[Resource_TTLMap_{fx_token}]"])
             joined = "\n".join(str(line) for section_lines in sections.values() for line in section_lines)
             self.assertNotIn(r"ResourceRabbitFXFXMap", joined)
             self.assertNotIn(r"ResourceNTEMIFXFXMap", joined)
 
-    def test_ttl_fxmap_only_writes_alpha_1(self):
-        """FX>>>TTL：仅有 FXMap 材质（无透明后缀）时 alpha 固定 1.0"""
+    def test_ttl_fxmap_mask_invert_appended_exactly_once_even_when_header_has_legacy_key(self):
+        """TTL：有 TTLMap 时 mask_invert 只出现一次；旧头部若残留该键不会被复制产生重复赋值"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            fxmap_path = os.path.join(temp_dir, "fxmap.png")
-            with open(fxmap_path, "wb") as file_obj:
+            ttlmap_path = os.path.join(temp_dir, "ttlmap.png")
+            with open(ttlmap_path, "wb") as file_obj:
                 file_obj.write(b"fxmap")
-            obj = _FakeObject("GenericMesh", {}, [("FXMap_Generic", fxmap_path)])
+            obj = _FakeObject("Body_透明0.5", {}, [("TTLMap_遮罩", ttlmap_path)])
+            _fake_bpy.data.objects[obj.name] = obj
+
+            sections = OrderedDict([
+                ("[TextureOverride_Body]", [
+                    "hash = 241deac5",
+                    "match_first_index = 0",
+                    "ib = Resource_Body_Index",
+                    "$" + BS + "TTL" + BS + "mask_invert = 0",
+                    "run = CommandListSkinTexture",
+                    "[mesh:Body_透明0.5]",
+                    "drawindexed = 100, 5, 0",
+                ]),
+                ("_config_path", temp_dir),
+            ])
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.process_texture_override_section(
+                "[TextureOverride_Body]", sections, material_group_to_swapkey={},
+                swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            new_section = next(key for key in sections if key.startswith("[TextureOverrideBody_"))
+            new_lines = sections[new_section]
+            mask_key = "$" + BS + "TTL" + BS + "mask_invert = 1"
+            legacy_key = "$" + BS + "TTL" + BS + "mask_invert = 0"
+            # 旧头部残留的 mask_invert 不再复制，统一写入 = 1，确保同段恰出现一次
+            self.assertIn(mask_key, new_lines)
+            self.assertNotIn(legacy_key, new_lines)
+            self.assertEqual(new_lines.count(mask_key), 1)
+
+    def test_ttl_fxmap_only_writes_alpha_1(self):
+        """TTL：仅有 TTLMap 材质（无透明后缀）时 alpha 固定 1.0"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            ttlmap_path = os.path.join(temp_dir, "ttlmap.png")
+            with open(ttlmap_path, "wb") as file_obj:
+                file_obj.write(b"fxmap")
+            obj = _FakeObject("GenericMesh", {}, [("TTLMap_Generic", ttlmap_path)])
             _fake_bpy.data.objects[obj.name] = obj
             sections = OrderedDict([
                 ("[TextureOverride_Generic]", [
@@ -1156,7 +1212,6 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.name = "MaterialNode"
             node.material_to_resource_override = False
             node.material_switch_var = "$swapkey150"
-            node.fx_to_ttl = True
             node.process_texture_override_section(
                 "[TextureOverride_Generic]", sections, material_group_to_swapkey={},
                 swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
@@ -1164,7 +1219,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             )
             new_lines = sections["[TextureOverrideGenericMesh]"]
             self.assertIn("; GenericMesh", new_lines)
-            self.assertIn("Resource" + BS + "TTL" + BS + "TransparencyTex = ref Resource_FXMap_Generic", new_lines)
+            self.assertIn("Resource" + BS + "TTL" + BS + "TransparencyTex = ref Resource_TTLMap_Generic", new_lines)
             self.assertIn("$" + BS + "TTL" + BS + "alpha = $TTLAlpha1_0", new_lines)
             self.assertIn("global $TTLAlpha1_0 = 1.0", sections["[Constants]"])
             self.assertIn("$" + BS + "TTL" + BS + "_1 = 3", new_lines)
@@ -1172,13 +1227,13 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertNotIn("[TextureOverride_Generic]", sections)
 
     def test_ttl_section_name_conflict_appends_suffix(self):
-        """FX>>>TTL：新段名与现有段冲突时追加 _2"""
+        """TTL：新段名与现有段冲突时追加 _2"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            fxmap_path = os.path.join(temp_dir, "fxmap.png")
-            with open(fxmap_path, "wb") as file_obj:
+            ttlmap_path = os.path.join(temp_dir, "ttlmap.png")
+            with open(ttlmap_path, "wb") as file_obj:
                 file_obj.write(b"fxmap")
-            obj = _FakeObject("GenericMesh", {}, [("FXMap_Generic", fxmap_path)])
+            obj = _FakeObject("GenericMesh", {}, [("TTLMap_Generic", ttlmap_path)])
             _fake_bpy.data.objects[obj.name] = obj
             sections = OrderedDict([
                 ("[TextureOverride_Generic]", [
@@ -1195,7 +1250,6 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.name = "MaterialNode"
             node.material_to_resource_override = False
             node.material_switch_var = "$swapkey150"
-            node.fx_to_ttl = True
             node.process_texture_override_section(
                 "[TextureOverride_Generic]", sections, material_group_to_swapkey={},
                 swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
@@ -1205,7 +1259,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertNotIn("[TextureOverride_Generic]", sections)
 
     def test_ttl_multiple_fxmap_materials_use_switch_branches(self):
-        """FX>>>TTL：同一物体多个 FXMap 材质生成 $swapkey 分支"""
+        """TTL：同一物体多个 TTLMap 材质生成 $swapkey 分支"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
             fx_a = os.path.join(temp_dir, "fxmap-a.png")
@@ -1213,7 +1267,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             for path in (fx_a, fx_b):
                 with open(path, "wb") as file_obj:
                     file_obj.write(os.path.basename(path).encode("ascii"))
-            obj = _FakeObject("Body", {}, [("FXMap_A", fx_a), ("FXMap_B", fx_b)])
+            obj = _FakeObject("Body", {}, [("TTLMap_A", fx_a), ("TTLMap_B", fx_b)])
             _fake_bpy.data.objects[obj.name] = obj
             sections = OrderedDict([
                 ("[TextureOverride_Body]", [
@@ -1229,7 +1283,6 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.name = "MaterialNode"
             node.material_to_resource_override = False
             node.material_switch_var = "$swapkey150"
-            node.fx_to_ttl = True
             node.process_texture_override_section(
                 "[TextureOverride_Body]", sections, material_group_to_swapkey={},
                 swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
@@ -1238,8 +1291,8 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             new_lines = sections["[TextureOverrideBody]"]
             self.assertIn("if $swapkey150 == 0", new_lines)
             self.assertIn("if $swapkey150 == 1", new_lines)
-            self.assertIn("    Resource" + BS + "TTL" + BS + "TransparencyTex = ref Resource_FXMap_A", new_lines)
-            self.assertIn("    Resource" + BS + "TTL" + BS + "TransparencyTex = ref Resource_FXMap_B", new_lines)
+            self.assertIn("    Resource" + BS + "TTL" + BS + "TransparencyTex = ref Resource_TTLMap_A", new_lines)
+            self.assertIn("    Resource" + BS + "TTL" + BS + "TransparencyTex = ref Resource_TTLMap_B", new_lines)
 
     def test_ttl_shared_if_only_transparent_gets_own_if(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1247,7 +1300,10 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             diffuse_path = os.path.join(temp_dir, "diffuse.png")
             with open(diffuse_path, "wb") as file_obj:
                 file_obj.write(b"diffuse")
-            transparent_obj = _FakeObject("Body_透明0.5", {}, [("DiffuseMap_衣服", diffuse_path)])
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+            transparent_obj = _FakeObject("Body_透明0.5", {}, [("DiffuseMap_衣服", diffuse_path), ("TTLMap_遮罩", ttl_path)])
             normal_obj = _FakeObject("Body", {}, [("DiffuseMap_衣服", diffuse_path)])
             _fake_bpy.data.objects[transparent_obj.name] = transparent_obj
             _fake_bpy.data.objects[normal_obj.name] = normal_obj
@@ -1272,7 +1328,6 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.name = "MaterialNode"
             node.material_to_resource_override = False
             node.material_switch_var = "$swapkey150"
-            node.fx_to_ttl = True
             node.process_texture_override_section(
                 "[TextureOverride_Shared]", sections, material_group_to_swapkey={},
                 swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
@@ -1293,14 +1348,17 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertLess(shared.index("  [mesh:Body]"), shared.index("  drawindexed = 100, 0, 0"))
 
     def test_ttl_same_alpha_value_reuses_same_variable(self):
-        """FX>>>TTL：相同透明数值复用同一个 $TTLAlpha 变量，[Constants] 只定义一次"""
+        """TTL：相同透明数值复用同一个 $TTLAlpha 变量，[Constants] 只定义一次"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
             diffuse_path = os.path.join(temp_dir, "diffuse.png")
             with open(diffuse_path, "wb") as file_obj:
                 file_obj.write(b"diffuse")
-            obj_a = _FakeObject("BodyA_透明0.75", {}, [("DiffuseMap_衣服", diffuse_path)])
-            obj_b = _FakeObject("BodyB_透明0.75", {}, [("DiffuseMap_衣服", diffuse_path)])
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+            obj_a = _FakeObject("BodyA_透明0.75", {}, [("DiffuseMap_衣服", diffuse_path), ("TTLMap_遮罩", ttl_path)])
+            obj_b = _FakeObject("BodyB_透明0.75", {}, [("DiffuseMap_衣服", diffuse_path), ("TTLMap_遮罩", ttl_path)])
             _fake_bpy.data.objects[obj_a.name] = obj_a
             _fake_bpy.data.objects[obj_b.name] = obj_b
             sections = OrderedDict([
@@ -1319,7 +1377,6 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             node.name = "MaterialNode"
             node.material_to_resource_override = False
             node.material_switch_var = "$swapkey150"
-            node.fx_to_ttl = True
             node.process_texture_override_section(
                 "[TextureOverride_Shared]", sections, material_group_to_swapkey={},
                 swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
@@ -1332,6 +1389,201 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                 if key.startswith("[TextureOverrideBody"):
                     alpha_lines.extend(ls)
             self.assertEqual(alpha_lines.count("$" + BS + "TTL" + BS + "alpha = $TTLAlpha0_75"), 2)
+
+    def test_transparency_suffix_alone_triggers_transparency_code_not_ttl(self):
+        """澄清：_透明 后缀不再自动触发 TTL/FX，仅独立生成透明代码（CustomShaderTransparencyCloth）"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            diffuse_path = os.path.join(temp_dir, "diffuse.png")
+            with open(diffuse_path, "wb") as file_obj:
+                file_obj.write(b"diffuse")
+            obj = _FakeObject("Body_透明0.5", {}, [("DiffuseMap_衣服", diffuse_path)])
+            _fake_bpy.data.objects[obj.name] = obj
+
+            sections = OrderedDict([
+                ("[TextureOverride_Test]", [
+                    "hash = 12345678",
+                    "match_first_index = 0",
+                    "ib = Resource_Body_Index",
+                    f"Resource{BS}ZZMI{BS}Diffuse = ref Resource-old-DiffuseMap",
+                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                    "run = CommandListSkinTexture",
+                    "[mesh:Body_透明0.5]",
+                    "drawindexed = 100, 5, 0",
+                ]),
+                ("_config_path", temp_dir),
+            ])
+            transparency_sections = OrderedDict()
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.process_texture_override_section(
+                "[TextureOverride_Test]", sections, material_group_to_swapkey={},
+                swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
+                transparency_sections_to_add=transparency_sections,
+            )
+
+            self.assertEqual(len(transparency_sections), 1)
+            transparency_lines = next(iter(transparency_sections.values()))
+            self.assertIn("blend_factor[0] = 0.5", transparency_lines)
+            self.assertIn("drawindexed = 100, 5, 0", transparency_lines)
+            override_lines = sections["[TextureOverride_Test]"]
+            self.assertTrue(any(line.startswith("run = CustomShaderTransparencyCloth") for line in override_lines))
+
+            joined = "\n".join(str(line) for key, ls in sections.items() for line in ls if key != "_config_path")
+            self.assertNotIn(r"CommandList\TTL\Draw", joined)
+            self.assertNotIn(f"Resource{BS}TTL{BS}TransparencyTex", joined)
+            self.assertNotIn(r"$\TTL\alpha", joined)
+            self.assertNotIn("Resource" + BS + "RabbitFX" + BS + "FXMap", joined)
+            self.assertNotIn("Resource" + BS + "NTEMIFX" + BS + "FXMap", joined)
+            self.assertFalse(any(key.startswith("[TextureOverrideBody_") for key in sections))
+
+    def test_ttl_fx_and_ttl_conflict_skips_ttl_and_keeps_fx(self):
+        """同一物体同时挂 FXMap 与 TTLMap 材质：TTL 检测跳过并警告，FX 按原流程保留"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            fx_path = os.path.join(temp_dir, "fx.png")
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            for path in (fx_path, ttl_path):
+                with open(path, "wb") as file_obj:
+                    file_obj.write(os.path.basename(path).encode("ascii"))
+            obj = _FakeObject("Body", {}, [("FXMap_特效", fx_path), ("TTLMap_遮罩", ttl_path)])
+            _fake_bpy.data.objects[obj.name] = obj
+
+            warnings_captured = []
+            log_module = sys.modules[f"{PKG}.utils.log_utils"]
+            original_warning = log_module.LOG.warning
+            log_module.LOG.warning = lambda *args, **_kwargs: warnings_captured.append(args)
+            try:
+                sections = OrderedDict([
+                    ("[TextureOverride_Body]", [
+                        "hash = 12345678",
+                        "match_first_index = 0",
+                        "ib = Resource_Body_Index",
+                        "run = CommandListSkinTexture",
+                        "[mesh:Body]",
+                        "drawindexed = 100, 5, 0",
+                    ]),
+                    ("_config_path", temp_dir),
+                ])
+                node = node_postprocess_material.SSMTNode_PostProcess_Material()
+                node.name = "MaterialNode"
+                node.material_to_resource_override = False
+                node.material_switch_var = "$swapkey150"
+                node.process_texture_override_section(
+                    "[TextureOverride_Body]", sections, material_group_to_swapkey={},
+                    swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
+                    transparency_sections_to_add=OrderedDict(),
+                )
+            finally:
+                log_module.LOG.warning = original_warning
+
+            override_lines = sections["[TextureOverride_Body]"]
+            joined = "\n".join(str(line) for line in override_lines)
+            self.assertIn(f"Resource{BS}RabbitFX{BS}FXMap = ref Resource_FXMap_", joined)
+            self.assertTrue(any("不能同时启用 FX 与 TTL" in str(warning) for warning in warnings_captured))
+            self.assertNotIn(f"Resource{BS}TTL{BS}TransparencyTex", joined)
+            self.assertNotIn(r"CommandList\TTL\Draw", joined)
+            self.assertFalse(any(
+                key.startswith("[TextureOverrideBody") and key != "[TextureOverride_Body]"
+                for key in sections
+            ))
+
+    def test_debug_disable_fx_ttl_skips_fxmap_generation(self):
+        """调试开关：开启后不生成 FX（FXMap→RabbitFX/NTEMIFX）段落"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            fx_path = os.path.join(temp_dir, "fx.png")
+            glow_path = os.path.join(temp_dir, "glow.png")
+            for path in (fx_path, glow_path):
+                with open(path, "wb") as file_obj:
+                    file_obj.write(os.path.basename(path).encode("ascii"))
+            obj = _FakeObject("Body", {}, [
+                ("FXMap_特效", fx_path),
+                ("Glowmap_发光", glow_path),
+            ])
+            _fake_bpy.data.objects[obj.name] = obj
+
+            sections = OrderedDict([
+                ("[TextureOverride_Body]", [
+                    "hash = 12345678",
+                    "match_first_index = 0",
+                    "ib = Resource_Body_Index",
+                    "run = CommandListSkinTexture",
+                    "[mesh:Body]",
+                    "drawindexed = 100, 5, 0",
+                ]),
+                ("_config_path", temp_dir),
+            ])
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.debug_disable_fx_ttl = True
+            node.process_texture_override_section(
+                "[TextureOverride_Body]", sections, material_group_to_swapkey={},
+                swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            joined = "\n".join(str(line) for line in sections["[TextureOverride_Body]"])
+            self.assertNotIn(f"Resource{BS}RabbitFX{BS}FXMap = ref Resource_FXMap_", joined)
+            self.assertNotIn(f"Resource{BS}NTEMIFX{BS}FXMap = ref", joined)
+            self.assertNotIn(f"Resource{BS}RabbitFX{BS}FXMap = ref null", joined)
+            # Glowmap 不属于 FX/TTL，调试开关不拦截
+            self.assertIn(f"Resource{BS}RabbitFX{BS}Glowmap = ref Resource_Glowmap_", joined)
+
+    def test_debug_disable_fx_ttl_skips_ttl_generation(self):
+        """调试开关：开启后不生成 TTL（TTLMap）段落，但透明代码仍独立生成"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            diffuse_path = os.path.join(temp_dir, "diffuse.png")
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            for path in (diffuse_path, ttl_path):
+                with open(path, "wb") as file_obj:
+                    file_obj.write(os.path.basename(path).encode("ascii"))
+            obj = _FakeObject("Body_透明0.5", {}, [
+                ("DiffuseMap_衣服", diffuse_path),
+                ("TTLMap_遮罩", ttl_path),
+            ])
+            _fake_bpy.data.objects[obj.name] = obj
+
+            sections = OrderedDict([
+                ("[TextureOverride_Body]", [
+                    "hash = 12345678",
+                    "match_first_index = 0",
+                    "ib = Resource_Body_Index",
+                    f"Resource{BS}ZZMI{BS}Diffuse = ref Resource-old-DiffuseMap",
+                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                    "run = CommandListSkinTexture",
+                    "[mesh:Body_透明0.5]",
+                    "drawindexed = 100, 5, 0",
+                ]),
+                ("_config_path", temp_dir),
+            ])
+            transparency_sections = OrderedDict()
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.debug_disable_fx_ttl = True
+            node.process_texture_override_section(
+                "[TextureOverride_Body]", sections, material_group_to_swapkey={},
+                swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
+                transparency_sections_to_add=transparency_sections,
+            )
+
+            joined = "\n".join(str(line) for key, ls in sections.items() for line in ls if key != "_config_path")
+            self.assertNotIn(r"CommandList\TTL\Draw", joined)
+            self.assertNotIn(f"Resource{BS}TTL{BS}TransparencyTex", joined)
+            self.assertNotIn("$" + BS + "TTL" + BS + "alpha", joined)
+            self.assertNotIn("$" + BS + "TTL" + BS + "mask_invert", joined)
+            self.assertFalse(any(key.startswith("[TextureOverrideBody_") for key in sections))
+            # 透明代码与 FX/TTL 独立，仍正常生成
+            self.assertEqual(len(transparency_sections), 1)
+            transparency_lines = next(iter(transparency_sections.values()))
+            self.assertIn("blend_factor[0] = 0.5", transparency_lines)
 
     def test_previous_transparency_tail_is_replaced_without_losing_auto_appended_tail(self):
         node = node_postprocess_material.SSMTNode_PostProcess_Material()

@@ -518,7 +518,7 @@ class BMTP_SceneCleanPanel(bpy.types.Panel):
         col.operator("toolkit.bmtp_clean_empty_material_slots", text="清理空材质槽")
         col.operator("toolkit.bmtp_remove_unused_material_slots", text="清理所有未使用槽")
         col.operator("toolkit.bmtp_clean_duplicate_materials", text="清理重复材质")
-        
+
         col.separator()
         
         batch_row = col.row()
@@ -905,7 +905,8 @@ class TT_AlphaExtractPanel(bpy.types.Panel):
         box.separator()
         box.label(text="材质选项", icon='MATERIAL')
         box.prop(props, "alpha_extract_create_materials", text="创建透明材质")
-        box.prop(props, "alpha_extract_material_prefix", text="新材质前缀")
+        auto_prefix = "TTLMap_" if props.alpha_extract_allow_semitransparency else "FXMap_"
+        box.label(text=f"自动前缀：{auto_prefix}")
         
         layout.separator()
         layout.operator("toolkit.tt_extract_alpha_channel", icon='EXPORT')
@@ -940,6 +941,13 @@ class TT_MaterialToolsPanel(bpy.types.Panel):
         col.label(text="自动合并项目中所有使用相同贴图的材质。")
         col.label(text="(例如: Mat 和 Mat.001 将合并为 Mat)")
         merge_box.operator("toolkit.tt_merge_duplicate_materials", icon='AUTOMERGE_ON')
+
+        layout.separator()
+        rename_box = layout.box()
+        rename_box.label(text="材质球批量重命名", icon='FONT_DATA')
+        rename_box.prop(props, "mat_rename_search", text="查找片段")
+        rename_box.prop(props, "mat_rename_replace", text="替换为")
+        rename_box.operator("toolkit.tt_rename_materials_by_fragment", text="按片段替换名称", icon='SORTALPHA')
 
 
 class TT_LightmapPanel(bpy.types.Panel):

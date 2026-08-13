@@ -451,6 +451,114 @@ class DragNodeLocateTests(unittest.TestCase):
         self.assertIn("global $body_state = 0", written)
         self.assertNotIn("global $driver_state", sections["[Constants]"])
 
+    def test_read_and_write_preserve_content_before_anim_driver_block(self):
+        """动画驱动块即使不在首部，也不得吞掉它前面的正常 INI 段。"""
+        import tempfile
+
+        node = _make_node(self.mod)
+        prefix = (
+            "[Constants]\n"
+            "global persist $body_state = 7\n\n"
+            "[TextureOverride_BeforeDriver]\n"
+            "hash = abc123\n"
+            "drawindexed = 3, 0, 0\n\n"
+        )
+        driver_block = (
+            "; --- ANIMATION DRIVER SECTION ---\n"
+            "[Present]\n"
+            "$driver_state = 1\n"
+            "; --- END ANIMATION DRIVER SECTION ---\n\n"
+        )
+        suffix = (
+            "[ResourceAfterDriver]\n"
+            "type = Buffer\n"
+            "format = R32_FLOAT\n"
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            ini_path = Path(td) / "test.ini"
+            ini_path.write_text(prefix + driver_block + suffix, encoding="utf-8")
+            sections, preserved_tail, preserved_driver = node._read_ini_to_ordered_dict(str(ini_path))
+            node._write_ordered_dict_to_ini(sections, str(ini_path), preserved_tail, preserved_driver)
+            written = ini_path.read_text(encoding="utf-8")
+
+        self.assertIn("global persist $body_state = 7", written)
+        self.assertIn("[TextureOverride_BeforeDriver]", written)
+        self.assertIn("[ResourceAfterDriver]", written)
+        self.assertEqual(written.count("; --- ANIMATION DRIVER SECTION ---"), 1)
+
+    def test_anim_driver_and_drag_ini_round_trip_is_idempotent(self):
+        import tempfile
+
+        node = _make_node(self.mod)
+        original = (
+            "[Constants]\n"
+            "global persist $body_state = 7\n\n"
+            "; --- ANIMATION DRIVER SECTION ---\n"
+            "[Present]\n"
+            "$driver_state = 1\n"
+            "; --- END ANIMATION DRIVER SECTION ---\n\n"
+            "[TextureOverride_Main]\n"
+            "hash = abc123\n"
+            "drawindexed = 3, 0, 0\n\n"
+            "; --- AUTO-APPENDED HEALTH DETECTION MODULE ---\n"
+            "[ResourceHealth]\n"
+            "type = Buffer\n"
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            ini_path = Path(td) / "test.ini"
+            ini_path.write_text(original, encoding="utf-8")
+
+            for iteration in range(2):
+                sections, preserved_tail, preserved_driver = node._read_ini_to_ordered_dict(
+                    str(ini_path)
+                )
+                node._write_ordered_dict_to_ini(
+                    sections, str(ini_path), preserved_tail, preserved_driver
+                )
+                if iteration == 0:
+                    first_write = ini_path.read_text(encoding="utf-8")
+
+            second_write = ini_path.read_text(encoding="utf-8")
+
+        self.assertEqual(second_write, first_write)
+        self.assertEqual(second_write.count("; --- ANIMATION DRIVER SECTION ---"), 1)
+        self.assertEqual(second_write.count("; --- AUTO-APPENDED HEALTH DETECTION MODULE ---"), 1)
+        self.assertIn("global persist $body_state = 7", second_write)
+        self.assertIn("[TextureOverride_Main]", second_write)
+
+    def test_is_postprocess_node_on_export_chain_uses_pointer_identity(self):
+        class FakeSocket:
+            def __init__(self, links=None):
+                self.links = links or []
+
+        class FakeLink:
+            def __init__(self, from_node, to_node):
+                self.from_node = from_node
+                self.to_node = to_node
+
+        class FakeNode:
+            def __init__(self, bl_idname, name, pointer):
+                self.bl_idname = bl_idname
+                self.name = name
+                self.inputs = []
+                self.outputs = []
+                self._pointer = pointer
+                self.id_data = types.SimpleNamespace(name="Main")
+
+            def as_pointer(self):
+                return self._pointer
+
+        result = FakeNode("SSMTNode_Result_Output", "Result", 1)
+        target_a = FakeNode("SSMTNode_PostProcess_DragInteraction", "Drag", 100)
+        target_b = FakeNode("SSMTNode_PostProcess_DragInteraction", "Drag", 100)
+        result.outputs = [FakeSocket([FakeLink(result, target_a)])]
+        tree = types.SimpleNamespace(nodes=[result, target_a])
+
+        self.assertTrue(self.mod.is_postprocess_node_on_export_chain(tree, target_b))
+
+
 class DragNodeObjectMapTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -527,6 +635,250 @@ class DragNodeEmitTests(unittest.TestCase):
         for sec in required:
             self.assertIn(sec, sections, f"缺少必需段 {sec}")
 
+    def test_present_without_shapekey_drive_does_not_reference_seed_flag(self):
+        node, sections, components = self._emit(enable_shapekey_drive=False)
+
+        node._emit_present_and_constants(sections, components, "testns")
+
+        self.assertFalse(
+            any("ssmtdrag_seed_pending_testns" in line for line in sections["[Present]"])
+        )
+
+    def test_empty_namespace_uses_stable_default_A(self):
+        node = _make_node(self.mod, mod_namespace="")
+
+        self.assertEqual(node._resolve_namespace("Character.ini"), "A")
+        self.assertEqual(node._resolve_namespace(""), "A")
+
+        custom = _make_node(self.mod, mod_namespace="My Mod-01")
+        self.assertEqual(custom._resolve_namespace("Character.ini"), "My_Mod_01")
+
+    def test_click_export_entries_reject_invalid_zone_and_bound_cycle_length(self):
+        invalid = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ClickExport",
+            click_zone_id=256,
+            cycle_length=999,
+            click_target_list=[types.SimpleNamespace(variable_name="$Invalid")],
+        )
+        valid = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ClickExport",
+            click_zone_id=2,
+            cycle_length=999,
+            click_target_list=[types.SimpleNamespace(variable_name="$Valid")],
+        )
+        anim_tree = types.SimpleNamespace(name="AnimTree", nodes=[invalid, valid])
+        postprocess = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_AnimDriver",
+            blueprint_name="AnimTree",
+        )
+        node = _make_node(self.mod, enable_shapekey_drive=True)
+        node.id_data = types.SimpleNamespace(nodes=[postprocess])
+
+        class _Groups(list):
+            def get(self, name, default=None):
+                return next((item for item in self if item.name == name), default)
+
+        self.mod.bpy.data.node_groups = _Groups([anim_tree])
+
+        self.assertEqual(node._collect_click_export_drivers(), [(2, 64, "$Valid")])
+
+    def test_click_export_entries_ignore_muted_animation_driver_nodes(self):
+        muted = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ClickExport",
+            mute=True,
+            click_zone_id=4,
+            cycle_length=5,
+            click_target_list=[types.SimpleNamespace(variable_name="$Muted")],
+        )
+        enabled = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ClickExport",
+            mute=False,
+            click_zone_id=2,
+            cycle_length=3,
+            click_target_list=[types.SimpleNamespace(variable_name="$Enabled")],
+        )
+        anim_tree = types.SimpleNamespace(name="AnimTree", nodes=[muted, enabled])
+        postprocess = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_AnimDriver",
+            blueprint_name="AnimTree",
+        )
+        node = _make_node(self.mod, enable_shapekey_drive=True)
+        node.id_data = types.SimpleNamespace(nodes=[postprocess])
+
+        class _Groups(list):
+            def get(self, name, default=None):
+                return next((item for item in self if item.name == name), default)
+
+        self.mod.bpy.data.node_groups = _Groups([anim_tree])
+
+        self.assertEqual(node._collect_click_export_drivers(), [(2, 3, "$Enabled")])
+
+    def test_click_export_entries_ignore_muted_anim_driver_postprocess_node(self):
+        click_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ClickExport",
+            mute=False,
+            click_zone_id=2,
+            cycle_length=3,
+            click_target_list=[types.SimpleNamespace(variable_name="$Enabled")],
+        )
+        anim_tree = types.SimpleNamespace(name="AnimTree", nodes=[click_node])
+        postprocess = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_AnimDriver",
+            mute=True,
+            blueprint_name="AnimTree",
+        )
+        node = _make_node(self.mod, enable_shapekey_drive=True)
+        node.id_data = types.SimpleNamespace(nodes=[postprocess])
+
+        class _Groups(list):
+            def get(self, name, default=None):
+                return next((item for item in self if item.name == name), default)
+
+        self.mod.bpy.data.node_groups = _Groups([anim_tree])
+
+        self.assertEqual(node._collect_click_export_drivers(), [])
+
+    def test_click_export_entries_ignore_disconnected_anim_driver_postprocess_node(self):
+        connected_click = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ClickExport",
+            mute=False,
+            click_zone_id=2,
+            cycle_length=3,
+            click_target_list=[types.SimpleNamespace(variable_name="$Connected")],
+        )
+        disconnected_click = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ClickExport",
+            mute=False,
+            click_zone_id=9,
+            cycle_length=10,
+            click_target_list=[types.SimpleNamespace(variable_name="$Disconnected")],
+        )
+        connected_tree = types.SimpleNamespace(name="ConnectedAnim", nodes=[connected_click])
+        disconnected_tree = types.SimpleNamespace(name="DisconnectedAnim", nodes=[disconnected_click])
+
+        result = types.SimpleNamespace(
+            bl_idname="SSMTNode_Result_Output", inputs=[], outputs=[]
+        )
+        connected = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_AnimDriver",
+            mute=False,
+            blueprint_name="ConnectedAnim",
+            inputs=[],
+            outputs=[],
+        )
+        disconnected = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_AnimDriver",
+            mute=False,
+            blueprint_name="DisconnectedAnim",
+            inputs=[],
+            outputs=[],
+        )
+        link = types.SimpleNamespace(from_node=result, to_node=connected)
+        result.outputs.append(types.SimpleNamespace(links=[link]))
+        connected.inputs.append(types.SimpleNamespace(links=[link]))
+
+        node = _make_node(self.mod, enable_shapekey_drive=True)
+        node.id_data = types.SimpleNamespace(nodes=[result, connected, disconnected])
+
+        class _Groups(list):
+            def get(self, name, default=None):
+                return next((item for item in self if item.name == name), default)
+
+        self.mod.bpy.data.node_groups = _Groups([connected_tree, disconnected_tree])
+
+        self.assertEqual(node._collect_click_export_drivers(), [(2, 3, "$Connected")])
+
+    def test_click_export_expands_sparse_buffer_and_emits_seed_bindings(self):
+        click_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ClickExport",
+            click_zone_id=3,
+            cycle_length=4,
+            click_target_list=[types.SimpleNamespace(variable_name="$Swap")],
+        )
+        anim_tree = types.SimpleNamespace(name="AnimTree", nodes=[click_node])
+        postprocess = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_AnimDriver",
+            blueprint_name="AnimTree",
+        )
+        node = _make_node(self.mod, enable_shapekey_drive=True)
+        node.id_data = types.SimpleNamespace(nodes=[postprocess])
+
+        class _Groups(list):
+            def get(self, name, default=None):
+                return next((item for item in self if item.name == name), default)
+
+        self.mod.bpy.data.node_groups = _Groups([anim_tree])
+
+        self.assertEqual(node._click_export_seed_entries(), [(3, "$Swap")])
+
+        total, bases, counts = node._drag_drive_buffer_layout()
+        self.assertEqual(counts, [1, 1, 1, 3])
+        self.assertEqual(bases, [0, 5, 10, 15])
+        self.assertEqual(total, 22)
+
+        sections = _base_sections()
+        node._emit_sections(sections, [], "testns")
+        node._emit_present_and_constants(sections, [], "testns")
+
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyDrive_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 22"],
+        )
+        shader = sections["[CustomShaderDragShapeKeyDrive_testns]"]
+        self.assertIn("x81 = 1", shader)
+        self.assertIn("x82 = 3", shader)
+        self.assertIn("y82 = $Swap", shader)
+        pin = sections["[CommandListDragPinDetected_testns]"]
+        self.assertIn("\t$ssmtdrag_seed_pending_testns = 1", pin)
+        self.assertLess(
+            pin.index("\trun = CustomShaderDragShapeKeyDrive_testns"),
+            pin.index("\t$ssmtdrag_seed_pending_testns = 0"),
+        )
+        present = sections["[Present]"]
+        boot_run = "if $ssmtdrag_booted_testns == 0"
+        seed_run = "elif $ssmtdrag_seed_pending_testns == 1"
+        interaction_run = "elif $ssmtdrag_drag_enabled_testns >= 1 && $ssmtdrag_mode_testns == 1"
+        self.assertIn(boot_run, present)
+        self.assertIn(seed_run, present)
+        self.assertLess(present.index(boot_run), present.index(seed_run))
+        self.assertLess(present.index(seed_run), present.index(interaction_run))
+
+    def test_click_export_seed_entries_reject_more_than_eight_unique_zones(self):
+        click_nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_AnimDriver_ClickExport",
+                click_zone_id=zone,
+                cycle_length=2,
+                click_target_list=[types.SimpleNamespace(variable_name=f"$Swap{zone}")],
+            )
+            for zone in range(10)
+        ]
+        click_nodes.insert(
+            1,
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_AnimDriver_ClickExport",
+                click_zone_id=0,
+                cycle_length=2,
+                click_target_list=[types.SimpleNamespace(variable_name="$Duplicate")],
+            ),
+        )
+        anim_tree = types.SimpleNamespace(name="AnimTree", nodes=click_nodes)
+        postprocess = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_AnimDriver",
+            blueprint_name="AnimTree",
+        )
+        node = _make_node(self.mod, enable_shapekey_drive=True)
+        node.id_data = types.SimpleNamespace(nodes=[postprocess])
+
+        class _Groups(list):
+            def get(self, name, default=None):
+                return next((item for item in self if item.name == name), default)
+
+        self.mod.bpy.data.node_groups = _Groups([anim_tree])
+
+        with self.assertRaisesRegex(ValueError, "最多支持 8 个不同区域"):
+            node._click_export_seed_entries()
+
     def test_shapekey_drive_dir_resource_and_bindings(self):
         zone = self._zone_item(0)
         node, sections, comps = self._emit(
@@ -549,6 +901,10 @@ class DragNodeEmitTests(unittest.TestCase):
             ["type = RWBuffer", "format = R32_UINT", "array = 1"],
         )
         self.assertEqual(
+            sections["[ResourceDragShapeKeyClickCountF_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
+        )
+        self.assertEqual(
             sections["[ResourceDragShapeKeyActiveDir_testns]"],
             ["type = RWBuffer", "format = R32_UINT", "array = 1"],
         )
@@ -558,6 +914,7 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("cs-u1 = ResourceDragShapeKeyDir_testns", cs)
         self.assertIn("cs-u2 = ResourceDragShapeKeyClickCount_testns", cs)
         self.assertIn("cs-u3 = ResourceDragShapeKeyActiveDir_testns", cs)
+        self.assertIn("cs-u4 = ResourceDragShapeKeyClickCountF_testns", cs)
         self.assertIn("post cs-u1 = null", cs)
         self.assertIn("z77 = $ssmtdrag_drag_enabled_testns", cs)
         self.assertIn("w77 = $ssmtdrag_lmb_down_testns", cs)
@@ -753,7 +1110,7 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("cs-u0 = ResourceDragShapeKeyDrive_testns", cs)
         self.assertIn("cs-u1 = ResourceDragShapeKeyClickCount_testns", cs)
         self.assertIn("cs-u2 = ResourceDragShapeKeyVarPrev_testns", cs)
-        self.assertNotIn("cs-u3", "\n".join(cs))
+        self.assertIn("cs-u3 = ResourceDragShapeKeyClickCountF_testns", cs)
         self.assertIn("cs-u4 = ResourceDragShapeKeyZoneActive_testns", cs)
         self.assertIn("dispatch = 1, 1, 1", cs)
         self.assertIn("post cs-t67 = null", cs)
@@ -875,6 +1232,7 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("RWBuffer<float> ShapeKeyDrive       : register(u0);", content)
         self.assertIn("RWBuffer<uint>  ClickCount          : register(u1);", content)
         self.assertIn("RWBuffer<float> VarSyncPrev         : register(u2);", content)
+        self.assertIn("RWBuffer<float> ClickCountF         : register(u3);", content)
         self.assertIn("RWBuffer<float> ZoneActive          : register(u4);", content)
         self.assertIn("Buffer<uint4>   VarSyncMap          : register(t69);", content)
         self.assertIn("StructuredBuffer<float4> PinnedDetectInfo : register(t67);", content)
@@ -891,6 +1249,7 @@ class DragNodeEmitTests(unittest.TestCase):
         # 区域拖拽激活中：变量→缓冲写入挂起（防驱动器中途拽走缓冲）
         self.assertIn("if (zone < clickSlots && ZoneActive[zone] > 0.5)", content)
         self.assertIn("ShapeKeyDrive[slot] = v;", content)
+        self.assertIn("ClickCountF[zone] = (float)ClickCount[zone];", content)
         # 无方向档位：变量非 0 打开对应档位，归 0 时仅清空本档位
         self.assertIn("ClickCount[zone] = ndStage;", content)
         self.assertIn("ClickCount[zone] = 0u;", content)

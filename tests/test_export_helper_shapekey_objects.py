@@ -133,6 +133,9 @@ export_helper = importlib.util.module_from_spec(spec)
 sys.modules[f"{PKG}.blueprint.export_helper"] = export_helper
 spec.loader.exec_module(export_helper)
 
+# 个别测试会临时替换 get_exportable_shape_key_infos 且不恢复，这里保留真实实现供后续测试重置
+_real_get_exportable_shape_key_infos = export_helper.BlueprintExportHelper.get_exportable_shape_key_infos
+
 
 class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
     """测试 ExportHelper 的形态键对象收集和分类功能"""
@@ -310,6 +313,75 @@ class BlueprintExportShapeKeyObjectsTests(unittest.TestCase):
         result = export_helper.BlueprintExportHelper.get_exportable_shape_key_infos(obj)
 
         self.assertEqual([(slot_index, shape_key_name) for slot_index, shape_key_name, _ in result], [(1, "Smile")])
+
+    def test_get_exportable_shape_key_infos_skips_unchecked_node_items(self):
+        """测试 get_exportable_shape_key_infos 跳过形态键配置节点中取消勾选的形态键"""
+        shapekey_node = _FakeNode(
+            "ShapeKeyPP",
+            "SSMTNode_PostProcess_ShapeKey",
+            shapekey_variable_items=[
+                types.SimpleNamespace(shape_key_name="Frown", export_enabled=False),
+            ],
+        )
+        output_node = _FakeNode(
+            "Output",
+            "SSMTNode_Result_Output",
+            inputs=[_FakeSocket(from_node=shapekey_node, linked=True, bl_idname="SSMTSocketPostProcess")],
+        )
+        tree = _make_tree("BP_Filter", output_node, shapekey_node)
+
+        export_helper.BlueprintExportHelper.get_exportable_shape_key_infos = staticmethod(
+            _real_get_exportable_shape_key_infos
+        )
+        original_get_tree = export_helper.BlueprintExportHelper.get_current_blueprint_tree
+        export_helper.BlueprintExportHelper.get_current_blueprint_tree = staticmethod(lambda context=None: tree)
+        try:
+            obj = types.SimpleNamespace(
+                name="Body",
+                data=types.SimpleNamespace(
+                    shape_keys=types.SimpleNamespace(
+                        key_blocks=[
+                            types.SimpleNamespace(name="Basis", mute=False),
+                            types.SimpleNamespace(name="Frown", mute=False),
+                            types.SimpleNamespace(name="Smile", mute=False),
+                        ]
+                    )
+                ),
+            )
+
+            result = export_helper.BlueprintExportHelper.get_exportable_shape_key_infos(obj)
+        finally:
+            export_helper.BlueprintExportHelper.get_current_blueprint_tree = original_get_tree
+
+        # Frown 未勾选被跳过，槽位索引保持紧密
+        self.assertEqual(
+            [(slot_index, shape_key_name) for slot_index, shape_key_name, _ in result],
+            [(1, "Smile")],
+        )
+
+    def test_get_exportable_shape_key_infos_unfiltered_without_blueprint_tree(self):
+        """测试无有效蓝图树时 get_exportable_shape_key_infos 不过滤形态键"""
+        export_helper.BlueprintExportHelper.get_exportable_shape_key_infos = staticmethod(
+            _real_get_exportable_shape_key_infos
+        )
+        obj = types.SimpleNamespace(
+            name="Body",
+            data=types.SimpleNamespace(
+                shape_keys=types.SimpleNamespace(
+                    key_blocks=[
+                        types.SimpleNamespace(name="Basis", mute=False),
+                        types.SimpleNamespace(name="Frown", mute=False),
+                    ]
+                )
+            ),
+        )
+
+        result = export_helper.BlueprintExportHelper.get_exportable_shape_key_infos(obj)
+
+        self.assertEqual(
+            [(slot_index, shape_key_name) for slot_index, shape_key_name, _ in result],
+            [(1, "Frown")],
+        )
 
 
     def test_collect_postprocess_nodes_preserves_chain_order(self):

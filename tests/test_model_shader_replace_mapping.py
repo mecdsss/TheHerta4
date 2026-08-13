@@ -29,6 +29,7 @@ _install_module(
         info=lambda *_args, **_kwargs: None,
         warning=lambda *_args, **_kwargs: None,
         debug=lambda *_args, **_kwargs: None,
+        error=lambda *_args, **_kwargs: None,
     ),
 )
 _install_module(f"{PKG}.common.m_key", M_Key=object)
@@ -51,6 +52,239 @@ spec.loader.exec_module(model_module)
 
 
 class ModelShaderReplaceMappingTests(unittest.TestCase):
+    def test_blueprint_validation_rejects_multiple_drag_postprocess_nodes(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_DragInteraction",
+                name="Drag A",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_DragInteraction",
+                name="Drag B",
+                mute=False,
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "拖拽交互.*只能存在一个"):
+            model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_blueprint_validation_allows_muted_second_drag_node(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_DragInteraction",
+                name="Drag A",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_DragInteraction",
+                name="Drag B",
+                mute=True,
+            ),
+        ]
+
+        model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_blueprint_validation_runs_active_postprocess_export_validator(self):
+        def reject_invalid_configuration():
+            raise ValueError("点击导出冷启动最多支持 8 个不同区域")
+
+        node = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_DragInteraction",
+            name="Drag",
+            mute=False,
+            validate_export_configuration=reject_invalid_configuration,
+        )
+
+        with self.assertRaisesRegex(ValueError, "最多支持 8 个不同区域"):
+            model_module.validate_postprocess_node_constraints([node])
+
+    def test_blueprint_validation_rejects_duplicate_aggregate_postprocess_type(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_AnimDriver",
+                name="Animation A",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_AnimDriver",
+                name="Animation B",
+                mute=False,
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "动画驱动蓝图.*只能存在一个"):
+            model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_blueprint_validation_rejects_duplicate_uv_offset_postprocess_nodes(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_UVOffset",
+                name="UV A",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_UVOffset",
+                name="UV B",
+                mute=False,
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "UV偏移.*只能存在一个"):
+            model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_blueprint_validation_rejects_duplicate_psbinding_postprocess_nodes(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_PSBinding",
+                name="PS A",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_PSBinding",
+                name="PS B",
+                mute=False,
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "PS绑定.*只能存在一个"):
+            model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_blueprint_validation_allows_multiple_ui_panels_with_unique_names(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_UIPanel",
+                name="UI A",
+                panel_name="Main",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_UIPanel",
+                name="UI B",
+                panel_name="Settings",
+                mute=False,
+            ),
+        ]
+
+        model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_blueprint_validation_rejects_duplicate_ui_panel_names(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_UIPanel",
+                name="UI A",
+                panel_name="Main Panel",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_UIPanel",
+                name="UI B",
+                panel_name=" main   panel ",
+                mute=False,
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "UI 面板名称.*不能重复"):
+            model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_blueprint_validation_requires_buffer_cleanup_to_run_last(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_BufferCleanup",
+                name="Cleanup",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_PSBinding",
+                name="Binding",
+                mute=False,
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "缓冲区清理.*最后"):
+            model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_blueprint_validation_allows_buffer_cleanup_to_run_last(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_ShapeKey",
+                name="ShapeKey",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_BufferCleanup",
+                name="Cleanup",
+                mute=False,
+            ),
+        ]
+
+        model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_traverse_postprocess_chain_rejects_export_chain_node(self):
+        tree = types.SimpleNamespace(name="Main")
+        bad_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_Object",
+            name="ObjectNode",
+            id_data=tree,
+        )
+        model = model_module.BluePrintModel.__new__(model_module.BluePrintModel)
+
+        with self.assertRaisesRegex(ValueError, "后处理链.*非后处理节点"):
+            model._traverse_postprocess_chain(bad_node)
+
+    def test_traverse_postprocess_chain_accepts_postprocess_node(self):
+        tree = types.SimpleNamespace(name="Main")
+        pp_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_ShapeKey",
+            name="ShapeKey",
+            mute=False,
+            id_data=tree,
+            outputs=[],
+        )
+        model = model_module.BluePrintModel.__new__(model_module.BluePrintModel)
+        model.postprocess_nodes = []
+
+        model._traverse_postprocess_chain(pp_node)
+
+        self.assertEqual(model.postprocess_nodes, [pp_node])
+
+    def test_postprocess_execution_propagates_node_failure(self):
+        def fail(_path):
+            raise OSError("disk full")
+
+        model = model_module.BluePrintModel.__new__(model_module.BluePrintModel)
+        model.postprocess_nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_Test",
+                name="Failing Postprocess",
+                execute_postprocess=fail,
+            )
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "Failing Postprocess.*disk full"):
+            model.execute_postprocess_nodes("C:/Export")
+
+    def test_object_swap_integration_failure_propagates_to_export_caller(self):
+        module_name = f"{PKG}.blueprint.node_swap_processor"
+        previous = sys.modules.get(module_name)
+
+        def fail_integration(_model):
+            raise ValueError("物体切换变量名重复")
+
+        _install_module(
+            module_name,
+            integrate_object_swap_to_blueprint_model=fail_integration,
+        )
+        model = model_module.BluePrintModel.__new__(model_module.BluePrintModel)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "物体切换节点集成失败.*变量名重复"):
+                model._integrate_object_swap_nodes()
+        finally:
+            if previous is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = previous
+
     def test_nested_trees_with_same_node_name_keep_distinct_shader_info(self):
         tree_a = types.SimpleNamespace(name="NestedA")
         tree_b = types.SimpleNamespace(name="NestedB")

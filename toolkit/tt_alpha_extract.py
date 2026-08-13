@@ -13,6 +13,11 @@ def _alpha_channel_is_effectively_opaque(alpha_channel, *, opaque_threshold: flo
     return bool(np.all(alpha_array >= opaque_threshold))
 
 
+def alpha_prefix_for_semitransparency(allow_semitransparency):
+    """允许半透明时生成 TTLMap 前缀，否则生成 FXMap 前缀。"""
+    return "TTLMap_" if allow_semitransparency else "FXMap_"
+
+
 class TT_OT_extract_alpha_channel(bpy.types.Operator):
     bl_idname = "toolkit.tt_extract_alpha_channel"
     bl_label = "提取透明通道"
@@ -122,6 +127,14 @@ class TT_OT_extract_alpha_channel(bpy.types.Operator):
         mesh.update()
         return True
 
+    @staticmethod
+    def _object_has_prefix_material(obj, prefix):
+        for material_slot in getattr(obj, "material_slots", []):
+            material = material_slot.material
+            if material and str(material.name).lower().startswith(prefix.lower()):
+                return True
+        return False
+
     def execute(self, context):
         props = context.scene.texture_tools_props
         if not props.output_dir:
@@ -147,7 +160,8 @@ class TT_OT_extract_alpha_channel(bpy.types.Operator):
         allow_semitransparency = props.alpha_extract_allow_semitransparency
         threshold = props.alpha_extract_threshold
         create_materials = props.alpha_extract_create_materials
-        material_prefix = props.alpha_extract_material_prefix
+        material_prefix = alpha_prefix_for_semitransparency(allow_semitransparency)
+        other_prefix = "FXMap_" if material_prefix == "TTLMap_" else "TTLMap_"
 
         processed_textures = {}
         created_materials_count = 0
@@ -185,7 +199,7 @@ class TT_OT_extract_alpha_channel(bpy.types.Operator):
                     alpha_map_pixels[..., 3] = alpha_channel
 
                     safe_name = "".join(c for c in os.path.splitext(base_texture.name)[0] if c.isalnum() or c in ('-', '_', '.'))
-                    output_filename = f"FXMap_{safe_name}.png"
+                    output_filename = f"{material_prefix}{safe_name}.png"
                     output_path = os.path.join(output_dir, output_filename)
 
                     alpha_image = bpy.data.images.new(name=output_filename, width=width, height=height, alpha=True)
@@ -210,11 +224,16 @@ class TT_OT_extract_alpha_channel(bpy.types.Operator):
                 self._write_alpha_to_vertex_colors(obj, alpha_channel, width, height)
 
             if create_materials and alpha_map_path:
-                new_mat_name = f"{material_prefix}{original_material.name}"
-                new_mat, created_new = self._create_alpha_material(new_mat_name, alpha_map_path)
-                if created_new:
-                    created_materials_count += 1
-                for obj in objects:
+                pending_objects = [
+                    obj for obj in objects
+                    if not self._object_has_prefix_material(obj, other_prefix)
+                ]
+                if pending_objects:
+                    new_mat_name = f"{material_prefix}{original_material.name}"
+                    new_mat, created_new = self._create_alpha_material(new_mat_name, alpha_map_path)
+                    if created_new:
+                        created_materials_count += 1
+                for obj in pending_objects:
                     obj.data.materials.append(new_mat)
 
         self.report({'INFO'}, f"完成！共提取 {len(processed_textures)} 张透明通道贴图。")

@@ -7,7 +7,11 @@ from ..common.m_key import M_Key
 from ..utils.log_utils import LOG
 from .export_helper import BlueprintExportHelper
 from .node_swap import SwapKeyConfig
-from .variable_registry import ensure_object_swap_variable_name, get_node_variable_name
+from .variable_registry import (
+    ensure_object_swap_variable_name,
+    get_node_variable_name,
+    validate_unique_object_swap_variable_names,
+)
 
 
 def _get_node_unique_key(node: bpy.types.Node) -> str:
@@ -219,7 +223,9 @@ def integrate_object_swap_to_blueprint_model(blueprint_model):
     logged_conditions = set()
     chains_with_swap = 0
 
-    for node in _collect_stable_swap_nodes(blueprint_model):
+    stable_swap_nodes = _collect_stable_swap_nodes(blueprint_model)
+    validate_unique_object_swap_variable_names(stable_swap_nodes)
+    for node in stable_swap_nodes:
         registry.register_node(node)
 
     for chain in blueprint_model.processing_chains:

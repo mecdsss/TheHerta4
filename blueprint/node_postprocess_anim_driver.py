@@ -317,7 +317,7 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
         if success:
             print(message)
         else:
-            print(f"错误: {message}")
+            raise RuntimeError(message)
 
     def _build_ini_content(self, paragraphs) -> str:
         lines = [

@@ -55,6 +55,11 @@ DDS_DEFAULT_RULES = [
         "format": "bc7_unorm",
     },
     {
+        "texture_type": "TTLMap",
+        "pattern": r"(?i)(?:^|[_\-. ])TTLMap(?:[_\-. ]|$)",
+        "format": "bc7_unorm",
+    },
+    {
         "texture_type": "RoughnessMap",
         "pattern": r"(?i)(?:^|[_\-. ])RoughnessMap(?:[_\-. ]|$)",
         "format": "bc7_unorm",

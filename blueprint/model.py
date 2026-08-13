@@ -27,6 +27,25 @@ _NODE_TYPE_BLUEPRINT_NEST = 'SSMTNode_Blueprint_Nest'
 _NODE_TYPE_CROSS_IB = 'SSMTNode_CrossIB'
 _NODE_TYPE_SHADER_REPLACE = 'SSMTNode_ShaderReplace'
 _NODE_TYPE_MULTI_FILE_EXPORT = 'SSMTNode_MultiFile_Export'
+_NODE_TYPE_POSTPROCESS_DRAG_INTERACTION = 'SSMTNode_PostProcess_DragInteraction'
+
+_SINGLE_INSTANCE_POSTPROCESS_LABELS = {
+    _NODE_TYPE_POSTPROCESS_DRAG_INTERACTION: "拖拽交互",
+    "SSMTNode_PostProcess_AnimDriver": "动画驱动蓝图",
+    "SSMTNode_PostProcess_BufferCleanup": "缓冲区清理",
+    "SSMTNode_PostProcess_CrossIB": "Cross IB",
+    "SSMTNode_PostProcess_Glow": "RabbitFX 贴图后处理",
+    "SSMTNode_PostProcess_HealthDetection": "血量检测",
+    "SSMTNode_PostProcess_Material": "材质转资源",
+    "SSMTNode_PostProcess_MultiFile": "多文件配置",
+    "SSMTNode_PostProcess_PSBinding": "PS绑定",
+    "SSMTNode_PostProcess_ResourceMerge": "资源合并",
+    "SSMTNode_PostProcess_ShapeKey": "形态键配置",
+    "SSMTNode_PostProcess_ShapeKeyExt": "形态键扩展配置",
+    "SSMTNode_PostProcess_SliderPanel": "滑块面板",
+    "SSMTNode_PostProcess_SwapPanel": "物体切换面板",
+    "SSMTNode_PostProcess_UVOffset": "UV偏移",
+}
 
 _KNOWN_NODE_TYPES = {
     _NODE_TYPE_OBJECT_INFO,
@@ -85,6 +104,72 @@ def _is_postprocess_node(bl_idname: str) -> bool:
 def _is_known_node_type(bl_idname: str) -> bool:
     """判断是否为已知的蓝图节点类型"""
     return bl_idname in _KNOWN_NODE_TYPES or _is_postprocess_node(bl_idname)
+
+
+def _is_postprocess_chain_member(node) -> bool:
+    """判断节点是否允许出现在后处理链中。
+
+    后处理链只能由后处理节点和重定向节点组成；也允许“混合”节点，即自身带有
+    SSMTSocketPostProcess 输入/输出 socket 的节点。
+    """
+    bl_idname = getattr(node, "bl_idname", "")
+    if bl_idname == "NodeReroute" or _is_postprocess_node(bl_idname):
+        return True
+    for socket in getattr(node, "inputs", None) or []:
+        if getattr(socket, "bl_idname", "") == "SSMTSocketPostProcess":
+            return True
+    for socket in getattr(node, "outputs", None) or []:
+        if getattr(socket, "bl_idname", "") == "SSMTSocketPostProcess":
+            return True
+    return False
+
+
+def validate_postprocess_node_constraints(nodes) -> None:
+    """验证跨全部已收集 Blueprint 的后处理单实例约束。"""
+    active_nodes = [node for node in (nodes or []) if not getattr(node, "mute", False)]
+    nodes_by_type = {}
+    for node in active_nodes:
+        nodes_by_type.setdefault(getattr(node, "bl_idname", ""), []).append(node)
+
+    for node_type, label in _SINGLE_INSTANCE_POSTPROCESS_LABELS.items():
+        duplicate_nodes = nodes_by_type.get(node_type, [])
+        if len(duplicate_nodes) <= 1:
+            continue
+        names = ", ".join(
+            str(getattr(node, "name", "未命名")) for node in duplicate_nodes
+        )
+        raise ValueError(
+            f"同一导出后处理链中{label}节点只能存在一个，当前检测到: {names}"
+        )
+
+    panel_names = {}
+    for node in nodes_by_type.get("SSMTNode_PostProcess_UIPanel", []):
+        display_name = " ".join(
+            str(getattr(node, "panel_name", "") or "").split()
+        ) or "UIPanel"
+        normalized_name = display_name.casefold()
+        if normalized_name in panel_names:
+            first_node = panel_names[normalized_name]
+            raise ValueError(
+                "同一导出后处理链中的 UI 面板名称不能重复："
+                f"{display_name}（节点 {getattr(first_node, 'name', '未命名')}、"
+                f"{getattr(node, 'name', '未命名')}）"
+            )
+        panel_names[normalized_name] = node
+
+    # execute_postprocess_nodes 按 postprocess_nodes 列表顺序执行，
+    # 因此“最后执行”等价于位于 active_nodes 末位。
+    cleanup_nodes = [
+        node for node in active_nodes
+        if getattr(node, "bl_idname", "") == "SSMTNode_PostProcess_BufferCleanup"
+    ]
+    if cleanup_nodes and cleanup_nodes[0] is not active_nodes[-1]:
+        raise ValueError("缓冲区清理节点必须是后处理链最后执行的节点，避免提前删除后续节点所需文件")
+
+    for node in active_nodes:
+        validator = getattr(node, "validate_export_configuration", None)
+        if callable(validator):
+            validator()
 
 
 @dataclass
@@ -480,6 +565,7 @@ class BluePrintModel:
         self._collect_postprocess_nodes(output_node)
         self._collect_special_nodes(tree)
         self._collect_nested_postprocess_nodes()
+        validate_postprocess_node_constraints(self.postprocess_nodes)
 
         if self.FORWARD_PARSE_MODE:
             self._forward_parse_blueprint(tree, output_node)
@@ -551,6 +637,12 @@ class BluePrintModel:
         if node_key in visited:
             return
         visited.add(node_key)
+
+        if not _is_postprocess_chain_member(node):
+            raise ValueError(
+                f"后处理链中不允许接入非后处理节点 '{getattr(node, 'name', '未命名')}' "
+                f"({getattr(node, 'bl_idname', '')})；后处理链只能由后处理节点（及重定向/混合节点）组成"
+            )
 
         if _is_postprocess_node(node.bl_idname):
             if not node.mute:
@@ -813,13 +905,15 @@ class BluePrintModel:
     def _integrate_object_swap_nodes(self):
         try:
             from .node_swap_processor import integrate_object_swap_to_blueprint_model
-
-            integrate_object_swap_to_blueprint_model(self)
-            LOG.info("✓ 物体切换节点集成完成")
         except ImportError:
             LOG.debug("⊘ 物体切换节点模块未找到（可选功能）")
+            return
+
+        try:
+            integrate_object_swap_to_blueprint_model(self)
         except Exception as e:
-            LOG.warning(f"⚠️ 物体切换节点集成遇到错误: {e}")
+            raise RuntimeError(f"物体切换节点集成失败：{e}") from e
+        LOG.info("✓ 物体切换节点集成完成")
 
     def _integrate_vertex_group_nodes(self):
         try:
@@ -1496,7 +1590,11 @@ class BluePrintModel:
                 else:
                     LOG.warning(f"   ⚠️ 后处理节点缺少 execute_postprocess 方法: {pp_node.bl_idname}")
             except Exception as e:
-                LOG.error(f"   ❌ 后处理节点执行失败: {pp_node.bl_idname} ({pp_node.name}): {e}")
+                # LOG.error 会立刻抛出 Fatal，导致下面带节点上下文的异常包装不可达。
+                LOG.warning(f"   ❌ 后处理节点执行失败: {pp_node.bl_idname} ({pp_node.name}): {e}")
+                raise RuntimeError(
+                    f"后处理节点 '{pp_node.name}' 执行失败: {e}"
+                ) from e
 
         LOG.info(f"   ✅ 后处理节点执行完成: {len(self.postprocess_nodes)} 个节点")
 

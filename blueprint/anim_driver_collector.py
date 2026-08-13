@@ -52,7 +52,9 @@ class AnimationDriverCollector:
                     if segment:
                         ini_content_parts.append(segment)
                 except Exception as e:
-                    print(f"动画驱动节点收集失败: {node.name} - {e}")
+                    raise RuntimeError(
+                        f"动画驱动节点 '{node.name}' 生成 INI 失败: {e}"
+                    ) from e
 
             merged = self._merge_paragraph_sections(ini_content_parts)
             if merged.strip():
@@ -99,6 +101,8 @@ class AnimationDriverCollector:
     def _find_animation_driver_nodes(self):
         result = []
         for node in self.node_group.nodes:
+            if getattr(node, "mute", False):
+                continue
             if hasattr(node, "generate_ini_segment") and callable(node.generate_ini_segment):
                 try:
                     if node.bl_idname != SSMTNode_AnimDriver_Base.bl_idname:

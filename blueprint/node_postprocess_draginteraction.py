@@ -35,9 +35,73 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 MAX_ZONES = 256
+DEFAULT_MOD_NAMESPACE = "A"
 SPARSE_ZONE_SLOTS = 4
 INVALID_ZONE_ID = 0xFFFFFFFF
 ZONES_PER_PAGE = 1
+
+
+def _node_identity_key(node):
+    """返回节点稳定身份键，避免 bpy 包装对象被反复创建导致 id()/is 失效。"""
+    if node is None:
+        return None
+    as_pointer = getattr(node, "as_pointer", None)
+    if callable(as_pointer):
+        try:
+            return ("pointer", as_pointer())
+        except Exception:
+            pass
+    tree_name = getattr(getattr(node, "id_data", None), "name", "") or ""
+    node_name = getattr(node, "name", "") or ""
+    if tree_name or node_name:
+        return ("name", tree_name, node_name)
+    return ("id", id(node))
+
+
+def is_postprocess_node_on_export_chain(tree, target_node):
+    """判断后处理节点是否从结果输出节点可达；无结果节点时兼容旧数据并视为可达。"""
+    result_nodes = [
+        node for node in (getattr(tree, "nodes", None) or [])
+        if getattr(node, "bl_idname", "") in {
+            "SSMTNode_Result_Output",
+            "SSMTNode_Result_Output_NTMIModImp",
+        }
+    ]
+    if not result_nodes:
+        return True
+
+    target_key = _node_identity_key(target_node)
+    if target_key is None:
+        return False
+
+    visited = set()
+    pending = list(result_nodes)
+    while pending:
+        node = pending.pop()
+        node_key = _node_identity_key(node)
+        if node_key is None or node_key in visited:
+            continue
+        visited.add(node_key)
+        if node_key == target_key:
+            return True
+
+        sockets = list(getattr(node, "outputs", None) or [])
+        sockets.extend(getattr(node, "inputs", None) or [])
+        for socket in sockets:
+            for link in getattr(socket, "links", None) or []:
+                for neighbor in (
+                    getattr(link, "from_node", None),
+                    getattr(link, "to_node", None),
+                ):
+                    neighbor_key = _node_identity_key(neighbor)
+                    if neighbor_key is None or neighbor_key == node_key:
+                        continue
+                    neighbor_type = getattr(neighbor, "bl_idname", "")
+                    if neighbor_type == "NodeReroute" or neighbor_type.startswith(
+                        "SSMTNode_PostProcess_"
+                    ):
+                        pending.append(neighbor)
+    return False
 
 SHADER_FILES = (
     "rzm_gs_probe.hlsl",
@@ -390,8 +454,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     )
     mod_namespace: bpy.props.StringProperty(
         name="命名空间后缀",
-        description="变量/资源命名后缀；留空则从 ini 文件名推导",
-        default="",
+        description="变量/资源命名后缀；默认使用稳定命名空间 A",
+        default=DEFAULT_MOD_NAMESPACE,
     )
     grab_key: bpy.props.EnumProperty(
         name="武装修饰键",
@@ -992,7 +1056,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f.write(chr(10))
             for section_name, lines in sections.items():
                 f.write(f"{section_name}\n")
-                for line in lines:
+                normalized_lines = list(lines)
+                while normalized_lines and not str(normalized_lines[-1]).strip():
+                    normalized_lines.pop()
+                for line in normalized_lines:
                     f.write(f"{line}\n")
                 f.write("\n")
             if preserved_tail_content:
@@ -1020,9 +1087,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     def _resolve_namespace(self, ini_file_path):
         if self.mod_namespace.strip():
-            return re.sub(r'\W+', '_', self.mod_namespace.strip())
-        base = os.path.splitext(os.path.basename(ini_file_path))[0]
-        return re.sub(r'\W+', '_', base).lower()
+            normalized = re.sub(r'\W+', '_', self.mod_namespace.strip())
+            return normalized or DEFAULT_MOD_NAMESPACE
+        # 点击计数导出、形态键后处理和拖拽后处理必须共享同一命名空间。
+        # 旧配置可能保存了空值，因此空值也回退到稳定默认值，而不是按 INI
+        # 文件名分别推导出不同后缀。
+        return DEFAULT_MOD_NAMESPACE
 
     def _find_existing_base_resource_name(self, sections, hash_filter, base_name):
         normalized_base = str(base_name or "").strip()
@@ -1936,6 +2006,74 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     def _zone_capacity(entries):
         return max(1, max((zone_id for zone_id, _ in entries), default=0) + 1)
 
+    def _collect_click_export_drivers(self):
+        """扫描同主树「动画驱动蓝图」关联树中的点击计数导出节点，
+        返回 [(zone_id, 循环档数, 首个受控变量名或"")]：
+        供缓冲布局把导出区域与循环档数纳入容量/档位计算，并供冷启动播种读取。"""
+        entries = []
+        tree = getattr(self, "id_data", None)
+        if tree is None:
+            return entries
+        for node in getattr(tree, "nodes", None) or []:
+            if getattr(node, "bl_idname", "") != "SSMTNode_PostProcess_AnimDriver":
+                continue
+            if getattr(node, "mute", False):
+                continue
+            if not is_postprocess_node_on_export_chain(tree, node):
+                continue
+            anim_tree = bpy.data.node_groups.get(str(getattr(node, "blueprint_name", "") or ""))
+            if anim_tree is None:
+                continue
+            for anim_node in getattr(anim_tree, "nodes", None) or []:
+                if getattr(anim_node, "bl_idname", "") != "SSMTNode_AnimDriver_ClickExport":
+                    continue
+                if getattr(anim_node, "mute", False):
+                    continue
+                try:
+                    zone = int(getattr(anim_node, "click_zone_id", -1))
+                except Exception:
+                    zone = -1
+                try:
+                    cycle = int(getattr(anim_node, "cycle_length", 0) or 0)
+                except Exception:
+                    cycle = 0
+                if not (0 <= zone < MAX_ZONES):
+                    print(
+                        f"[DragInteraction][WARNING] 点击导出区域 ID {zone} 超出稳定范围 "
+                        f"0-{MAX_ZONES - 1}，已跳过"
+                    )
+                    continue
+                first_var = ""
+                for target in getattr(anim_node, "click_target_list", None) or []:
+                    name = normalize_variable_name(getattr(target, "variable_name", "") or "")
+                    if name:
+                        first_var = f"${name}"
+                        break
+                entries.append((zone, min(64, max(0, cycle)), first_var))
+        return entries
+
+    def _click_export_seed_entries(self):
+        """冷启动播种项：[(zone_id, $首个受控变量)]，同区域去重，最多 8 条。
+        仅含配置了受控变量的导出节点；超限时明确报错，避免静默错误播种。"""
+        seed_entries = []
+        seen_zones = set()
+        for zone, _cycle, first_var in self._collect_click_export_drivers():
+            if not first_var or zone in seen_zones:
+                continue
+            seen_zones.add(zone)
+            seed_entries.append((zone, first_var))
+        if len(seed_entries) > 8:
+            raise ValueError(
+                "拖拽交互的点击导出冷启动最多支持 8 个不同区域，"
+                f"当前配置了 {len(seed_entries)} 个；请合并区域或减少点击导出节点。"
+            )
+        return seed_entries
+
+    def validate_export_configuration(self):
+        """在写入任何导出文件前验证拖拽交互的跨节点约束。"""
+        if getattr(self, "enable_shapekey_drive", False):
+            self._click_export_seed_entries()
+
     def _drag_drive_zone_stage_counts(self):
         """按区域统计点击档位数：扫描同树所有开启拖拽驱动的形态键节点，
         每个区域取该区域无方向形态键 drag_click_stage 最大值（方向形态键忽略档位），最少 1。
@@ -1976,8 +2114,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         每个区域段 = 4 方向槽 + 该区域档位数 N 个无方向槽；
         zone_bases[z] = 区域 z 段在缓冲中的起始槽位；total_slots = 所有区域段长之和。"""
         capacity = self._zone_capacity(self._collect_enabled_zone_entries())
+        export_entries = self._collect_click_export_drivers()
+        if export_entries:
+            # 点击计数导出节点的区域必须落在缓冲容量内
+            capacity = max(capacity, max(zone for zone, _cycle, _var in export_entries) + 1)
         zone_counts = self._drag_drive_zone_stage_counts()
         zone_stage_counts = [max(1, int(zone_counts.get(z, 1))) for z in range(capacity)]
+        for zone, cycle, _first_var in export_entries:
+            if cycle >= 2:
+                # 点击计数导出节点的循环档数扩展该区域点击循环（0..档数-1），与形态键档位取大
+                zone_stage_counts[zone] = max(zone_stage_counts[zone], cycle - 1)
         zone_bases = []
         running = 0
         for stage_count in zone_stage_counts:
@@ -2092,6 +2238,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # 点击计数缓冲：每区域 1 个点击档位（1..stage_count，0=未点击），供多段切换
             global_resources[f"[ResourceDragShapeKeyClickCount_{ns}]"] = [
                 "type = RWBuffer", "format = R32_UINT",
+                f"array = {_drive_capacity}",
+            ]
+            # 点击计数浮点镜像：CPU 经 store 回读仅对浮点格式有验证过的先例
+            #（R32_UINT 直接 store 无格式保证），供点击计数导出使用
+            global_resources[f"[ResourceDragShapeKeyClickCountF_{ns}]"] = [
+                "type = RWBuffer", "format = R32_FLOAT",
                 f"array = {_drive_capacity}",
             ]
             # 主导方向缓冲：每区域 1 个当前主导方向（0=上 1=右 2=下 3=左），供“任意方向”绑定读取
@@ -2482,7 +2634,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if sec in sections:
             return
         drag_mode_var = self._runtime_variable_names(ns)[0]
-        sections[sec] = [
+        lines = [
             f"cs = {RES_SHADER_DIR}/rzm_shapekey_drive.hlsl",
             f"x76 = $ssmtdrag_delta_time_{ns}",
             f"y76 = $ssmtdrag_sim_speed_{ns}",
@@ -2493,12 +2645,23 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "x79 = $ssmtdrag_shapekey_dy_" + ns,
             "y79 = $ssmtdrag_shapekey_dx_" + ns,
             "x80 = " + self._fmt(self.shapekey_drive_move_sensitivity),
+            f"y80 = $ssmtdrag_seed_pending_{ns}",
+        ]
+        seed_entries = self._click_export_seed_entries()
+        if seed_entries:
+            # 冷启动播种参数：x81=条目数，从 82 起每条 (x=区域, y=导出变量当前值)
+            lines.append(f"x81 = {len(seed_entries)}")
+            for seed_idx, (seed_zone, seed_var) in enumerate(seed_entries):
+                lines.append(f"x{82 + seed_idx} = {seed_zone}")
+                lines.append(f"y{82 + seed_idx} = {seed_var}")
+        lines.extend([
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
             f"cs-t68 = ResourceDragShapeKeyZoneStageCounts_{ns}",
             f"cs-u0 = ResourceDragShapeKeyDrive_{ns}",
             f"cs-u1 = ResourceDragShapeKeyDir_{ns}",
             f"cs-u2 = ResourceDragShapeKeyClickCount_{ns}",
             f"cs-u3 = ResourceDragShapeKeyActiveDir_{ns}",
+            f"cs-u4 = ResourceDragShapeKeyClickCountF_{ns}",
             "dispatch = 1, 1, 1",
             "post cs-t67 = null",
             "post cs-t68 = null",
@@ -2506,7 +2669,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "post cs-u1 = null",
             "post cs-u2 = null",
             "post cs-u3 = null",
-        ]
+            "post cs-u4 = null",
+        ])
+        sections[sec] = lines
 
     # ---- ShapeKeyVarSync：变量变化时把当前强度实时写入 ShapeKeyDrive 缓冲 ----
 
@@ -2536,6 +2701,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"cs-u0 = ResourceDragShapeKeyDrive_{ns}",
             f"cs-u1 = ResourceDragShapeKeyClickCount_{ns}",
             f"cs-u2 = ResourceDragShapeKeyVarPrev_{ns}",
+            f"cs-u3 = ResourceDragShapeKeyClickCountF_{ns}",
             f"cs-u4 = ResourceDragShapeKeyZoneActive_{ns}",
             "dispatch = 1, 1, 1",
             "post cs-t67 = null",
@@ -2543,6 +2709,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "post cs-u0 = null",
             "post cs-u1 = null",
             "post cs-u2 = null",
+            "post cs-u3 = null",
             "post cs-u4 = null",
         ])
         sections[sec] = lines
@@ -2617,7 +2784,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 lines.append(f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0")
                 lines.append(f"\tclear = ResourceDragShapeKeyDir_{ns} 0.0")
                 lines.append(f"\tclear = ResourceDragShapeKeyClickCount_{ns}")
+                lines.append(f"\tclear = ResourceDragShapeKeyClickCountF_{ns} 0.0")
                 lines.append(f"\tclear = ResourceDragShapeKeyActiveDir_{ns}")
+                if self._click_export_seed_entries():
+                    # 冷启动播种：缓冲随游戏关闭销毁、persist 变量仍有上次值——
+                    # boot 清零后由驱动 CS 把导出变量值写回点击计数（含镜像与档位槽）
+                    lines.append(f"\t$ssmtdrag_seed_pending_{ns} = 1")
                 if self._drag_drive_var_sync_bindings():
                     # prev 值缓冲/激活标志随 boot 一并清零：persist 变量非 0 时首帧即触发同步写入
                     lines.append(f"\tclear = ResourceDragShapeKeyVarPrev_{ns} 0.0")
@@ -2636,6 +2808,17 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\t$ssmtdrag_booted_{ns} = 1",
                 "endif",
                 "",
+            ])
+            if getattr(self, "enable_shapekey_drive", False) and self._click_export_seed_entries():
+                lines.extend([
+                    # 冷启动恢复不能依赖 Alt/命中门控；boot 清零后立即从 persist 变量播种。
+                    f"if $ssmtdrag_seed_pending_{ns} == 1",
+                    f"\trun = CustomShaderDragShapeKeyDrive_{ns}",
+                    f"\t$ssmtdrag_seed_pending_{ns} = 0",
+                    "endif",
+                    "",
+                ])
+            lines.extend([
                 "local $ssmtdrag_detect_next_time",
                 "local $ssmtdrag_detect_interval = 0.25",
                 # dt 钳制 [0.001, 0.100]（time 单位分钟 → 秒）
@@ -3131,6 +3314,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             _sync_n = len(self._drag_drive_var_sync_bindings())
             if _sync_n:
                 globals_to_add.append(f"global $ssmtdrag_skheld_{ns} = 0")
+            # 冷启动播种标志：开启驱动即声明，保证引用处变量恒存在（默认 0）
+            globals_to_add.append(f"global $ssmtdrag_seed_pending_{ns} = 0")
             for i in range(_sync_n):
                 globals_to_add.extend([
                     f"global $ssmtdrag_skact_{ns}_{i} = 0",
@@ -3337,8 +3522,17 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ])
         block.extend(interaction_gate_lines)
         block.extend([
-            # 执行序列
-            f"if {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1",
+            # boot / 冷启动播种不依赖 Alt；正常检测与拖拽仍要求交互门控。
+            f"if $ssmtdrag_booted_{ns} == 0",
+            f"\tpre run = CommandListDragPinDetected_{ns}",
+        ])
+        if getattr(self, "enable_shapekey_drive", False) and self._click_export_seed_entries():
+            block.extend([
+                f"elif $ssmtdrag_seed_pending_{ns} == 1",
+                f"\tpre run = CommandListDragPinDetected_{ns}",
+            ])
+        block.extend([
+            f"elif {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1",
             f"\tpre run = CommandListDragPinDetected_{ns}",
             f"\trun = CommandListDragCursorUpdate_{ns}",
             "endif",

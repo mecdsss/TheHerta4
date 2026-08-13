@@ -194,6 +194,29 @@ def ensure_object_swap_variable_name(node, context=None) -> str:
         return candidate
 
 
+def validate_unique_object_swap_variable_names(nodes, context=None) -> None:
+    """校验每个物体切换节点最终生效的变量名在本次导出中唯一。"""
+    owners = {}
+    for node in nodes or ():
+        custom_name = normalize_variable_name(getattr(node, "custom_var_name", ""))
+        effective_name = custom_name or ensure_object_swap_variable_name(node, context=context)
+        if not effective_name:
+            raise ValueError(f"物体切换节点“{getattr(node, 'name', '未命名')}”没有有效变量名")
+
+        # 3DMigoto INI 标识符按不区分大小写处理；只比较 custom/assigned
+        # 二者中最终生效的一个，避免将同一节点自身误报为重复声明。
+        comparison_key = effective_name.casefold()
+        previous_node = owners.get(comparison_key)
+        if previous_node is not None and previous_node is not node:
+            previous_name = getattr(previous_node, "name", "未命名")
+            current_name = getattr(node, "name", "未命名")
+            raise ValueError(
+                f"物体切换变量名 '${effective_name}' 重复："
+                f"节点“{previous_name}”与“{current_name}”必须使用不同变量名"
+            )
+        owners[comparison_key] = node
+
+
 def allocate_shape_key_variable_name(
     shape_key_name: str,
     *,

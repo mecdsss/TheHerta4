@@ -40,20 +40,43 @@ AnimationDriverCollector = collector_module.AnimationDriverCollector
 
 
 class _FakeNode:
-    def __init__(self, name, bl_idname, segment, fps=None, playback_rate=None):
+    def __init__(self, name, bl_idname, segment, fps=None, playback_rate=None, mute=False):
         self.name = name
         self.bl_idname = bl_idname
         self._segment = segment
+        self.mute = mute
         if fps is not None:
             self.fps = fps
         if playback_rate is not None:
             self.playback_rate = playback_rate
 
     def generate_ini_segment(self, connected_nodes=None):
+        if isinstance(self._segment, BaseException):
+            raise self._segment
         return self._segment
 
 
 class AnimationDriverCollectorTests(unittest.TestCase):
+    def test_collect_propagates_node_generation_failure_with_node_name(self):
+        broken = _FakeNode("Broken Driver", "Driver", ValueError("invalid variable"))
+
+        with self.assertRaisesRegex(RuntimeError, "Broken Driver.*invalid variable"):
+            AnimationDriverCollector(
+                types.SimpleNamespace(nodes=[broken], links=[])
+            ).collect()
+
+    def test_collect_ignores_muted_animation_driver_nodes(self):
+        enabled = _FakeNode("Enabled", "Driver", "[Present]\nenabled = 1")
+        muted = _FakeNode("Muted", "Driver", "[Present]\nmuted = 1", mute=True)
+
+        result = AnimationDriverCollector(
+            types.SimpleNamespace(nodes=[enabled, muted], links=[])
+        ).collect()
+
+        merged_text = "\n".join(paragraph["ini_content"] for paragraph in result)
+        self.assertIn("enabled = 1", merged_text)
+        self.assertNotIn("muted = 1", merged_text)
+
     def test_merge_paragraph_sections_tolerates_leading_comment_before_first_section(self):
         collector = AnimationDriverCollector(types.SimpleNamespace(nodes=[], links=[]))
 

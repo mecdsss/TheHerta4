@@ -147,6 +147,16 @@ class NodePostprocessAnimDriverTests(unittest.TestCase):
             self.assertIn("[TextureOverrideA]", updated)
             self.assertIn("hash = 123", updated)
 
+    def test_execute_postprocess_raises_when_refresh_fails(self):
+        node = SSMTNode_PostProcess_AnimDriver()
+        node.refresh_exported_anim_driver_section = lambda _path: (
+            False,
+            "动画驱动节点生成失败",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "动画驱动节点生成失败"):
+            node.execute_postprocess("C:/Export")
+
     def test_refresh_exported_anim_driver_section_can_clear_stale_section(self):
         blueprint = _FakeBlueprint("AnimBlueprint")
         _fake_bpy.data.node_groups[blueprint.name] = blueprint

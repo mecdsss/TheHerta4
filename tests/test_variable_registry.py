@@ -50,9 +50,10 @@ sys.modules[f"{PKG}.blueprint.variable_registry"] = variable_registry
 spec.loader.exec_module(variable_registry)
 
 
-def _make_swap_node(var_name: str):
+def _make_swap_node(var_name: str, *, name: str = "Swap"):
     return types.SimpleNamespace(
         bl_idname="SSMTNode_ObjectSwap",
+        name=name,
         custom_var_name=var_name,
         assigned_variable_name=var_name,
     )
@@ -200,6 +201,56 @@ class VariableRegistryTests(unittest.TestCase):
 
         self.assertIn("driven_a", used_names)
         self.assertIn("driven_b", used_names)
+
+    def test_generated_variable_families_use_disjoint_prefixes(self):
+        swap_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_ObjectSwap",
+            custom_var_name="",
+            assigned_variable_name="",
+        )
+
+        swap_name = variable_registry.ensure_object_swap_variable_name(swap_node)
+        shape_name = variable_registry.allocate_shape_key_variable_name("Smile")
+        continuous_name = variable_registry.allocate_continuous_shapekey_index_variable_name()
+        uv_name = variable_registry.allocate_uv_offset_variable_name("X")
+
+        generated = {swap_name, shape_name, continuous_name, uv_name}
+        self.assertEqual(len(generated), 4)
+        self.assertTrue(swap_name.startswith("swapkey"))
+        self.assertTrue(shape_name.startswith("Freq_"))
+        self.assertTrue(continuous_name.startswith("continuous_shapekey_frame"))
+        self.assertTrue(uv_name.startswith("uv_offset_"))
+
+    def test_normalize_variable_name_is_ini_safe_and_stable(self):
+        self.assertEqual(variable_registry.normalize_variable_name(" $9 Hair/Style! "), "_9_HairStyle")
+        self.assertEqual(variable_registry.normalize_variable_name("$$$"), "")
+
+    def test_object_swap_export_validation_rejects_duplicate_effective_names(self):
+        nodes = [
+            _make_swap_node("$Shared_Swap", name="Hair"),
+            _make_swap_node("shared_swap", name="Coat"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "物体切换变量名.*重复.*Hair.*Coat"):
+            variable_registry.validate_unique_object_swap_variable_names(nodes)
+
+    def test_object_swap_export_validation_uses_only_each_nodes_effective_name(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_ObjectSwap",
+                name="Hair",
+                custom_var_name="hair_mode",
+                assigned_variable_name="swapkey0",
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_ObjectSwap",
+                name="Coat",
+                custom_var_name="coat_mode",
+                assigned_variable_name="swapkey0",
+            ),
+        ]
+
+        variable_registry.validate_unique_object_swap_variable_names(nodes)
 
 
 if __name__ == "__main__":

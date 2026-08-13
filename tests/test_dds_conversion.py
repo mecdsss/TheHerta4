@@ -112,6 +112,14 @@ class DDSConversionTests(unittest.TestCase):
         self.assertEqual(texture_type, "NormalMap")
         self.assertEqual(dds_format, "r8g8b8a8_unorm")
 
+    def test_default_rules_recognize_ttlmap(self):
+        """测试 TTLMap 前缀与 FXMap 一样按遮罩格式识别（bc7_unorm，非 sRGB）"""
+        props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
+        texture_type, dds_format, _matched_by = dds_conversion.resolve_dds_target("TTLMap_BaseTex.png", props)
+        self.assertEqual(texture_type, "TTLMap")
+        self.assertEqual(dds_format, "bc7_unorm")
+        self.assertIn("--ignore-srgb", dds_conversion._texconv_colorspace_flags(texture_type))
+
 
 if __name__ == "__main__":
     unittest.main()

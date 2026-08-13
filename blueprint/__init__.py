@@ -100,6 +100,7 @@ _MODULE_REGISTRY = [
     {"name": "anim_driver_random", "required": False},
     {"name": "anim_driver_toggle", "required": False},
     {"name": "anim_driver_shapekey_seq", "required": False},
+    {"name": "anim_driver_click_export", "required": False},
     {"name": "node_postprocess_anim_driver", "required": False},
     # 原 TheHerta4NodeExtras 扩展插件的节点，已集成进主插件
     {"name": "node_postprocess_shapekey_ext", "required": False},

@@ -1762,6 +1762,7 @@ def draw_node_add_menu(self, context):
         layout.operator("node.add_node", text="随机驱动", icon='RNDCURVE').type = "SSMTNode_AnimDriver_Random"
         layout.operator("node.add_node", text="动画驱动开关", icon='KEYFRAME').type = "SSMTNode_AnimDriver_Toggle"
         layout.operator("node.add_node", text="形态键动画序列", icon='SHAPEKEY_DATA').type = "SSMTNode_AnimDriver_ShapeKeySequence"
+        layout.operator("node.add_node", text="点击计数导出", icon='DRIVER').type = "SSMTNode_AnimDriver_ClickExport"
         return
 
     layout.menu("SSMT_MT_NodeMenu_Object", text="物体", icon='OBJECT_DATAMODE')
@@ -1807,6 +1808,7 @@ def draw_node_context_menu(self, context):
         layout.operator("node.add_node", text="随机驱动", icon='RNDCURVE').type = "SSMTNode_AnimDriver_Random"
         layout.operator("node.add_node", text="动画驱动开关", icon='KEYFRAME').type = "SSMTNode_AnimDriver_Toggle"
         layout.operator("node.add_node", text="形态键动画序列", icon='SHAPEKEY_DATA').type = "SSMTNode_AnimDriver_ShapeKeySequence"
+        layout.operator("node.add_node", text="点击计数导出", icon='DRIVER').type = "SSMTNode_AnimDriver_ClickExport"
         layout.separator()
         _add_anim_driver_conversion_menu(layout, node_tree)
         layout.separator()
