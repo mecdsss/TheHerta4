@@ -206,6 +206,17 @@ def _zone_allowed_names(settings):
     return names
 
 
+def _zone_has_included_objects(settings):
+    """返回该权重球是否配置了非空的包含物体列表（导出侧据此读取 IB 部件名）。"""
+    include = getattr(settings, "include_objects", None)
+    if include is None:
+        return False
+    try:
+        return len(include) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _zone_allowed_by_target(settings, target_name):
     """预览单物体：包含列表为空 → 全部允许；否则仅列表内物体名命中。
     列表项全部无效（物体指针已清空）时同样按全部允许，避免预览被误过滤。"""
@@ -1267,11 +1278,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         return draw_ranges
 
     def _collect_draw_parts(self, sections, hash_value):
-        """按 mesh 前缀归属和活动 IB 收集绘制组；无前缀配置回退到段 hash。"""
+        """按目标 hash 和活动 IB 收集绘制组，并把同一 IB 的 copy 段合并为一个 part。
+
+        材质 copy 段会重复声明同一个 IB；按 IB 归并既保留完整 index_count，又避免每个
+        copy 段各注入一个重复 hook。
+        """
         parts = []
         normalized_hash = hash_value.casefold()
-        for section_name, lines in sections.items():
-            if not (section_name.startswith("[TextureOverride_") and section_name.endswith("]")):
+        all_records = []
+        for section_order, (section_name, lines) in enumerate(sections.items()):
+            if not (section_name.startswith("[TextureOverride") and section_name.endswith("]")):
                 continue
 
             section_hash = None
@@ -1376,40 +1392,57 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     pending_mesh_comment = None
                     pending_mesh_comment_occurrence = 0
 
-            draw_groups = []
+            base_name = (
+                section_name[len("[TextureOverride_"):-1]
+                if section_name.startswith("[TextureOverride_")
+                else section_name[1:-1]
+            )
             for record in draw_records:
-                if (
-                    draw_groups
-                    and draw_groups[-1][-1]["ordinal"] + 1 == record["ordinal"]
-                    and draw_groups[-1][-1]["ib_resource"] == record["ib_resource"]
-                ):
-                    draw_groups[-1].append(record)
-                else:
-                    draw_groups.append([record])
+                record["section"] = section_name
+                record["section_order"] = section_order
+                record["match_first_index"] = match_first_index
+                record["base_name"] = base_name
+                all_records.append(record)
 
-            for draw_group in draw_groups:
-                ib_resource = draw_group[0]["ib_resource"]
-                ib_first_index = min(record["draw_offset"] for record in draw_group)
-                ib_index_end = max(record["draw_offset"] + record["draw_count"] for record in draw_group)
-                index_count = ib_index_end - ib_first_index
-                mesh_first_index = draw_group[0]["mesh_first_index"]
-                first_index = (
-                    mesh_first_index
-                    if mesh_first_index is not None
-                    else match_first_index if match_first_index is not None
-                    else ib_first_index
-                )
-                base_name = section_name[len("[TextureOverride_"):-1]
-                parts.append({
-                    "section": section_name,
-                    "ib_resource": ib_resource,
-                    "index_count": index_count,
-                    "ib_first_index": ib_first_index,
-                    "first_index": first_index,
-                    "base_name": base_name,
-                    "hook_anchor_comment": draw_group[0]["hook_anchor_comment"],
-                    "hook_anchor_occurrence": draw_group[0]["hook_anchor_occurrence"],
-                })
+        def _record_sort_key(record):
+            is_base = 0 if record["section"].startswith("[TextureOverride_") else 1
+            return (record["draw_offset"], is_base, record["section_order"])
+
+        records_by_ib = {}
+        for record in all_records:
+            records_by_ib.setdefault(record["ib_resource"], []).append(record)
+
+        for ib_resource, records in records_by_ib.items():
+            ib_first_index = min(record["draw_offset"] for record in records)
+            ib_index_end = max(record["draw_offset"] + record["draw_count"] for record in records)
+            index_count = ib_index_end - ib_first_index
+
+            representative = min(records, key=_record_sort_key)
+            mesh_first_index = representative["mesh_first_index"]
+            if mesh_first_index is None:
+                for record in sorted(records, key=_record_sort_key):
+                    if record["mesh_first_index"] is not None:
+                        mesh_first_index = record["mesh_first_index"]
+                        break
+
+            match_first_index = representative["match_first_index"]
+            first_index = (
+                mesh_first_index
+                if mesh_first_index is not None
+                else match_first_index if match_first_index is not None
+                else ib_first_index
+            )
+
+            parts.append({
+                "section": representative["section"],
+                "ib_resource": ib_resource,
+                "index_count": index_count,
+                "ib_first_index": ib_first_index,
+                "first_index": first_index,
+                "base_name": representative["base_name"],
+                "hook_anchor_comment": representative["hook_anchor_comment"],
+                "hook_anchor_occurrence": representative["hook_anchor_occurrence"],
+            })
         return parts
 
     # =======================================================================
@@ -1562,16 +1595,23 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # radius 参数与球尺度失配检查（防“整块刚体动”失配，原版实测 ratio 0.3~2.2）
         self._check_zone_radius_scale(zones)
 
-        # 沿表面传播拓扑：任一启用区域开了球级沿表面扩散（旧数据回退节点级）就读一次
-        # IB 三角形 → 去重边，全部 zone 共用；同时得到逐三角形部件名供包含列表过滤
+        # 拓扑读取：任一启用区域开了球级沿表面扩散，或任一权重球配置了包含物体列表时读一次
+        # IB 三角形 → 去重边（沿表面扩散用）；同时得到逐三角形部件名供包含列表过滤。
+        # 只关闭沿表面扩散但仍需要包含列表过滤时也必须读 IB，否则 allowed_mask 会退化成全允许。
         edge_verts = None
         triangles = None
         tri_part_names = None
-        if any(_zone_propagate(empty.ssmt_drag_zone, self) for _, empty in entries):
+        needs_component_topology = any(
+            _zone_propagate(empty.ssmt_drag_zone, self)
+            or _zone_has_included_objects(empty.ssmt_drag_zone)
+            for _, empty in entries
+        )
+        if needs_component_topology:
             result = self._read_component_triangles(mod_export_path, sections, comp, vertex_count)
             if result is not None:
                 triangles, tri_part_names = result
-                edge_verts = gb_core.edges_from_triangles(triangles)
+                if any(_zone_propagate(empty.ssmt_drag_zone, self) for _, empty in entries):
+                    edge_verts = gb_core.edges_from_triangles(triangles)
             else:
                 print(f"[DragInteraction][WARNING] {comp['comp_name']} 无法读取 IB 拓扑，沿表面传播回退体积球")
 
@@ -2401,14 +2441,20 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     # ---- Detect{Comp}（dispatch 1,1,1）----
 
-    def _emit_detect_section(self, sections, comp, ns):
+    def _detect_section_lines(self, comp, ns, part_index):
         cn = comp["comp_name"]
-        sec = f"[CustomShaderDragDetect{cn}_{ns}]"
-        if sec in sections:
-            return
         lines = [
             f"cs = {RES_SHADER_DIR}/rzm_object_detect.hlsl",
             "x28 = 0",
+        ]
+        if part_index is not None:
+            # 每部件变体段只 raycast 本部件对应的 ObjectMap 条目，避免每个部件钩子
+            # 都遍历整个 mesh 的所有三角形（N 倍放大）。y28/z28 为 shader 子区间。
+            lines.extend([
+                f"y28 = {part_index}",
+                "z28 = 1",
+            ])
+        lines.extend([
             "cs-t0 = vb0",
             "cs-t1 = ib",
             f"cs-t2 = ResourceDragDetect{cn}ObjectMap_{ns}",
@@ -2424,14 +2470,24 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "x26 = 48", "w26 = 8.0",
             "x27 = $cursorX", "y27 = $cursorY", "z27 = res_width", "w27 = res_height",
             "x85 = 0", "y85 = 0", "z85 = 1", "w85 = 1",  # 视口恒等（offset=0,0 scale=1,1）
-            # VIEWPORT_VALID 必须为 1：shader L720 的检测主循环被
-            # ValidViewportCursor 门控（要求 IniParams[86].x > 0.5），x86=0 会让检测永远不执行
+            # VIEWPORT_VALID 必须为 1：shader 检测主循环被 ValidViewportCursor 门控。
             "x86 = 1",
             "x74 = 0",  # debug dump 门控关闭
             "dispatch = 1, 1, 1",
             "cs-u0 = null", "cs-u1 = null", "cs-u2 = null",
-        ]
-        sections[sec] = lines
+        ])
+        return lines
+
+    def _emit_detect_section(self, sections, comp, ns):
+        cn = comp["comp_name"]
+        sec = f"[CustomShaderDragDetect{cn}_{ns}]"
+        if sec not in sections:
+            sections[sec] = self._detect_section_lines(comp, ns, None)
+        # 每个部件额外生成一个限定范围的变体段；基座段保留旧默认（遍历全部件）。
+        for p_idx in range(len(comp["parts"])):
+            part_sec = f"[CustomShaderDragDetect{cn}P{p_idx}_{ns}]"
+            if part_sec not in sections:
+                sections[part_sec] = self._detect_section_lines(comp, ns, p_idx)
 
     # ---- Bake{Comp}{Part} + Sample×8 ----
 
@@ -3160,9 +3216,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ])
         lines.extend([
             f"\t$ssmtdrag_drawn_{ns} = 1",
-            f"\tif {drag_mode_var} >= 1 && $ObjectDetectAllowed_{ns} == 1",
+            f"\tif {drag_mode_var} >= 1 && $ObjectDetectAllowed_{ns} == 1 && $ssmtdrag_mode_{ns} == 1",
             f"\t\trun = CustomShaderDragBake{part_tag}_{ns}",
-            f"\t\trun = CustomShaderDragDetect{cn}_{ns}",
+            f"\t\trun = CustomShaderDragDetect{part_tag}_{ns}",
             "\tendif",
             f"\tif {drag_mode_var} >= 2 && $ssmtdrag_mode_{ns} == 1",
             f"\t\tif time != {last_dispatch}",
@@ -3582,8 +3638,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         block.extend([
             f"post run = CommandListDragUIReadback_{ns}",
             f"post $ssmtdrag_drawn_{ns} = 0",
-            "\t; --- DRAG PRESENT END ---",
         ])
+        block.append("\t; --- DRAG PRESENT END ---")
         self._place_drag_present_block(present_lines, block)
 
 

@@ -535,6 +535,21 @@ void main(uint3 threadID : SV_DispatchThreadID)
     float objectID = sharedAlive ? sharedCenter.w : (stateAlive ? stateCenter.w : capturedID);
     uint activeZone = ClampZoneID(ReadSharedInteraction(9u, float4(0.0, 0.0, 0.0, 0.0)).x);
 
+    bool anyPathSlide = AnyPathSlideZone();
+    bool idleFastPath = !sharedAlive
+        && !stateAlive
+        && !mouseHeld
+        && !anyPathSlide
+        && DEBUG_PARAMS.x <= 0.5
+        && VERTEX_DEBUG_PARAMS.x <= 0.5;
+
+    if (idleFastPath)
+    {
+        if (i < vertexCount)
+            rw_buffer[i] = base_buffer[i];
+        return;
+    }
+
     // Default parameters from IniParams/fallbacks
     float radius       = SafePositive(JIGGLE_PARAMS.x, 0.25);
     float strength     = SafeNonZero(JIGGLE_PARAMS.y, 1.0);
@@ -655,43 +670,6 @@ void main(uint3 threadID : SV_DispatchThreadID)
     float4 nextScreenDown;
     float4 nextInputFlags;
 
-    ComputeNextPhysics(
-        mouseHeld,
-        hasCapturedID,
-        capturedID,
-        capturedCenterWorld,
-        capturedNormalWorld,
-        radius,
-        strength,
-        dragScale,
-        grabDamping,
-        grabSpring,
-        releaseDamping,
-        releaseSpring,
-        releaseKick,
-        maxOffset,
-        targetFollow,
-        SimulationStep(),
-        mouseXDirection,
-        mouseYDirection,
-        capturedRight.xyz,
-        capturedDown.xyz,
-        screenBasisValid,
-        nextCurrent,
-        nextPrevious,
-        nextCenter,
-        nextNormal,
-        nextTarget,
-        nextPrevTarget,
-        nextRawTarget,
-        nextScreenRight,
-        nextScreenDown,
-        nextInputFlags
-    );
-
-    // One canonical interaction state is advanced once in LLUpdateScreenJiggle
-    // after collection.  Components never derive their own falloff center or
-    // physical offset: that would split duplicated seam vertices.
     if (sharedAlive)
     {
         nextCurrent = sharedCurrent;
@@ -703,6 +681,43 @@ void main(uint3 threadID : SV_DispatchThreadID)
         nextRawTarget = nextTarget;
         nextScreenRight = ReadSharedInteraction(6u, float4(1.0, 0.0, 0.0, 0.0));
         nextScreenDown = ReadSharedInteraction(7u, float4(0.0, 1.0, 0.0, 0.0));
+        nextInputFlags = float4(mouseHeld ? 1.0 : 0.0, 0.0, 0.0, 0.0);
+    }
+    else
+    {
+        ComputeNextPhysics(
+            mouseHeld,
+            hasCapturedID,
+            capturedID,
+            capturedCenterWorld,
+            capturedNormalWorld,
+            radius,
+            strength,
+            dragScale,
+            grabDamping,
+            grabSpring,
+            releaseDamping,
+            releaseSpring,
+            releaseKick,
+            maxOffset,
+            targetFollow,
+            SimulationStep(),
+            mouseXDirection,
+            mouseYDirection,
+            capturedRight.xyz,
+            capturedDown.xyz,
+            screenBasisValid,
+            nextCurrent,
+            nextPrevious,
+            nextCenter,
+            nextNormal,
+            nextTarget,
+            nextPrevTarget,
+            nextRawTarget,
+            nextScreenRight,
+            nextScreenDown,
+            nextInputFlags
+        );
     }
 
     // Per-component resolved input/output evidence.  This is intentionally

@@ -128,6 +128,30 @@ def _install_toolkit_gb_core(root):
 def _load_drag_module():
     """用纯 stub 包路径加载节点模块（不执行任何真实 __init__.py）。"""
     _install_stub_bpy()
+    # discover 模式下 test_bmtp_mesh_face_topology 等模块会把 sys.modules["numpy"]
+    # 换成假实现（缺 float64 等属性），导致 export_space 等真实模块导入即崩；
+    # 本模块顶层 np 在 import 阶段也可能已绑定假 numpy。这里从其他已加载模块的
+    # 命名空间找回真实 numpy 模块对象（不能 pop+重导入：那会产生第二个 numpy
+    # 实例，C 扩展子模块仍绑定旧实例，import numpy.linalg 会递归失败），
+    # 并同步 sys.modules 与本模块全局 np 引用。
+    global np
+    current = sys.modules.get("numpy")
+    if not hasattr(current, "float64") or not hasattr(np, "eye"):
+        real_numpy = None
+        for module in list(sys.modules.values()):
+            for attr in ("np", "numpy"):
+                try:
+                    candidate = getattr(module, attr, None)
+                except Exception:
+                    continue
+                if getattr(candidate, "__name__", None) == "numpy" and hasattr(candidate, "float64"):
+                    real_numpy = candidate
+                    break
+            if real_numpy is not None:
+                break
+        if real_numpy is not None:
+            sys.modules["numpy"] = real_numpy
+            np = real_numpy
     import importlib
 
     root = "_ssmt_root"
@@ -270,6 +294,24 @@ class DragNodeLocateTests(unittest.TestCase):
         self.assertEqual(parts[0]["index_count"], 52688)
         self.assertEqual(parts[1]["first_index"], 52688)
         self.assertEqual(parts[0]["ib_resource"], "Resourceabc123-43191AIB")
+
+    def test_collect_draw_parts_merges_copy_sections_with_same_ib(self):
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        sections["[TextureOverrideLOD0_abc123_43191A_copy]"] = [
+            "hash = abc123",
+            "match_first_index = 0",
+            "ib = Resourceabc123-43191AIB",
+            "; [mesh:LOD0.abc123-43191-0.CopyA] [vertex_count:80]",
+            "drawindexed = 500, 52688, 0",
+        ]
+
+        parts = node._collect_draw_parts(sections, "abc123")
+        part_a = next(p for p in parts if p["ib_resource"] == "Resourceabc123-43191AIB")
+
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(part_a["index_count"], 53188)
+        self.assertEqual(part_a["section"], "[TextureOverride_abc123_abc123-43191A]")
 
     def test_collect_draw_parts_combines_multiple_draws_in_one_ib_section(self):
         node = _make_node(self.mod)
@@ -1399,6 +1441,57 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("x86 = 1", det)
         self.assertNotIn("x86 = 0", det)
 
+    def test_per_part_detect_sections_limit_object_range(self):
+        # 性能回归：旧行为在每个部件钩子里 raycast 全部件三角形范围（N 倍放大）。
+        # 每部件变体段以 y28/z28 限定只测本部件条目，基座段保持旧默认（遍历全部件）
+        _, sections, _ = self._emit()
+        cn = "abc123_43191"
+        base = "\n".join(sections[f"[CustomShaderDragDetect{cn}_testns]"])
+        self.assertNotIn("y28 =", base)
+        self.assertNotIn("z28 =", base)
+        for p_idx in range(2):
+            part = "\n".join(sections[f"[CustomShaderDragDetect{cn}P{p_idx}_testns]"])
+            self.assertIn(f"y28 = {p_idx}", part)
+            self.assertIn("z28 = 1", part)
+            # 其余绑定与基座一致（含 x86=1 主循环门控）
+            self.assertIn("x86 = 1", part)
+            self.assertIn(f"cs-t2 = ResourceDragDetect{cn}ObjectMap_testns", part)
+
+    def test_hook_runs_bake_detect_and_uses_per_part_section(self):
+        # 每帧每个钩子仍正常跑 Bake+Detect，不得用帧内去重标志吞掉后续 pass；
+        # 且 Detect 只跑本部件的变体段
+        node, sections, comps = self._emit()
+        comp = comps[0]
+        node._inject_draw_hooks(sections, comp, "testns")
+        cn = "abc123_43191"
+        for p_idx, section in enumerate((
+            "[TextureOverride_abc123_abc123-43191A]",
+            "[TextureOverride_abc123_abc123-43191B]",
+        )):
+            text = "\n".join(sections[section])
+            self.assertIn(f"run = CustomShaderDragBake{cn}P{p_idx}_testns", text)
+            self.assertIn(f"run = CustomShaderDragDetect{cn}P{p_idx}_testns", text)
+            self.assertNotIn(f"run = CustomShaderDragDetect{cn}_testns", text)
+            self.assertNotIn("detect_run", text)
+
+    def test_constants_do_not_declare_per_part_detect_run(self):
+        node, sections, comps = self._emit()
+        node._emit_present_and_constants(sections, comps, "testns")
+        const = "\n".join(sections["[Constants]"])
+        self.assertNotIn("detect_run", const)
+
+    def test_detect_shader_supports_object_subrange(self):
+        # 着色器契约：IniParams[28].yz 限定 ObjectMap 子区间，z28=0 回退遍历全部件
+        shader = (Path(__file__).resolve().parents[1]
+                  / "Toolset" / "drag_interaction" / "rzm_object_detect.hlsl"
+                  ).read_text(encoding="utf-8")
+        self.assertIn("#define DETECT_OBJECT_FIRST IniParams[28].y", shader)
+        self.assertIn("#define DETECT_OBJECT_SPAN  IniParams[28].z", shader)
+        self.assertIn(
+            "for (uint objectIndex = objectFirst; objectIndex < objectLast; objectIndex++)",
+            shader)
+        self.assertIn(": objectCount;", shader)
+
     def test_sparse_mask_resource_sections(self):
         _, sections, _ = self._emit()
         cn = "abc123_43191"
@@ -1479,6 +1572,44 @@ class DragNodeEmitTests(unittest.TestCase):
             kept = {int(zone_id): float(weight) for zone_id, weight in zip(row_ids, row_weights)}
             self.assertEqual(set(kept), {2, 3, 4, 255})
             self.assertAlmostEqual(kept[255], 0.6, places=6)
+
+    def test_sparse_bake_includes_objects_even_when_propagation_off(self):
+        """关闭沿表面扩散时，包含物体列表仍必须参与导出侧权重烘焙。"""
+        import tempfile
+        item = self._zone_item(0)
+        settings = item.zone_object.ssmt_drag_zone
+        settings.propagate = False
+        settings.include_objects = [
+            types.SimpleNamespace(object=types.SimpleNamespace(name="Body"))
+        ]
+        node = _make_node(self.mod, zone_objects=[item])
+        node._check_zone_radius_scale = lambda zones: False
+        node._read_position_buf = lambda *args: np.zeros((6, 3), dtype=np.float32)
+        node._get_reference_matrix_inv = lambda comp: None
+        node._get_export_space_matrix = lambda: np.eye(4)
+        node._get_non_mirror_mirror = lambda: None
+        node._buffer_dir = lambda sections, comp: "Meshes"
+        triangles = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+        tri_part_names = np.array(["Body", "Head"], dtype=object)
+        node._read_component_triangles = lambda *args: (triangles, tri_part_names)
+
+        def eval_field(positions, empty, *args, **kwargs):
+            allowed = kwargs.get("allowed_mask")
+            self.assertIsNotNone(allowed)
+            np.testing.assert_array_equal(allowed, [True, True, True, False, False, False])
+            return allowed.astype(np.float32)
+
+        node._evaluate_zone_field = eval_field
+
+        comp = {"vertex_count": 6, "base_name": "sample", "comp_name": "sample", "parts": []}
+        with tempfile.TemporaryDirectory() as td:
+            node._write_jiggle_masks(td, {}, comp, "testns")
+            weights = np.fromfile(
+                Path(td) / "Meshes" / "sampleJiggleZoneWeights.buf", dtype=np.float32
+            ).reshape(-1, 4)
+
+        self.assertTrue(bool(np.all(weights[:3, 0] > 0.0)))
+        self.assertTrue(bool(np.all(weights[3:, 0] == 0.0)))
 
     def test_zone_field_applies_export_space_matrix_to_empty(self):
         node = _make_node(self.mod)

@@ -46,6 +46,9 @@ struct Calibration
     float4 c1;
     float4 c2;
     float4 c3;
+    float4 col0;
+    float4 col1;
+    float4 col2;
     float  invDet;
     float  valid;
 };
@@ -117,6 +120,12 @@ Texture1D<float4> IniParams : register(t120);
 #define DETECT_PARAMS IniParams[26]
 #define ALT_CURSOR_PARAMS IniParams[27]
 #define COMPONENT_TOKEN   IniParams[28].x
+// Optional ObjectMap sub-range for this dispatch: .y = first entry index,
+// .z = entry count (0 = all entries, legacy behaviour). Per-part hooks set
+// these so each dispatch raycasts only its own part's index range instead of
+// every part's range on every part's hook.
+#define DETECT_OBJECT_FIRST IniParams[28].y
+#define DETECT_OBJECT_SPAN  IniParams[28].z
 #define DEBUG_PARAMS      IniParams[74]
 #define VIEWPORT_XFORM    IniParams[85]
 #define VIEWPORT_VALID    IniParams[86].x
@@ -180,7 +189,7 @@ bool NormalizedCursorValid(float4 cursorParams)
         && cursorParams.y < 1.0f;
 }
 
-bool ReadCalibSample(uint slot, out float3 localPos, out float4 clipPos)
+bool ReadCalibSample(uint slot, uint vertexCount, out float3 localPos, out float4 clipPos)
 {
     localPos = float3(0.0f, 0.0f, 0.0f);
     clipPos = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -193,9 +202,6 @@ bool ReadCalibSample(uint slot, out float3 localPos, out float4 clipPos)
 
     uint vertexIndex = (uint)(meta.x + 0.5f);
 
-    uint vertexCount;
-    uint vertexStride;
-    gVB0.GetDimensions(vertexCount, vertexStride);
     if (vertexIndex >= vertexCount)
         return false;
 
@@ -216,10 +222,14 @@ void SelectCalibration(out Calibration cal)
     float4 c[CALIB_SAMPLES];
     float  v[CALIB_SAMPLES];
 
+    uint vertexCount;
+    uint stride;
+    gVB0.GetDimensions(vertexCount, stride);
+
     [unroll]
     for (uint i = 0u; i < CALIB_SAMPLES; ++i)
     {
-        v[i] = ReadCalibSample(i, p[i], c[i]) ? 1.0f : 0.0f;
+        v[i] = ReadCalibSample(i, vertexCount, p[i], c[i]) ? 1.0f : 0.0f;
     }
 
     float bestVol = 0.0f;
@@ -268,24 +278,31 @@ void SelectCalibration(out Calibration cal)
     cal.c2 = c[bestC];
     cal.c3 = c[bestD];
 
-    float det = Det3(cal.p1 - cal.p0, cal.p2 - cal.p0, cal.p3 - cal.p0);
+    float3 e1 = cal.p1 - cal.p0;
+    float3 e2 = cal.p2 - cal.p0;
+    float3 e3 = cal.p3 - cal.p0;
+    float det = Det3(e1, e2, e3);
     cal.valid = bestVol > 1e-8f && abs(det) > 1e-8f ? 1.0f : 0.0f;
     cal.invDet = cal.valid > 0.5f ? rcp(det) : 0.0f;
+
+    // Precompute the affine local->clip map once so the per-vertex hot path is
+    // four dot products instead of three cross/dot barycentric solves. This is
+    // the dominant cost of the original detector (three vertices per triangle).
+    float3 r0 = cross(e2, e3) * cal.invDet;
+    float3 r1 = cross(e3, e1) * cal.invDet;
+    float3 r2 = cross(e1, e2) * cal.invDet;
+    float4 d1 = cal.c1 - cal.c0;
+    float4 d2 = cal.c2 - cal.c0;
+    float4 d3 = cal.c3 - cal.c0;
+    cal.col0 = d1 * r0.x + d2 * r1.x + d3 * r2.x;
+    cal.col1 = d1 * r0.y + d2 * r1.y + d3 * r2.y;
+    cal.col2 = d1 * r0.z + d2 * r1.z + d3 * r2.z;
 }
 
 float4 LocalToClip(Calibration cal, float3 localPos)
 {
-    float3 e1 = cal.p1 - cal.p0;
-    float3 e2 = cal.p2 - cal.p0;
-    float3 e3 = cal.p3 - cal.p0;
     float3 d = localPos - cal.p0;
-
-    float b1 = Det3(d, e2, e3) * cal.invDet;
-    float b2 = Det3(e1, d, e3) * cal.invDet;
-    float b3 = Det3(e1, e2, d) * cal.invDet;
-    float b0 = 1.0f - b1 - b2 - b3;
-
-    return cal.c0 * b0 + cal.c1 * b1 + cal.c2 * b2 + cal.c3 * b3;
+    return cal.c0 + cal.col0 * d.x + cal.col1 * d.y + cal.col2 * d.z;
 }
 
 bool ClipToScreenUV(float4 clipPos, out float2 uv, out float depth)
@@ -735,6 +752,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
     if (cal.valid > 0.5f && ValidViewportCursor(CURSOR_PARAMS))
     {
         uint objectCount = (uint)min(max(gObjectMap[0u].x, 0.0f), (float)MAX_OBJECTS);
+        uint objectFirst = min((uint)max(DETECT_OBJECT_FIRST, 0.0f), objectCount);
+        uint objectLast = DETECT_OBJECT_SPAN > 0.5f
+            ? min(objectFirst + (uint)max(DETECT_OBJECT_SPAN, 0.0f), objectCount)
+            : objectCount;
         float2 primaryCursor = CursorUVFromParams(CURSOR_PARAMS);
         float2 altCursor = CursorUVFromParams(ALT_CURSOR_PARAMS);
         bool useAltCursor = NormalizedCursorValid(ALT_CURSOR_PARAMS);
@@ -746,7 +767,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
         bool isClicked = CLICK_PARAMS.x > 0.0f;
 
         [loop]
-        for (uint objectIndex = 0u; objectIndex < objectCount; objectIndex++)
+        for (uint objectIndex = objectFirst; objectIndex < objectLast; objectIndex++)
         {
             float4 entry = gObjectMap[1u + objectIndex];
             uint firstIndex = (uint)max(entry.x, 0.0f);
