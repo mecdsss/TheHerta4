@@ -383,8 +383,11 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
     def _load_panel_config_text(self, zip_path: str):
         """读取面板配置文本，返回 (文本内容, 来源描述)。
 
-        优先使用面板目录中松散的 ui_config_*.txt/.ini；目录中没有时，
-        改从 ui_assets_*.zip 压缩包内读取日期最新的一份配置条目。
+        松散配置与压缩包内配置条目都按文件名时间戳取最新——资源检查与注入
+        必须基于「实际最新的配置表」，避免旧版松散配置（可能引用已被新版
+        移除的资源，如 draw_2d_fx.hlsl）与新资源压缩包错配而误报缺文件。
+        无时间戳的松散配置视为用户手动放置的明确意图，优先级最高。
+        目录与压缩包都没有配置时读取失败。
         """
         folder = self._get_panel_folder()
         if not folder or not os.path.isdir(folder):
@@ -393,16 +396,40 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
             panel_ini_path = self._find_panel_ini_path()
         except ValueError:
             panel_ini_path = ""
+        zip_entry_name = ""
+        if zip_path:
+            zip_entry_name = self._find_latest_config_entry_in_zip(zip_path)
+
+        loose_ts = self._config_timestamp(panel_ini_path) if panel_ini_path else None
+        zip_ts = self._config_timestamp(zip_entry_name) if zip_entry_name else None
+
+        if panel_ini_path and zip_entry_name and loose_ts is not None and zip_ts is not None and zip_ts > loose_ts:
+            # 压缩包内配置条目更新：以压缩包内的配置为准
+            with zipfile.ZipFile(zip_path, 'r') as zfile:
+                text = zfile.read(zip_entry_name).decode('utf-8-sig')
+            return text, f"{os.path.basename(zip_path)} 内的 {zip_entry_name}"
         if panel_ini_path:
             with open(panel_ini_path, 'r', encoding='utf-8-sig') as f:
                 return f.read(), os.path.basename(panel_ini_path)
-        if zip_path:
-            entry_name = self._find_latest_config_entry_in_zip(zip_path)
-            if entry_name:
-                with zipfile.ZipFile(zip_path, 'r') as zfile:
-                    text = zfile.read(entry_name).decode('utf-8-sig')
-                return text, f"{os.path.basename(zip_path)} 内的 {entry_name}"
+        if zip_entry_name:
+            with zipfile.ZipFile(zip_path, 'r') as zfile:
+                text = zfile.read(zip_entry_name).decode('utf-8-sig')
+            return text, f"{os.path.basename(zip_path)} 内的 {zip_entry_name}"
         raise ValueError(f"面板目录中未找到 INI 配置文件: {folder}")
+
+    @classmethod
+    def _config_timestamp(cls, path_or_name):
+        """返回 (1, 时间戳) 或 None。
+
+        文件名末尾 `_<10位以上数字>.txt/.ini` 视为网页导出时间戳；
+        其余形式（如 `_123.txt`）视为无时间戳（用户手动放置）。
+        """
+        if not path_or_name:
+            return None
+        match = cls._UI_CONFIG_TIMESTAMP_PATTERN.search(os.path.basename(str(path_or_name)))
+        if match:
+            return (1, float(match.group(1)))
+        return None
 
     def _find_latest_config_entry_in_zip(self, zip_path: str) -> str:
         """在压缩包内查找日期最新的 ui_config_*.txt/.ini 条目（严格限前缀）。"""
@@ -438,7 +465,8 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
             normalized = normalized[2:]
         return normalized
 
-    def _extract_ui_assets_zip(self, zip_path: str, mod_export_path: str, panel_sections) -> int:
+    def _extract_ui_assets_zip(self, zip_path: str, mod_export_path: str, panel_sections,
+                               config_source: str = "") -> int:
         """把 ui_assets 压缩包解压到模组导出目录，返回解压的文件数。
 
         解压前校验 INI 引用的资源都在压缩包内；配置条目（ui_config_*.txt/.ini）
@@ -459,9 +487,10 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
             normalized_entries = {self._normalize_reference_path(name) for name in file_names}
             missing = sorted(ref for ref in referenced if ref not in normalized_entries)
             if missing:
+                source_hint = f" (配置来源: {config_source})" if config_source else ""
                 raise ValueError(
                     f"UI面板资源压缩包缺少 INI 引用的文件: {', '.join(missing)} "
-                    f"(压缩包: {os.path.basename(zip_path)})"
+                    f"(压缩包: {os.path.basename(zip_path)}){source_hint}"
                 )
             for info in zfile.infolist():
                 if info.is_dir():
@@ -546,7 +575,8 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
 
         # 有压缩包时资源直接解压到模组目录；否则退回松散文件复制
         if zip_path:
-            extracted_count = self._extract_ui_assets_zip(zip_path, mod_export_path, panel_sections)
+            extracted_count = self._extract_ui_assets_zip(
+                zip_path, mod_export_path, panel_sections, config_source)
             print(f"UI面板资源压缩包已解压: {os.path.basename(zip_path)} "
                   f"({extracted_count} 个文件 -> {mod_export_path})")
         else:
@@ -573,7 +603,7 @@ class SSMTNode_PostProcess_UIPanel(SSMTNode_PostProcess_Base):
                 return False, f"面板INI为空或无法解析: {config_source}"
 
             if zip_path:
-                self._extract_ui_assets_zip(zip_path, mod_export_path, panel_sections)
+                self._extract_ui_assets_zip(zip_path, mod_export_path, panel_sections, config_source)
             else:
                 self._copy_referenced_files(panel_sections, self._get_panel_folder(), mod_export_path)
         except Exception as exc:

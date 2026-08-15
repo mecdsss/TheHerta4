@@ -2455,8 +2455,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # ---- 全局共享资源 ----
         global_resources = {
             f"[ResourceDragDetectID_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
-            f"[ResourceDragPinnedDetectID_{ns}]": ["type = StructuredBuffer", "stride = 4", "array = 1"],
+            f"[ResourceDragPinnedDetectID_{ns}]": ["type = StructuredBuffer", "stride = 4", "array = 2"],
             f"[ResourceDragPinnedDetectInfo_{ns}]": ["type = StructuredBuffer", "stride = 16", "array = 15"],
+            f"[ResourceDragZoneOut_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
             f"[ResourceDragJiggleScreenState_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
             f"[ResourceDragPathProgressState_{ns}]": [
                 "type = RWBuffer", "format = R32_FLOAT",
@@ -2615,8 +2616,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ],
             f"[ResourceDragDebugDetect_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 23"],
             f"[ResourceDragComponentDetect_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
-            f"[ResourceDragPinnedComponentID_{cn}_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
+            f"[ResourceDragPinnedComponentID_{cn}_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 2"],
             f"[ResourceDragPinnedComponentInfo_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
+            f"[ResourceDragComponentZoneOut_{cn}_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
             f"[ResourceDragJiggleState_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 10"],
             # TempVB0：空声明段（type=RWBuffer，无 format/array），copy 往返后换绑
             f"[ResourceDragJiggleTempVB0_{cn}_{ns}]": ["type = RWBuffer"],
@@ -2868,8 +2870,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"cs-u0 = ResourceDragComponentDetect_{cn}_{ns}",
             f"cs-u1 = ResourceDragPinnedComponentID_{cn}_{ns}",
             f"cs-u2 = ResourceDragPinnedComponentInfo_{cn}_{ns}",
+            f"cs-u3 = ResourceDragComponentZoneOut_{cn}_{ns}",
             "dispatch = 1, 1, 1",
-            "post cs-u0 = null", "post cs-u1 = null", "post cs-u2 = null",
+            "post cs-u0 = null", "post cs-u1 = null", "post cs-u2 = null", "post cs-u3 = null",
         ]
 
     # ---- 全局 Pin（槽 10 注入光标 x24..w24）----
@@ -2884,8 +2887,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"cs-u0 = ResourceDragDetectID_{ns}",
             f"cs-u1 = ResourceDragPinnedDetectID_{ns}",
             f"cs-u2 = ResourceDragPinnedDetectInfo_{ns}",
+            f"cs-u3 = ResourceDragZoneOut_{ns}",
             "dispatch = 1, 1, 1",
-            "post cs-u0 = null", "post cs-u1 = null", "post cs-u2 = null",
+            "post cs-u0 = null", "post cs-u1 = null", "post cs-u2 = null", "post cs-u3 = null",
         ]
 
     # ---- UpdateScreenJiggle（y72=1.0 非 mult_radius，照原作不对称）----
@@ -3103,6 +3107,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tclear = ResourceDragDetectID_{ns} 0.0",
                 f"\tclear = ResourceDragPinnedDetectID_{ns}",
                 f"\tclear = ResourceDragPinnedDetectInfo_{ns}",
+                f"\tclear = ResourceDragZoneOut_{ns} 0.0",
                 f"\tclear = ResourceDragJiggleScreenState_{ns} 0.0",
                 f"\tclear = ResourceDragPathProgressState_{ns} 0.0",
                 f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
@@ -3131,6 +3136,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     f"\tclear = ResourceDragComponentDetect_{cn}_{ns} 0.0",
                     f"\tclear = ResourceDragPinnedComponentID_{cn}_{ns} 0.0",
                     f"\tclear = ResourceDragPinnedComponentInfo_{cn}_{ns} 0.0",
+                    f"\tclear = ResourceDragComponentZoneOut_{cn}_{ns} 0.0",
                     f"\tclear = ResourceDragJiggleState_{cn}_{ns} 0.0",
                 ])
             lines.extend([
@@ -3720,20 +3726,21 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         present_lines = sections.setdefault(present_sec, [])
         ui_bridge_lines = [
             "\t; --- DRAG UI BRIDGE BEGIN ---",
-            # PinnedDetectInfo[7].w 是区域索引；按 float 标量索引即 7*4+3 = 31。
-            # store 读取上一份已完成的 GPU 数据，允许 UI 侧以一帧延迟稳定消费。
-            # 目标未绘制时必须主动失效，避免消费上一帧/上一个角色的残留命中。
-            f"if {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_booted_{ns} == 1",
+            # zone 直出回读（store 无条件执行，结果有效性由 pre 阶段设置的
+            # ObjectDetectAllowed 仲裁，避免 post 阶段门控变量时序不可靠）：
+            #   - 命中 ID：ResourceDragPinnedDetectID 槽 0（RWStructuredBuffer<float> stride 4）
+            #   - 区域 ID：ResourceDragZoneOut 槽 0（RWBuffer R32_FLOAT 标量）
+            # 两者同走 R32 标量路径，与点击计数回读同型。历史版本曾从
+            # stride-16 StructuredBuffer 按 float 标量索引 31 读 zone，实测不可靠
+            # （zone 恒 -1），故改由 pin 着色器直出到 R32 标量槽。
+            # store 读取上一份已完成的 GPU 数据，允许 UI 侧以一帧延迟稳定消费；
+            # 本帧检测未运行（ObjectDetectAllowed=0）或未命中时主动失效，避免残留命中。
             f"\tstore = {ui_detected_var}, ResourceDragPinnedDetectID_{ns}, 0",
-            f"\tif {ui_detected_var} >= 0",
-            f"\t\tstore = {ui_zone_var}, ResourceDragPinnedDetectInfo_{ns}, 31",
-            "\telse",
+            f"\tstore = {ui_zone_var}, ResourceDragZoneOut_{ns}, 0",
+            f"\tif {ui_detected_var} < 0 || $ObjectDetectAllowed_{ns} != 1",
+            f"\t\t{ui_detected_var} = -1",
             f"\t\t{ui_zone_var} = -1",
             "\tendif",
-            "else",
-            f"\t{ui_detected_var} = -1",
-            f"\t{ui_zone_var} = -1",
-            "endif",
             "\t; --- DRAG UI BRIDGE END ---",
         ]
         interaction_gate_lines = [
@@ -3765,6 +3772,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"\tclear = ResourceDragDetectID_{ns} 0.0",
             f"\tclear = ResourceDragPinnedDetectID_{ns}",
             f"\tclear = ResourceDragPinnedDetectInfo_{ns}",
+            f"\tclear = ResourceDragZoneOut_{ns} 0.0",
         ])
         for comp in components:
             cn = comp['comp_name']
@@ -3772,6 +3780,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tclear = ResourceDragComponentDetect_{cn}_{ns} 0.0",
                 f"\tclear = ResourceDragPinnedComponentID_{cn}_{ns} 0.0",
                 f"\tclear = ResourceDragPinnedComponentInfo_{cn}_{ns} 0.0",
+                f"\tclear = ResourceDragComponentZoneOut_{cn}_{ns} 0.0",
             ])
         interaction_gate_lines.extend([
             "endif",

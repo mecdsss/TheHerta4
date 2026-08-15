@@ -6,6 +6,7 @@
 //   cs-u0 = ResourceRZMDetectID,         RWBuffer<float4> (frame accumulator)
 //   cs-u1 = ResourceRZMPinnedDetectID,   RWStructuredBuffer<float>  (legacy pinned R32_FLOAT)
 //   cs-u2 = ResourceRZMPinnedDetectInfo, RWStructuredBuffer<float4> (pinned extended info)
+//   cs-u3 = ResourceRZMZoneOut,          RWBuffer<float> (stable zone ID scalar, R32_FLOAT)
 //
 // Accumulator/pinned info layout:
 //   [0] legacy ABI, do not reorder:
@@ -33,6 +34,7 @@
 RWBuffer<float4> gAccumulated : register(u0);
 RWStructuredBuffer<float>  gPinnedID    : register(u1);
 RWStructuredBuffer<float4> gPinnedInfo  : register(u2);
+RWBuffer<float>            gZoneOut     : register(u3);
 Texture1D<float4> IniParams   : register(t120);
 
 #define CURSOR_PARAMS IniParams[24]
@@ -48,6 +50,16 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     bool   invalid = best.x < 0.0f || best.y > 1e30f;
 
     gPinnedID[0] = invalid ? -1.0f : best.x;
+
+    // 区域直出：slot 7 = (layout, objectIndex, objectCount, stable zone)。
+    // 在下方 loop 重置 gAccumulated 之前读出 .w，双路写出：
+    //   gPinnedID[1] —— 与命中 ID 同资源（RWStructuredBuffer<float> stride 4）的相邻槽，
+    //                     INI 侧 store 与命中 ID 完全同型同寻址，回读最可靠；
+    //   gZoneOut[0]  —— 独立 R32_FLOAT 标量槽（RWBuffer），与点击计数回读同型。
+    // 历史问题：zone 曾从 stride-16 StructuredBuffer 按 float 标量索引 31 回读，
+    // 实测该跨结构寻址不可靠（zone 恒 -1），故改为 R32 标量双路直出。
+    gPinnedID[1] = invalid ? -1.0f : gAccumulated[7].w;
+    gZoneOut[0]  = invalid ? -1.0f : gAccumulated[7].w;
 
     [unroll]
     for (uint slot = 0u; slot < RZM_DETECT_SLOTS; slot++)

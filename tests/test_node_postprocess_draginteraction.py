@@ -2042,14 +2042,16 @@ class DragNodeEmitTests(unittest.TestCase):
             readback,
         )
         self.assertIn(
-            "store = $ssmtdrag_ui_zone_testns, ResourceDragPinnedDetectInfo_testns, 31",
+            "store = $ssmtdrag_ui_zone_testns, ResourceDragZoneOut_testns, 0",
             readback,
         )
-        self.assertIn("if $ssmtdrag_ui_detected_testns >= 0", readback)
+        self.assertIn("if $ssmtdrag_ui_detected_testns < 0 || $ObjectDetectAllowed_testns != 1", readback)
         self.assertIn("$ssmtdrag_ui_detected_testns = -1", readback)
         self.assertIn("$ssmtdrag_ui_zone_testns = -1", readback)
         self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedDetectID_testns]"])
         self.assertIn("stride = 4", sections["[ResourceDragPinnedDetectID_testns]"])
+        self.assertIn("array = 2", sections["[ResourceDragPinnedDetectID_testns]"])
+        self.assertIn("type = RWBuffer", sections["[ResourceDragZoneOut_testns]"])
         self.assertIn("type = StructuredBuffer", sections["[ResourceDragPinnedDetectInfo_testns]"])
         self.assertIn("stride = 16", sections["[ResourceDragPinnedDetectInfo_testns]"])
 
@@ -2123,7 +2125,7 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("if $custom_drag_mode >= 1", hook)
         self.assertIn("if $custom_drag_mode >= 2", hook)
         self.assertIn("store = $custom_hit_id, ResourceDragPinnedDetectID_testns, 0", readback)
-        self.assertIn("store = $custom_zone_id, ResourceDragPinnedDetectInfo_testns, 31", readback)
+        self.assertIn("store = $custom_zone_id, ResourceDragZoneOut_testns, 0", readback)
 
     def test_drag_runtime_switch_defaults_on_and_upgrades_legacy_present(self):
         node, sections, comps = self._emit()

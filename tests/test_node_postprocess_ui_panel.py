@@ -720,5 +720,73 @@ $active = 1
             self.assertLess(result_text.index(first_marker), result_text.index(second_marker))
             self.assertGreater(result_text.index(second_marker), result_text.index("[TextureOverride_drawhash]"))
 
+    def test_zip_entry_newer_than_loose_timestamped_config_wins(self):
+        # 松散配置与压缩包内配置条目都有时间戳时，取最新的那一份——
+        # 避免旧版松散配置（可能引用新版已移除的资源）与新资源包错配误报
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            panel_dir = root / "panel"
+            panel_dir.mkdir()
+            with zipfile.ZipFile(panel_dir / "ui_assets_1782784000000.zip", "w") as zfile:
+                zfile.writestr("ui_config_c209c22b_1782784000000.txt",
+                               PANEL_INI.replace("c209c22b", "aaaaaaaa").encode("utf-8"))
+                zfile.writestr("res/__glass_panel.png", b"png-bytes")
+                zfile.writestr("res/draw_2d.hlsl", b"shader")
+                zfile.writestr("res/draw_2d_fx.hlsl", b"shader-fx")
+            # 松散配置时间戳更旧（数字更小）
+            (panel_dir / "ui_config_c209c22b_1782783000000.txt").write_text(
+                PANEL_INI.replace("c209c22b", "bbbbbbbb"), encoding="utf-8")
+            mod_dir = root / "mod"
+            mod_dir.mkdir()
+            (mod_dir / "character.ini").write_text(TARGET_INI, encoding="utf-8")
+
+            node = _make_node(str(panel_dir))
+            node.execute_postprocess(str(mod_dir))
+            result_text = (mod_dir / "character.ini").read_text(encoding="utf-8")
+
+            # 选中压缩包内更新的配置条目（aaaaaaaa），而非旧松散配置（bbbbbbbb）
+            self.assertIn("aaaaaaaa", result_text)
+            self.assertNotIn("bbbbbbbb", result_text)
+
+    def test_loose_timestamped_config_newer_than_zip_entry_wins(self):
+        # 松散配置时间戳更新时保持优先
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            panel_dir = root / "panel"
+            panel_dir.mkdir()
+            with zipfile.ZipFile(panel_dir / "ui_assets_1782783000000.zip", "w") as zfile:
+                zfile.writestr("ui_config_c209c22b_1782783000000.txt",
+                               PANEL_INI.replace("c209c22b", "aaaaaaaa").encode("utf-8"))
+                zfile.writestr("res/__glass_panel.png", b"png-bytes")
+                zfile.writestr("res/draw_2d.hlsl", b"shader")
+                zfile.writestr("res/draw_2d_fx.hlsl", b"shader-fx")
+            (panel_dir / "ui_config_c209c22b_1782784000000.txt").write_text(
+                PANEL_INI.replace("c209c22b", "bbbbbbbb"), encoding="utf-8")
+            mod_dir = root / "mod"
+            mod_dir.mkdir()
+            (mod_dir / "character.ini").write_text(TARGET_INI, encoding="utf-8")
+
+            node = _make_node(str(panel_dir))
+            node.execute_postprocess(str(mod_dir))
+            result_text = (mod_dir / "character.ini").read_text(encoding="utf-8")
+
+            self.assertIn("bbbbbbbb", result_text)
+            self.assertNotIn("aaaaaaaa", result_text)
+
+    def test_missing_resource_error_reports_config_source(self):
+        # 缺资源报错带配置来源，便于定位配置错位
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            panel_dir = _write_zip_panel_folder(root, entries={
+                "ui_config_c209c22b_1782784000000.txt": PANEL_INI.encode("utf-8"),
+                "res/__glass_panel.png": b"png-bytes",
+                # 缺少 INI 引用的 draw_2d.hlsl / draw_2d_fx.hlsl
+            })
+            mod_dir = _make_mod_dir(root)
+            node = _make_node(str(panel_dir))
+            with self.assertRaisesRegex(ValueError, "配置来源: ui_assets_1782784000000.zip 内的"):
+                node.execute_postprocess(str(mod_dir))
+
+
 if __name__ == "__main__":
     unittest.main()
