@@ -1027,6 +1027,10 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertIn(mask_line, new_lines)
             self.assertLess(new_lines.index(ttl_ref_line), new_lines.index(mask_line))
             self.assertLess(new_lines.index(mask_line), new_lines.index("$" + BS + "TTL" + BS + "alpha = $TTLAlpha0_75"))
+            mask_channel_line = "$" + BS + "TTL" + BS + "mask_channel = 3"
+            self.assertIn(mask_channel_line, new_lines)
+            self.assertLess(new_lines.index(ttl_ref_line), new_lines.index(mask_channel_line))
+            self.assertLess(new_lines.index(mask_channel_line), new_lines.index(mask_line))
 
     def test_ttl_if_switch_block_moved_with_condition(self):
         """TTL：if/endif 条件块整体迁入新段并包住 _1/_2/run，原段删除"""
@@ -1389,6 +1393,137 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                 if key.startswith("[TextureOverrideBody"):
                     alpha_lines.extend(ls)
             self.assertEqual(alpha_lines.count("$" + BS + "TTL" + BS + "alpha = $TTLAlpha0_75"), 2)
+
+    def test_ttl_drag_hook_generates_geometry_binding_command_list(self):
+        """TTL：头部含拖拽钩子时，TTL 绘制改走显式绑定 ib 的 command list;
+        仅在拖拽激活时绑定 jiggle 临时 VB0,否则不覆盖 vb0(继承已蒙皮/形态键
+        的 SO 输出)。严禁生成 else 分支绑定 Position 基础输入,否则骨骼丢失。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+            mesh_name = "LOD0.241deac5-56376-0.中文中文_透明0.75_copy"
+            obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
+            _fake_bpy.data.objects[obj.name] = obj
+
+            sections = OrderedDict([
+                ("[TextureOverride_LOD0.241deac5_56376_0]", [
+                    "hash = 241deac5",
+                    "match_first_index = 0",
+                    "ib = Resource_LOD0.241deac5_56376_0_Index",
+                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                    "run = CommandListSkinTexture",
+                    "    ; --- DRAG HOOK BEGIN 241deac5P0_A ---",
+                    "    if $ssmtdrag_drag_enabled_A >= 1 && $ObjectDetectAllowed_A == 1",
+                    "        run = CustomShaderDragBake241deac5P0_A",
+                    "        run = CustomShaderDragDetect241deac5P0_A",
+                    "    endif",
+                    "    if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1",
+                    "        if time != $ssmtdrag_last_dispatch_241deac5_A",
+                    "            run = CustomShaderDragJiggle241deac5_A",
+                    "            $ssmtdrag_last_dispatch_241deac5_A = time",
+                    "        endif",
+                    "        vb0 = ResourceDragJiggleTempVB0_241deac5_A",
+                    "    endif",
+                    "    ; --- DRAG HOOK END 241deac5P0_A ---",
+                    f"; [mesh:{mesh_name}] [vertex_count:15618]",
+                    "drawindexed = 56376, 0, 0",
+                ]),
+                ("[TextureOverride_VB_241deac5_241deac5_Position]", [
+                    "hash = 13c77c3a",
+                    "vb2 = Resource241deac5Blend",
+                    "vb0 = Resource241deac5Position",
+                ]),
+                ("_config_path", temp_dir),
+            ])
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.process_texture_override_section(
+                "[TextureOverride_LOD0.241deac5_56376_0]",
+                sections,
+                material_group_to_swapkey={},
+                swap_key_prefix="$swapkey",
+                next_swap_key_num=150,
+                used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            command_list_section = "[CommandListSSMTTTLDraw_241deac5_A]"
+            self.assertIn(command_list_section, sections)
+            command_list_lines = sections[command_list_section]
+            self.assertIn("if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1", command_list_lines)
+            self.assertIn("    vb0 = ResourceDragJiggleTempVB0_241deac5_A", command_list_lines)
+            self.assertNotIn("else", command_list_lines)
+            self.assertNotIn("Resource241deac5Position", command_list_lines)
+            self.assertIn("endif", command_list_lines)
+            self.assertIn("ib = Resource_LOD0.241deac5_56376_0_Index", command_list_lines)
+            self.assertIn(f"run = CommandList{BS}TTL{BS}Draw", command_list_lines)
+
+            new_section = next(
+                key for key in sections
+                if key.startswith("[TextureOverrideLOD0_241deac5")
+            )
+            new_lines = sections[new_section]
+            self.assertIn("run = CommandListSSMTTTLDraw_241deac5_A", new_lines)
+            self.assertNotIn(f"run = CommandList{BS}TTL{BS}Draw", new_lines)
+
+    def test_ttl_draw_lines_preserve_drag_vis_flags(self):
+        """TTL 块重建必须保留拖拽物体显隐 flag 行（否则隐藏判定失效）。"""
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        block = [
+            "if $swapkey6 == 5 && $swapkey4 == 2",
+            "    $ssmtdrag_objvis_A_30 = 1",
+            "    drawindexed = 15255, 272901, 0",
+            "endif",
+        ]
+        ttl_lines, found = node._build_ttl_draw_lines(block)
+
+        self.assertTrue(found)
+        stripped = [str(line).strip() for line in ttl_lines]
+        self.assertIn("$ssmtdrag_objvis_A_30 = 1", stripped)
+        self.assertIn("$" + chr(92) + "TTL" + chr(92) + "_1 = 15255", stripped)
+
+    def test_ttl_draw_lines_preserve_flags_when_block_starts_mid_if(self):
+        """TTL 块边界从 mesh 注释行开始（if 头在块外）时，flag 与 drawindexed
+        都走非 if 路径——flag 必须在 $\TTL 参数之前被保留（回归：此前整批 54
+        个 TTL 段标志被静默丢弃，导致可见 TTL 副本无法被命中）。"""
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        block = [
+            "; [mesh:LOD0.241deac5-56376-0.服装03主体替换_copy] [vertex_count:2702]",
+            f"Resource{chr(92)}ZZMI{chr(92)}Diffuse = ref Resource_DiffuseMap_X",
+            "    $ssmtdrag_objvis_A_30 = 1",
+            "  drawindexed = 15255,272901,0",
+            "endif",
+        ]
+        ttl_lines, found = node._build_ttl_draw_lines(block)
+
+        self.assertTrue(found)
+        stripped = [str(line).strip() for line in ttl_lines]
+        self.assertIn("$ssmtdrag_objvis_A_30 = 1", stripped)
+        arg1_idx = stripped.index("$" + chr(92) + "TTL" + chr(92) + "_1 = 15255")
+        flag_idx = stripped.index("$ssmtdrag_objvis_A_30 = 1")
+        self.assertLess(flag_idx, arg1_idx, "flag 必须在 TTL 参数/绘制之前")
+        self.assertNotIn("drawindexed =", stripped)
+
+    def test_ttl_draw_lines_preserve_bare_flags_before_bare_draw(self):
+        """无 if 包裹的 bare flag + bare drawindexed：flag 同样必须保留。"""
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        block = [
+            "$ssmtdrag_objvis_A_7 = 1",
+            "drawindexed = 618,60234,0",
+        ]
+        ttl_lines, found = node._build_ttl_draw_lines(block)
+
+        self.assertTrue(found)
+        stripped = [str(line).strip() for line in ttl_lines]
+        self.assertIn("$ssmtdrag_objvis_A_7 = 1", stripped)
+        arg1_idx = stripped.index("$" + chr(92) + "TTL" + chr(92) + "_1 = 618")
+        flag_idx = stripped.index("$ssmtdrag_objvis_A_7 = 1")
+        self.assertLess(flag_idx, arg1_idx)
 
     def test_transparency_suffix_alone_triggers_transparency_code_not_ttl(self):
         """澄清：_透明 后缀不再自动触发 TTL/FX，仅独立生成透明代码（CustomShaderTransparencyCloth）"""

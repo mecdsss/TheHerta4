@@ -109,6 +109,12 @@ Buffer<float4>                 gJiggleZoneWeights : register(t5);
 // LLMenu's own scalar viewport contract. It is read directly on GPU so UI
 // offset/resize never needs per-frame CPU synchronization.
 Buffer<float>                      gViewportFrameAPI : register(t6);
+// Per-triangle object id (baked geometry mapping) + per-object visibility
+// flags published each frame from CPU-side draw-branch flags. A triangle is
+// skipped when its object is currently not drawn (0xFFFFFFFF = unmapped,
+// never gated by visibility).
+Buffer<uint>                       gTriangleObjectIDs : register(t7);
+Buffer<float>                      gObjectVis : register(t8);
 RWBuffer<float4>                   gBestHit     : register(u0);
 RWBuffer<float4>                   gComponentHit : register(u1);
 RWBuffer<float4>                   gDebug       : register(u2);
@@ -668,7 +674,13 @@ void TestTriangleRange(
             float zoneWeight = 1.0f;
             float zone = 0.0f;
             if (objectMode == 7.0f)
+            {
+                // 物体显隐门控：命中三角形所属物体当前未绘制 → 跳过
+                uint visObjectId = gTriangleObjectIDs.Load(indexBase / 3u);
+                if (visObjectId != 0xFFFFFFFFu && gObjectVis[visObjectId] < 0.5f)
+                    continue;
                 zone = ResolveJiggleZone(i0, i1, i2, bary, zoneWeight);
+            }
             if (objectMode == 7.0f && zoneWeight <= 1e-4f)
                 continue;
 
@@ -700,7 +712,12 @@ void TestTriangleRange(
             float anchorZoneWeight = 1.0f;
             float anchorZone = 0.0f;
             if (objectMode == 7.0f)
+            {
+                uint anchorVisObjectId = gTriangleObjectIDs.Load(indexBase / 3u);
+                if (anchorVisObjectId != 0xFFFFFFFFu && gObjectVis[anchorVisObjectId] < 0.5f)
+                    continue;
                 anchorZone = ResolveJiggleZone(i0, i1, i2, anchorBary, anchorZoneWeight);
+            }
             if (objectMode == 7.0f && anchorZoneWeight <= 1e-4f)
                 continue;
             float candidateDistance = DistSqPointTriangle(primaryCursor, s0, s1, s2);

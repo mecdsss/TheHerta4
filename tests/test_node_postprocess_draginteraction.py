@@ -378,6 +378,44 @@ class DragNodeLocateTests(unittest.TestCase):
             "; [mesh:LOD0.sourcehash-120-0.SourceA_copy] [vertex_count:80]",
         )
 
+    def test_collect_draw_parts_captures_ttl_run_sites(self):
+        node = _make_node(self.mod)
+        sections = _base_sections(hash_value="deadbeef", base_name="deadbeef-43191")
+        sections["[TextureOverrideLOD0_deadbeef_43191A_copy]"] = [
+            "hash = deadbeef",
+            "match_first_index = 0",
+            "ib = Resourcedeadbeef-43191AIB",
+            "; [mesh:LOD0.deadbeef-43191-0.CopyA] [vertex_count:80]",
+            "if $swapkey6 == 5",
+            "    $\\TTL\\_1 = 15255",
+            "    $\\TTL\\_2 = 272901",
+            "    run = CommandListSSMTTTLDraw_deadbeef_A",
+            "endif",
+        ]
+
+        parts = node._collect_draw_parts(sections, "deadbeef")
+        part_a = next(p for p in parts if p["ib_resource"] == "Resourcedeadbeef-43191AIB")
+        ttl_records = [r for r in part_a["draw_records"] if r["draw_offset"] == 272901]
+
+        self.assertEqual(len(ttl_records), 1)
+        self.assertEqual(ttl_records[0]["draw_count"], 15255)
+
+    def test_object_id_map_assigned_from_mesh_comments(self):
+        node = _make_node(self.mod)
+        sections = _cross_ib_sections()
+        comps = node._locate_components(sections, ["targethash", "sourcehash"])
+
+        # 两个组件的物体编号全局连续
+        targethash = next(c for c in comps if c["hash"] == "targethash")
+        sourcehash = next(c for c in comps if c["hash"] == "sourcehash")
+        self.assertIn("LOD0.targethash-300-0.Target_copy", targethash["object_id_map"])
+        self.assertIn("LOD0.sourcehash-120-0.SourceA_copy", sourcehash["object_id_map"])
+        self.assertIn("LOD0.sourcehash-120-0.SourceB_copy", sourcehash["object_id_map"])
+        all_ids = []
+        for comp in comps:
+            all_ids.extend(comp["object_id_map"].values())
+        self.assertEqual(sorted(all_ids), list(range(len(all_ids))))
+
     def test_get_vertex_count_from_vlr(self):
         node = _make_node(self.mod)
         sections = _base_sections()
@@ -417,6 +455,35 @@ class DragNodeLocateTests(unittest.TestCase):
             positions,
             np.asarray([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32),
         )
+
+    def test_read_component_triangles_labels_each_draw_range(self):
+        import tempfile
+        node = _make_node(self.mod)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ib_dir = Path(temp_dir) / "Meshes"
+            ib_dir.mkdir()
+            idx = np.array([0, 1, 2, 3, 4, 5], dtype=np.uint32)  # 两个三角形
+            (ib_dir / "foo-Index.buf").write_bytes(idx.tobytes())
+
+            sections = OrderedDict({
+                "[Resourcefoo-Index]": [
+                    "type = Buffer",
+                    "filename = Meshes/foo-Index.buf",
+                ],
+            })
+            comp = {
+                "parts": [{
+                    "ib_resource": "Resourcefoo-Index",
+                    "name_ranges": [
+                        (0, 3, "Body"),
+                        (3, 3, "Head"),
+                    ],
+                }],
+            }
+            tri, names = node._read_component_triangles(temp_dir, sections, comp, 0)
+
+        np.testing.assert_array_equal(tri, np.array([[0, 1, 2], [3, 4, 5]]))
+        np.testing.assert_array_equal(names, np.array(["Body", "Head"], dtype=object))
 
     def test_read_removes_old_drag_tail_but_preserves_other_postprocess_modules(self):
         import tempfile
@@ -626,6 +693,53 @@ class DragNodeObjectMapTests(unittest.TestCase):
         # indexBase = firstIndex + tri*3，各部件 IB 为独立分区文件），objectID 恒 0
         #（着色器 entry.w==0 时回退 objectID=firstIndex=0，统一匹配碰撞档案条目 0）
         self.assertEqual(rec2, (0.0, 12000.0, 7.0, 0.0))
+
+    def test_triangle_object_ids_bake(self):
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        comp = node._locate_components(sections, ["abc123"])[0]
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            # 伪造 part A 的 IB 文件（12 索引 = 4 三角形）
+            ib_dir = Path(td) / "Meshes"
+            ib_dir.mkdir(parents=True)
+            ib = np.arange(12, dtype=np.uint32)
+            ib.tofile(ib_dir / "abc123-43191AIB.buf")
+            # 资源段声明 filename（指向伪造文件）
+            sections["[Resourceabc123-43191AIB]"] = [
+                "type = Buffer", "format = DXGI_FORMAT_R32_UINT",
+                "filename = Meshes/abc123-43191AIB.buf",
+            ]
+            node._write_triangle_object_ids(td, sections, comp)
+
+            out = ib_dir / "abc123-43191TriangleObjectIDsP0.buf"
+            self.assertTrue(out.exists())
+            ids = np.fromfile(out, dtype=np.uint32)
+        # A 无 mesh 注释 → 无 name_ranges → 全部三角形保持未映射哨兵 0xFFFFFFFF
+        self.assertEqual(len(ids), 4)
+        self.assertTrue((ids == 0xFFFFFFFF).all())
+
+    def test_triangle_object_ids_bake_maps_named_ranges(self):
+        node = _make_node(self.mod)
+        sections = _cross_ib_sections()
+        comps = node._locate_components(sections, ["targethash"])
+        comp = comps[0]
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ib_dir = Path(td) / "Meshes"
+            ib_dir.mkdir(parents=True)
+            ib = np.arange(300, dtype=np.uint32)
+            ib.tofile(ib_dir / "targethash_0_Index.buf")
+            sections["[Resource_targethash_0_Index]"] = [
+                "type = Buffer", "format = DXGI_FORMAT_R32_UINT",
+                "filename = Meshes/targethash_0_Index.buf",
+            ]
+            node._write_triangle_object_ids(td, sections, comp)
+            ids = np.fromfile(ib_dir / "targethashTriangleObjectIDsP0.buf", dtype=np.uint32)
+        target_id = comp["object_id_map"]["LOD0.targethash-300-0.Target_copy"]
+        # 前 100 三角形 = Target_copy（draw 300@0）
+        self.assertEqual(len(ids), 100)
+        self.assertTrue((ids == target_id).all())
 
 class DragNodeEmitTests(unittest.TestCase):
     @classmethod
@@ -879,7 +993,7 @@ class DragNodeEmitTests(unittest.TestCase):
         present = sections["[Present]"]
         boot_run = "if $ssmtdrag_booted_testns == 0"
         seed_run = "elif $ssmtdrag_seed_pending_testns == 1"
-        interaction_run = "elif $ssmtdrag_drag_enabled_testns >= 1 && $ssmtdrag_mode_testns == 1"
+        interaction_run = "elif $ssmtdrag_drag_enabled_testns >= 1"
         self.assertIn(boot_run, present)
         self.assertIn(seed_run, present)
         self.assertLess(present.index(boot_run), present.index(seed_run))
@@ -1177,22 +1291,28 @@ class DragNodeEmitTests(unittest.TestCase):
         rb = "\n".join(sections["[CommandListDragShapeKeyVarReadback_testns]"])
         # store 直接读源缓冲（无镜像/克隆）
         self.assertNotIn(" = copy ", rb)
-        # 分时互斥：仅在对应区域拖拽激活（ZoneActive 标志）时才回读
+        # 值仲裁、变量为主：
+        # 1) 变量变化 → prev 跟随 + 沉淀期 + pull=0（不回读）
+        # 2) 沉淀期只等缓冲追平（rb == var 才退出），期间绝不回读
+        # 3) 拖拽激活（变量未变）→ 缓冲为主，pull=1
+        # 4) 缓冲变化（点击联动/释放收敛）→ 缓冲为主，pull=1
         self.assertIn("store = $ssmtdrag_skact_testns_0, ResourceDragShapeKeyZoneActive_testns, 0", rb)
-        self.assertIn("if $ssmtdrag_skact_testns_0 >= 1", rb)
-        # A 绑定区域0 档位2 → 驱动槽 4+(2-1)=5
         self.assertIn("store = $ssmtdrag_skrb_testns_0, ResourceDragShapeKeyDrive_testns, 5", rb)
-        self.assertIn("$Freq_A = $ssmtdrag_skrb_testns_0", rb)
-        self.assertIn("$ssmtdrag_skprev_testns_0 = $ssmtdrag_skrb_testns_0", rb)
-        self.assertIn("$ssmtdrag_skcd_testns_0 = 6", rb)
-        # 释放沉淀：驱动器抢先步进（编辑沿）则立即交还控制权
-        self.assertIn("elif $ssmtdrag_skcd_testns_0 > 0", rb)
         self.assertIn("if $Freq_A != $ssmtdrag_skprev_testns_0", rb)
+        self.assertIn("$ssmtdrag_skprev_testns_0 = $Freq_A", rb)
+        self.assertIn("$ssmtdrag_skcd_testns_0 = 6", rb)
+        self.assertIn("$ssmtdrag_skpull_testns_0 = 0", rb)
+        self.assertIn("elif $ssmtdrag_skcd_testns_0 > 0", rb)
+        self.assertIn("if $ssmtdrag_skrb_testns_0 == $Freq_A", rb)
+        self.assertIn("$ssmtdrag_skcd_testns_0 = 0", rb)
+        self.assertIn("elif $ssmtdrag_skact_testns_0 >= 1", rb)
+        self.assertIn("$Freq_A = $ssmtdrag_skrb_testns_0", rb)
+        self.assertIn("$ssmtdrag_skpull_testns_0 = 1", rb)
+        self.assertIn("elif $ssmtdrag_skrb_testns_0 != $Freq_A", rb)
         # B 绑定同属区域 0 → 同一标志索引；方向 0 → 驱动槽 0
         self.assertIn("store = $ssmtdrag_skact_testns_1, ResourceDragShapeKeyZoneActive_testns, 0", rb)
         self.assertIn("store = $ssmtdrag_skrb_testns_1, ResourceDragShapeKeyDrive_testns, 0", rb)
         self.assertIn("$Freq_B = $ssmtdrag_skrb_testns_1", rb)
-        self.assertNotIn("skrbp", rb)
 
         constants = "\n".join(sections["[Constants]"])
         self.assertIn("global $ssmtdrag_skheld_testns = 0", constants)
@@ -1200,8 +1320,13 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("global $ssmtdrag_skrb_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skprev_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skcd_testns_0 = 0", constants)
+        self.assertIn("global $ssmtdrag_skpull_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skrb_testns_1 = 0", constants)
-        self.assertNotIn("skrbp", constants)
+
+        # 同步段把 pull 标志打包进 IniParams[83+] 供着色器回声抑制
+        cs = "\n".join(sections["[CustomShaderDragShapeKeyVarSync_testns]"])
+        self.assertIn("x83 = $ssmtdrag_skpull_testns_0", cs)
+        self.assertIn("y83 = $ssmtdrag_skpull_testns_1", cs)
 
     def test_shapekey_var_sync_skipped_without_bindings(self):
         zone = self._zone_item(0)
@@ -1282,14 +1407,16 @@ class DragNodeEmitTests(unittest.TestCase):
         # 变量 4 个一组打包：从 IniParams[81] 起（76-80 为驱动 CS 占用）
         self.assertIn("#define VAR_SYNC_INIPARAM_BASE 81", content)
         self.assertIn("#define VAR_SYNC_GATE_PARAMS 75", content)
+        self.assertIn("#define VAR_SYNC_PULL_BASE 83", content)
         self.assertIn("IniParams[VAR_SYNC_INIPARAM_BASE + (i >> 2)][i & 3]", content)
         # 与驱动 CS 同一命中判定，每帧重算每区域激活标志
         self.assertIn("ZoneActive[z] = (hasHit && z == hoverZone) ? 1.0 : 0.0;", content)
         # 仅在变量真实变化时处理（不变则不覆写拖拽结果）
         self.assertIn("if (abs(raw - VarSyncPrev[i]) <= 1e-6)", content)
         self.assertIn("VarSyncPrev[i] = raw;", content)
-        # 区域拖拽激活中：变量→缓冲写入挂起（防驱动器中途拽走缓冲）
-        self.assertIn("if (zone < clickSlots && ZoneActive[zone] > 0.5)", content)
+        # 变量为主：变化即回写（不再挂起拖拽激活帧）；仅 CPU 回读回声帧跳过
+        self.assertNotIn("if (zone < clickSlots && ZoneActive[zone] > 0.5)", content)
+        self.assertIn("IniParams[VAR_SYNC_PULL_BASE + (i >> 2)][i & 3] > 0.5", content)
         self.assertIn("ShapeKeyDrive[slot] = v;", content)
         self.assertIn("ClickCountF[zone] = (float)ClickCount[zone];", content)
         # 无方向档位：变量非 0 打开对应档位，归 0 时仅清空本档位
@@ -1501,6 +1628,71 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("format = R32G32B32A32_FLOAT", weights)
         self.assertIn("[ResourceDragZoneParams_testns]", sections)
         self.assertFalse(any("JiggleMasks" in name for name in sections))
+
+    def test_vis_publish_sections_present(self):
+        _, sections, _ = self._emit()
+        self.assertIn("[ResourceDragObjectVis_testns]", sections)
+        self.assertIn("[CustomShaderDragVisPublish_testns]", sections)
+        pub = "\n".join(sections["[CommandListDragVisPublish_testns]"])
+        self.assertIn("x130 = $ssmtdrag_objvis_testns_0", pub)
+        self.assertIn("run = CustomShaderDragVisPublish_testns", pub)
+
+    def test_vis_globals_and_present_wiring(self):
+        node, sections, comps = self._emit()
+        node._emit_present_and_constants(sections, comps, "testns")
+        const = "\n".join(sections["[Constants]"])
+        present = "\n".join(sections["[Present]"])
+        self.assertIn("global $ssmtdrag_objvis_testns_0 = 0", const)
+        self.assertIn("pre run = CommandListDragVisPublish_testns", present)
+        self.assertIn("post $ssmtdrag_objvis_testns_0 = 0", present)
+
+    def test_global_object_oids_union(self):
+        node = _make_node(self.mod)
+        comps = [
+            {"object_id_map": {"a": 0, "b": 2}},
+            {"object_id_map": {"c": 5, "d": 1}},
+        ]
+        self.assertEqual(node._global_object_oids(comps), [0, 1, 2, 5])
+
+    def test_vis_globals_use_global_oid_union_across_components(self):
+        """回归：第二个组件起的 objvis flag 必须按全局 oid 声明/清零，
+        不能按组件内 range 重数——曾致 b1870eee 的 oid 37-51 无 global 声明
+        （透明布料显隐门控恒 0、命中被误杀），且 post 出现 0-14 重复。"""
+        node, sections, _ = self._emit()
+        comps = [
+            {"comp_name": "abc123_43191", "object_count": 4,
+             "object_id_map": {"A": 0, "B": 1, "C": 2, "D": 3}},
+            {"comp_name": "xyz789_12345", "object_count": 3,
+             "object_id_map": {"E": 4, "F": 5, "G": 6}},
+        ]
+        node._emit_present_and_constants(sections, comps, "testns")
+        const = "\n".join(sections["[Constants]"])
+        present = "\n".join(sections["[Present]"])
+        for oid in range(7):
+            self.assertEqual(
+                const.count(f"global $ssmtdrag_objvis_testns_{oid} = 0"), 1,
+                f"oid {oid} global 声明缺失或重复")
+            self.assertEqual(
+                present.count(f"post $ssmtdrag_objvis_testns_{oid} = 0"), 1,
+                f"oid {oid} post 清零缺失或重复")
+
+    def test_detect_variants_bind_triangle_ids_and_object_vis(self):
+        _, sections, _ = self._emit()
+        cn = "abc123_43191"
+        p0 = "\n".join(sections[f"[CustomShaderDragDetect{cn}P0_testns]"])
+        self.assertIn(f"cs-t7 = ResourceDragTriangleObjectIDs_{cn}P0_testns", p0)
+        self.assertIn("cs-t8 = ResourceDragObjectVis_testns", p0)
+        res = sections[f"[ResourceDragTriangleObjectIDs_{cn}P0_testns]"]
+        self.assertIn("format = R32_UINT", res)
+
+    def test_detect_shader_has_object_vis_gate(self):
+        shader = (Path(__file__).resolve().parents[1]
+                  / "Toolset" / "drag_interaction" / "rzm_object_detect.hlsl"
+                  ).read_text(encoding="utf-8")
+        self.assertIn("gTriangleObjectIDs : register(t7)", shader)
+        self.assertIn("gObjectVis : register(t8)", shader)
+        self.assertIn("gTriangleObjectIDs.Load(indexBase / 3u)", shader)
+        self.assertIn("gObjectVis[visObjectId] < 0.5f", shader)
 
     def test_stable_zone_ids_migrate_and_preserve_high_ids(self):
         self.assertEqual(self.mod.MAX_ZONES, 256)
@@ -1967,6 +2159,61 @@ class DragNodeInjectTests(unittest.TestCase):
         node._inject_draw_hooks(sections, comp, "testns")
         a_lines = sections["[TextureOverride_abc123_abc123-43191A]"]
         self.assertEqual(sum(1 for l in a_lines if "DRAG HOOK BEGIN" in l), 1)
+
+    def test_vis_flag_injected_inside_draw_branch(self):
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        section_name = "[TextureOverride_abc123_abc123-43191A]"
+        sections[section_name][-1:] = [
+            "if $swapkey4 == 2",
+            "    drawindexed = 52688, 0, 0",
+            "endif",
+        ]
+        comp = node._locate_components(sections, ["abc123"])[0]
+        node._inject_draw_hooks(sections, comp, "testns")
+
+        lines = sections[section_name]
+        flag_idx = next(
+            i for i, line in enumerate(lines)
+            if line.strip().startswith("$ssmtdrag_objvis_")
+        )
+        draw_idx = next(
+            i for i, line in enumerate(lines)
+            if line.strip().startswith("drawindexed =")
+        )
+        if_idx = next(
+            i for i, line in enumerate(lines)
+            if line.strip().startswith("if $swapkey4 == 2")
+        )
+        # flag 行位于分支 if 与绘制行之间（分支执行才置位）
+        self.assertLess(if_idx, flag_idx)
+        self.assertLess(flag_idx, draw_idx)
+        oid = comp["object_id_map"].get("{}#0".format(section_name))
+        self.assertIsNotNone(oid)
+        self.assertIn(f"$ssmtdrag_objvis_testns_{oid} = 1", lines[flag_idx])
+
+    def test_vis_flag_injection_idempotent(self):
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        section_name = "[TextureOverride_abc123_abc123-43191A]"
+        sections[section_name][-1:] = [
+            "if $swapkey4 == 2",
+            "    drawindexed = 52688, 0, 0",
+            "endif",
+        ]
+        comp = node._locate_components(sections, ["abc123"])[0]
+        node._inject_draw_hooks(sections, comp, "testns")
+        first = sum(
+            1 for line in sections[section_name]
+            if line.strip().startswith("$ssmtdrag_objvis_")
+        )
+        node._inject_draw_hooks(sections, comp, "testns")
+        second = sum(
+            1 for line in sections[section_name]
+            if line.strip().startswith("$ssmtdrag_objvis_")
+        )
+        self.assertEqual(first, 1)
+        self.assertEqual(first, second)
 
     def test_cross_ib_source_and_target_hooks_follow_their_mesh_prefixes(self):
         node = _make_node(self.mod)
@@ -2501,6 +2748,30 @@ class DragNodeZoneFilterTests(unittest.TestCase):
         # 空列表 / 无拓扑 → None（全允许）
         self.assertIsNone(mod._zone_allowed_vertex_mask(self._settings(), 6, triangles, tri_part_names))
         self.assertIsNone(mod._zone_allowed_vertex_mask(settings, 6, None, None))
+
+    def test_zone_allowed_vertex_mask_matches_export_mesh_comment_names(self):
+        # 导出 IB 的 mesh 注释名只是场景物体名末尾追加 _copy 后缀；
+        # 完整 LOD/IB 前缀必须保留，仅剥掉导出追加的后缀后比较。
+        mod = self.mod
+        triangles = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+        tri_part_names = np.array([
+            "LOD0.b1870eee-42927-0.服装03丝袜.004_透明0.75_copy",
+            "LOD0.b1870eee-42927-0.头部.002_copy",
+        ], dtype=object)
+        settings = self._settings(include_names=["LOD0.b1870eee-42927-0.服装03丝袜.004_透明0.75"])
+        mask = mod._zone_allowed_vertex_mask(settings, 6, triangles, tri_part_names)
+        np.testing.assert_array_equal(mask, np.array([True, True, True, False, False, False]))
+
+    def test_zone_allowed_vertex_mask_keeps_ib_prefix_distinct(self):
+        # 同名物体但 IB 前缀不同时不得互相命中，前缀用于区分 IB。
+        mod = self.mod
+        triangles = np.array([[0, 1, 2]], dtype=np.int64)
+        tri_part_names = np.array([
+            "LOD0.b1870eee-42927-0.服装03丝袜.004_透明0.75_copy",
+        ], dtype=object)
+        settings = self._settings(include_names=["LOD0.aaaaaaa-42927-0.服装03丝袜.004_透明0.75"])
+        mask = mod._zone_allowed_vertex_mask(settings, 3, triangles, tri_part_names)
+        np.testing.assert_array_equal(mask, np.zeros(3, dtype=bool))
 
     def test_preview_target_field_include_list_filters_targets(self):
         """预览单物体：未包含在列表里的目标网格即使被球命中也不加权。"""

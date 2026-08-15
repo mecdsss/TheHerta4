@@ -15,6 +15,8 @@ _reverse_name_mapping_cache = {}
 # 资源缓存按“材质内容签名”去重，避免同一套贴图被重复复制/重复生成 Resource。
 _material_resource_cache = {}
 _TTL_MASK_INVERT_PREFIX = "${}TTL{}mask_invert".format(chr(92), chr(92)).casefold()
+# 拖拽物体显隐 flag 行（注入在绘制分支内；TTL 块重建必须原样保留，否则隐藏判定失效）
+_DRAG_OBJVIS_LINE_RE = re.compile(r'^\s*\$ssmtdrag_objvis_[\w]*\s*=\s*1\s*$')
 
 
 def clear_name_mapping_cache():
@@ -1598,14 +1600,107 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             break
         return start
 
+    @staticmethod
+    def _strip_drag_hook_blocks(lines):
+        result = []
+        i = 0
+        n = len(lines)
+        while i < n:
+            line = lines[i]
+            if "DRAG HOOK BEGIN" in line:
+                result.append(line)
+                i += 1
+                while i < n:
+                    current = lines[i]
+                    cs = current.strip()
+                    if "DRAG HOOK END" in current:
+                        result.append(current)
+                        i += 1
+                        break
+                    if cs.startswith("if "):
+                        block = []
+                        depth = 0
+                        while i < n:
+                            b = lines[i]
+                            bs = b.strip()
+                            block.append(b)
+                            if bs.startswith("if "):
+                                depth += 1
+                            elif bs == "endif":
+                                depth -= 1
+                                if depth == 0:
+                                    i += 1
+                                    break
+                            i += 1
+                        block_text = "\n".join(block)
+                        if "CustomShaderDragBake" in block_text or "CustomShaderDragDetect" in block_text:
+                            continue
+                        result.extend(block)
+                        continue
+                    result.append(current)
+                    i += 1
+                continue
+            result.append(line)
+            i += 1
+        return result
+
+    @staticmethod
+    def _ttl_extract_drag_vb0(lines):
+        for line in lines:
+            match = re.search(r'\b(ResourceDragJiggleTempVB0_[A-Za-z0-9_]+)\b', str(line or ""))
+            if match:
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def _ttl_extract_ib(lines):
+        for line in lines:
+            stripped = str(line or "").strip()
+            match = re.match(r'^ib\s*=\s*([A-Za-z0-9_.]+)', stripped, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def _ttl_extract_drag_condition(lines, drag_vb0):
+        for index, line in enumerate(lines):
+            if drag_vb0 not in str(line or ""):
+                continue
+            depth = 0
+            cursor = index - 1
+            while cursor >= 0:
+                stripped = str(lines[cursor] or "").strip()
+                if stripped.casefold() == "endif":
+                    depth += 1
+                elif re.match(r'^if\s+', stripped, re.IGNORECASE):
+                    if depth == 0:
+                        return re.sub(r'^if\s+', '', stripped, flags=re.IGNORECASE).strip()
+                    depth -= 1
+                cursor -= 1
+            break
+        return None
+
     def _build_ttl_draw_lines(self, block_lines):
         ttl_lines = []
         found = False
+        pending_flags = []
         i = 0
         n = len(block_lines)
         while i < n:
             stripped = str(block_lines[i]).strip()
+            if _DRAG_OBJVIS_LINE_RE.match(stripped):
+                # 拖拽显隐 flag 行先收集，在紧随的绘制转换输出前冲刷。
+                # TTL 块边界从 mesh 注释行开始（可能落在 if 块内部），此时
+                # flag 与 drawindexed 都走「非 if 路径」——必须保留 flag，
+                # 否则隐藏物体仍可被命中。
+                if not pending_flags or str(pending_flags[-1]).strip() != stripped:
+                    pending_flags.append(block_lines[i])
+                i += 1
+                continue
             if re.match(r'^if\s+', stripped, re.IGNORECASE):
+                if pending_flags:
+                    ttl_lines.extend(pending_flags)
+                    pending_flags = []
                 depth = 0
                 j = i
                 else_index = -1
@@ -1635,12 +1730,19 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 found = True
                 ttl_lines.append(head)
                 if draw1 is not None:
+                    # 保留拖拽显隐 flag 行（重建不得丢弃，否则隐藏物体仍可被命中）
+                    for bl in branch1:
+                        if _DRAG_OBJVIS_LINE_RE.match(str(bl).strip()):
+                            ttl_lines.append(bl)
                     ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw1[0]))
                     ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw1[1]))
                     ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
                 if else_index != -1:
                     ttl_lines.append(block_lines[else_index])
                     if draw2 is not None:
+                        for bl in branch2:
+                            if _DRAG_OBJVIS_LINE_RE.match(str(bl).strip()):
+                                ttl_lines.append(bl)
                         ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw2[0]))
                         ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw2[1]))
                         ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
@@ -1650,6 +1752,8 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 draw = self._ttl_parse_drawindexed(stripped)
                 if draw is not None:
                     found = True
+                    ttl_lines.extend(pending_flags)
+                    pending_flags = []
                     ttl_lines.append("${}TTL{}_1 = {}".format(chr(92), chr(92), draw[0]))
                     ttl_lines.append("${}TTL{}_2 = {}".format(chr(92), chr(92), draw[1]))
                     ttl_lines.append("run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
@@ -1678,10 +1782,13 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
         first_mesh_index = mesh_lines_info[0][0]
         first_block_start = self._ttl_find_block_start(lines, first_mesh_index)
-        header_lines = lines[:first_block_start]
+        header_lines = self._strip_drag_hook_blocks(lines[:first_block_start])
+        drag_vb0 = self._ttl_extract_drag_vb0(header_lines)
+        ib_resource = self._ttl_extract_ib(header_lines)
 
         generated_section_names = set()
         ttl_sections_to_add = OrderedDict()
+        ttl_draw_command_lists = OrderedDict()
 
         if_stack = []
         if_endif_map = {}
@@ -1726,6 +1833,31 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 _LOG.info(f"      TTL: 跳过 '{mesh_name}'（块内无 drawindexed）")
                 continue
 
+            if drag_vb0:
+                token = drag_vb0[len("ResourceDragJiggleTempVB0_"):]
+                command_list_name = f"CommandListSSMTTTLDraw_{token}"
+                if command_list_name not in ttl_draw_command_lists:
+                    drag_condition = self._ttl_extract_drag_condition(header_lines, drag_vb0)
+                    command_list_lines = []
+                    if drag_condition:
+                        # 仅在拖拽激活时绑定 jiggle 临时 VB0;其余情况不覆盖 vb0,
+                        # 让 TTL 二次绘制继承游戏当前已蒙皮/形态键的 SO 输出。
+                        # 严禁绑定 Position 基础输入(会丢失骨骼与蒙皮)。
+                        command_list_lines.append(f"if {drag_condition}")
+                        command_list_lines.append(f"    vb0 = {drag_vb0}")
+                        command_list_lines.append("endif")
+                    if ib_resource:
+                        command_list_lines.append(f"ib = {ib_resource}")
+                    command_list_lines.append("run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
+                    ttl_draw_command_lists[command_list_name] = command_list_lines
+                ttl_draw_lines = [
+                    str(line).replace(
+                        "run = CommandList{}TTL{}Draw".format(chr(92), chr(92)),
+                        "run = CommandListSSMTTTLDraw_{}".format(token),
+                    )
+                    for line in ttl_draw_lines
+                ]
+
             new_lines = []
             object_to_diffuse_swapkey = {}
             for header_line in header_lines:
@@ -1764,6 +1896,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     ttl_materials, r"Resource\TTL\TransparencyTex", "TTLMap", obj, texture_folder, all_sections,
                     {}, material_group_to_swapkey, swap_key_prefix, next_swap_key_num, used_swap_keys)
                 new_lines.extend(ttl_lines_ref)
+                new_lines.append("${}TTL{}mask_channel = 3".format(chr(92), chr(92)))
 
             if ttl_materials:
                 new_lines.append("${}TTL{}mask_invert = 1".format(chr(92), chr(92)))
@@ -1795,6 +1928,9 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             del lines[block_start:block_end]
 
         self._cleanup_empty_if_blocks(lines)
+
+        for command_list_name, command_list_lines in ttl_draw_command_lists.items():
+            all_sections[f"[{command_list_name}]"] = command_list_lines
 
         for new_section_name, new_section_lines in ttl_sections_to_add.items():
             all_sections[f"[{new_section_name}]"] = new_section_lines

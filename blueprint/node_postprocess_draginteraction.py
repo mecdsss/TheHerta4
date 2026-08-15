@@ -111,6 +111,7 @@ SHADER_FILES = (
     "rzm_jiggle_interaction.hlsl",
     "rzm_shapekey_drive.hlsl",
     "rzm_shapekey_var_sync.hlsl",
+    "rzm_vis_publish.hlsl",
 )
 HAND_SHADER_FILES = ("rzm_jiggle_cursor_preview.hlsl", "rzm_jiggle_hand.hlsl", "rzm_jiggle_cursor.hlsl")
 # 手部网格/法线资产（二进制，原样复制）
@@ -135,6 +136,13 @@ DEFAULT_VERTEX_STRUCT = (
 
 DRAG_TAIL_MARKER = "; --- AUTO-APPENDED DRAG INTERACTION MODULE ---"
 MESH_COMMENT_RE = re.compile(r"^;\s*\[mesh:(?P<object_name>[^\]]+)\]", re.IGNORECASE)
+# TTL 二次绘制的区间参数：$\TTL\_1 = 索引数，$\TTL\_2 = 起始索引；
+# run 目标形如 CommandListSSMTTTLDraw_<token>（TTL 库 drawindexedinstanced 读取 $_1/$_2）。
+TTL_ARG1_RE = re.compile(r'^\$\\TTL\\_1\s*=\s*(\d+)', re.IGNORECASE)
+TTL_ARG2_RE = re.compile(r'^\$\\TTL\\_2\s*=\s*(\d+)', re.IGNORECASE)
+TTL_DRAW_RUN_RE = re.compile(r'^run\s*=\s*CommandListSSMTTTLDraw_', re.IGNORECASE)
+# 物体显隐 flag 行（注入绘制分支内；material 的 TTL 块重建必须保留）
+DRAG_OBJVIS_LINE_RE = re.compile(r'^\s*\$ssmtdrag_objvis_[\w]*\s*=\s*1\s*$')
 
 # 导出的着色器在 ini 中的引用路径（mod 根 → res/drag_interaction/）
 RES_SHADER_DIR = "res/drag_interaction"
@@ -203,7 +211,27 @@ def _zone_allowed_names(settings):
                 continue
             names.add(str(candidate))
             names.add(str(candidate).rsplit(".", 1)[0])
+            key = _blender_object_key(candidate)
+            if key:
+                names.add(key)
+                names.add(key.rsplit(".", 1)[0])
     return names
+
+
+def _blender_object_key(name):
+    """把导出 mesh 注释名归一化为场景物体名：仅剥掉导出追加的运行时后缀。
+
+    保留完整 LOD/IB 结构化前缀。不同 IB 可能包含同名物体，前缀用于区分 IB，
+    不能被剥掉。
+    """
+    if not name:
+        return ""
+    clean = str(name).strip()
+    try:
+        clean, _suffix = ObjectPrefixHelper._strip_runtime_suffix(clean)
+    except Exception:
+        pass
+    return clean.strip()
 
 
 def _zone_has_included_objects(settings):
@@ -245,8 +273,10 @@ def _zone_allowed_vertex_mask(settings, vertex_count, triangles, tri_part_names)
         return None
     mask = np.zeros(int(vertex_count), dtype=bool)
     tri_names = np.asarray(tri_part_names)
+    tri_keys = np.asarray([_blender_object_key(name) for name in tri_part_names], dtype=object)
     for name in allowed_names:
-        tri_sel = tri_names == name
+        name_key = _blender_object_key(name)
+        tri_sel = (tri_names == name) | (tri_names == name_key) | (tri_keys == name) | (tri_keys == name_key)
         idx = triangles[tri_sel].reshape(-1)
         idx = idx[idx < int(vertex_count)]
         mask[idx] = True
@@ -1200,6 +1230,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     def _locate_components(self, sections, hash_values):
         components = []
+        object_offset = 0
         for hash_value in hash_values:
             parts = self._collect_draw_parts(sections, hash_value)
             if not parts:
@@ -1210,6 +1241,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             base_name = self._resolve_position_stem(sections, hash_value) or parts[0]["base_name"]
             vertex_count = self._get_vertex_count(sections, hash_value)
             base_resource = self._find_existing_base_resource_name(sections, hash_value, base_name)
+            # 物体显隐：按记录稳定分配全局物体编号（mesh 注释名 → id；跨组件连续），
+            # 供 flag 变量注入与 TriangleObjectIDs 烘焙共用同一编号空间。
+            name_to_id = {}
+            for part in parts:
+                for record in part.get("draw_records") or []:
+                    key = self._record_object_key(record)
+                    if key not in name_to_id:
+                        name_to_id[key] = object_offset
+                        object_offset += 1
             components.append({
                 "hash": hash_value,
                 "base_name": base_name,
@@ -1217,8 +1257,32 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "vertex_count": vertex_count or 0,
                 "base_resource": base_resource,
                 "parts": parts,
+                "object_id_map": name_to_id,
+                "object_count": len(name_to_id),
             })
         return components
+
+    @staticmethod
+    def _record_object_key(record):
+        """记录对应的物体稳定键：优先 mesh 注释名，无注释回退 section+偏移。"""
+        comment = record.get("hook_anchor_comment") or ""
+        match = MESH_COMMENT_RE.match(str(comment))
+        if match:
+            return match.group("object_name")
+        return "{}#{}".format(record.get("section"), record.get("draw_offset"))
+
+    @staticmethod
+    def _global_object_oids(components):
+        """跨组件全局物体编号的有序并集（object_id_map 取值）。
+
+        oid 由 _locate_components 的 object_offset 跨组件累计分配，所有按 oid
+        索引的发射点（flag 声明 / post 清零）都必须使用该并集，禁止按组件内
+        range 重数——否则第二个组件起的编号整体错位。
+        """
+        oids = set()
+        for comp in components or []:
+            oids.update((comp.get("object_id_map") or {}).values())
+        return sorted(oids)
 
     def _resolve_position_stem(self, sections, hash_value):
         """从 Position 资源段的 filename 推导组件 stem（如 abc123-43191）。"""
@@ -1311,10 +1375,20 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             comment_occurrences = {}
             draw_ordinal = 0
             draw_records = []
+            pending_ttl_1 = None
+            pending_ttl_2 = None
 
-            for line in lines:
+            for line_idx, line in enumerate(lines):
                 s = line.strip()
                 normalized = s.casefold()
+                ttl_arg1 = TTL_ARG1_RE.match(s)
+                if ttl_arg1:
+                    pending_ttl_1 = int(ttl_arg1.group(1))
+                    continue
+                ttl_arg2 = TTL_ARG2_RE.match(s)
+                if ttl_arg2:
+                    pending_ttl_2 = int(ttl_arg2.group(1))
+                    continue
                 if normalized.startswith("ib ="):
                     val = s.split("=", 1)[1].strip()
                     active_ib_resource = None if val.casefold() == "null" else val
@@ -1337,6 +1411,39 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                             pending_mesh_first_index = None
                     continue
 
+                if TTL_DRAW_RUN_RE.match(s) and pending_mesh_comment:
+                    # TTL 二次绘制站点：范围来自 $\TTL\_1(index count)/$\TTL\_2(first index)，
+                    # 而非 drawindexed。跨命名空间的 CommandList\TTL\Draw 无法被
+                    # _collect_referenced_draw_ranges 解析，这里显式补记录。
+                    draw_owner = pending_mesh_owner or section_hash
+                    if (
+                        draw_owner
+                        and draw_owner.casefold() == normalized_hash
+                        and active_ib_resource
+                        and pending_ttl_1 is not None
+                        and pending_ttl_2 is not None
+                        and pending_ttl_1 > 0
+                        and pending_ttl_2 >= 0
+                    ):
+                        draw_records.append({
+                            "ordinal": draw_ordinal,
+                            "ib_resource": active_ib_resource,
+                            "draw_offset": pending_ttl_2,
+                            "draw_count": pending_ttl_1,
+                            "mesh_first_index": pending_mesh_first_index,
+                            "hook_anchor_comment": pending_mesh_comment,
+                            "hook_anchor_occurrence": pending_mesh_comment_occurrence,
+                            "line_index": line_idx,
+                        })
+                        draw_ordinal += 1
+                    pending_ttl_1 = None
+                    pending_ttl_2 = None
+                    pending_mesh_owner = None
+                    pending_mesh_first_index = None
+                    pending_mesh_comment = None
+                    pending_mesh_comment_occurrence = 0
+                    continue
+
                 if normalized.startswith("run =") and pending_mesh_comment:
                     command_name = s.split("=", 1)[1].strip()
                     referenced_ranges = self._collect_referenced_draw_ranges(sections, command_name)
@@ -1352,6 +1459,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                                     "mesh_first_index": pending_mesh_first_index,
                                     "hook_anchor_comment": pending_mesh_comment,
                                     "hook_anchor_occurrence": pending_mesh_comment_occurrence,
+                                    "line_index": line_idx,
                                 })
                             draw_ordinal += 1
                         pending_mesh_owner = None
@@ -1385,6 +1493,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                             "mesh_first_index": pending_mesh_first_index,
                             "hook_anchor_comment": pending_mesh_comment,
                             "hook_anchor_occurrence": pending_mesh_comment_occurrence,
+                            "line_index": line_idx,
                         })
                     draw_ordinal += 1
                     pending_mesh_owner = None
@@ -1417,6 +1526,18 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ib_index_end = max(record["draw_offset"] + record["draw_count"] for record in records)
             index_count = ib_index_end - ib_first_index
 
+            # 保留同一 IB 内每个 draw 的索引区间与 mesh 注释名，供烘焙侧按物体过滤。
+            # 同一区间因材质/换装条件重复出现时名字相同；若偶发重叠，base 段优先。
+            name_ranges = []
+            for record in sorted(records, key=_record_sort_key):
+                comment = record.get("hook_anchor_comment") or ""
+                mesh_match = MESH_COMMENT_RE.match(comment)
+                if not mesh_match:
+                    continue
+                object_name = mesh_match.group("object_name")
+                if object_name:
+                    name_ranges.append((record["draw_offset"], record["draw_count"], object_name))
+
             representative = min(records, key=_record_sort_key)
             mesh_first_index = representative["mesh_first_index"]
             if mesh_first_index is None:
@@ -1442,6 +1563,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "base_name": representative["base_name"],
                 "hook_anchor_comment": representative["hook_anchor_comment"],
                 "hook_anchor_occurrence": representative["hook_anchor_occurrence"],
+                "name_ranges": name_ranges,
+                "draw_records": records,
             })
         return parts
 
@@ -1497,8 +1620,53 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     def _bake_component_resources(self, mod_export_path, sections, comp, ns):
         # ObjectMap：游戏索引空间 (1+N)×16B
         self._write_object_map(mod_export_path, sections, comp)
+        # 逐三角形物体编号（显隐过滤：几何映射，与权重烘焙同类）
+        self._write_triangle_object_ids(mod_export_path, sections, comp)
         # 每顶点 Top-K 区域权重：高斯场烘焙
         self._write_jiggle_masks(mod_export_path, sections, comp, ns)
+
+    def _write_triangle_object_ids(self, mod_export_path, sections, comp):
+        """逐 part 读 IB 文件，按 name_ranges 给每个三角形写入物体编号
+        （0xFFFFFFFF = 未映射，不受显隐门控）。文件名 {stem}TriangleObjectIDsP{p}.buf，
+        与检测着色器的 indexBase/3 三角形序一致。"""
+        name_to_id = comp.get("object_id_map") or {}
+        for p_idx, part in enumerate(comp["parts"]):
+            res = part.get("ib_resource")
+            lines = sections.get(f"[{res}]", [])
+            rel = None
+            for line in lines:
+                if line.strip().startswith("filename ="):
+                    rel = line.split("=", 1)[1].strip()
+                    break
+            if not rel:
+                continue
+            full = os.path.join(mod_export_path, rel.replace("\\", os.sep).replace("/", os.sep))
+            if not os.path.exists(full):
+                continue
+            try:
+                idx = np.fromfile(full, dtype=np.uint32)
+                n_tri = len(idx) // 3
+                ids = np.full(n_tri, 0xFFFFFFFF, dtype=np.uint32)
+                for offset, count, name in part.get("name_ranges", []):
+                    oid = name_to_id.get(name)
+                    if oid is None:
+                        continue
+                    start = max(0, min(int(offset) // 3, n_tri))
+                    end = max(0, min((int(offset) + int(count)) // 3, n_tri))
+                    if start >= end:
+                        continue
+                    fill = np.zeros(n_tri, dtype=bool)
+                    fill[start:end] = True
+                    fill &= ids == 0xFFFFFFFF
+                    ids[fill] = oid
+                out = os.path.join(
+                    mod_export_path, self._buffer_dir(sections, comp),
+                    f"{comp['base_name']}TriangleObjectIDsP{p_idx}.buf",
+                )
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                ids.tofile(out)
+            except Exception:
+                continue
 
     def _write_zone_resources(self, mod_export_path, ns):
         """写每区域物理参数和路径向量；按稳定 zone_id 直接索引。"""
@@ -1639,7 +1807,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 settings, len(positions), triangles, tri_part_names
             )
             if allowed_mask is not None and not np.any(allowed_mask):
-                # 包含列表存在但该组件没有列表内部件 → 本球对此组件零权重
+                print(
+                    f"[DragInteraction][WARNING] {comp['comp_name']} 区域 {empty.name} "
+                    "包含物体列表未命中任何 IB 部件，该区域对本组件被跳过；"
+                    "请检查包含物体是否属于当前 IB 前缀"
+                )
                 continue
             field = self._evaluate_zone_field(
                 positions,
@@ -1939,7 +2111,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         并返回与三角形逐行对齐的部件 mesh 名（object 数组，无注释为 None）；
         读不到返回 None（调用方回退体积球）。"""
         tris = []
-        part_name_counts = []
+        name_arrays = []
         for part in comp["parts"]:
             res = part.get("ib_resource")
             lines = sections.get(f"[{res}]", [])
@@ -1957,21 +2129,27 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 idx = np.fromfile(full, dtype=np.uint32)
                 t_part = idx[: (len(idx) // 3) * 3].reshape(-1, 3)
                 tris.append(t_part)
-                # 从 mesh 注释提取部件名（如 ; [mesh:LOD0.xxx-1-2.Owner]），
-                # 供包含物体列表过滤：无注释时归为 None（按全部允许处理）
-                comment = part.get("hook_anchor_comment") or ""
-                mesh_match = MESH_COMMENT_RE.match(comment)
-                name = mesh_match.group("object_name") if mesh_match else None
-                part_name_counts.append((name, len(t_part)))
+                # 按 draw 区间标注每个三角形所属物体；未标注的三角形按 None
+                # 处理（无法判定归属，不因包含物体列表而清零）。区间重叠时先到者优先。
+                names = np.full(len(t_part), None, dtype=object)
+                for offset, count, name in part.get("name_ranges", []):
+                    start = int(offset) // 3
+                    end = (int(offset) + int(count)) // 3
+                    start = max(0, min(start, len(names)))
+                    end = max(0, min(end, len(names)))
+                    if start >= end:
+                        continue
+                    fill = np.zeros(len(names), dtype=bool)
+                    fill[start:end] = True
+                    fill &= names == None  # noqa: E711
+                    names[fill] = name
+                name_arrays.append(names)
             except Exception:
                 continue
         if not tris:
             return None
         t = np.concatenate(tris, axis=0)
-        tri_part_names = np.repeat(
-            np.asarray([name for name, _count in part_name_counts], dtype=object),
-            [count for _name, count in part_name_counts],
-        )
+        tri_part_names = np.concatenate(name_arrays, axis=0)
         if vertex_count:
             keep = (t < int(vertex_count)).all(axis=1)
             t = t[keep]
@@ -2367,6 +2545,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             self._emit_shapekey_drive_section(sections, ns)
             self._emit_shapekey_var_sync_section(sections, ns)
             self._emit_shapekey_var_readback_command_list(sections, ns)
+        # ---- 物体显隐：发布 CS + 命令列表 + 缓冲资源 ----
+        self._emit_vis_publish_sections(sections, components, ns)
         self._emit_command_lists(sections, components, ns)
 
         # ---- 手型光标（S8）：资源 + 绘制段 ----
@@ -2403,6 +2583,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "type = Buffer", "format = R32G32B32A32_FLOAT",
             f"filename = {res_dir}/{stem}JiggleZoneWeights.buf",
         ]
+        # 逐三角形物体编号（显隐过滤：检测着色器按命中三角形查 ObjectVis）
+        for p_idx, _part in enumerate(comp["parts"]):
+            comp_resources[f"[ResourceDragTriangleObjectIDs_{cn}P{p_idx}_{ns}]"] = [
+                "type = Buffer", "format = R32_UINT",
+                f"filename = {res_dir}/{stem}TriangleObjectIDsP{p_idx}.buf",
+            ]
         # JiggleParams：每部件 1 条碰撞体档案（原作契约，条目同值；array = 4×部件数）
         n_parts = max(1, len(comp["parts"]))
         jp = self._jiggle_params_data(n_parts)
@@ -2412,6 +2598,31 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         ]
         for sec, lines in comp_resources.items():
             sections.setdefault(sec, lines)
+
+    def _emit_vis_publish_sections(self, sections, components, ns):
+        """物体显隐发布：CPU flag 变量 → ini params → 发布 CS → GPU 缓冲。
+        复用与 rzm_shapekey_var_sync 相同的“变量→缓冲”链路；flag 槽位从
+        IniParams[130] 起按 4/float4 打包（与 81/100/119 的既有用法错开）。"""
+        total = sum(int(comp.get("object_count") or 0) for comp in components)
+        if not total:
+            return
+        sections.setdefault(
+            f"[ResourceDragObjectVis_{ns}]",
+            ["type = RWBuffer", "format = R32_FLOAT", f"array = {total}"],
+        )
+        sections.setdefault(f"[CustomShaderDragVisPublish_{ns}]", [
+            f"cs = {RES_SHADER_DIR}/rzm_vis_publish.hlsl",
+            f"cs-u0 = ResourceDragObjectVis_{ns}",
+            "dispatch = 1, 1, 1",
+            "post cs-u0 = null",
+        ])
+        pub_lines = []
+        for oid in range(total):
+            slot = 130 + oid // 4
+            channel = "xyzw"[oid % 4]
+            pub_lines.append(f"{channel}{slot} = $ssmtdrag_objvis_{ns}_{oid}")
+        pub_lines.append(f"run = CustomShaderDragVisPublish_{ns}")
+        sections.setdefault(f"[CommandListDragVisPublish_{ns}]", pub_lines)
 
     def _jiggle_params_data(self, collider_count=1):
         """每条 16 float：objectID radius strength falloff dragScale grabDamping grabSpring
@@ -2450,9 +2661,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if part_index is not None:
             # 每部件变体段只 raycast 本部件对应的 ObjectMap 条目，避免每个部件钩子
             # 都遍历整个 mesh 的所有三角形（N 倍放大）。y28/z28 为 shader 子区间。
+            # t7/t8 = 逐三角形物体编号 + 物体显隐缓冲（隐式跳过隐藏物体）。
             lines.extend([
                 f"y28 = {part_index}",
                 "z28 = 1",
+                f"cs-t7 = ResourceDragTriangleObjectIDs_{cn}P{part_index}_{ns}",
+                f"cs-t8 = ResourceDragObjectVis_{ns}",
             ])
         lines.extend([
             "cs-t0 = vb0",
@@ -2751,6 +2965,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         ]
         for i, (var_name, _slot, _zone, _nd_stage) in enumerate(bindings):
             lines.append(f"{'xyzw'[i % 4]}{81 + i // 4} = {var_name}")
+        # 回读回声标志（每绑定 1 位，从 83 起打包）：回读把缓冲值拉进变量时
+        # 置 1，同步 CS 据此跳过本帧的变量→缓冲回推（防 store 延迟的旧值
+        # 与拖拽 CS 打架）；变量变化帧置 0，保证变量优先回写。
+        for i, (_var_name, _slot, _zone, _nd_stage) in enumerate(bindings):
+            lines.append(f"{'xyzw'[i % 4]}{83 + i // 4} = $ssmtdrag_skpull_{ns}_{i}")
         lines.extend([
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
             f"cs-t69 = ResourceDragShapeKeyVarSyncMap_{ns}",
@@ -2784,37 +3003,43 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 分词器把 ref 当独立 token 交给 GetTarget，ParseTarget 无此分支 →
         # Unknown target: ref，整条 store 行在加载期被静默丢弃（GIMI 实证有效
         # 写法为 store = $health, ps-cb0, 33，裸目标）。
-        # 分时互斥：仅在「对应区域拖拽激活」（同步 CS 每帧重算的 ZoneActive 标志）时
-        # 才回读，变量跟随缓冲、驱动器自然被忽略；区域未激活时完全不回读，
-        # 变量→缓冲单向写入，两边在时间上互斥，无需值模式仲裁。
+        # 值仲裁、变量为主（修复「快捷键切换下一瞬间被回读顶掉」）：
+        #   - 变量变化（热键/驱动器步进）→ 不回读，prev 跟随，进入沉淀期；
+        #     沉淀期只等缓冲追平，期间绝不回读——store 有数帧延迟，旧缓冲值
+        #     会把刚切换的变量立刻顶回去（历史 bug 根因）。
+        #   - 变量未变且拖拽激活 → 缓冲为主（回读）。
+        #   - 变量未变且缓冲变化（点击联动/释放收敛）→ 缓冲为主（回读）。
+        #   - 回读帧置 pull 标志：同步 CS 据此跳过「把拉取值推回缓冲」的
+        #     回声，避免拖拽中把带延迟的旧值写回缓冲与拖拽 CS 打架。
         lines = []
         for i, (var_name, slot, zone, _nd_stage) in enumerate(bindings):
             act = f"$ssmtdrag_skact_{ns}_{i}"
             rb = f"$ssmtdrag_skrb_{ns}_{i}"
             prev = f"$ssmtdrag_skprev_{ns}_{i}"
             cd = f"$ssmtdrag_skcd_{ns}_{i}"
+            pull = f"$ssmtdrag_skpull_{ns}_{i}"
             lines.extend([
                 f"store = {act}, ResourceDragShapeKeyZoneActive_{ns}, {zone}",
-                # 对应区域拖拽激活：每帧回读，变量跟随缓冲（驱动器被忽略）
-                f"if {act} >= 1",
-                f"\tstore = {rb}, ResourceDragShapeKeyDrive_{ns}, {slot}",
-                f"\t{var_name} = {rb}",
-                f"\t{prev} = {rb}",
+                f"store = {rb}, ResourceDragShapeKeyDrive_{ns}, {slot}",
+                f"if {var_name} != {prev}",
+                f"\t{prev} = {var_name}",
                 f"\t{cd} = 6",
-                # 释放沉淀：store 有数帧延迟，松手后继续采用数帧让最终值完整落进变量；
-                # 期间驱动器抢先步进（编辑沿）则立即交还控制权
+                f"\t{pull} = 0",
                 f"elif {cd} > 0",
                 f"\t{cd} = {cd} - 1",
-                f"\tif {var_name} != {prev}",
-                f"\t\t{prev} = {var_name}",
+                f"\tif {rb} == {var_name}",
                 f"\t\t{cd} = 0",
-                "\telse",
-                f"\t\tstore = {rb}, ResourceDragShapeKeyDrive_{ns}, {slot}",
-                f"\t\tif {rb} != {var_name}",
-                f"\t\t\t{var_name} = {rb}",
-                f"\t\t\t{prev} = {rb}",
-                "\t\tendif",
                 "\tendif",
+                f"elif {act} >= 1",
+                f"\t{var_name} = {rb}",
+                f"\t{prev} = {rb}",
+                f"\t{pull} = 1",
+                f"elif {rb} != {var_name}",
+                f"\t{var_name} = {rb}",
+                f"\t{prev} = {rb}",
+                f"\t{pull} = 1",
+                "else",
+                f"\t{pull} = 0",
                 "endif",
             ])
         sections[sec] = lines
@@ -2836,6 +3061,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tclear = ResourceDragPathProgressState_{ns} 0.0",
                 f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
             ]
+            if any(int(comp.get("object_count") or 0) for comp in components):
+                lines.append(f"\tclear = ResourceDragObjectVis_{ns} 0.0")
             if getattr(self, "enable_shapekey_drive", False):
                 lines.append(f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0")
                 lines.append(f"\tclear = ResourceDragShapeKeyDir_{ns} 0.0")
@@ -3157,6 +3384,35 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     def _inject_draw_hooks(self, sections, comp, ns):
         cn = comp["comp_name"]
+
+        # 1) 物体显隐 flag：注入到每条绘制行（drawindexed=/run=）之前、其 if 块内部。
+        #    分支执行才置位——条件求值留给 ini 引擎（活条件，手改即生效，零复制）。
+        #    同段内按行号倒序插入避免索引位移；幂等防护同站点方案。
+        name_to_id = comp.get("object_id_map") or {}
+        sites = {}
+        for part in comp["parts"]:
+            for record in part.get("draw_records") or []:
+                oid = name_to_id.get(self._record_object_key(record))
+                if oid is None:
+                    continue
+                sites.setdefault(record["section"], []).append((record["line_index"], oid))
+        for section, items in sites.items():
+            lines = sections.get(section)
+            if not lines:
+                continue
+            for line_idx, oid in sorted(items, key=lambda item: -item[0]):
+                target = ""
+                if 0 <= line_idx < len(lines):
+                    target = (lines[line_idx] or "").strip().casefold()
+                if not (target.startswith("drawindexed =") or target.startswith("run =")):
+                    continue
+                window = lines[max(0, line_idx - 4):line_idx]
+                if any("$ssmtdrag_objvis_{}_{}".format(ns, oid) in (line or "") for line in window):
+                    continue
+                lines[line_idx:line_idx] = ["\t$ssmtdrag_objvis_{}_{} = 1".format(ns, oid)]
+            sections[section] = lines
+
+        # 2) 提升式 part 钩子（探针 + Bake + Detect + jiggle + vb0）
         for p_idx, part in enumerate(comp["parts"]):
             section = part["section"]
             lines = sections.get(section)
@@ -3181,7 +3437,23 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 if line.strip() == anchor_comment
             ]
             if occurrence < len(matches):
-                return matches[occurrence]
+                index = matches[occurrence]
+                # The anchor mesh comment may sit inside an if/else visibility block.
+                # A hook placed right before it would be gated by that condition, so
+                # when the base draw is hidden but a TTL/material copy of the same IB
+                # is drawn, the only hook would not run and detection would be lost.
+                # Move the hook above the enclosing conditional headers.
+                while index > 0:
+                    previous = lines[index - 1].strip()
+                    if not previous:
+                        index -= 1
+                        continue
+                    lowered = previous.casefold()
+                    if lowered.startswith("if ") or lowered == "else" or lowered.startswith("else if"):
+                        index -= 1
+                        continue
+                    break
+                return index
         return cls._find_hook_insert_index(lines)
 
     @staticmethod
@@ -3216,7 +3488,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ])
         lines.extend([
             f"\t$ssmtdrag_drawn_{ns} = 1",
-            f"\tif {drag_mode_var} >= 1 && $ObjectDetectAllowed_{ns} == 1 && $ssmtdrag_mode_{ns} == 1",
+            # 悬停检测不要求 Alt（与实机验证过的可用配置一致）：
+            # 模式开关（drag_mode_var >= 1）打开即检测，Alt 只门控实际形变（jiggle 门）。
+            f"\tif {drag_mode_var} >= 1 && $ObjectDetectAllowed_{ns} == 1",
             f"\t\trun = CustomShaderDragBake{part_tag}_{ns}",
             f"\t\trun = CustomShaderDragDetect{part_tag}_{ns}",
             "\tendif",
@@ -3378,12 +3652,21 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     f"global $ssmtdrag_skrb_{ns}_{i} = 0",
                     f"global $ssmtdrag_skprev_{ns}_{i} = 0",
                     f"global $ssmtdrag_skcd_{ns}_{i} = 0",
+                    f"global $ssmtdrag_skpull_{ns}_{i} = 0",
                 ])
         for comp in components:
             globals_to_add.append(f"global $ssmtdrag_last_dispatch_{comp['comp_name']}_{ns} = -1")
+        # 物体显隐 flag：绘制分支内置位、Present 发布进 GPU 缓冲、post 清零。
+        # oid 是跨组件连续编号（_locate_components 的 object_offset 累计），
+        # 声明必须取 object_id_map 的全局 id 并集；按组件内 range 重数会导致
+        # 第二个组件起全部缺失/错位（曾致 b1870eee 透明布料 flag 无 global、
+        # 发布恒读 0、显隐门控误杀全部命中）。
+        for oid in self._global_object_oids(components):
+            globals_to_add.append(f"global $ssmtdrag_objvis_{ns}_{oid} = 0")
         for g in globals_to_add:
             var = g.split("=", 1)[0].replace("global ", "").replace("persist ", "").strip()
-            if not any(var in line for line in const_lines):
+            # 精确匹配变量名（防 $ssmtdrag_objvis_A_3 误匹配 A_37 这类前缀串）
+            if not any(f"{var} " in line or f"{var}=" in line for line in const_lines):
                 const_lines.append(g)
 
         # ---- Present 块（手势归约 + 手部蓄力进度 + S8 手部绘制）----
@@ -3588,7 +3871,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tpre run = CommandListDragPinDetected_{ns}",
             ])
         block.extend([
-            f"elif {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1",
+            # 与实机可用配置一致：Pin 检测/光标更新只由模式开关门控，不要求 Alt。
+            f"elif {drag_mode_var} >= 1",
             f"\tpre run = CommandListDragPinDetected_{ns}",
             f"\trun = CommandListDragCursorUpdate_{ns}",
             "endif",
@@ -3619,7 +3903,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # S8 手型光标：先更新手部屏幕位置，描边先画垫底（只露轮廓边）、填充后画；
             # 抓取中或 RMB 独按蓄力时用 Action 网格（握拳），否则 NoAction（张开）
             block.extend([
-                f"if {drag_mode_var} >= 1 && $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_mode_{ns} == 1",
+                # 与实机可用配置一致：悬停预览/手型光标由模式开关 + drawn 门控，不要求 Alt。
+                f"if {drag_mode_var} >= 1 && $ssmtdrag_drawn_{ns} == 1",
                 f"\trun = CustomShaderDragUpdateJiggleCursorPreview_{ns}",
                 f"\tif $ssmtdrag_hand_debug_{ns} == 2",
                 f"\t\trun = CustomShaderDragJiggleCursor_{ns}",
@@ -3635,6 +3920,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "\tendif",
                 "endif",
             ])
+        # 物体显隐发布：每帧把分支置位的 flag 经 ini params 喂给发布 CS →
+        # GPU 缓冲（下一帧检测消费）；随后 post 清零供下一帧分支重算。
+        total_objs = sum(int(comp.get("object_count") or 0) for comp in components)
+        if total_objs:
+            block.append(f"\tpre run = CommandListDragVisPublish_{ns}")
+            # 同上：post 清零按全局 oid 并集发射，按组件 range 会产生重复且漏掉
+            # 第二组件起的 oid（曾出现 0-14 重复、37-51 缺失）。
+            for oid in self._global_object_oids(components):
+                block.append(f"post $ssmtdrag_objvis_{ns}_{oid} = 0")
         block.extend([
             f"post run = CommandListDragUIReadback_{ns}",
             f"post $ssmtdrag_drawn_{ns} = 0",

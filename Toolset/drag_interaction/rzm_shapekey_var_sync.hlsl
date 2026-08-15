@@ -12,26 +12,25 @@
 // Without this pass, changing the variable leaves the buffer stale and the
 // next drag resumes from the stale value (visible snap back to 0).
 //
-// Semantics: the two writers of ShapeKeyDrive are mutually exclusive in
-// time, gated by the per-zone ZoneActive flag recomputed HERE every frame
-// (same hit test as rzm_shapekey_drive: hit-only mode + grab modifier +
-// target drawn + LMB/X held + zone hit):
-//   - Zone inactive: the variable owns the buffer. The buffer is written
-//     only when the variable actually changed this frame (directional:
-//     slot = v; no-direction stage: slot = v plus click-count open/clear).
-//   - Zone active (dragging): the drive CS owns the buffer; the
-//     variable->buffer write is SUSPENDED so an animation driver stepping
-//     the variable mid-drag cannot yank the buffer away from the drag.
-// After the drag ends (flag falls) the buffer keeps the dragged value:
-// VarSyncPrev tracked the variable silently during the suspension, so no
-// write fires until the variable actually changes again.
-//
+// Semantics (value arbitration, variable-first):
+//   - The variable changed this frame (hotkey / animation driver) -> the
+//     variable owns the buffer and is written immediately, even while a
+//     drag is active (variable always wins).
+//   - The only exception is the CPU readback echo: the generated
+//     CommandListDragShapeKeyVarReadback mirrors the buffer into the
+//     variable on pull frames and marks those frames via the pull flag
+//     (IniParams[83 + i/4][i%4]); such frames must NOT push the variable
+//     back into the buffer, or the store-latency-stale value would fight
+//     the drag CS every frame.
+//   - ZoneActive is still recomputed here every frame (same hit test as
+//     rzm_shapekey_drive) and consumed by the CPU readback to decide which
+//     side owns the variable.
 // GPU->CPU synchronization is emitted by the generated
 // CommandListDragShapeKeyVarReadback section. It reads ZoneActive and the
-// drive slot with the loader's direct-resource store syntax (without ref),
-// then mirrors the dragged value into the export variable. A short cooldown
-// after release absorbs the asynchronous store latency before ownership is
-// returned to the variable-driven path.
+// drive slot with the loader's direct-resource store syntax (without ref).
+// A short settle window after each variable change absorbs the store
+// latency before pulls resume, so a fresh hotkey value is never clobbered
+// by a stale buffer read (the "hotkey toggle snapped back next frame" bug).
 //
 // Bindings:
 //   t67  = ResourceDragPinnedDetectInfo (hover hit + zone id; same SRV the
@@ -52,6 +51,9 @@
 // IniParams (packed 4 variables per float4, from index 81; 76-80 are used
 // by the drive CS, 100+ by the shape-key anim CS):
 //   [81 + i/4][i%4] = current value of binding i's export variable
+//   [83 + i/4][i%4] = CPU readback pull flag of binding i (1 = the value
+//                     change this frame came from the buffer pull; suppress
+//                     the variable->buffer push this frame to avoid echo)
 // IniParams[75] gate inputs (fixed below the drive CS range):
 //   x = drag system mode (1 = hit only), y = grab modifier + LMB/X held,
 //   z = target drawn this frame, w = input mode (0 = game)
@@ -66,6 +68,7 @@ StructuredBuffer<float4> PinnedDetectInfo : register(t67);
 Texture1D<float4> IniParams         : register(t120);
 
 #define VAR_SYNC_INIPARAM_BASE 81
+#define VAR_SYNC_PULL_BASE 83
 #define VAR_SYNC_GATE_PARAMS 75
 
 uint ClampZoneID(float zoneValue, uint zoneCount)
@@ -109,16 +112,16 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         float raw = IniParams[VAR_SYNC_INIPARAM_BASE + (i >> 2)][i & 3];
         if (abs(raw - VarSyncPrev[i]) <= 1e-6)
             continue;
-        // 跟踪变量值：拖拽激活期间只跟踪不写入，松手后缓冲保持拖拽值
+        // 变量为主：变量一旦变化立即回写缓冲（即使区域拖拽激活中）。
+        // 唯一例外是 CPU 回读回声帧（pull flag）——拉取值本就来自缓冲，
+        // 且带 store 延迟，推回会与拖拽 CS 每帧打架。
         VarSyncPrev[i] = raw;
+        if (IniParams[VAR_SYNC_PULL_BASE + (i >> 2)][i & 3] > 0.5)
+            continue;
         uint4 mapping = VarSyncMap[i];
         uint slot = mapping.x;
         uint zone = mapping.y;
         uint ndStage = mapping.z;
-        // 该区域拖拽激活中：缓冲归拖拽 CS 所有，变量→缓冲写入挂起，
-        // 避免驱动器中途步进把缓冲从拖拽值上拽走（双向打架）
-        if (zone < clickSlots && ZoneActive[zone] > 0.5)
-            continue;
         float v = clamp(raw, 0.0, 1.0);
         if (slot < driveSlots)
             ShapeKeyDrive[slot] = v;

@@ -143,22 +143,42 @@ class ClickExportTests(unittest.TestCase):
         self.assertEqual(len(paragraphs), 1)
         content = paragraphs[0]["ini_content"]
         self.assertEqual(content.count("[Present]"), 1)
-        self.assertNotIn("[Constants]", content)
+        # 值仲裁、变量为主：受控变量本身不重新声明，只声明每绑定的 ckprev 辅助变量
+        self.assertEqual(content.count("[Constants]"), 1)
+        self.assertNotIn("global $Swap", content)
+        self.assertIn("global $ssmtdrag_ckprev_A_Swap = 0", content)
+        self.assertIn("global $ssmtdrag_ckprev_A_Other = 0", content)
         self.assertIn("store = $Swap, ResourceDragShapeKeyClickCountF_A, 6", content)
         self.assertIn("store = $Other, ResourceDragShapeKeyClickCountF_A, 6", content)
+        self.assertIn("$ssmtdrag_seed_pending_A = 1", content)
 
     def test_generate_ini_segment_references_owned_variables_without_redeclaring_them(self):
         node = _click_node(targets=("$Swap", "Swap", "", "$Other"), zone=7)
 
         content = node.generate_ini_segment()
 
-        self.assertNotIn("[Constants]", content)
         self.assertNotIn("global $Swap", content)
         self.assertNotIn("global $Other", content)
         self.assertEqual(content.count("store = $Swap,"), 1)
         self.assertIn("if $ssmtdrag_booted_A == 1 && $ssmtdrag_seed_pending_A == 0", content)
         self.assertIn("store = $Swap, ResourceDragShapeKeyClickCountF_A, 7", content)
         self.assertIn("store = $Other, ResourceDragShapeKeyClickCountF_A, 7", content)
+
+    def test_generate_ini_segment_arbitrates_variable_first(self):
+        """回归：点击计数导出必须做值仲裁——变量变化(热键)时置 seed_pending
+        触发播种推回缓冲且不回读；变量未变才拉取缓冲。旧实现每帧无条件
+        store 会把快捷键切换下一瞬间顶掉。"""
+        node = _click_node(targets=("$Swap",), zone=7)
+
+        content = node.generate_ini_segment()
+
+        self.assertIn("if $Swap != $ssmtdrag_ckprev_A_Swap", content)
+        self.assertIn("$ssmtdrag_ckprev_A_Swap = $Swap", content)
+        self.assertIn("$ssmtdrag_seed_pending_A = 1", content)
+        self.assertIn("else", content)
+        self.assertIn("\t\tstore = $Swap, ResourceDragShapeKeyClickCountF_A, 7", content)
+        # store 只在变量未变分支里出现
+        self.assertEqual(content.count("store = $Swap,"), 1)
 
     def test_generate_ini_segment_fails_closed_when_animation_tree_has_multiple_drag_owners(self):
         node = _click_node(owners=2)

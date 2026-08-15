@@ -1,3 +1,5 @@
+import re
+
 import bpy
 from bpy.props import IntProperty, StringProperty, CollectionProperty
 
@@ -275,16 +277,39 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
             return ""
         if not 0 <= zone < MAX_ZONES:
             return ""
-        lines = [
+        # 值仲裁、变量为主（修复「快捷键切换被每帧点击计数回读顶掉」）：
+        #   变量变化（热键/驱动器）→ 不回读，置 seed_pending 触发播种把变量值
+        #   推回点击计数缓冲（播种 = 驱动 CS 的 seed 模式，天然就是
+        #   「变量→缓冲」方向）；变量未变 → 拉取缓冲值（点击推进）。
+        #   prev 辅助变量按受控变量名派生（同一变量天然共享、不同变量天然
+        #   隔离，且多节点不会互相覆盖索引）。
+        block_lines = [
             "[Present]",
-            "; 点击计数导出：boot 且冷启动播种完成后，每帧把绑定区域的点击次数写入受控变量",
-            "; （点击次数是持久状态，不做模式门控；播种完成前不发布，防止缓冲清零态冲刷 persist 变量）",
+            "; 点击计数导出（值仲裁、变量为主）：变量变化时经 seed_pending 触发播种",
+            "; 把变量值推回点击计数缓冲（下一帧点击从新值继续推进）；变量未变时",
+            "; 每帧拉取缓冲值（点击推进）；热键改动绝不被回读顶掉。",
             f"if $ssmtdrag_booted_{ns} == 1 && $ssmtdrag_seed_pending_{ns} == 0",
         ]
+        prev_names = []
         for var in target_vars:
-            lines.append(f"\tstore = {var}, ResourceDragShapeKeyClickCountF_{ns}, {zone}")
-        lines.append("endif")
-        return "\n".join(lines)
+            stem = re.sub(r"[^0-9A-Za-z_]", "_", str(var).lstrip("$"))
+            prev = f"$ssmtdrag_ckprev_{ns}_{stem}"
+            prev_names.append(prev)
+            block_lines.extend([
+                f"\tif {var} != {prev}",
+                f"\t\t{prev} = {var}",
+                f"\t\t$ssmtdrag_seed_pending_{ns} = 1",
+                "\telse",
+                f"\t\tstore = {var}, ResourceDragShapeKeyClickCountF_{ns}, {zone}",
+                f"\t\t{prev} = {var}",
+                "\tendif",
+            ])
+        block_lines.append("endif")
+        # 每绑定声明一个 prev 辅助变量（全局、跨节可见）
+        globals_lines = ["[Constants]"]
+        for prev in prev_names:
+            globals_lines.append(f"global {prev} = 0")
+        return "\n".join(globals_lines) + "\n" + "\n".join(block_lines)
 
 
 classes = (
