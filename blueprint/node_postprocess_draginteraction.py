@@ -1196,9 +1196,27 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             self._create_cumulative_backup(ini_path, mod_export_path)
 
             # 1) 资源烘焙（稀疏区域权重/ObjectMap/ZoneParams/PathVectors）
+            # 无有效区域的组件（包含列表未命中/影响球无交集）整体跳过，不注入钩子。
             self._write_zone_resources(mod_export_path, ns)
+            active_components = []
+            skipped_components = []
             for comp in components:
-                self._bake_component_resources(mod_export_path, sections, comp, ns)
+                if self._bake_component_resources(mod_export_path, sections, comp, ns):
+                    active_components.append(comp)
+                else:
+                    skipped_components.append(comp)
+            if skipped_components:
+                print(
+                    "[DragInteraction] 已跳过无有效区域的组件: "
+                    + ", ".join(comp["comp_name"] for comp in skipped_components)
+                )
+            if not active_components:
+                print(
+                    f"[DragInteraction][WARNING] {ini_file} 的所有目标组件均无有效拖拽区域，"
+                    "未做任何注入（着色器已复制，INI 保持不变）"
+                )
+                continue
+            components = active_components
 
             # 2) 生成 CustomShader/CommandList/Resource 段
             self._emit_sections(sections, components, ns)
@@ -1618,12 +1636,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # =======================================================================
 
     def _bake_component_resources(self, mod_export_path, sections, comp, ns):
+        # 每顶点 Top-K 区域权重：高斯场烘焙。所有配置区域对本组件均无有效权重时
+        # （包含物体列表未命中 / 影响球与顶点无交集）跳过该组件——不生成
+        # ObjectMap/逐三角编号/掩码，调用方也不再为它注入任何拖拽钩子。
+        if not self._write_jiggle_masks(mod_export_path, sections, comp, ns):
+            return False
         # ObjectMap：游戏索引空间 (1+N)×16B
         self._write_object_map(mod_export_path, sections, comp)
         # 逐三角形物体编号（显隐过滤：几何映射，与权重烘焙同类）
         self._write_triangle_object_ids(mod_export_path, sections, comp)
-        # 每顶点 Top-K 区域权重：高斯场烘焙
-        self._write_jiggle_masks(mod_export_path, sections, comp, ns)
+        return True
 
     def _write_triangle_object_ids(self, mod_export_path, sections, comp):
         """逐 part 读 IB 文件，按 name_ranges 给每个三角形写入物体编号
@@ -1750,6 +1772,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         return "Meshes"
 
     def _write_jiggle_masks(self, mod_export_path, sections, comp, ns):
+        """烘焙每顶点 Top-K 区域权重。返回 True = 掩码已写出（或回退写出）；
+        False = 所有配置区域对本组件均无有效权重，调用方应整体跳过该组件。"""
         entries = self._collect_enabled_zone_entries()
         zones = [empty for _, empty in entries]
         vertex_count = comp["vertex_count"]
@@ -1758,7 +1782,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if not zones or not GB_CORE_AVAILABLE:
             fallback_zone_id = entries[0][0] if entries else 0
             self._write_masks_fallback(mod_export_path, sections, comp, vertex_count, fallback_zone_id)
-            return
+            return True
 
         # radius 参数与球尺度失配检查（防“整块刚体动”失配，原版实测 ratio 0.3~2.2）
         self._check_zone_radius_scale(zones)
@@ -1787,7 +1811,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         positions = self._read_position_buf(mod_export_path, sections, comp, vertex_count)
         if positions is None:
             self._write_masks_fallback(mod_export_path, sections, comp, vertex_count, entries[0][0])
-            return
+            return True
 
         # 烘焙参考物体世界矩阵的逆（坐标系换算）
         ref_matrix_inv = self._get_reference_matrix_inv(comp)
@@ -1838,10 +1862,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             zone_ids[replace_rows, replace_slots] = np.uint32(zone_id)
 
         if not np.any(zone_weights > 1e-4):
-            raise RuntimeError(
-                f"[DragInteraction] {comp['comp_name']}: all configured drag zones produced zero weights; "
-                "check the game coordinate mapping and Empty placement"
+            # 所有配置区域对本组件均无有效权重（包含物体列表未命中 IB 部件，
+            # 或影响球与顶点包围盒无交集）：该组件按配置即不受拖拽，跳过注入
+            # 而不是中止整个导出；逐区域原因已在上方逐条警告。
+            print(
+                f"[DragInteraction][WARNING] {comp['comp_name']}: "
+                "所有配置区域对本组件均无有效权重，已跳过该组件的拖拽注入；"
+                "若该组件预期应有拖拽，请检查区域的包含物体列表与空物体摆放"
             )
+            self._remove_mask_files(mod_export_path, sections, comp)
+            return False
 
         out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
         os.makedirs(out_dir, exist_ok=True)
@@ -1859,6 +1889,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"[DragInteraction] SparseZoneMasks: {comp['comp_name']} "
             f"({vertex_count} 顶点, {len(zones)} 区域, Top-{SPARSE_ZONE_SLOTS})"
         )
+        return True
+
+    def _remove_mask_files(self, mod_export_path, sections, comp):
+        """组件被跳过时清掉可能残留的掩码文件（含旧命名），避免陈旧缓冲被打包。"""
+        out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
+        for suffix in ("JiggleZoneIDs.buf", "JiggleZoneWeights.buf"):
+            path = os.path.join(out_dir, f"{comp['base_name']}{suffix}")
+            if os.path.isfile(path):
+                os.remove(path)
+        self._remove_legacy_mask_files(out_dir, comp["base_name"])
 
     def _write_masks_fallback(self, mod_export_path, sections, comp, vertex_count, fallback_zone_id=0):
         zone_ids = np.full((vertex_count, SPARSE_ZONE_SLOTS), INVALID_ZONE_ID, dtype=np.uint32)
@@ -2306,6 +2346,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             if not getattr(node, "drag_drive_enabled", False):
                 continue
             for item in getattr(node, "shapekey_variable_items", None) or []:
+                if not getattr(item, "export_enabled", True):
+                    # 未勾选导出的形态键不生成变量与缓冲，不参与档位统计
+                    continue
                 try:
                     zone = int(getattr(item, "drag_zone_id", -1))
                 except Exception:
@@ -2369,6 +2412,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             if get_var_name is None:
                 continue
             for item in getattr(node, "shapekey_variable_items", None) or []:
+                if not getattr(item, "export_enabled", True):
+                    # 未勾选导出的形态键不会生成 INI 变量，不产生同步绑定
+                    continue
                 try:
                     zone = int(getattr(item, "drag_zone_id", -1))
                 except Exception:
@@ -3903,8 +3949,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # S8 手型光标：先更新手部屏幕位置，描边先画垫底（只露轮廓边）、填充后画；
             # 抓取中或 RMB 独按蓄力时用 Action 网格（握拳），否则 NoAction（张开）
             block.extend([
-                # 与实机可用配置一致：悬停预览/手型光标由模式开关 + drawn 门控，不要求 Alt。
-                f"if {drag_mode_var} >= 1 && $ssmtdrag_drawn_{ns} == 1",
+                # 门控必须含 $ssmtdrag_mode（Alt 臂动）：检测只在臂动时刷新命中数据，
+                # 松开 Alt 后 PinnedDetectInfo 是陈旧值——若只按 drawn 门控，手型光标
+                # 会停留在松开前的命中点上不消失（用户报告）。NONE 常开模式下
+                # $ssmtdrag_mode 恒 1，行为与之前一致。
+                f"if {drag_mode_var} >= 1 && $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1",
                 f"\trun = CustomShaderDragUpdateJiggleCursorPreview_{ns}",
                 f"\tif $ssmtdrag_hand_debug_{ns} == 2",
                 f"\t\trun = CustomShaderDragJiggleCursor_{ns}",

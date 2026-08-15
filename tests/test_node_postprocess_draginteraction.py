@@ -1216,6 +1216,37 @@ class DragNodeEmitTests(unittest.TestCase):
             ("$Freq_B", 0, 0, -1),
         ])
 
+    def test_drag_drive_skips_unchecked_shapekey_items(self):
+        """未勾选导出（export_enabled=False）的形态键不参与档位统计与变量同步绑定：
+        其变量不会生成到 INI，拖拽侧也不得引用。"""
+        zone = self._zone_item(0)
+        node = _make_node(
+            self.mod,
+            enable_shapekey_drive=True,
+            zone_objects=[zone],
+        )
+        checked = types.SimpleNamespace(
+            shape_key_name="A", drag_zone_id=0, drag_dir_id="-1", drag_click_stage=1,
+            export_enabled=True,
+        )
+        unchecked = types.SimpleNamespace(
+            shape_key_name="B", drag_zone_id=0, drag_dir_id="-1", drag_click_stage=3,
+            export_enabled=False,
+        )
+        sk_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_ShapeKey",
+            drag_drive_enabled=True,
+            shapekey_variable_items=[checked, unchecked],
+            get_shape_key_export_variable_name=lambda name: f"$Freq_{name}",
+        )
+        node.id_data = types.SimpleNamespace(nodes=[sk_node])
+
+        # 未勾选的 B（档位 3）不计入 → 区域 0 档位为已勾选 A 的 1
+        self.assertEqual(node._drag_drive_zone_stage_counts(), {0: 1})
+        # 未勾选的 B 不产生同步绑定
+        bindings = node._drag_drive_var_sync_bindings()
+        self.assertEqual(bindings, [("$Freq_A", 4, 0, 1)])
+
     def test_shapekey_var_sync_sections_and_present_run(self):
         zone = self._zone_item(0)
         node = _make_node(
@@ -1828,7 +1859,7 @@ class DragNodeEmitTests(unittest.TestCase):
 
         np.testing.assert_allclose(field, [1.0])
 
-    def test_sparse_bake_rejects_all_zero_configured_zones(self):
+    def test_sparse_bake_skips_component_when_all_zones_zero(self):
         import tempfile
         item = self._zone_item(0)
         node = _make_node(self.mod, zone_objects=[item])
@@ -1842,9 +1873,47 @@ class DragNodeEmitTests(unittest.TestCase):
         comp = {"vertex_count": 3, "base_name": "sample", "comp_name": "sample", "parts": []}
 
         with tempfile.TemporaryDirectory() as td:
-            with self.assertRaisesRegex(RuntimeError, "all configured drag zones produced zero weights"):
-                node._write_jiggle_masks(td, {}, comp, "testns")
+            # 全区域零权重 → 跳过该组件（返回 False），不报错也不写掩码
+            self.assertFalse(node._write_jiggle_masks(td, {}, comp, "testns"))
             self.assertFalse((Path(td) / "Meshes" / "sampleJiggleZoneWeights.buf").exists())
+            self.assertFalse((Path(td) / "Meshes" / "sampleJiggleZoneIDs.buf").exists())
+
+    def test_bake_component_resources_skips_object_map_when_masks_skipped(self):
+        import tempfile
+        item = self._zone_item(0)
+        node = _make_node(self.mod, zone_objects=[item])
+        node._check_zone_radius_scale = lambda zones: False
+        node._read_position_buf = lambda *args: np.zeros((3, 3), dtype=np.float32)
+        node._get_reference_matrix_inv = lambda comp: None
+        node._get_export_space_matrix = lambda: np.eye(4)
+        node._get_non_mirror_mirror = lambda: None
+        node._buffer_dir = lambda sections, comp: "Meshes"
+        node._evaluate_zone_field = lambda *args, **kwargs: None
+        comp = {"vertex_count": 3, "base_name": "sample", "comp_name": "sample", "parts": []}
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(node._bake_component_resources(td, {}, comp, "testns"))
+            # 组件被跳过时 ObjectMap / 掩码都不应生成
+            self.assertFalse((Path(td) / "Meshes" / "sampleObjectMap.buf").exists())
+            self.assertFalse((Path(td) / "Meshes" / "sampleJiggleZoneWeights.buf").exists())
+
+    def test_bake_component_resources_writes_object_map_when_masks_written(self):
+        import tempfile
+        item = self._zone_item(0)
+        node = _make_node(self.mod, zone_objects=[item])
+        node._check_zone_radius_scale = lambda zones: False
+        node._read_position_buf = lambda *args: np.zeros((3, 3), dtype=np.float32)
+        node._get_reference_matrix_inv = lambda comp: None
+        node._get_export_space_matrix = lambda: np.eye(4)
+        node._get_non_mirror_mirror = lambda: None
+        node._buffer_dir = lambda sections, comp: "Meshes"
+        node._evaluate_zone_field = lambda *args, **kwargs: np.ones(3, dtype=np.float32)
+        comp = {"vertex_count": 3, "base_name": "sample", "comp_name": "sample", "parts": []}
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(node._bake_component_resources(td, {}, comp, "testns"))
+            self.assertTrue((Path(td) / "Meshes" / "sampleObjectMap.buf").exists())
+            self.assertTrue((Path(td) / "Meshes" / "sampleJiggleZoneWeights.buf").exists())
 
     def test_zone_params_buffer_uses_stable_id_and_grabbable_flag(self):
         import tempfile
@@ -1996,6 +2065,22 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertEqual(readback.count("DRAG UI BRIDGE BEGIN"), 1)
         node._emit_present_and_constants(legacy_sections, comps, "testns")
         self.assertEqual(readback.count("DRAG UI BRIDGE BEGIN"), 1)
+
+    def test_hand_cursor_gate_requires_armed_mode(self):
+        """手型光标门控必须含 $ssmtdrag_mode（Alt 臂动）：检测只在臂动时刷新命中，
+        松开 Alt 后命中数据是陈旧的——若无臂动门控，手会停留在松开前的命中点不消失。"""
+        node, sections, comps = self._emit(enable_hand_cursor=True)
+        node._emit_present_and_constants(sections, comps, "testns")
+        present = sections["[Present]"]
+        # 门控行同时包含模式开关、臂动标志与 drawn
+        gate_line = next(
+            line for line in present
+            if line.strip().startswith("if $ssmtdrag_drag_enabled_testns >= 1")
+            and "$ssmtdrag_mode_testns == 1" in line
+            and "$ssmtdrag_drawn_testns == 1" in line
+        )
+        idx = present.index(gate_line)
+        self.assertIn("run = CustomShaderDragUpdateJiggleCursorPreview_testns", present[idx + 1])
 
     def test_drag_runtime_mode_one_keeps_detection_but_disables_deformation(self):
         node, sections, comps = self._emit(drag_system_mode_default=1, enable_hand_cursor=True)

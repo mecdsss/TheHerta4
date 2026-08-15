@@ -326,7 +326,9 @@ class AnimDriverBaseTests(unittest.TestCase):
         ini = node.generate_ini_segment()
 
         self.assertIn("global persist $cond_paused = 1", ini)
-        self.assertIn("global persist $cond_state1 = 0", ini)
+        self.assertIn("if $cond_paused == 1", ini)
+        self.assertIn("    $target = 1", ini)
+        self.assertNotIn("$cond_state", ini)
 
     def test_accumulative_trigger_stacks_each_matching_condition_dynamically(self):
         node = accumulative_trigger_module.SSMTNode_AnimDriver_AccumulativeTrigger()
@@ -395,7 +397,7 @@ class AnimDriverBaseTests(unittest.TestCase):
 
         self.assertEqual([group["threshold"] for group in groups], ["NaN", "1"])
 
-    def test_conditional_trigger_and_mode_resets_when_any_condition_fails(self):
+    def test_conditional_trigger_and_mode_level_triggered_with_else(self):
         node = cond_trigger_module.SSMTNode_AnimDriver_ConditionalTrigger()
         node.name = "CondTrigger"
         node.auto_index = 1
@@ -412,8 +414,34 @@ class AnimDriverBaseTests(unittest.TestCase):
 
         ini = node.generate_ini_segment()
 
-        self.assertIn("if ($a != 1) || ($b <= 2)", ini)
-        self.assertNotIn("if $a != 1\n            if $b <= 2", ini)
+        self.assertIn("if ($a == 1) && ($b > 2)", ini)
+        self.assertIn("\n    else\n", ini)
+        self.assertIn("        $target = 0", ini)
+        self.assertNotIn("$cond_state", ini)
+        self.assertNotIn("$cond_flag", ini)
+        _assert_balanced_conditionals(self, ini)
+
+    def test_conditional_trigger_or_mode_combines_with_or(self):
+        node = cond_trigger_module.SSMTNode_AnimDriver_ConditionalTrigger()
+        node.name = "CondTrigger"
+        node.auto_index = 2
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.default_paused = True
+        node.custom_paused_var = "$cond_paused"
+        node.logic_operator = "OR"
+        node.condition_list = [
+            types.SimpleNamespace(variable_name="$a", comparison_op="==", compare_value="1"),
+            types.SimpleNamespace(variable_name="$b", comparison_op=">", compare_value="2"),
+        ]
+        node.target_list = [types.SimpleNamespace(variable_name="$target", trigger_value="1")]
+        node.else_target_list = [types.SimpleNamespace(variable_name="$target", trigger_value="0")]
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("if ($a == 1) || ($b > 2)", ini)
+        self.assertNotIn("$cond_flag", ini)
+        self.assertNotIn("$cond_state", ini)
+        _assert_balanced_conditionals(self, ini)
 
     def test_shapekey_sequence_default_play_exports_persisted_play_state(self):
         node = shapekey_seq_module.SSMTNode_AnimDriver_ShapeKeySequence()

@@ -8,25 +8,14 @@ from .anim_driver_base import (
 )
 
 
-_INVERTED_COMPARISON_OPS = {
-    '==': '!=',
-    '!=': '==',
-    '>': '<=',
-    '<': '>=',
-    '>=': '<',
-    '<=': '>',
-}
-
-
-def _invert_comparison_op(op: str) -> str:
-    return _INVERTED_COMPARISON_OPS.get(op, '!=')
+def _combine_conditions(conditions, joiner: str) -> str:
+    clauses = [f"({var} {op} {val})" for var, op, val in conditions]
+    return f" {joiner} ".join(clauses)
 
 
 def _combine_conditions_with_or(conditions) -> str:
-    clauses = []
-    for var, op, val in conditions:
-        clauses.append(f"({var} {op} {val})")
-    return " || ".join(clauses)
+    # 兼容入口：OR 组合
+    return _combine_conditions(conditions, "||")
 
 
 class ConditionItem(bpy.types.PropertyGroup):
@@ -499,117 +488,38 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
                     val = "1"
                 else_target_assignments.append((target, val))
 
-        state_var = f"$cond_state{idx}"
-        flag_var = f"$cond_flag{idx}"
-
         lines = [
             "[Constants]",
             self._format_global_assignment(paused_var, paused_state, persist=True),
             "; 暂停状态",
-            self._format_global_assignment(state_var, 0, persist=True),
-            "; 条件触发状态（0=未触发，1=已触发）",
         ]
 
-        # flag_var 仅在 OR 模式下用于判断"任一条件成立"
-        needs_flag = bool(conditions) and self.logic_operator == 'OR'
-        if needs_flag:
-            lines.append(self._format_global_assignment(flag_var, 0, persist=True))
-            lines.append("; OR 条件临时标志")
-
-        # 边沿触发：避免在条件持续满足期间每帧强制覆盖目标变量
-        # - state=0 + 条件由不满足翻转为满足：执行 met 目标，state 置 1
-        # - state=1 + 条件由满足翻转为不满足：执行 else 目标（若有），state 置 0
-        # state 重置始终执行（保证状态机可再次触发），else 目标可选
-        # 仅在 paused==1 时检查翻转，避免暂停时误触发
+        # 电平触发：每帧独立判定，无状态锁存
+        # - paused==1 且条件成立 → 执行满足目标
+        # - paused==1 且条件不成立 → 执行不满足目标（若有）
+        # 两条分支各自独立判定、互不牵连；paused==0 时整段跳过
+        lines.append("[Present]")
+        lines.append(f"if {paused_var} == 1")
 
         if not conditions:
-            # 无条件：paused 0→1 触发 met，1→0 触发 else
-            lines.append("[Present]")
-            lines.append(f"if {state_var} == 0")
-            lines.append(f"    if {paused_var} == 1")
+            # 无条件：paused==1 视为满足 → 满足目标，否则执行不满足目标
             for target, val in target_assignments:
-                lines.append(f"        {target} = {val}")
-            lines.append(f"        {state_var} = 1")
-            lines.append("    endif")
-            lines.append("endif")
-
-            lines.append("[Present]")
-            lines.append(f"if {state_var} == 1")
-            lines.append(f"    if {paused_var} == 0")
-            for target, val in else_target_assignments:
-                lines.append(f"        {target} = {val}")
-            lines.append(f"        {state_var} = 0")
-            lines.append("    endif")
-            lines.append("endif")
-        elif self.logic_operator == 'AND':
-            # AND: met=全部条件成立，not met=任一条件不成立
-            # state=0 + paused=1 + 全部条件成立 → 触发 met
-            lines.append("[Present]")
-            lines.append(f"if {state_var} == 0")
-            lines.append(f"    if {paused_var} == 1")
-            indent = "        "
-            for var, op, val in conditions:
-                lines.append(f"{indent}if {var} {op} {val}")
-                indent += "    "
-            for target, val in target_assignments:
-                lines.append(f"{indent}{target} = {val}")
-            lines.append(f"{indent}{state_var} = 1")
-            for _ in conditions:
-                indent = indent[:-4]
-                lines.append(f"{indent}endif")
-            lines.append("    endif")
-            lines.append("endif")
-
-            # state=1 + paused=1 + 任一条件不成立 → 触发 else（可选），state 置 0
-            lines.append("[Present]")
-            lines.append(f"if {state_var} == 1")
-            lines.append(f"    if {paused_var} == 1")
-            inverted_or_condition = _combine_conditions_with_or(
-                (var, _invert_comparison_op(op), val)
-                for var, op, val in conditions
-            )
-            lines.append(f"        if {inverted_or_condition}")
-            indent = "            "
-            for target, val in else_target_assignments:
-                lines.append(f"{indent}{target} = {val}")
-            lines.append(f"{indent}{state_var} = 0")
-            lines.append("        endif")
-            lines.append("    endif")
+                lines.append(f"    {target} = {val}")
+            if else_target_assignments:
+                lines.append("else")
+                for target, val in else_target_assignments:
+                    lines.append(f"    {target} = {val}")
             lines.append("endif")
         else:
-            # OR: met=任一条件成立，not met=全部条件不成立
-            # state=0 + paused=1 + 任一条件成立 → 触发 met
-            lines.append("[Present]")
-            lines.append(f"if {state_var} == 0")
-            lines.append(f"    if {paused_var} == 1")
-            lines.append(f"        {flag_var} = 0")
-            for var, op, val in conditions:
-                lines.append(f"        if {var} {op} {val}")
-                lines.append(f"            {flag_var} = 1")
-                lines.append("        endif")
-            lines.append(f"        if {flag_var} == 1")
+            joiner = "&&" if self.logic_operator == 'AND' else "||"
+            condition_expr = _combine_conditions(conditions, joiner)
+            lines.append(f"    if {condition_expr}")
             for target, val in target_assignments:
-                lines.append(f"            {target} = {val}")
-            lines.append(f"            {state_var} = 1")
-            lines.append("        endif")
-            lines.append("    endif")
-            lines.append("endif")
-
-            # state=1 + paused=1 + 全部条件不成立 → 触发 else（可选），state 置 0
-            lines.append("[Present]")
-            lines.append(f"if {state_var} == 1")
-            lines.append(f"    if {paused_var} == 1")
-            indent = "        "
-            for var, op, val in conditions:
-                inv_op = _invert_comparison_op(op)
-                lines.append(f"{indent}if {var} {inv_op} {val}")
-                indent += "    "
-            for target, val in else_target_assignments:
-                lines.append(f"{indent}{target} = {val}")
-            lines.append(f"{indent}{state_var} = 0")
-            for _ in conditions:
-                indent = indent[:-4]
-                lines.append(f"{indent}endif")
+                lines.append(f"        {target} = {val}")
+            if else_target_assignments:
+                lines.append("    else")
+                for target, val in else_target_assignments:
+                    lines.append(f"        {target} = {val}")
             lines.append("    endif")
             lines.append("endif")
 
