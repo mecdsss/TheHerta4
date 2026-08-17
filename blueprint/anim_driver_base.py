@@ -341,6 +341,13 @@ class SSMTSocketAnimDriver(NodeSocket):
 
 
 class SSMTNode_AnimDriver_Base(SSMTNodeBase):
+    """动画驱动节点的抽象基类（不注册为可放置节点）。
+
+    仅为 Python 继承层级的公共基类：驱动变量 UI、连续形态键模式、
+    动态插槽管理与 generate_ini_segment() 契约均在此定义。
+    本身不实现驱动语义（generate_ini_segment 直接抛 NotImplementedError），
+    因此刻意不放入 classes 注册元组，避免被放置在蓝图中。
+    """
     PLAY_STATE_MIGRATION_KEY = "_th4_default_play_state_migrated"
     bl_idname = 'SSMTNode_AnimDriver_Base'
     bl_label = 'AnimDriver Base'
@@ -946,7 +953,6 @@ classes = (
     SSMT_OT_ContinuousShapeKeyRemove,
     SSMT_OT_ContinuousShapeKeyClear,
     SSMTSocketAnimDriver,
-    SSMTNode_AnimDriver_Base,
 )
 
 

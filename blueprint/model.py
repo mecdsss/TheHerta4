@@ -33,7 +33,6 @@ _SINGLE_INSTANCE_POSTPROCESS_LABELS = {
     _NODE_TYPE_POSTPROCESS_DRAG_INTERACTION: "拖拽交互",
     "SSMTNode_PostProcess_AnimDriver": "动画驱动蓝图",
     "SSMTNode_PostProcess_BufferCleanup": "缓冲区清理",
-    "SSMTNode_PostProcess_CrossIB": "Cross IB",
     "SSMTNode_PostProcess_Glow": "RabbitFX 贴图后处理",
     "SSMTNode_PostProcess_HealthDetection": "血量检测",
     "SSMTNode_PostProcess_Material": "材质转资源",

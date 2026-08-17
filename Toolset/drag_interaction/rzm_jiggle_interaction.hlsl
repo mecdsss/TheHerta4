@@ -96,6 +96,15 @@ Buffer<float4> SharedInteractionState           : register(t71);
 Buffer<float4> PathVectors                      : register(t73);
 Buffer<float> PathProgressState                 : register(t74);
 Buffer<float4> ZoneParams                       : register(t75);
+// Collision (anti-clipping): baked at export from the collider's vb0 subset.
+//   t76 = interleaved point cloud (position float4 + unit normal float4 per point)
+//   t77 = fine uniform-grid cells (offset, count) uint4 per cell
+//   t78 = coarse uniform-grid cells (centroid.xyz, radius) float4 per cell
+//   t79 = per-vertex L0 contact data (q0.xyz,t0)(n0.xyz,valid)
+Buffer<float4> ColliderPoints                    : register(t76);
+Buffer<uint4>  ColliderCellsFine                : register(t77);
+Buffer<float4> ColliderCellsCoarse              : register(t78);
+Buffer<float4> ColliderVertexL0                 : register(t79);
 
 Texture1D<float4> IniParams : register(t120);
 
@@ -110,6 +119,15 @@ Texture1D<float4> IniParams : register(t120);
 #define VERTEX_DEBUG_PARAMS  IniParams[75]
 #define TIME_PARAMS          IniParams[76]
 #define ZONE_RUNTIME_META    IniParams[119]
+// Collision params (anti-clipping). Set by the jiggle INI section; zero = disabled.
+//   [101]: x=enabled, y=margin, z=mode (0=soft-slide, 1=hard-clamp), w=safety
+//   [102]: xyz=bmin, w=h (fine cell size)
+//   [103]: xyz=fine grid dims (nx,ny,nz), w=h_c (coarse cell size)
+//   [104]: x=drag mode variable, yzw=coarse grid dims (cnx,cny,cnz)
+#define COLLISION_PARAMS    IniParams[101]
+#define COLLISION_BOX       IniParams[102]
+#define COLLISION_GRID      IniParams[103]
+#define COLLISION_META      IniParams[104]
 
 #define DETECT_SLOT_ID       0u
 #define DETECT_SLOT_HIT      1u
@@ -510,6 +528,156 @@ void ComputeNextPhysics(
 }
 
 // ============================================================
+// COLLISION (anti-clipping) — mode 3 (drag) only, per-hit vertices
+// Staged search: L0 fast reject → coarse broad-phase → fine narrow-phase
+// (boundary-aware neighbor expansion, ≤8 cells) → confirm/adjust
+// (fixed 5-step bisection for hard, normal-clamp + tangent-preserve for soft).
+// ============================================================
+
+static const uint COLLISION_K_MAX = 32u;
+
+uint CollisionFineCellIndex(float3 p, int3 dims)
+{
+    int3 c = int3(floor((p - COLLISION_BOX.xyz) / max(COLLISION_BOX.w, 1e-6)));
+    c = clamp(c, int3(0, 0, 0), dims - int3(1, 1, 1));
+    return (uint)c.x + (uint)c.y * (uint)dims.x + (uint)c.z * (uint)dims.x * (uint)dims.y;
+}
+
+uint CollisionCoarseCellIndex(float3 p, int3 dims)
+{
+    int3 c = int3(floor((p - COLLISION_BOX.xyz) / max(COLLISION_GRID.w, 1e-6)));
+    c = clamp(c, int3(0, 0, 0), dims - int3(1, 1, 1));
+    return (uint)c.x + (uint)c.y * (uint)dims.x + (uint)c.z * (uint)dims.x * (uint)dims.y;
+}
+
+void CollisionScanCell(uint cellIndex, float3 p, inout float bestD, inout float3 bestN, inout float3 bestQ)
+{
+    uint4 info = ColliderCellsFine[cellIndex];
+    uint offset = info.x;
+    uint count = min(info.y, COLLISION_K_MAX);
+    [loop]
+    for (uint k = 0u; k < count; ++k)
+    {
+        float4 q = ColliderPoints[(offset + k) * 2u];
+        float3 d = p - q.xyz;
+        float distSq = dot(d, d);
+        if (distSq < bestD * bestD)
+        {
+            bestD = sqrt(max(distSq, 1e-12));
+            bestQ = q.xyz;
+            bestN = ColliderPoints[(offset + k) * 2u + 1u].xyz;
+        }
+    }
+}
+
+// 细网格最近点查询：本 cell + 仅必要时（越界轴方向）扩展邻居，最多 8 cell。
+void CollisionQueryFine(float3 p, inout float bestD, inout float3 bestN, inout float3 bestQ)
+{
+    float h = max(COLLISION_BOX.w, 1e-6);
+    int3 dims = int3(COLLISION_GRID.xyz);
+    float3 base = COLLISION_BOX.xyz;
+    float3 coord = floor((p - base) / h);
+    int3 c0 = clamp(int3(coord), int3(0, 0, 0), dims - int3(1, 1, 1));
+
+    CollisionScanCell(
+        (uint)c0.x + (uint)c0.y * (uint)dims.x + (uint)c0.z * (uint)dims.x * (uint)dims.y,
+        p, bestD, bestN, bestQ);
+
+    float3 dNeg = p - (base + coord * h);
+    float3 dPos = (base + (coord + 1.0) * h) - p;
+
+    [unroll]
+    for (int ox = -1; ox <= 1; ++ox)
+    {
+        [unroll]
+        for (int oy = -1; oy <= 1; ++oy)
+        {
+            [unroll]
+            for (int oz = -1; oz <= 1; ++oz)
+            {
+                if (ox == 0 && oy == 0 && oz == 0)
+                    continue;
+                if (ox == -1 && dNeg.x >= bestD) continue;
+                if (ox == 1 && dPos.x >= bestD) continue;
+                if (oy == -1 && dNeg.y >= bestD) continue;
+                if (oy == 1 && dPos.y >= bestD) continue;
+                if (oz == -1 && dNeg.z >= bestD) continue;
+                if (oz == 1 && dPos.z >= bestD) continue;
+                int3 c = clamp(c0 + int3(ox, oy, oz), int3(0, 0, 0), dims - int3(1, 1, 1));
+                CollisionScanCell(
+                    (uint)c.x + (uint)c.y * (uint)dims.x + (uint)c.z * (uint)dims.x * (uint)dims.y,
+                    p, bestD, bestN, bestQ);
+            }
+        }
+    }
+}
+
+float3 CollisionSolve(uint i, float3 p0, float3 offset)
+{
+    float3 p1 = p0 + offset;
+    float margin = COLLISION_PARAMS.y;
+    float safety = COLLISION_PARAMS.w;
+
+    // Stage 0: L0 fast reject（每顶点预烘焙接触平面；绝大多数顶点在此退出）
+    float4 l0q = ColliderVertexL0[i * 2u];
+    float4 l0n = ColliderVertexL0[i * 2u + 1u];
+    if (l0n.w > 0.5)
+    {
+        if (dot(offset, l0n.xyz) >= -safety * l0q.w)
+            return p1;
+    }
+
+    // Stage 1: 粗网格大范围扫描（整格拒绝）
+    int3 cdims = int3(COLLISION_META.yzw);
+    float4 coarse = ColliderCellsCoarse[CollisionCoarseCellIndex(p1, cdims)];
+    float dc = distance(p1, coarse.xyz);
+    if (dc - coarse.w > margin)
+        return p1;
+
+    // Stage 2: 细网格收窄精确评估（最近表面点 + 法线）
+    float bestD = 1e30;
+    float3 bestN = float3(0.0, 0.0, 1.0);
+    float3 bestQ = p1;
+    CollisionQueryFine(p1, bestD, bestN, bestQ);
+
+    if (bestD > margin)
+        return p1;
+
+    // Stage 3: 确认 + 调整
+    if (COLLISION_PARAMS.z > 0.5)
+    {
+        // 硬模式：沿位移路径固定 5 次二分
+        float tLo = 0.0;
+        float tHi = 1.0;
+        [unroll]
+        for (uint b = 0u; b < 5u; ++b)
+        {
+            float tMid = (tLo + tHi) * 0.5;
+            float d = 1e30;
+            float3 n = float3(0.0, 0.0, 1.0);
+            float3 q = p0 + offset * tMid;
+            CollisionQueryFine(q, d, n, q);
+            if (d >= margin)
+                tLo = tMid;
+            else
+                tHi = tMid;
+        }
+        return p0 + offset * tLo;
+    }
+    else
+    {
+        // 软模式：只裁法向分量、保留切向（沿碰撞体面滑动）。
+        // 法线优先取 L0 预烘焙平滑法线以降低帧间抖动。
+        float3 n = (l0n.w > 0.5) ? l0n.xyz : bestN;
+        float t0 = (l0n.w > 0.5) ? l0q.w : bestD;
+        float dn = dot(offset, n);
+        float maxIn = max(t0 - margin, 0.0);
+        float s = clamp(dn, -maxIn, maxIn);
+        return p0 + (offset - n * dn) + n * s;
+    }
+}
+
+// ============================================================
 // MAIN
 // ============================================================
 
@@ -837,6 +1005,15 @@ void main(uint3 threadID : SV_DispatchThreadID)
     if (hasPathOffset)
     {
         v.position += pathOffset;
+    }
+
+    // 碰撞检测（防穿模）：仅在模式三（拉扯模式）且该顶点确实被移动时。
+    // 门控为 wave-uniform（COLLISION_PARAMS.x / COLLISION_META.x 是统一参数），
+    // 空闲/非拉扯帧整波跳过，零成本。
+    if (COLLISION_PARAMS.x > 0.5 && COLLISION_META.x >= 2.0 && (influence > 0.0 || hasPathOffset))
+    {
+        float3 totalOffset = v.position - localPos;
+        v.position = CollisionSolve(i, localPos, totalOffset);
     }
 
     rw_buffer[i] = v;

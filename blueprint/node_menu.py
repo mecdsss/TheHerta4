@@ -1317,26 +1317,33 @@ class SSMT_MT_ObjectContextMenuSub(bpy.types.Menu):
         layout.operator("ssmt.quick_add_vertex_group_match", text="快速添加顶点组匹配", icon='GROUP_VERTEX')
 
 
-class SSMT_MT_NodeMenu_Object(bpy.types.Menu):
-    bl_label = "物体"
+class SSMT_MT_NodeMenu_ModOutput(bpy.types.Menu):
+    bl_label = "模组输出"
+
+    def draw(self, context):
+        layout = self.layout
+        _add_node_entry(layout, "Mod输出", 'EXPORT', "SSMTNode_Result_Output")
+        _add_node_entry(layout, "NTMI ModImp输出", 'EXPORT', "SSMTNode_Result_Output_NTMIModImp")
+
+
+class SSMT_MT_NodeMenu_ObjectBase(bpy.types.Menu):
+    bl_label = "物体基础"
 
     def draw(self, context):
         layout = self.layout
         _add_node_entry(layout, "物体信息", 'OBJECT_DATAMODE', "SSMTNode_Object_Info")
         _add_node_entry(layout, "物体组", 'GROUP', "SSMTNode_Object_Group")
-        _add_node_entry(layout, "Mod输出", 'EXPORT', "SSMTNode_Result_Output")
-        _add_node_entry(layout, "NTMI ModImp输出", 'EXPORT', "SSMTNode_Result_Output_NTMIModImp")
-        _add_node_entry(layout, "重命名物体", 'FONT_DATA', "SSMTNode_Object_Rename")
         _add_node_entry(layout, "物体切换", 'ARROW_LEFTRIGHT', "SSMTNode_ObjectSwap")
 
 
-class SSMT_MT_NodeMenu_ShapeKey(bpy.types.Menu):
-    bl_label = "形态键"
+class SSMT_MT_NodeMenu_Legacy(bpy.types.Menu):
+    bl_label = "旧版功能"
 
     def draw(self, context):
         layout = self.layout
         _add_node_entry(layout, "形态键", 'SHAPEKEY_DATA', "SSMTNode_ShapeKey")
         _add_node_entry(layout, "形态键输出", 'FILE_SCRIPT', "SSMTNode_ShapeKey_Output")
+        _add_node_entry(layout, "Mod面板", 'MENU_PANEL', "SSMTNode_ModPanel")
 
 
 class SSMT_MT_NodeMenu_DataType(bpy.types.Menu):
@@ -1355,6 +1362,7 @@ class SSMT_MT_NodeMenu_VertexGroup(bpy.types.Menu):
         _add_node_entry(layout, "顶点组匹配", 'GROUP', "SSMTNode_VertexGroupMatch")
         _add_node_entry(layout, "顶点组处理", 'MESH_DATA', "SSMTNode_VertexGroupProcess")
         _add_node_entry(layout, "映射表输入", 'TEXT', "SSMTNode_VertexGroupMappingInput")
+        _add_node_entry(layout, "重命名物体", 'FONT_DATA', "SSMTNode_Object_Rename")
 
 
 class SSMT_MT_NodeMenu_Blueprint(bpy.types.Menu):
@@ -1363,7 +1371,6 @@ class SSMT_MT_NodeMenu_Blueprint(bpy.types.Menu):
     def draw(self, context):
         layout = self.layout
         _add_node_entry(layout, "蓝图嵌套", 'NODETREE', "SSMTNode_Blueprint_Nest")
-        _add_node_entry(layout, "Mod面板", 'MENU_PANEL', "SSMTNode_ModPanel")
         _add_node_entry(layout, "跨IB节点", 'ARROW_LEFTRIGHT', "SSMTNode_CrossIB")
         _add_node_entry(layout, "着色器替换节点", 'SHADERFX', "SSMTNode_ShaderReplace")
         _add_node_entry(layout, "多文件导出", 'FILE', "SSMTNode_MultiFile_Export")
@@ -1374,22 +1381,62 @@ class SSMT_MT_NodeMenu_PostProcess(bpy.types.Menu):
 
     def draw(self, context):
         layout = self.layout
+        layout.menu("SSMT_MT_NodeMenu_PostProcess_Dynamic", text="动态相关", icon='DRIVER')
+        layout.menu("SSMT_MT_NodeMenu_PostProcess_Material", text="材质资源相关", icon='MATERIAL')
+        layout.menu("SSMT_MT_NodeMenu_PostProcess_Panel", text="面板相关", icon='WINDOW')
+        layout.menu("SSMT_MT_NodeMenu_PostProcess_AnimDriver", text="动画驱动相关", icon='ACTION')
+        layout.menu("SSMT_MT_NodeMenu_PostProcess_Creative", text="创意", icon='LIGHT')
+
+
+class SSMT_MT_NodeMenu_PostProcess_Dynamic(bpy.types.Menu):
+    bl_label = "动态相关"
+
+    def draw(self, context):
+        layout = self.layout
         _add_node_entry(layout, "顶点属性定义", 'PROPERTIES', "SSMTNode_PostProcess_VertexAttrs")
         _add_node_entry(layout, "形态键配置", 'SHAPEKEY_DATA', "SSMTNode_PostProcess_ShapeKey")
         _add_node_entry(layout, "UV属性定义", 'UV', "SSMTNode_PostProcess_UVAttrs")
         _add_node_entry(layout, "UV偏移", 'DRIVER', "SSMTNode_PostProcess_UVOffset")
+        _add_node_entry(layout, "多文件配置", 'FILE_FOLDER', "SSMTNode_PostProcess_MultiFile")
+
+
+class SSMT_MT_NodeMenu_PostProcess_Material(bpy.types.Menu):
+    bl_label = "材质资源相关"
+
+    def draw(self, context):
+        layout = self.layout
         _add_node_entry(layout, "材质转资源", 'MATERIAL', "SSMTNode_PostProcess_Material")
-        _add_node_entry(layout, "血量检测", 'HEART', "SSMTNode_PostProcess_HealthDetection")
-        _add_node_entry(layout, "滑块面板", 'GRIP', "SSMTNode_PostProcess_SliderPanel")
-        _add_node_entry(layout, "UI面板注入", 'RESTRICT_VIEW_OFF', "SSMTNode_PostProcess_UIPanel")
         _add_node_entry(layout, "贴图资源去重", 'PACKAGE', "SSMTNode_PostProcess_ResourceMerge")
         _add_node_entry(layout, "缓冲区清理", 'TRASH', "SSMTNode_PostProcess_BufferCleanup")
-        _add_node_entry(layout, "多文件配置", 'FILE_FOLDER', "SSMTNode_PostProcess_MultiFile")
+
+
+class SSMT_MT_NodeMenu_PostProcess_Panel(bpy.types.Menu):
+    bl_label = "面板相关"
+
+    def draw(self, context):
+        layout = self.layout
+        _add_node_entry(layout, "UI面板注入", 'RESTRICT_VIEW_OFF', "SSMTNode_PostProcess_UIPanel")
+        _add_node_entry(layout, "滑块面板", 'GRIP', "SSMTNode_PostProcess_SliderPanel")
+
+
+class SSMT_MT_NodeMenu_PostProcess_AnimDriver(bpy.types.Menu):
+    bl_label = "动画驱动相关"
+
+    def draw(self, context):
+        layout = self.layout
         _add_node_entry(layout, "拖拽交互", 'MOUSE_MOVE', "SSMTNode_PostProcess_DragInteraction")
         _add_node_entry(layout, "动画驱动蓝图", 'ACTION', "SSMTNode_PostProcess_AnimDriver")
+
+
+class SSMT_MT_NodeMenu_PostProcess_Creative(bpy.types.Menu):
+    bl_label = "创意"
+
+    def draw(self, context):
+        layout = self.layout
+        _add_node_entry(layout, "血量检测", 'HEART', "SSMTNode_PostProcess_HealthDetection")
         _add_node_entry(layout, "形态键扩展配置", 'ACTION', "SSMTNode_PostProcess_ShapeKeyExt")
-        _add_node_entry(layout, "贴图切换 V5.1", 'TEXTURE', "SSMTNode_PostProcess_DiffuseSwitch")
         _add_node_entry(layout, "物体切换面板", 'SHADERFX', "SSMTNode_PostProcess_SwapPanel")
+        _add_node_entry(layout, "贴图切换 V5.1", 'TEXTURE', "SSMTNode_PostProcess_DiffuseSwitch")
         _add_node_entry(layout, "RabbitFX贴图后处理", 'LIGHT', "SSMTNode_PostProcess_Glow")
         _add_node_entry(layout, "PS绑定+IB限定", 'SHADERFX', "SSMTNode_PostProcess_PSBinding")
 
@@ -1766,8 +1813,9 @@ def draw_node_add_menu(self, context):
         layout.operator("node.add_node", text="点击计数导出", icon='DRIVER').type = "SSMTNode_AnimDriver_ClickExport"
         return
 
-    layout.menu("SSMT_MT_NodeMenu_Object", text="物体", icon='OBJECT_DATAMODE')
-    layout.menu("SSMT_MT_NodeMenu_ShapeKey", text="形态键", icon='SHAPEKEY_DATA')
+    layout.menu("SSMT_MT_NodeMenu_ModOutput", text="模组输出", icon='EXPORT')
+    layout.menu("SSMT_MT_NodeMenu_ObjectBase", text="物体基础", icon='OBJECT_DATAMODE')
+    layout.menu("SSMT_MT_NodeMenu_Legacy", text="旧版功能", icon='SHAPEKEY_DATA')
     layout.menu("SSMT_MT_NodeMenu_DataType", text="数据类型", icon='FILE_FOLDER')
     layout.menu("SSMT_MT_NodeMenu_VertexGroup", text="顶点组", icon='GROUP_VERTEX')
     layout.menu("SSMT_MT_NodeMenu_Blueprint", text="蓝图", icon='NODETREE')
@@ -1816,8 +1864,9 @@ def draw_node_context_menu(self, context):
         return
 
     layout.separator()
-    layout.menu("SSMT_MT_NodeMenu_Object", text="添加物体节点", icon='OBJECT_DATAMODE')
-    layout.menu("SSMT_MT_NodeMenu_ShapeKey", text="添加形态键节点", icon='SHAPEKEY_DATA')
+    layout.menu("SSMT_MT_NodeMenu_ModOutput", text="添加模组输出节点", icon='EXPORT')
+    layout.menu("SSMT_MT_NodeMenu_ObjectBase", text="添加物体基础节点", icon='OBJECT_DATAMODE')
+    layout.menu("SSMT_MT_NodeMenu_Legacy", text="添加旧版功能节点", icon='SHAPEKEY_DATA')
     layout.menu("SSMT_MT_NodeMenu_DataType", text="添加数据类型节点", icon='FILE_FOLDER')
     layout.menu("SSMT_MT_NodeMenu_VertexGroup", text="添加顶点组节点", icon='GROUP_VERTEX')
     layout.menu("SSMT_MT_NodeMenu_Blueprint", text="添加蓝图节点", icon='NODETREE')
@@ -1895,12 +1944,18 @@ def register():
     bpy.utils.register_class(SSMT_OT_AlignNodes)
     bpy.utils.register_class(SSMT_OT_BatchConnectNodes)
     bpy.utils.register_class(SSMT_MT_ObjectContextMenuSub)
-    bpy.utils.register_class(SSMT_MT_NodeMenu_Object)
-    bpy.utils.register_class(SSMT_MT_NodeMenu_ShapeKey)
+    bpy.utils.register_class(SSMT_MT_NodeMenu_ModOutput)
+    bpy.utils.register_class(SSMT_MT_NodeMenu_ObjectBase)
+    bpy.utils.register_class(SSMT_MT_NodeMenu_Legacy)
     bpy.utils.register_class(SSMT_MT_NodeMenu_DataType)
     bpy.utils.register_class(SSMT_MT_NodeMenu_VertexGroup)
     bpy.utils.register_class(SSMT_MT_NodeMenu_Blueprint)
     bpy.utils.register_class(SSMT_MT_NodeMenu_PostProcess)
+    bpy.utils.register_class(SSMT_MT_NodeMenu_PostProcess_Dynamic)
+    bpy.utils.register_class(SSMT_MT_NodeMenu_PostProcess_Material)
+    bpy.utils.register_class(SSMT_MT_NodeMenu_PostProcess_Panel)
+    bpy.utils.register_class(SSMT_MT_NodeMenu_PostProcess_AnimDriver)
+    bpy.utils.register_class(SSMT_MT_NodeMenu_PostProcess_Creative)
 
     if not _is_add_menu_hooked:
         bpy.types.NODE_MT_add.prepend(draw_node_add_menu)
@@ -1936,12 +1991,18 @@ def unregister():
         bpy.types.VIEW3D_MT_object_context_menu.remove(draw_objects_context_menu_add)
         _is_object_context_menu_hooked = False
 
+    bpy.utils.unregister_class(SSMT_MT_NodeMenu_PostProcess_Creative)
+    bpy.utils.unregister_class(SSMT_MT_NodeMenu_PostProcess_AnimDriver)
+    bpy.utils.unregister_class(SSMT_MT_NodeMenu_PostProcess_Panel)
+    bpy.utils.unregister_class(SSMT_MT_NodeMenu_PostProcess_Material)
+    bpy.utils.unregister_class(SSMT_MT_NodeMenu_PostProcess_Dynamic)
     bpy.utils.unregister_class(SSMT_MT_NodeMenu_PostProcess)
     bpy.utils.unregister_class(SSMT_MT_NodeMenu_Blueprint)
     bpy.utils.unregister_class(SSMT_MT_NodeMenu_VertexGroup)
     bpy.utils.unregister_class(SSMT_MT_NodeMenu_DataType)
-    bpy.utils.unregister_class(SSMT_MT_NodeMenu_ShapeKey)
-    bpy.utils.unregister_class(SSMT_MT_NodeMenu_Object)
+    bpy.utils.unregister_class(SSMT_MT_NodeMenu_Legacy)
+    bpy.utils.unregister_class(SSMT_MT_NodeMenu_ObjectBase)
+    bpy.utils.unregister_class(SSMT_MT_NodeMenu_ModOutput)
     bpy.utils.unregister_class(SSMT_MT_ObjectContextMenuSub)
     bpy.utils.unregister_class(SSMT_OT_BatchConnectNodes)
     bpy.utils.unregister_class(SSMT_OT_AlignNodes)

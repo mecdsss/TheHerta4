@@ -29,8 +29,16 @@ float Similarity(uint w, uint h, out float uiLuma)
     float sim = 0.0; uiLuma = 0.0;
     [unroll] for (uint i = 0u; i < 8u; ++i) {
         float3 a = LoadRGB(UiTexture, probes[i], w, h);
-        float3 b = LoadRGB(ViewportSource, probes[i], w, h);
-        sim += 1.0 - saturate(dot(abs(a - b), 1.0 / 3.0));
+        // The captured character RT can be stored Y-flipped relative to the
+        // UI texture (the display page renders the portrait upside-down into
+        // its own RT and the UI blit unflips it later). Score BOTH source
+        // orientations and keep the better one, so the probe works on the
+        // portrait page as well as on any upright layout.
+        float3 bN = LoadRGB(ViewportSource, probes[i], w, h);
+        float3 bF = LoadRGB(ViewportSource, float2(probes[i].x, 1.0 - probes[i].y), w, h);
+        float sN = 1.0 - saturate(dot(abs(a - bN), 1.0 / 3.0));
+        float sF = 1.0 - saturate(dot(abs(a - bF), 1.0 / 3.0));
+        sim += max(sN, sF);
         uiLuma += dot(a, float3(.2126,.7152,.0722));
     }
     uiLuma *= .125;

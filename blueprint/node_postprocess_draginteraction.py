@@ -161,6 +161,15 @@ class SSMT_DragZoneIncludeRef(bpy.types.PropertyGroup):
     )
 
 
+class SSMT_DragZoneColliderRef(bpy.types.PropertyGroup):
+    """SSMT_DragZoneSettings.collider_objects 里的一项：指向一个作为碰撞体的 MESH 物体。"""
+    object: bpy.props.PointerProperty(
+        name="碰撞体",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'MESH',
+    )
+
+
 class SSMT_DragZoneSettings(bpy.types.PropertyGroup):
     """挂在一个 Empty 上的区域参数（画刷 + 拖拽物理）。"""
 
@@ -174,6 +183,14 @@ class SSMT_DragZoneSettings(bpy.types.PropertyGroup):
         default=True,
     )
     include_objects: bpy.props.CollectionProperty(type=SSMT_DragZoneIncludeRef)
+
+    # 碰撞体对象列表（留空 = 该区域不参与碰撞约束）
+    collider_objects: bpy.props.CollectionProperty(type=SSMT_DragZoneColliderRef)
+    collision_override: bpy.props.IntProperty(
+        name="碰撞开关",
+        description="0=继承节点开关，1=强制开启，2=强制关闭（仅模式三/拉扯模式生效）",
+        default=0, min=0, max=2,
+    )
 
     # 拖拽参数（0 = 继承回退到全局）
     radius: bpy.props.FloatProperty(name="影响半径", default=0.0, min=0.0)
@@ -284,6 +301,47 @@ def _zone_allowed_vertex_mask(settings, vertex_count, triangles, tri_part_names)
     none_sel = tri_names == None  # noqa: E711
     if np.any(none_sel):
         idx = triangles[none_sel].reshape(-1)
+        idx = idx[idx < int(vertex_count)]
+        mask[idx] = True
+    return mask
+
+
+def _collider_allowed_names(settings):
+    """碰撞体列表内物体的候选名（含去重后缀形式，与 _zone_allowed_names 同规约）。"""
+    colliders = getattr(settings, "collider_objects", None) or ()
+    names = set()
+    for item in colliders:
+        obj = getattr(item, "object", None)
+        if obj is None:
+            continue
+        candidates = (getattr(obj, "name", None), getattr(obj, "name_full", None))
+        for candidate in candidates:
+            if not candidate:
+                continue
+            names.add(str(candidate))
+            names.add(str(candidate).rsplit(".", 1)[0])
+            key = _blender_object_key(candidate)
+            if key:
+                names.add(key)
+                names.add(key.rsplit(".", 1)[0])
+    return names
+
+
+def _collider_vertex_mask(settings, vertex_count, triangles, tri_part_names):
+    """烘焙侧：碰撞体列表 → (N,) bool 表示属于碰撞体的顶点；空列表/无拓扑 → None。"""
+    colliders = getattr(settings, "collider_objects", None) or ()
+    if not colliders or len(colliders) == 0:
+        return None
+    allowed_names = _collider_allowed_names(settings)
+    if not allowed_names or triangles is None or tri_part_names is None:
+        return None
+    mask = np.zeros(int(vertex_count), dtype=bool)
+    tri_names = np.asarray(tri_part_names)
+    tri_keys = np.asarray([_blender_object_key(name) for name in tri_part_names], dtype=object)
+    for name in allowed_names:
+        name_key = _blender_object_key(name)
+        tri_sel = (tri_names == name) | (tri_names == name_key) | (tri_keys == name) | (tri_keys == name_key)
+        idx = triangles[tri_sel].reshape(-1)
         idx = idx[idx < int(vertex_count)]
         mask[idx] = True
     return mask
@@ -474,6 +532,55 @@ class SSMT_OT_DragZoneIncludeRemove(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SSMT_OT_DragZoneColliderAdd(bpy.types.Operator):
+    """把当前活动 MESH 物体加入权重球的碰撞体列表。"""
+    bl_idname = "ssmt.drag_zone_collider_add"
+    bl_label = "添加碰撞体"
+    bl_options = {'INTERNAL'}
+
+    empty_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = getattr(context, "active_object", None)
+        if obj is None or getattr(obj, "type", None) != 'MESH':
+            self.report({'WARNING'}, "请先选中一个网格物体")
+            return {'CANCELLED'}
+        empty = bpy.data.objects.get(self.empty_name) if self.empty_name else None
+        if empty is None or not hasattr(empty, "ssmt_drag_zone"):
+            self.report({'WARNING'}, "权重球不存在")
+            return {'CANCELLED'}
+        settings = empty.ssmt_drag_zone
+        for item in settings.collider_objects:
+            if item.object == obj:
+                self.report({'INFO'}, f"{obj.name} 已在碰撞体列表")
+                return {'FINISHED'}
+        item = settings.collider_objects.add()
+        item.object = obj
+        self.report({'INFO'}, f"已加入碰撞体 {obj.name}")
+        return {'FINISHED'}
+
+
+class SSMT_OT_DragZoneColliderRemove(bpy.types.Operator):
+    """从权重球碰撞体列表移除一项。"""
+    bl_idname = "ssmt.drag_zone_collider_remove"
+    bl_label = "移除碰撞体"
+    bl_options = {'INTERNAL'}
+
+    empty_name: bpy.props.StringProperty()
+    index: bpy.props.IntProperty(min=0)
+
+    def execute(self, context):
+        empty = bpy.data.objects.get(self.empty_name) if self.empty_name else None
+        if empty is None or not hasattr(empty, "ssmt_drag_zone"):
+            self.report({'WARNING'}, "权重球不存在")
+            return {'CANCELLED'}
+        settings = empty.ssmt_drag_zone
+        if 0 <= self.index < len(settings.collider_objects):
+            settings.collider_objects.remove(self.index)
+            self.report({'INFO'}, "已移除碰撞体")
+        return {'FINISHED'}
+
+
 # ---------------------------------------------------------------------------
 # 主节点
 # ---------------------------------------------------------------------------
@@ -639,6 +746,37 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         poll=lambda self, obj: obj.type == 'MESH',
     )
 
+    # ---- 碰撞检测（防穿模；仅模式三/拉扯模式生效）----
+    collision_enabled: bpy.props.BoolProperty(
+        name="启用碰撞检测",
+        description="拉扯时被拖拽层顶点逼近指定碰撞体（如大腿）表面即停止，消除穿模；仅在拉扯模式（默认模式 2）下生效",
+        default=False,
+    )
+    collision_margin: bpy.props.FloatProperty(
+        name="碰撞裕量",
+        description="顶点与碰撞体表面保持的最小距离（vb0 局部单位）；吸收蒙皮后的毫米级偏差",
+        default=0.002, min=0.0, max=0.05,
+    )
+    collision_mode: bpy.props.EnumProperty(
+        name="碰撞模式",
+        description="软滑动：只裁法向分量、保留切向（拖拽时沿碰撞体面滑动）；硬钳制：沿位移路径整体二分停止",
+        items=[
+            ('SOFT', "软滑动", "只阻挡向内分量，保留切向滑动（布料贴肤感）"),
+            ('HARD', "硬钳制", "沿位移路径整体停止"),
+        ],
+        default='SOFT',
+    )
+    collision_point_budget: bpy.props.IntProperty(
+        name="点云预算",
+        description="碰撞体点云抽稀后的最大点数（0=不抽稀，用全部碰撞体顶点）；降低可减少显存与查询成本",
+        default=4096, min=0, max=65536,
+    )
+    collision_cell_size: bpy.props.FloatProperty(
+        name="网格边长",
+        description="均匀网格细格边长（vb0 局部单位）；0=按点云平均间距自适应",
+        default=0.0, min=0.0, max=10.0,
+    )
+
     _RUNTIME_VARIABLE_DEFAULTS = {
         "drag_mode_variable_name": "ssmtdrag_drag_enabled",
         "ui_detected_variable_name": "ssmtdrag_ui_detected",
@@ -802,10 +940,35 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     rm_inc = inc_item_row.operator(SSMT_OT_DragZoneIncludeRemove.bl_idname, text="", icon='X')
                     rm_inc.empty_name = obj.name
                     rm_inc.index = inc_index
+                # 碰撞体列表（留空 = 该区域不参与碰撞约束）
+                col_box = sub.box()
+                col_box.label(text="碰撞体（防穿模，留空=不约束）", icon='PHYSICS')
+                col_box.prop(obj.ssmt_drag_zone, "collision_override", text="碰撞开关")
+                col_row = col_box.row(align=True)
+                add_col = col_row.operator(SSMT_OT_DragZoneColliderAdd.bl_idname, text="添加活动物体", icon='ADD')
+                add_col.empty_name = obj.name
+                for col_index, col_item in enumerate(obj.ssmt_drag_zone.collider_objects):
+                    col_item_row = col_box.row(align=True)
+                    col_item_row.prop(col_item, "object", text="")
+                    rm_col = col_item_row.operator(SSMT_OT_DragZoneColliderRemove.bl_idname, text="", icon='X')
+                    rm_col.empty_name = obj.name
+                    rm_col.index = col_index
                 box.separator()
 
         layout.prop(self, "bake_reference_object")
         layout.prop(self, "mask_plateau")
+
+        # 碰撞检测（防穿模）
+        col_box = layout.box()
+        col_box.label(text="碰撞检测（防穿模，仅拉扯模式生效）", icon='PHYSICS')
+        col_box.prop(self, "collision_enabled")
+        if self.collision_enabled:
+            col = col_box.column(align=True)
+            col.prop(self, "collision_mode")
+            col.prop(self, "collision_margin")
+            col.prop(self, "collision_point_budget")
+            col.prop(self, "collision_cell_size")
+            col_box.label(text="在下方区域的「碰撞体」列表中指定被遮挡物体（如大腿）", icon='INFO')
 
         # 权重预览（视口热力图）
         box = layout.box()
@@ -1645,6 +1808,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         self._write_object_map(mod_export_path, sections, comp)
         # 逐三角形物体编号（显隐过滤：几何映射，与权重烘焙同类）
         self._write_triangle_object_ids(mod_export_path, sections, comp)
+        # 碰撞检测资源（仅模式三/拉扯模式；碰撞体未命中仅警告，不阻断拖拽导出）
+        if self._collision_enabled_for_component():
+            self._write_collision_resources(mod_export_path, sections, comp, ns)
         return True
 
     def _write_triangle_object_ids(self, mod_export_path, sections, comp):
@@ -1921,6 +2087,272 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             legacy_path = os.path.join(out_dir, f"{base_name}JiggleMasks{index}.buf")
             if os.path.isfile(legacy_path):
                 os.remove(legacy_path)
+
+    # =======================================================================
+    # 碰撞检测资源烘焙（点云 + 两级均匀网格 + 每顶点 L0）
+    # =======================================================================
+
+    @staticmethod
+    def _collider_vertex_normals(positions, triangles, collider_mask, vertex_count):
+        """碰撞体顶点法线：三角面法线面积加权平均，winding 按碰撞体质心统一朝外。
+
+        面法线用 cross（模长 = 2×面积）即天然面积加权；累加前先统一朝向。
+        返回 (vertex_count, 3) float32 单位法线；非碰撞体顶点为 0。
+        """
+        p = np.asarray(positions, dtype=np.float32)
+        tris = np.asarray(triangles, dtype=np.int64)
+        p0 = p[tris[:, 0]]
+        p1 = p[tris[:, 1]]
+        p2 = p[tris[:, 2]]
+        face_n = np.cross(p1 - p0, p2 - p0).astype(np.float32)  # (M,3) 面积加权未归一化
+
+        # winding 统一：面法线应指向碰撞体质心外侧
+        collider_idx = np.flatnonzero(collider_mask)
+        if len(collider_idx) == 0:
+            return np.zeros((int(vertex_count), 3), dtype=np.float32)
+        centroid = p[collider_idx].mean(axis=0)
+        tri_centroid = (p0 + p1 + p2) / 3.0
+        flip = np.einsum("ij,ij->i", face_n, tri_centroid - centroid) < 0.0
+        face_n[flip] = -face_n[flip]
+
+        normals = np.zeros((int(vertex_count), 3), dtype=np.float32)
+        np.add.at(normals, tris[:, 0], face_n)
+        np.add.at(normals, tris[:, 1], face_n)
+        np.add.at(normals, tris[:, 2], face_n)
+        norms = np.linalg.norm(normals, axis=1, keepdims=True)
+        norms[norms < 1e-12] = 1.0
+        return (normals / norms).astype(np.float32)
+
+    @staticmethod
+    def _decimate_collider_points(points, normals, budget):
+        """体素质心保留抽稀：把点云压到 ≤ budget 点，每格保留距几何质心最近的一点。
+
+        初始格边长按体积/预算反推；因边界效应实际格数可能略超预算，迭代放大
+        格边长（最多 10 次）直到格数 ≤ budget，保证硬上界。
+        """
+        if len(points) <= budget or budget <= 0:
+            return points, normals
+        pts = np.asarray(points, dtype=np.float64)
+        bmin = pts.min(axis=0)
+        bmax = pts.max(axis=0)
+        ext = np.maximum(bmax - bmin, 1e-8)
+        vol = float(np.prod(ext))
+        h = (vol / budget) ** (1.0 / 3.0)
+        cell = None
+        dims = None
+        cid = None
+        for _ in range(10):
+            cell = np.floor((pts - bmin) / h).astype(np.int64)
+            dims = np.floor((bmax - bmin) / h).astype(np.int64) + 1
+            cid = cell[:, 0] + cell[:, 1] * dims[0] + cell[:, 2] * dims[0] * dims[1]
+            if len(np.unique(cid)) <= budget:
+                break
+            h *= 1.1
+        order = np.argsort(cid, kind="stable")
+        sorted_cid = cid[order]
+        boundaries = np.flatnonzero(np.diff(sorted_cid)) + 1
+        starts = np.concatenate([[0], boundaries])
+        ends = np.concatenate([boundaries, [len(sorted_cid)]])
+        keep = []
+        for s, e in zip(starts, ends):
+            idx = order[s:e]
+            c = pts[idx].mean(axis=0)
+            d = np.einsum("ij,ij->i", pts[idx] - c, pts[idx] - c)
+            keep.append(idx[int(np.argmin(d))])
+        keep = np.asarray(keep, dtype=np.int64)
+        return np.asarray(points, dtype=np.float32)[keep], np.asarray(normals, dtype=np.float32)[keep]
+
+    @staticmethod
+    def _build_collider_grid(points, cell_size, margin):
+        """count-sort 均匀网格 + 粗层。返回 dict：
+        - fine_cells: uint32 (cellN,4) 每 cell (offset,count,0,0)
+        - coarse_cells: float32 (coarseN,4) 每 cell (centroid.xyz,R)
+        - dims: (nx,ny,nz) 细格；cdims: 粗格；h: 细格边长；h_c: 粗格边长；bmin
+        points 已按细格重排（返回重排后的顺序引用，与 fine_cells offset 对齐）。
+        """
+        pts = np.asarray(points, dtype=np.float64)
+        bmin = pts.min(axis=0) - margin
+        bmax = pts.max(axis=0) + margin
+        ext = np.maximum(bmax - bmin, 1e-8)
+        if cell_size > 0:
+            h = float(cell_size)
+        else:
+            # 自适应：平均最近邻距的 2.5 倍近似
+            h = 2.5 * (float(np.prod(ext)) / max(len(pts), 1)) ** (1.0 / 3.0)
+        dims = np.maximum(np.floor((bmax - bmin) / h).astype(np.int64) + 1, 1)
+        h_c = h * 4.0
+        cdims = np.maximum(np.floor((bmax - bmin) / h_c).astype(np.int64) + 1, 1)
+
+        cell = np.floor((pts - bmin) / h).astype(np.int64)
+        cell = np.minimum(np.maximum(cell, 0), dims - 1)
+        cid = cell[:, 0] + cell[:, 1] * dims[0] + cell[:, 2] * dims[0] * dims[1]
+        order = np.argsort(cid, kind="stable")
+        sorted_cid = cid[order]
+        sorted_pts = pts[order]
+
+        cell_n = int(dims[0] * dims[1] * dims[2])
+        fine_cells = np.zeros((cell_n, 4), dtype=np.uint32)
+        if len(sorted_pts):
+            boundaries = np.flatnonzero(np.diff(sorted_cid)) + 1
+            starts = np.concatenate([[0], boundaries])
+            ends = np.concatenate([boundaries, [len(sorted_cid)]])
+            for s, e, c in zip(starts, ends, sorted_cid[starts]):
+                fine_cells[int(c), 0] = np.uint32(s)
+                fine_cells[int(c), 1] = np.uint32(e - s)
+
+        # 粗层
+        ccell = np.floor((sorted_pts - bmin) / h_c).astype(np.int64)
+        ccell = np.minimum(np.maximum(ccell, 0), cdims - 1)
+        ccid = ccell[:, 0] + ccell[:, 1] * cdims[0] + ccell[:, 2] * cdims[0] * cdims[1]
+        coarse_n = int(cdims[0] * cdims[1] * cdims[2])
+        coarse_cells = np.zeros((coarse_n, 4), dtype=np.float32)
+        if len(sorted_pts):
+            corder = np.argsort(ccid, kind="stable")
+            c_sorted = ccid[corder]
+            c_pts = sorted_pts[corder]
+            c_boundaries = np.flatnonzero(np.diff(c_sorted)) + 1
+            c_starts = np.concatenate([[0], c_boundaries])
+            c_ends = np.concatenate([c_boundaries, [len(c_sorted)]])
+            for s, e, c in zip(c_starts, c_ends, c_sorted[c_starts]):
+                gp = c_pts[s:e]
+                centroid = gp.mean(axis=0)
+                r = np.sqrt(np.max(np.einsum("ij,ij->i", gp - centroid, gp - centroid), initial=0.0))
+                coarse_cells[int(c), 0:3] = centroid.astype(np.float32)
+                coarse_cells[int(c), 3] = np.float32(r)
+
+        return {
+            "sorted_points": sorted_pts.astype(np.float32),
+            "order": order,
+            "fine_cells": fine_cells,
+            "coarse_cells": coarse_cells,
+            "dims": dims,
+            "cdims": cdims,
+            "h": np.float32(h),
+            "h_c": np.float32(h_c),
+            "bmin": bmin.astype(np.float32),
+        }
+
+    @staticmethod
+    def _bake_collider_l0(positions, points, masked):
+        """每顶点 L0 接触数据：最近碰撞点 q0、表面距离 t0、外向单位法线 n0。
+
+        布局：l0[2i]=(q0.xyz,t0)、l0[2i+1]=(n0.xyz,valid)。未遮顶点 valid=0。
+        分块向量化全量对拍，避免 (V×Nc×3) 一次性内存爆炸。
+        """
+        V = len(positions)
+        l0 = np.zeros((V * 2, 4), dtype=np.float32)
+        if masked is None:
+            idx = np.arange(V)
+        else:
+            idx = np.flatnonzero(np.asarray(masked, dtype=bool))
+        if len(idx) == 0 or len(points) == 0:
+            return l0
+        pts = np.asarray(points, dtype=np.float32)
+        pos = np.asarray(positions, dtype=np.float32)
+        chunk = 512
+        for start in range(0, len(idx), chunk):
+            sel = idx[start:start + chunk]
+            q = pos[sel]  # (c,3)
+            diff = q[:, None, :] - pts[None, :, :]  # (c,Nc,3)
+            d2 = np.einsum("cnk,cnk->cn", diff, diff)
+            j = np.argmin(d2, axis=1)
+            rows = np.arange(len(sel))
+            q0 = pts[j]
+            t0 = np.sqrt(d2[rows, j])
+            n0 = q - q0
+            nn = np.linalg.norm(n0, axis=1, keepdims=True)
+            nn[nn < 1e-12] = 1.0
+            n0 = n0 / nn
+            l0[2 * sel, 0:3] = q0.astype(np.float32)
+            l0[2 * sel, 3] = t0.astype(np.float32)
+            l0[2 * sel + 1, 0:3] = n0.astype(np.float32)
+            l0[2 * sel + 1, 3] = 1.0
+        return l0
+
+    def _collider_l0_mask(self, mod_export_path, sections, comp):
+        """读已烘焙的稀疏权重，返回「任一 zone 权重 > 1e-4」的顶点布尔掩码（L0 只烘焙这些顶点）。"""
+        out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
+        path = os.path.join(out_dir, f"{comp['base_name']}JiggleZoneWeights.buf")
+        if not os.path.isfile(path):
+            return None
+        try:
+            w = np.fromfile(path, dtype=np.float32).reshape(-1, SPARSE_ZONE_SLOTS)
+            return np.any(w > 1e-4, axis=1)
+        except Exception:
+            return None
+
+    def _write_collision_resources(self, mod_export_path, sections, comp, ns):
+        """烘焙碰撞检测资源：ColliderPoints / ColliderCellsFine / ColliderCellsCoarse / ColliderVertexL0。
+
+        返回 True = 已写出；False = 无可烘焙内容（碰撞体选择为空/不在本组件）。
+        """
+        vertex_count = comp["vertex_count"]
+        positions = self._read_position_buf(mod_export_path, sections, comp, vertex_count)
+        if positions is None:
+            print(f"[DragInteraction][WARNING] 碰撞烘焙：{comp['comp_name']} 无法读取 Position.buf，跳过")
+            return False
+
+        result = self._read_component_triangles(mod_export_path, sections, comp, vertex_count)
+        if result is None:
+            print(f"[DragInteraction][WARNING] 碰撞烘焙：{comp['comp_name']} 无法读取 IB 拓扑，跳过")
+            return False
+        triangles, tri_part_names = result
+
+        collider_mask = np.zeros(int(vertex_count), dtype=bool)
+        for _, empty in self._collect_enabled_zone_entries():
+            m = _collider_vertex_mask(empty.ssmt_drag_zone, vertex_count, triangles, tri_part_names)
+            if m is not None:
+                collider_mask |= m
+        if not np.any(collider_mask):
+            print(
+                f"[DragInteraction][WARNING] 碰撞烘焙：{comp['comp_name']} 碰撞体对象未命中本组件任何顶点，"
+                "已跳过（请确认碰撞体属于当前 IB）"
+            )
+            return False
+
+        normals = self._collider_vertex_normals(positions, triangles, collider_mask, vertex_count)
+        collider_idx = np.flatnonzero(collider_mask)
+        points = np.asarray(positions, dtype=np.float32)[collider_idx]
+        point_normals = normals[collider_idx]
+
+        budget = int(getattr(self, "collision_point_budget", 4096) or 0)
+        if budget > 0 and len(points) > budget:
+            points, point_normals = self._decimate_collider_points(points, point_normals, budget)
+
+        margin = float(getattr(self, "collision_margin", 0.002) or 0.0)
+        cell_size = float(getattr(self, "collision_cell_size", 0.0) or 0.0)
+        grid = self._build_collider_grid(points, cell_size, margin)
+
+        masked = self._collider_l0_mask(mod_export_path, sections, comp)
+        l0 = self._bake_collider_l0(positions, grid["sorted_points"], masked)
+
+        out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
+        os.makedirs(out_dir, exist_ok=True)
+        stem = comp["base_name"]
+        # 点云交错布局：每点 2×float4（位置 + 单位法线），法线按网格 count-sort 同一 order 重排
+        reordered_normals = np.asarray(point_normals, dtype=np.float32)[grid["order"]]
+        interleaved = np.zeros((len(grid["sorted_points"]) * 2, 4), dtype=np.float32)
+        interleaved[0::2, 0:3] = grid["sorted_points"]
+        interleaved[1::2, 0:3] = reordered_normals
+        interleaved.tofile(os.path.join(out_dir, f"{stem}ColliderPoints.buf"))
+        grid["fine_cells"].tofile(os.path.join(out_dir, f"{stem}ColliderCellsFine.buf"))
+        grid["coarse_cells"].tofile(os.path.join(out_dir, f"{stem}ColliderCellsCoarse.buf"))
+        l0.tofile(os.path.join(out_dir, f"{stem}ColliderVertexL0.buf"))
+
+        print(
+            f"[DragInteraction] Collision: {comp['comp_name']} "
+            f"({len(collider_idx)} 碰撞体顶点 → {len(grid['sorted_points'])} 点, "
+            f"细格 {tuple(int(d) for d in grid['dims'])}, h={float(grid['h']):.4f})"
+        )
+        # 网格参数回写 comp，供 ini 发射（x102/x103/x104）使用
+        comp["collision_grid"] = {
+            "bmin": grid["bmin"],
+            "h": float(grid["h"]),
+            "h_c": float(grid["h_c"]),
+            "dims": tuple(int(d) for d in grid["dims"]),
+            "cdims": tuple(int(d) for d in grid["cdims"]),
+        }
+        return True
 
     def _read_position_buf(self, mod_export_path, sections, comp, vertex_count):
         """从 ini 的 Position 资源段 filename 解析路径读取顶点坐标（float3×N）。"""
@@ -2263,6 +2695,40 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     @staticmethod
     def _zone_capacity(entries):
         return max(1, max((zone_id for zone_id, _ in entries), default=0) + 1)
+
+    def _collect_collider_objects(self):
+        """返回所有启用区域的碰撞体对象引用列表（考虑 zone 级 collision_override）。
+
+        规则：节点级 collision_enabled 关闭 → 空；否则遍历启用区域，zone 级
+        override==2（强制关）跳过、override==1（强制开）或 override==0（继承）均纳入，
+        收集其 collider_objects 中有效且去重的 MESH 对象。
+        """
+        if not getattr(self, "collision_enabled", False):
+            return []
+        colliders = []
+        seen = set()
+        for _, empty in self._collect_enabled_zone_entries():
+            settings = empty.ssmt_drag_zone
+            try:
+                override = int(getattr(settings, "collision_override", 0) or 0)
+            except (TypeError, ValueError):
+                override = 0
+            if override == 2:
+                continue
+            for item in getattr(settings, "collider_objects", None) or ():
+                obj = getattr(item, "object", None)
+                if obj is None or getattr(obj, "type", None) != 'MESH':
+                    continue
+                key = getattr(obj, "name", None) or id(obj)
+                if key in seen:
+                    continue
+                seen.add(key)
+                colliders.append(obj)
+        return colliders
+
+    def _collision_enabled_for_component(self):
+        """组件级碰撞烘焙/发射开关：节点级开启且至少一个区域配置了碰撞体。"""
+        return len(self._collect_collider_objects()) > 0
 
     def _collect_click_export_drivers(self):
         """扫描同主树「动画驱动蓝图」关联树中的点击计数导出节点，
@@ -2644,6 +3110,24 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "type = Buffer", "format = R32G32B32A32_FLOAT", f"array = {4 * n_parts}",
             f"data = {jp}",
         ]
+        # 碰撞检测资源（防穿模；仅开关开启且已成功烘焙时发射）
+        if comp.get("collision_grid"):
+            comp_resources[f"[ResourceDragColliderPoints_{cn}_{ns}]"] = [
+                "type = Buffer", "format = R32G32B32A32_FLOAT",
+                f"filename = {res_dir}/{stem}ColliderPoints.buf",
+            ]
+            comp_resources[f"[ResourceDragColliderCellsFine_{cn}_{ns}]"] = [
+                "type = Buffer", "format = R32G32B32A32_UINT",
+                f"filename = {res_dir}/{stem}ColliderCellsFine.buf",
+            ]
+            comp_resources[f"[ResourceDragColliderCellsCoarse_{cn}_{ns}]"] = [
+                "type = Buffer", "format = R32G32B32A32_FLOAT",
+                f"filename = {res_dir}/{stem}ColliderCellsCoarse.buf",
+            ]
+            comp_resources[f"[ResourceDragColliderVertexL0_{cn}_{ns}]"] = [
+                "type = Buffer", "format = R32G32B32A32_FLOAT",
+                f"filename = {res_dir}/{stem}ColliderVertexL0.buf",
+            ]
         for sec, lines in comp_resources.items():
             sections.setdefault(sec, lines)
 
@@ -2797,6 +3281,13 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "local $CursorXPast", "local $CursorYPast", "local $WasMouseButtonDown",
             "local $back_x69 = x69", "local $back_y69 = y69",
             "local $back_z69 = z69", "local $back_w69 = w69",
+            # 根源卫生修复：本段也写共享槽 70/72/73（TTL 合成器同名槽），一并存还。
+            "local $back_x70 = x70", "local $back_y70 = y70",
+            "local $back_z70 = z70", "local $back_w70 = w70",
+            "local $back_x72 = x72", "local $back_y72 = y72",
+            "local $back_z72 = z72", "local $back_w72 = w72",
+            "local $back_x73 = x73", "local $back_y73 = y73",
+            "local $back_z73 = z73", "local $back_w73 = w73",
             "",
             "if $isMouseButtonDown == 1",
             "\tif $WasMouseButtonDown == 0",
@@ -2832,6 +3323,25 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "x119 = 0",  # 是否存在 Path Slide；当前节点尚未开放路径模式
             f"y119 = {self._zone_capacity(self._collect_enabled_zone_entries())}",
         ])
+        # 碰撞检测参数（防穿模）：仅在模式三/拉扯模式生效。槽位 101–104 在拖拽着色器族内空闲。
+        # 显式写全（含关闭时的 x101 = 0），遵守「读了必设」残留纪律。
+        collision_grid = comp.get("collision_grid")
+        if collision_grid:
+            drag_mode_var = self._runtime_variable_names(ns)[0]
+            mode = 0 if getattr(self, "collision_mode", 'SOFT') == 'SOFT' else 1
+            margin = self._fmt(float(getattr(self, "collision_margin", 0.002) or 0.0))
+            safety = self._fmt(0.9)
+            bmin = collision_grid["bmin"]
+            nx, ny, nz = collision_grid["dims"]
+            cnx, cny, cnz = collision_grid["cdims"]
+            lines.extend([
+                f"x101 = 1 {margin} {mode} {safety}",
+                f"x102 = {self._fmt(float(bmin[0]))} {self._fmt(float(bmin[1]))} {self._fmt(float(bmin[2]))} {self._fmt(collision_grid['h'])}",
+                f"x103 = {nx} {ny} {nz} {self._fmt(collision_grid['h_c'])}",
+                f"x104 = {drag_mode_var} {cnx} {cny} {cnz}",
+            ])
+        else:
+            lines.extend(["x101 = 0", "x102 = 0", "x103 = 0", "x104 = 0"])
         lines.extend([
             f"cs-t67 = ResourceDragPinnedComponentInfo_{cn}_{ns}",
             f"cs-t68 = ResourceDragJiggleParams_{cn}_{ns}",
@@ -2842,6 +3352,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"cs-t74 = ResourceDragPathProgressState_{ns}",
             f"cs-t75 = ResourceDragZoneParams_{ns}",
             f"cs-u6 = ResourceDragJiggleState_{cn}_{ns}",
+        ])
+        if collision_grid:
+            lines.extend([
+                f"cs-t76 = ResourceDragColliderPoints_{cn}_{ns}",
+                f"cs-t77 = ResourceDragColliderCellsFine_{cn}_{ns}",
+                f"cs-t78 = ResourceDragColliderCellsCoarse_{cn}_{ns}",
+                f"cs-t79 = ResourceDragColliderVertexL0_{cn}_{ns}",
+            ])
+        lines.extend([
             "",
             f"ResourceDragJiggleTempVB0_{cn}_{ns} = vb0",
             "cs-t24 = vb0",
@@ -2855,6 +3374,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "",
             "post x69 = $back_x69", "post y69 = $back_y69",
             "post z69 = $back_z69", "post w69 = $back_w69",
+            "post x70 = $back_x70", "post y70 = $back_y70",
+            "post z70 = $back_z70", "post w70 = $back_w70",
+            "post x72 = $back_x72", "post y72 = $back_y72",
+            "post z72 = $back_z72", "post w72 = $back_w72",
+            "post x73 = $back_x73", "post y73 = $back_y73",
+            "post z73 = $back_z73", "post w73 = $back_w73",
         ])
         sections[sec] = lines
 
@@ -3175,15 +3700,25 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "",
                 f"if {drag_mode_var} >= 1 && $inputMode == 0 && $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1",
                 f"\t$ObjectDetectAllowed_{ns} = 1",
-                f"\trun = CustomShaderDragPinDetected_{ns}",
             ])
+            # 根源卫生修复：UpdateScreenJiggle 等 CustomShader 会写共享 IniParams 槽
+            # 69/70/72/73/97（TTL 合成器读同名槽：alpha/pass/depth/mask/slot）。
+            # 这些槽位是跨 mod 共享的：一旦写入不还原，TTL 的 Push/PopIniParams
+            # 会把污染值保存并原样还原，垃圾跨帧固化（曾导致 86ec 身份探针读到
+            # 被污染的 SLOT_ID=1.05 而把判决写进错误 cell，整条合成链失效）。
+            # 先存后还，杜绝污染外泄。
+            for _slot in ("69", "70", "72", "73", "97"):
+                for _comp in ("x", "y", "z", "w"):
+                    lines.append(f"\t$ssmtdrag_ipbak_{_comp}{_slot} = {_comp}{_slot}")
+            lines.append(f"\trun = CustomShaderDragPinDetected_{ns}")
             for comp in components:
                 lines.append(f"\trun = CustomShaderDragPinComponent{comp['comp_name']}_{ns}")
-            lines.extend([
-                f"\trun = CustomShaderDragUpdateScreenJiggle_{ns}",
-            ])
+            lines.append(f"\trun = CustomShaderDragUpdateScreenJiggle_{ns}")
             if getattr(self, "enable_shapekey_drive", False):
                 lines.append(f"\trun = CustomShaderDragShapeKeyDrive_{ns}")
+            for _slot in ("69", "70", "72", "73", "97"):
+                for _comp in ("x", "y", "z", "w"):
+                    lines.append(f"\t{_comp}{_slot} = $ssmtdrag_ipbak_{_comp}{_slot}")
             lines.extend([
                 "else",
                 f"\t$ObjectDetectAllowed_{ns} = 0",
@@ -3370,6 +3905,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         probe_resources = {
             f"[ResourceDragViewportSource_{ns}]": [],
             f"[ResourceDragViewportLayoutT0_{ns}]": [],
+            f"[ResourceDragViewportTempoO0_{ns}]": [],
             f"[ResourceDragViewportLayoutData_{ns}]": [
                 "type = Texture2D", "mode = mono", "width = 8", "height = 1",
                 "mips = 1", "array = 1", "msaa = 1", "msaa_quality = 0",
@@ -3390,12 +3926,28 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tpost run = CustomShaderDragViewportLayoutProbe_{ns}",
                 "endif",
             ]
+        # 展示页窗口 quad：与 cdc90aee 同族（o0 变换逐条一致，仅 o3 不同——
+        # 探针 GS 只消费 SV_Position，同一套复刻 VS 可直接复用）。
+        # 展示页的角色窗口区域由它绘制，多钩一个 hash 提高窗口矩形的捕获率。
+        so2 = f"[ShaderOverrideDragViewportLayoutProbe2_{ns}]"
+        if so2 not in sections:
+            sections[so2] = [
+                "hash = 8509ae6f43c21eb0",
+                "allow_duplicate_hash = true",
+                f"if $ssmtdrag_viewport_probe_armed_{ns} == 1",
+                f"\tpost run = CustomShaderDragViewportLayoutProbe_{ns}",
+                "endif",
+            ]
 
         # GS 探针：读 ViewportSource（角色 RT）→ 8×1 LayoutData
         probe_sec = f"[CustomShaderDragViewportLayoutProbe_{ns}]"
         if probe_sec not in sections:
             sections[probe_sec] = [
                 f"ResourceDragViewportLayoutT0_{ns} = ref ps-t0",
+                # 保存当前 o0，探针结束后原样还原（对齐 TTL steal 的做法）：
+                # 否则 o0/viewport 会残留 8x1 的 LayoutData，污染同帧后续绘制，
+                # 并让 TTL steal 的 ResourceTempo0 = ref o0 抓到被污染的目标。
+                f"ResourceDragViewportTempoO0_{ns} = ref o0",
                 "run = BuiltInCommandListUnbindAllRenderTargets",
                 "blend = ADD ONE ZERO",
                 "alpha = ADD ONE ZERO",
@@ -3416,6 +3968,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "else",
                 "\tdrawindexed = auto",
                 "endif",
+                "run = BuiltInCommandListUnbindAllRenderTargets",
+                f"o0 = ref ResourceDragViewportTempoO0_{ns}",
+                f"ResourceDragViewportTempoO0_{ns} = null",
             ]
 
         # Decode CS：LayoutData → ViewportFrameAPI（检测着色器 cs-t6 读取它映射光标）
@@ -3532,9 +4087,13 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         last_dispatch = f"$ssmtdrag_last_dispatch_{cn}_{ns}"
         lines = [f"\t; --- DRAG HOOK BEGIN {part_tag}_{ns} ---"]
         if self.enable_viewport_probe:
-            # 视口探针快照：armed 且尚无快照时，抓本帧角色渲染 RT 供探针分析视口矩形
+            # 视口探针快照：armed 时抓本帧角色渲染 RT 供探针分析视口矩形。
+            # 注意：条件里不能写 ResourceDragViewportSource === null —— 该资源是
+            # 空声明占位，3DMigoto 解析期会把它当静态 null 折叠整个 if 块
+            # （日志 "Optimised out post"），导致捕获链从未执行。
+            # 因此无条件抓取（armed 帧内最后一次为准，arm 周期先置 null，语义等价）。
             lines.extend([
-                f"\tif {drag_mode_var} >= 1 && $ssmtdrag_viewport_probe_armed_{ns} == 1 && ResourceDragViewportSource_{ns} === null",
+                f"\tif {drag_mode_var} >= 1 && $ssmtdrag_viewport_probe_armed_{ns} == 1",
                 f"\t\tResourceDragViewportSource_{ns} = copy o0 unless_null",
                 "\tendif",
             ])
@@ -3715,6 +4274,13 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 发布恒读 0、显隐门控误杀全部命中）。
         for oid in self._global_object_oids(components):
             globals_to_add.append(f"global $ssmtdrag_objvis_{ns}_{oid} = 0")
+        # IniParams 卫生修复：存/还共享槽位的备份变量（drag 块 + 手型绘制段引用）
+        for _slot in ("69", "70", "72", "73", "97"):
+            for _comp in ("x", "y", "z", "w"):
+                globals_to_add.append(f"global $ssmtdrag_ipbak_{_comp}{_slot} = 0")
+        for _slot in ("94", "95", "98"):
+            for _comp in ("x", "y", "z", "w"):
+                globals_to_add.append(f"global $ssmtdrag_ipbak_{_comp}{_slot} = 0")
         for g in globals_to_add:
             var = g.split("=", 1)[0].replace("global ", "").replace("persist ", "").strip()
             # 精确匹配变量名（防 $ssmtdrag_objvis_A_3 误匹配 A_37 这类前缀串）
@@ -3898,10 +4464,13 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "endif",
         ])
         if self.enable_viewport_probe:
-            # 视口探针：有快照则解码出视口矩形（供 Detect 的 FrameAPI 光标映射）；
-            # 到节流间隔则清旧快照+FrameAPI 并武装下一代（低频节流，非逐帧拷贝）
+            # 视口探针：armed 则解码视口矩形（供 Detect 的 FrameAPI 光标映射）；
+            # 到节流间隔则清旧快照+FrameAPI 并武装下一代（低频节流，非逐帧拷贝）。
+            # 条件里不能写 ResourceDragViewportSource !== null —— 空声明占位会被
+            # 3DMigoto 解析期折叠（"Optimised out post"），decode 链从未执行。
+            # decode CS 对空/无效 LayoutData 有完整保护（直接返回并清零），无条件运行安全。
             block.extend([
-                f"if {drag_mode_var} >= 1 && $ssmtdrag_viewport_probe_armed_{ns} == 1 && ResourceDragViewportSource_{ns} !== null",
+                f"if {drag_mode_var} >= 1 && $ssmtdrag_viewport_probe_armed_{ns} == 1",
                 f"\trun = CustomShaderDragViewportLayoutDecode_{ns}",
                 "endif",
                 f"if {drag_mode_var} >= 1 && $ssmtdrag_viewport_probe_enabled_{ns} == 1 && time >= $ssmtdrag_viewport_probe_next_time_{ns}",
@@ -3968,6 +4537,20 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\t\trun = CustomShaderDragJiggleCursor_{ns}",
                 "\tendif",
                 f"\tif $ssmtdrag_hand_debug_{ns} >= 1",
+                # 根源卫生修复：手型绘制段写共享 IniParams 槽 83/89-95/98，
+                # 其中 94/95/98 与 TTL 的 layout/mask/lift 槽冲突——先存后还。
+                f"\t\t$ssmtdrag_ipbak_x94 = x94",
+                f"\t\t$ssmtdrag_ipbak_y94 = y94",
+                f"\t\t$ssmtdrag_ipbak_z94 = z94",
+                f"\t\t$ssmtdrag_ipbak_w94 = w94",
+                f"\t\t$ssmtdrag_ipbak_x95 = x95",
+                f"\t\t$ssmtdrag_ipbak_y95 = y95",
+                f"\t\t$ssmtdrag_ipbak_z95 = z95",
+                f"\t\t$ssmtdrag_ipbak_w95 = w95",
+                f"\t\t$ssmtdrag_ipbak_x98 = x98",
+                f"\t\t$ssmtdrag_ipbak_y98 = y98",
+                f"\t\t$ssmtdrag_ipbak_z98 = z98",
+                f"\t\t$ssmtdrag_ipbak_w98 = w98",
                 f"\t\tif $isMouseButtonDown == 1 || $ssmtdrag_rmb_lone_hold_{ns} == 1",
                 f"\t\t\trun = CustomShaderDragPresentHandActionOutline_{ns}",
                 f"\t\t\trun = CustomShaderDragPresentHandAction_{ns}",
@@ -3975,6 +4558,18 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\t\t\trun = CustomShaderDragPresentHandOutline_{ns}",
                 f"\t\t\trun = CustomShaderDragPresentHand_{ns}",
                 "\t\tendif",
+                f"\t\tx94 = $ssmtdrag_ipbak_x94",
+                f"\t\ty94 = $ssmtdrag_ipbak_y94",
+                f"\t\tz94 = $ssmtdrag_ipbak_z94",
+                f"\t\tw94 = $ssmtdrag_ipbak_w94",
+                f"\t\tx95 = $ssmtdrag_ipbak_x95",
+                f"\t\ty95 = $ssmtdrag_ipbak_y95",
+                f"\t\tz95 = $ssmtdrag_ipbak_z95",
+                f"\t\tw95 = $ssmtdrag_ipbak_w95",
+                f"\t\tx98 = $ssmtdrag_ipbak_x98",
+                f"\t\ty98 = $ssmtdrag_ipbak_y98",
+                f"\t\tz98 = $ssmtdrag_ipbak_z98",
+                f"\t\tw98 = $ssmtdrag_ipbak_w98",
                 "\tendif",
                 "endif",
             ])
@@ -4631,6 +5226,7 @@ def _preview_cleanup():
 
 classes = (
     SSMT_DragZoneIncludeRef,
+    SSMT_DragZoneColliderRef,
     SSMT_DragZoneSettings,
     SSMT_DragZoneRef,
     SSMT_OT_DragZoneAdd,
@@ -4638,6 +5234,8 @@ classes = (
     SSMT_OT_DragZonePage,
     SSMT_OT_DragZoneIncludeAdd,
     SSMT_OT_DragZoneIncludeRemove,
+    SSMT_OT_DragZoneColliderAdd,
+    SSMT_OT_DragZoneColliderRemove,
     SSMTNode_PostProcess_DragInteraction,
 )
 

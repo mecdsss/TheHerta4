@@ -3,6 +3,8 @@ __pycache__
 .codex_benchmarks/
 .dbg/
 .kunsdd/
+.dsh/
+.dsh-vision-router/
 # Codex benchmark output directory
 dist/
 DIST/

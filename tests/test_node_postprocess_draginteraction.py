@@ -192,6 +192,8 @@ def _make_node(mod, **props):
         phys_release_kick=0.12, phys_target_follow=1.10,
         mult_radius=1.0, mult_strength=0.333, mult_spring=0.333, mult_damping=1.0,
         zone_objects=[], bake_reference_object=None, mask_plateau=0.0,
+        collision_enabled=False, collision_margin=0.002, collision_mode="SOFT",
+        collision_point_budget=4096, collision_cell_size=0.0,
     )
     defaults.update(props)
     for k, v in defaults.items():
@@ -3099,6 +3101,248 @@ class DragNodeGeodesicTests(unittest.TestCase):
         empty = self._ball()
         f = node._evaluate_zone_field(verts, empty, empty.ssmt_drag_zone, None, None, None)
         self.assertGreater(float(f[7]), 0.0)                     # 无拓扑 → 体积球
+
+
+class DragCollisionTests(unittest.TestCase):
+    """碰撞检测（防穿模）烘焙与发射的纯逻辑测试。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+        cls.NodeCls = cls.mod.SSMTNode_PostProcess_DragInteraction
+
+    # ---- 辅助 ----
+
+    def _collider_item(self, zone_id=0, collider_names=None, override=0, enabled=True):
+        colliders = []
+        for name in (collider_names or []):
+            obj = types.SimpleNamespace(name=name, name_full=name, type='MESH')
+            colliders.append(types.SimpleNamespace(object=obj))
+        settings = types.SimpleNamespace(
+            enabled=enabled, brush_strength=1.0, brush_falloff_k=4.6,
+            radius=0.0, strength=0.0, max_offset=0.0, falloff=0.0, damping=0.0,
+            grabbable=True, include_objects=[], collider_objects=colliders,
+            collision_override=override,
+        )
+        empty = types.SimpleNamespace(name=f"zone_{zone_id}", ssmt_drag_zone=settings, matrix_world=np.eye(4))
+        return types.SimpleNamespace(zone_id=zone_id, zone_object=empty)
+
+    def _emit_with_collision_grid(self):
+        node = _make_node(self.mod, collision_enabled=True)
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        comps[0]["collision_grid"] = {
+            "bmin": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            "h": 0.1, "h_c": 0.4,
+            "dims": (10, 8, 6), "cdims": (3, 2, 2),
+        }
+        node._emit_sections(sections, comps, "testns")
+        return node, sections, comps
+
+    def _emit(self, **props):
+        node = _make_node(self.mod, **props)
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        return node, sections, comps
+
+    # ---- 纯函数烘焙测试 ----
+
+    def test_collider_vertex_normals_face_outward(self):
+        verts = np.array([
+            [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+            [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+        ], dtype=np.float32)
+        tris = np.array([
+            [0, 1, 2], [0, 2, 3],
+            [4, 6, 5], [4, 7, 6],
+            [0, 4, 5], [0, 5, 1],
+            [3, 2, 6], [3, 6, 7],
+            [0, 3, 7], [0, 7, 4],
+            [1, 5, 6], [1, 6, 2],
+        ], dtype=np.int64)
+        mask = np.ones(8, dtype=bool)
+        n = self.NodeCls._collider_vertex_normals(verts, tris, mask, 8)
+        dots = np.einsum("ij,ij->i", n, verts.astype(np.float32))
+        self.assertTrue(np.all(dots > 0.0), f"法线应朝外，dot={dots}")
+
+    def test_decimate_points_within_budget(self):
+        rng = np.random.RandomState(0)
+        pts = rng.rand(3000, 3).astype(np.float32)
+        nrm = np.ones((3000, 3), dtype=np.float32)
+        dec_p, dec_n = self.NodeCls._decimate_collider_points(pts, nrm, 512)
+        self.assertLessEqual(len(dec_p), 512)
+        self.assertEqual(len(dec_p), len(dec_n))
+
+    def test_decimate_points_noop_when_under_budget(self):
+        pts = np.random.RandomState(1).rand(50, 3).astype(np.float32)
+        nrm = np.ones((50, 3), dtype=np.float32)
+        dec_p, dec_n = self.NodeCls._decimate_collider_points(pts, nrm, 512)
+        self.assertEqual(len(dec_p), 50)
+
+    def test_build_collider_grid_invariants(self):
+        rng = np.random.RandomState(2)
+        pts = rng.rand(1000, 3).astype(np.float32)
+        grid = self.NodeCls._build_collider_grid(pts, 0.0, 0.002)
+        # count 总和 = 点数
+        self.assertEqual(int(grid["fine_cells"][:, 1].sum()), len(grid["sorted_points"]))
+        # 非空 cell 的 offset 单调递增（count-sort 布局）
+        nonempty = np.flatnonzero(grid["fine_cells"][:, 1] > 0)
+        offsets = grid["fine_cells"][nonempty, 0].astype(np.int64)
+        self.assertTrue(np.all(np.diff(offsets) > 0))
+        # 粗层每 cell 半径非负且质心在有限范围
+        self.assertTrue(np.all(grid["coarse_cells"][:, 3] >= 0.0))
+
+    def test_bake_collider_l0_matches_bruteforce(self):
+        rng = np.random.RandomState(3)
+        positions = rng.rand(50, 3).astype(np.float32)
+        points = rng.rand(20, 3).astype(np.float32)
+        l0 = self.NodeCls._bake_collider_l0(positions, points, None)
+        for i in range(50):
+            d = np.linalg.norm(positions[i] - points, axis=1)
+            j = int(np.argmin(d))
+            self.assertAlmostEqual(float(l0[2 * i, 3]), float(d[j]), places=5)
+            np.testing.assert_allclose(l0[2 * i, 0:3], points[j], atol=1e-5)
+            expected_n = (positions[i] - points[j]) / max(d[j], 1e-12)
+            np.testing.assert_allclose(l0[2 * i + 1, 0:3], expected_n, atol=1e-4)
+            self.assertEqual(float(l0[2 * i + 1, 3]), 1.0)
+
+    def test_collider_vertex_mask_selects_objects(self):
+        triangles = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+        tri_part_names = np.array(["Thigh", "Stocking"], dtype=object)
+        obj = types.SimpleNamespace(name="Thigh", name_full="Thigh", type='MESH')
+        settings = types.SimpleNamespace(collider_objects=[types.SimpleNamespace(object=obj)])
+        mask = self.mod._collider_vertex_mask(settings, 6, triangles, tri_part_names)
+        np.testing.assert_array_equal(mask, np.array([True, True, True, False, False, False]))
+
+    def test_collider_vertex_mask_empty_list_returns_none(self):
+        settings = types.SimpleNamespace(collider_objects=[])
+        self.assertIsNone(self.mod._collider_vertex_mask(settings, 6, None, None))
+
+    def test_collect_collider_objects_respects_override_and_enabled(self):
+        node = _make_node(self.mod, collision_enabled=True,
+                          zone_objects=[self._collider_item(0, ["Thigh"], override=0)])
+        objs = node._collect_collider_objects()
+        self.assertEqual(len(objs), 1)
+        self.assertEqual(objs[0].name, "Thigh")
+
+        forced_off = _make_node(self.mod, collision_enabled=True,
+                                zone_objects=[self._collider_item(0, ["Thigh"], override=2)])
+        self.assertEqual(forced_off._collect_collider_objects(), [])
+
+        global_off = _make_node(self.mod, collision_enabled=False,
+                                zone_objects=[self._collider_item(0, ["Thigh"], override=0)])
+        self.assertEqual(global_off._collect_collider_objects(), [])
+        self.assertFalse(global_off._collision_enabled_for_component())
+
+    # ---- ini 发射测试 ----
+
+    def test_jiggle_section_emits_collision_bindings_and_params(self):
+        node, sections, comps = self._emit_with_collision_grid()
+        cn = comps[0]["comp_name"]
+        lines = sections[f"[CustomShaderDragJiggle{cn}_testns]"]
+        text = "\n".join(lines)
+        self.assertIn(f"cs-t76 = ResourceDragColliderPoints_{cn}_testns", text)
+        self.assertIn(f"cs-t77 = ResourceDragColliderCellsFine_{cn}_testns", text)
+        self.assertIn(f"cs-t78 = ResourceDragColliderCellsCoarse_{cn}_testns", text)
+        self.assertIn(f"cs-t79 = ResourceDragColliderVertexL0_{cn}_testns", text)
+        # x101: enabled=1 margin=0.002 mode=0(soft) safety=0.9
+        self.assertIn("x101 = 1 0.002 0 0.9", text)
+        self.assertIn("x102 = 0 0 0 0.1", text)
+        self.assertIn("x103 = 10 8 6 0.4", text)
+        # x104 携带 drag_mode 变量（模式三门控在 shader 内再确认）
+        self.assertIn("x104 = $ssmtdrag_drag_enabled_testns 3 2 2", text)
+
+    def test_jiggle_section_without_collision_writes_zero_and_no_bindings(self):
+        node, sections, comps = self._emit()  # 无 collision_grid
+        cn = comps[0]["comp_name"]
+        text = "\n".join(sections[f"[CustomShaderDragJiggle{cn}_testns]"])
+        self.assertIn("x101 = 0", text)
+        self.assertNotIn("cs-t76", text)
+        self.assertNotIn("cs-t79", text)
+
+    def test_component_resources_emit_collider_sections(self):
+        node, sections, comps = self._emit_with_collision_grid()
+        cn = comps[0]["comp_name"]
+        for suffix in ("ColliderPoints", "ColliderCellsFine", "ColliderCellsCoarse", "ColliderVertexL0"):
+            self.assertIn(f"[ResourceDrag{suffix}_{cn}_testns]", sections)
+
+    def test_component_resources_no_collider_sections_by_default(self):
+        node, sections, comps = self._emit()
+        cn = comps[0]["comp_name"]
+        for suffix in ("ColliderPoints", "ColliderCellsFine", "ColliderCellsCoarse", "ColliderVertexL0"):
+            self.assertNotIn(f"[ResourceDrag{suffix}_{cn}_testns]", sections)
+
+    # ---- HLSL 契约 ----
+
+    def test_shader_collision_contract(self):
+        shader = (REPO_ROOT / "Toolset" / "drag_interaction" / "rzm_jiggle_interaction.hlsl").read_text(encoding="utf-8")
+        # 寄存器与 ini 发射的 cs-t76..t79 一致
+        for reg in ("t76", "t77", "t78", "t79"):
+            self.assertIn(f"register({reg})", shader)
+        # 参数宏槽位与 ini 发射的 x101..x104 一致
+        self.assertIn("#define COLLISION_PARAMS    IniParams[101]", shader)
+        self.assertIn("#define COLLISION_BOX       IniParams[102]", shader)
+        self.assertIn("#define COLLISION_GRID      IniParams[103]", shader)
+        self.assertIn("#define COLLISION_META      IniParams[104]", shader)
+        # 模式三门控（拉扯模式）在 shader 内显式再确认
+        self.assertIn("COLLISION_META.x >= 2.0", shader)
+        # 无 while 循环（固定二分 + 固定上限扫描）；排除注释里的 "While" 字样
+        self.assertNotIn("while (", shader)
+        self.assertNotIn("while(", shader)
+
+    # ---- 端到端烘焙 ----
+
+    def test_write_collision_resources_end_to_end(self):
+        import tempfile
+        node = _make_node(self.mod, collision_enabled=True,
+                          zone_objects=[self._collider_item(0, ["Thigh"])])
+        verts = np.array([
+            [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+            [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+        ], dtype=np.float32)
+        tris = np.array([
+            [0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6],
+            [0, 4, 5], [0, 5, 1], [3, 2, 6], [3, 6, 7],
+            [0, 3, 7], [0, 7, 4], [1, 5, 6], [1, 6, 2],
+        ], dtype=np.int64)
+        tri_part_names = np.array(["Thigh"] * 12, dtype=object)
+        node._read_position_buf = lambda *a: verts
+        node._read_component_triangles = lambda *a: (tris, tri_part_names)
+        node._buffer_dir = lambda sections, comp: "Meshes"
+        comp = {"vertex_count": 8, "base_name": "sample", "comp_name": "sample", "parts": []}
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(node._write_collision_resources(td, {}, comp, "testns"))
+            p = Path(td) / "Meshes"
+            self.assertTrue((p / "sampleColliderPoints.buf").exists())
+            self.assertTrue((p / "sampleColliderCellsFine.buf").exists())
+            self.assertTrue((p / "sampleColliderCellsCoarse.buf").exists())
+            self.assertTrue((p / "sampleColliderVertexL0.buf").exists())
+            self.assertIn("collision_grid", comp)
+            # 点云交错布局：每点 2×float4 = 8 float
+            pts = np.fromfile(p / "sampleColliderPoints.buf", dtype=np.float32)
+            self.assertEqual(len(pts) % 8, 0)
+            self.assertEqual(len(pts) // 8, 8)  # 8 碰撞体顶点未抽稀
+            # L0：每顶点 2 float4，共 8 顶点
+            l0 = np.fromfile(p / "sampleColliderVertexL0.buf", dtype=np.float32)
+            self.assertEqual(len(l0), 8 * 2 * 4)
+
+    def test_write_collision_resources_skips_when_no_collider_hits(self):
+        import tempfile
+        node = _make_node(self.mod, collision_enabled=True,
+                          zone_objects=[self._collider_item(0, ["Missing"])])
+        verts = np.random.RandomState(4).rand(4, 3).astype(np.float32)
+        tris = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int64)
+        tri_part_names = np.array(["Other", "Other"], dtype=object)
+        node._read_position_buf = lambda *a: verts
+        node._read_component_triangles = lambda *a: (tris, tri_part_names)
+        node._buffer_dir = lambda sections, comp: "Meshes"
+        comp = {"vertex_count": 4, "base_name": "sample", "comp_name": "sample", "parts": []}
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(node._write_collision_resources(td, {}, comp, "testns"))
+            self.assertNotIn("collision_grid", comp)
 
 
 if __name__ == "__main__":
