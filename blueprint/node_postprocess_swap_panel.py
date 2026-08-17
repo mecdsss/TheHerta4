@@ -1,7 +1,7 @@
-"""
+﻿"""
 物体切换面板 后处理节点
 ================================
-读取蓝图中的「物体切换」节点(SSMTNode_ObjectSwap)，以及 mod 的 ini 中的物体切换配置
+读取蓝图中的物体切换节点、贴图切换后处理节点，以及 mod 的 ini 中的切换配置
 ([KeySwap_*] 段落)，生成一个类似「滑块面板」的图形面板。
 
 面板中为每个物体切换生成一个按钮（没有滑块），点击按钮的行为与按下该切换对应的
@@ -33,6 +33,16 @@ except ImportError:
     VARIABLE_REGISTRY_AVAILABLE = False
 
 try:
+    from .node_postprocess_diffuse_switch import (
+        diffuse_group_hotkey,
+        diffuse_group_option_count,
+        diffuse_group_variable_name,
+    )
+    DIFFUSE_SWITCH_AVAILABLE = True
+except ImportError:
+    DIFFUSE_SWITCH_AVAILABLE = False
+
+try:
     from PIL import Image as PILImage
     from PIL import ImageDraw as PILDraw
     from PIL import ImageFont as PILImageFont
@@ -48,6 +58,14 @@ class SSMT_SwapPanelEntry(bpy.types.PropertyGroup):
     option_count: bpy.props.IntProperty(name="选项数", default=2, min=1, max=1024)
     hotkey: bpy.props.StringProperty(name="按键", default="")
     node_name: bpy.props.StringProperty(name="节点", default="")
+
+
+class SSMT_SwapPanelButtonEntry(bpy.types.PropertyGroup):
+    """One generated control button and its optional custom image."""
+    label: bpy.props.StringProperty(name="功能", default="")
+    hotkey: bpy.props.StringProperty(name="按键", default="", options={'HIDDEN'})
+    variables: bpy.props.StringProperty(name="变量", default="", options={'HIDDEN'})
+    image_path: bpy.props.StringProperty(name="按钮图片", subtype='FILE_PATH', default="")
 
 
 class SSMT_OT_SwapPanel_ParseObject(bpy.types.Operator):
@@ -73,7 +91,7 @@ class SSMT_OT_SwapPanel_ParseObject(bpy.types.Operator):
 class SSMT_OT_SwapPanel_Scan(bpy.types.Operator):
     bl_idname = "ssmt.swap_panel_scan"
     bl_label = "刷新物体切换列表"
-    bl_description = "从蓝图收集物体切换节点，若设置了 INI 文件则同时读取其 [KeySwap_*] 配置"
+    bl_description = "从蓝图收集物体切换与贴图切换节点，并读取 INI 中的 [KeySwap_*] 配置"
     bl_options = {'REGISTER', 'INTERNAL'}
     node_name: bpy.props.StringProperty()
 
@@ -135,6 +153,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     PRESENT_BEGIN = "; ========== SWAP PANEL LOGIC (appended) [{ns}] =========="
     PRESENT_END = "; ========== SWAP PANEL LOGIC END (appended) [{ns}] =========="
     DUP_GUARD = "SWAP PANEL LOGIC (appended)"
+    GUI_GUARD_MARKER = "; @@SSMTSwapPanel:gui_guard:{ns}@@"
 
     create_cumulative_backup: bpy.props.BoolProperty(name="创建累积备份", default=True)
 
@@ -143,8 +162,22 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     zoom_in_key: bpy.props.StringProperty(name="放大", default="up")
     zoom_out_key: bpy.props.StringProperty(name="缩小", default="down")
     drag_key: bpy.props.StringProperty(name="拖拽键", default="VK_LBUTTON")
+    gui_only: bpy.props.BoolProperty(
+        name="GUI全局模式",
+        description="启用后屏蔽物体切换原始按键，只允许使用面板按钮",
+        default=False,
+    )
 
     button_height: bpy.props.FloatProperty(name="按钮高度", default=0.05, min=0.001, max=1.0, precision=4)
+    button_width: bpy.props.FloatProperty(
+        name="按钮默认宽度",
+        description="按钮宽度；设置为 0 时按各按钮图片比例自动计算",
+        default=0.0, min=0.0, max=1.0, precision=4,
+    )
+    buttons_per_row: bpy.props.IntProperty(name="每行按钮数", default=1, min=1, max=1024)
+    button_column_spacing: bpy.props.FloatProperty(name="列间距", default=0.02, min=0.0, max=1.0, precision=4)
+    button_row_spacing: bpy.props.FloatProperty(name="行间距", default=0.02, min=0.0, max=1.0, precision=4)
+    button_top_padding: bpy.props.FloatProperty(name="顶部留白", default=0.03, min=0.0, max=1.0, precision=4)
     panel_min_height: bpy.props.FloatProperty(name="面板最小高度", default=0.75, min=0.01, max=1.0, precision=4)
 
     panel_default_scale: bpy.props.FloatProperty(
@@ -183,6 +216,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
     background_image: bpy.props.StringProperty(name="背景图片", subtype='FILE_PATH', default="")
     button_image: bpy.props.StringProperty(name="按钮图片", subtype='FILE_PATH', default="")
+    button_border_image: bpy.props.StringProperty(name="按钮边框图片", subtype='FILE_PATH', default="")
 
     # ---- 面板背景样式（圆角 + 边框，对背景图应用；自定义背景同样生效）----
     background_corner_radius: bpy.props.IntProperty(name="背景圆角", default=24, min=0, max=100)
@@ -213,6 +247,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     )
 
     swap_panel_entries: bpy.props.CollectionProperty(type=SSMT_SwapPanelEntry)
+    swap_panel_button_entries: bpy.props.CollectionProperty(type=SSMT_SwapPanelButtonEntry)
 
     def _ensure_namespace(self):
         """生成/返回面板实例唯一命名空间（稳定持久，保证位置/缩放跨导出保留）。"""
@@ -284,6 +319,51 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                     new_lines.append(line)
             sections['[Present]'] = new_lines
 
+    def _remove_gui_only_guards(self, sections, ns):
+        """Remove this panel's keyboard guards before regenerating settings."""
+        guard_expr = f"&& ${ns}_gui_only == 0"
+        marker = self.GUI_GUARD_MARKER.format(ns=ns)
+        for sec_name, lines in sections.items():
+            new_lines = []
+            marker_pending = False
+            for line in lines:
+                if marker in line:
+                    marker_pending = True
+                    continue
+                if marker_pending and line.strip().lower().startswith("condition ="):
+                    marker_pending = False
+                    continue
+                marker_pending = False
+                if line.strip().lower().startswith("condition =") and guard_expr in line:
+                    line = line.replace(guard_expr, "").rstrip()
+                new_lines.append(line)
+            sections[sec_name] = new_lines
+
+    def _apply_gui_only_guards(self, sections, ns, buttons):
+        """Gate the original KeySwap sections while leaving panel commands free."""
+        if not self.gui_only:
+            return
+        variables = set()
+        for button in buttons:
+            variables.update(button.get("var_names") or [button.get("var_name", "")])
+        guard = f"${ns}_gui_only == 0"
+        marker = self.GUI_GUARD_MARKER.format(ns=ns)
+        for sec_name, lines in sections.items():
+            if not re.match(r"^\[KeySwap_[^\]]+\]$", sec_name.strip()):
+                continue
+            if not any(re.match(rf"^\s*{re.escape(var)}\s*=", line) for var in variables for line in lines):
+                continue
+            condition_index = next(
+                (index for index, line in enumerate(lines)
+                 if line.strip().lower().startswith("condition =")),
+                None,
+            )
+            if condition_index is None:
+                lines.insert(0, marker)
+                lines.insert(1, f"condition = {guard}")
+            elif guard not in lines[condition_index]:
+                lines[condition_index] = f"{lines[condition_index]} && {guard}"
+
     # ==========================================
     # UI
     # ==========================================
@@ -311,6 +391,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         col.prop(self, "zoom_in_key", text="放大")
         col.prop(self, "zoom_out_key", text="缩小")
         col.prop(self, "drag_key", text="拖拽键")
+        col.prop(self, "gui_only", text="GUI全局模式")
 
         box = col_left.box()
         box.label(text="UI尺寸设置", icon='PROPERTIES')
@@ -318,6 +399,12 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         col.prop(self, "panel_default_scale", text="面板默认缩放")
         col.separator()
         col.prop(self, "button_height", text="按钮高度")
+        col.prop(self, "button_width", text="按钮默认宽度")
+        col.prop(self, "buttons_per_row", text="每行按钮数")
+        row = col.row(align=True)
+        row.prop(self, "button_column_spacing", text="列间距")
+        row.prop(self, "button_row_spacing", text="行间距")
+        col.prop(self, "button_top_padding", text="顶部留白")
         col.prop(self, "panel_min_height", text="面板最小高度")
         col.label(text="按钮/面板背景尺寸按图片比例自动计算", icon='INFO')
 
@@ -330,7 +417,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         box.prop(self, "detect_index_count", text="IndexCount")
 
         box = col_left.box()
-        box.label(text="物体切换按钮列表", icon='SHADERFX')
+        box.label(text="物体/贴图切换按钮列表", icon='SHADERFX')
         row = box.row(align=True)
         row.operator("ssmt.swap_panel_scan", text="刷新列表", icon='FILE_REFRESH').node_name = self.name
         box.label(text="修改设置后点顶部「应用设置到Mod」即可原地更新", icon='INFO')
@@ -367,8 +454,17 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         box = col_right.box()
         box.label(text="面板图片资源（自定义）", icon='TEXTURE')
         box.prop(self, "background_image", text="背景")
-        box.prop(self, "button_image", text="按钮")
-        box.label(text="留空则自动生成默认按钮图片", icon='INFO')
+        box.prop(self, "button_image", text="按钮全局回退")
+        box.prop(self, "button_border_image", text="按钮边框")
+        box.label(text="单独按钮图片优先；留空时使用全局回退或自动生成", icon='INFO')
+        box.label(text="边框会缩放并叠加到所有按钮，建议使用透明PNG", icon='INFO')
+        if self.swap_panel_button_entries:
+            box.separator()
+            box.label(text="各控制按钮图片", icon='IMAGE_DATA')
+            for entry in self.swap_panel_button_entries:
+                row = box.row(align=True)
+                row.label(text=entry.label or "(无备注)", icon='NONE')
+                row.prop(entry, "image_path", text="")
 
         box = col_right.box()
         box.label(text="面板背景样式（圆角/边框）", icon='MATERIAL')
@@ -409,6 +505,32 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         except Exception:
             return []
 
+    def _collect_diffuse_groups(self):
+        """Collect enabled V5.1 diffuse groups from this and nested blueprints."""
+        tree = getattr(self, "id_data", None)
+        if tree is None or not DIFFUSE_SWITCH_AVAILABLE:
+            return []
+        collected = []
+        visited = set()
+
+        def collect(current_tree):
+            tree_key = getattr(current_tree, "name", str(id(current_tree)))
+            if tree_key in visited:
+                return
+            visited.add(tree_key)
+            for node in current_tree.nodes:
+                if node.bl_idname == 'SSMTNode_PostProcess_DiffuseSwitch' and not node.mute:
+                    for group in node.groups:
+                        collected.append((node, group))
+                elif node.bl_idname == 'SSMTNode_Blueprint_Nest' and not node.mute:
+                    blueprint_name = str(getattr(node, "blueprint_name", "") or "")
+                    nested = bpy.data.node_groups.get(blueprint_name) if blueprint_name and blueprint_name != "NONE" else None
+                    if nested and getattr(nested, "bl_idname", "") == "SSMTBlueprintTreeType":
+                        collect(nested)
+
+        collect(tree)
+        return collected
+
     def _refresh_entries(self):
         """刷新节点 UI 中的物体切换列表：蓝图节点 + 可选 INI 配置。"""
         self._ensure_namespace()
@@ -431,7 +553,29 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             entry.node_name = node.name
             idx_map[var] = len(self.swap_panel_entries) - 1
 
-        # 2. 可选：从 INI 读取 [KeySwap_*] 配置并合并（覆盖备注/选项数/按键）
+        # 2. 蓝图贴图切换节点：每个组对应一个多状态切换功能。
+        for node, group in self._collect_diffuse_groups():
+            var = diffuse_group_variable_name(group)
+            if not var:
+                continue
+            if var in idx_map:
+                entry = self.swap_panel_entries[idx_map[var]]
+                comment = str(getattr(group, "comment", "") or getattr(group, "name", "") or "").strip()
+                if comment and comment not in entry.comment.split(" / "):
+                    entry.comment = " / ".join(part for part in (entry.comment, comment) if part)
+                entry.option_count = max(entry.option_count, diffuse_group_option_count(group))
+                if not entry.hotkey:
+                    entry.hotkey = diffuse_group_hotkey(group)
+                continue
+            entry = self.swap_panel_entries.add()
+            entry.variable_name = var
+            entry.comment = str(getattr(group, "comment", "") or getattr(group, "name", "") or "")
+            entry.option_count = diffuse_group_option_count(group)
+            entry.hotkey = diffuse_group_hotkey(group)
+            entry.node_name = f"{node.name}:{getattr(group, 'name', '')}"
+            idx_map[var] = len(self.swap_panel_entries) - 1
+
+        # 3. 可选：从 INI 读取 [KeySwap_*] 配置并合并（覆盖备注/选项数/按键）
         ini_path = (self.ini_file_path or "").strip()
         if ini_path and os.path.isfile(ini_path):
             ini_swaps = self._parse_ini_key_swaps(ini_path)
@@ -451,7 +595,66 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                     entry.option_count = s["option_count"]
                     entry.hotkey = s["key"]
                     entry.node_name = ""
+        self._refresh_button_image_entries()
         return len(self.swap_panel_entries)
+
+    def _refresh_button_image_entries(self):
+        """Build one image input per generated control button.
+
+        Controls with the same non-empty hotkey share one image input, just as
+        they share one runtime button. Existing paths are retained on refresh.
+        """
+        old_images = {}
+        for entry in self.swap_panel_button_entries:
+            key = self._normalize_hotkey(entry.hotkey)
+            if key:
+                old_images[key] = entry.image_path
+            elif entry.variables:
+                for var_name in entry.variables.split("|"):
+                    old_images[f"var:{var_name}"] = entry.image_path
+
+        groups = OrderedDict()
+        for index, entry in enumerate(self.swap_panel_entries):
+            hotkey = self._normalize_hotkey(entry.hotkey)
+            group_key = hotkey if hotkey else f"__unbound_{index}"
+            group = groups.get(group_key)
+            if group is None:
+                group = {
+                    "hotkey": entry.hotkey,
+                    "variables": [],
+                    "labels": [],
+                }
+                groups[group_key] = group
+            var_name = (entry.variable_name or "").strip()
+            if var_name:
+                group["variables"].append(var_name)
+            label = (entry.comment or "").strip() or var_name or "(无备注)"
+            if label not in group["labels"]:
+                group["labels"].append(label)
+
+        self.swap_panel_button_entries.clear()
+        for group_key, group in groups.items():
+            button_entry = self.swap_panel_button_entries.add()
+            button_entry.hotkey = group["hotkey"]
+            button_entry.variables = "|".join(group["variables"])
+            button_entry.label = " / ".join(group["labels"])
+            if group_key.startswith("__unbound_"):
+                button_entry.image_path = next(
+                    (old_images.get(f"var:{var_name}", "") for var_name in group["variables"] if old_images.get(f"var:{var_name}", "")),
+                    "",
+                )
+            else:
+                button_entry.image_path = old_images.get(group_key, "")
+
+    def _button_image_for_source(self, hotkey, var_name):
+        """Return the custom image configured for a generated control."""
+        normalized = self._normalize_hotkey(hotkey)
+        for entry in self.swap_panel_button_entries:
+            if normalized and self._normalize_hotkey(entry.hotkey) == normalized:
+                return (entry.image_path or "").strip()
+            if not normalized and var_name in (entry.variables or "").split("|"):
+                return (entry.image_path or "").strip()
+        return ""
 
     # ==========================================
     # INI 解析
@@ -527,18 +730,19 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             print(f"写入INI文件失败: {e}")
 
     def _parse_ini_key_swaps(self, ini_path):
-        """解析 ini 中所有 [KeySwap_N] 段落，返回 [{index,var_name,comment,key,option_count}]。"""
+        """Parse numeric object swaps and named V5.1 diffuse KeySwap sections."""
         result = self._read_ini_to_ordered_dict(ini_path)
         if result is None or not result[0]:
             return []
         sections, _, _ = result
 
         swaps = []
-        for section_name, lines in sections.items():
-            m = re.match(r'^\[KeySwap_(\d+)\]$', section_name.strip())
-            if not m:
+        for order, (section_name, lines) in enumerate(sections.items()):
+            numeric_match = re.match(r'^\[KeySwap_(\d+)\]$', section_name.strip())
+            diffuse_match = re.match(r'^\[KeySwap_Diffuse_[^\]]+\]$', section_name.strip())
+            if not numeric_match and not diffuse_match:
                 continue
-            index = int(m.group(1))
+            index = int(numeric_match.group(1)) if numeric_match else 1000000 + order
             entry = {"index": index, "var_name": "", "comment": "", "key": "", "option_count": 2}
             for line in lines:
                 s = line.strip()
@@ -570,41 +774,128 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     def _build_button_list(self, target_ini_file):
         """构建按钮数据列表。
 
-        优先顺序：
-        1. 用户显式指定的 INI 文件（ini_file_path）
-        2. 目标 mod 导出 ini 中的 [KeySwap_*] 段落
-        3. 蓝图物体切换节点（回退）
+        INI configuration takes priority, then blueprint nodes fill in remarks
+        and any switch functions that have not been written yet.
         """
-        # 1. 显式指定 INI
+        buttons = []
+        by_variable = {}
+
+        def add_button(item):
+            var_name = str(item.get("var_name") or "").strip()
+            if not var_name:
+                return
+            existing = by_variable.get(var_name)
+            if existing is not None:
+                comment = str(item.get("comment") or "").strip()
+                old_comment = str(existing.get("comment") or "").strip()
+                if comment and comment not in old_comment.split(" / "):
+                    existing["comment"] = " / ".join(part for part in (old_comment, comment) if part)
+                if not existing.get("hotkey") and item.get("hotkey"):
+                    existing["hotkey"] = item["hotkey"]
+                existing["option_count"] = max(
+                    int(existing.get("option_count", 2) or 2),
+                    int(item.get("option_count", 2) or 2),
+                )
+                return
+            by_variable[var_name] = item
+            buttons.append(item)
+
+        # 1. Explicit INI takes priority; otherwise inspect the generated INI.
         explicit = (self.ini_file_path or "").strip()
+        ini_swaps = []
         if explicit and os.path.isfile(explicit):
             ini_swaps = self._parse_ini_key_swaps(explicit)
-            if ini_swaps:
-                return [{"var_name": s["var_name"], "comment": s["comment"],
-                         "option_count": s["option_count"], "hotkey": s["key"]} for s in ini_swaps]
+        if not ini_swaps:
+            ini_swaps = self._parse_ini_key_swaps(target_ini_file)
+        for swap in ini_swaps:
+            add_button({
+                "var_name": swap["var_name"],
+                "comment": swap["comment"],
+                "option_count": swap["option_count"],
+                "hotkey": swap["key"],
+                "image_path": self._button_image_for_source(swap["key"], swap["var_name"]),
+            })
 
-        # 2. 目标 ini
-        ini_swaps = self._parse_ini_key_swaps(target_ini_file)
-        if ini_swaps:
-            return [{"var_name": s["var_name"], "comment": s["comment"],
-                     "option_count": s["option_count"], "hotkey": s["key"]} for s in ini_swaps]
-
-        # 3. 蓝图节点
-        buttons = []
-        nodes = self._collect_swap_nodes()
-        for node in nodes:
+        # 2. Fill from blueprint object switches.
+        for node in self._collect_swap_nodes():
             if not VARIABLE_REGISTRY_AVAILABLE:
-                break
+                continue
             var = get_node_variable_name(node)
             if not var:
                 continue
-            buttons.append({
+            add_button({
                 "var_name": var,
                 "comment": str(getattr(node, "comment", "") or ""),
                 "option_count": max(1, int(getattr(node, "input_slot_count", 2) or 2)),
                 "hotkey": str(getattr(node, "hotkey", "") or ""),
+                "image_path": self._button_image_for_source(
+                    str(getattr(node, "hotkey", "") or ""), var
+                ),
             })
-        return buttons
+
+        # 3. Fill from every V5.1 diffuse group in this blueprint.
+        for _node, group in self._collect_diffuse_groups():
+            var = diffuse_group_variable_name(group)
+            hotkey = diffuse_group_hotkey(group)
+            add_button({
+                "var_name": var,
+                "comment": str(getattr(group, "comment", "") or getattr(group, "name", "") or ""),
+                "option_count": diffuse_group_option_count(group),
+                "hotkey": hotkey,
+                "image_path": self._button_image_for_source(hotkey, var),
+            })
+        return self._merge_buttons_by_hotkey(buttons)
+
+    @staticmethod
+    def _normalize_hotkey(value):
+        """Return a stable comparison key for an INI key binding."""
+        tokens = str(value or "").strip().lower().split()
+        if tokens and tokens[0] == "no_modifiers":
+            tokens = tokens[1:]
+        return " ".join(token[3:] if token.startswith("vk_") else token for token in tokens)
+
+    @classmethod
+    def _merge_buttons_by_hotkey(cls, buttons):
+        """Merge controls sharing the same non-empty hotkey.
+
+        A merged button keeps all variables and option counts so its command
+        list can cycle every KeySwap that the original key would trigger.
+        Empty bindings stay separate because they are not an actual shared key.
+        """
+        merged = []
+        by_hotkey = {}
+        for source_index, button in enumerate(buttons):
+            var_name = str(button.get("var_name") or "").strip()
+            if not var_name:
+                continue
+            hotkey = cls._normalize_hotkey(button.get("hotkey"))
+            group_key = hotkey if hotkey else f"__unbound_{source_index}"
+            group_index = by_hotkey.get(group_key)
+            if group_index is None:
+                item = dict(button)
+                item["var_names"] = [var_name]
+                item["option_counts"] = [max(1, int(button.get("option_count", 2) or 2))]
+                item["image_paths"] = [str(button.get("image_path") or "").strip()]
+                item["comments"] = []
+                if str(button.get("comment") or "").strip():
+                    item["comments"].append(str(button["comment"]).strip())
+                merged.append(item)
+                if hotkey:
+                    by_hotkey[group_key] = len(merged) - 1
+                continue
+
+            item = merged[group_index]
+            item["var_names"].append(var_name)
+            item["option_counts"].append(max(1, int(button.get("option_count", 2) or 2)))
+            item["image_paths"].append(str(button.get("image_path") or "").strip())
+            comment = str(button.get("comment") or "").strip()
+            if comment and comment not in item["comments"]:
+                item["comments"].append(comment)
+            item["comment"] = " / ".join(item["comments"])
+        for item in merged:
+            item["comment"] = " / ".join(item.pop("comments", []))
+            item["image_path"] = next((path for path in item.pop("image_paths", []) if path), "")
+        return merged
 
     @staticmethod
     def _cycle_command_lines(var, option_count):
@@ -698,11 +989,40 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             print(f"[物体切换面板] 生成文字图标失败: {e}")
             return None
 
+    def _apply_button_border_image(self, dest_path):
+        """Alpha-composite the configured border over one final button image."""
+        border_path = (self.button_border_image or "").strip()
+        if not border_path or not os.path.isfile(border_path):
+            return dest_path
+        if not PIL_AVAILABLE or not dest_path or not os.path.isfile(dest_path):
+            print("[物体切换面板] 无法叠加按钮边框：Pillow不可用或按钮图片不存在")
+            return dest_path
+        try:
+            with PILImage.open(dest_path) as base_source:
+                base = base_source.convert('RGBA')
+            with PILImage.open(border_path) as border_source:
+                border = border_source.convert('RGBA')
+            if border.size != base.size:
+                resampling = getattr(PILImage, "Resampling", PILImage)
+                border = border.resize(base.size, resampling.LANCZOS)
+            PILImage.alpha_composite(base, border).save(dest_path)
+        except Exception as e:
+            print(f"[物体切换面板] 叠加按钮边框失败: {e}")
+        return dest_path
+
     def _ensure_button_image(self, dest_res_dir, ns, i, source_asset_dir, button):
         """生成第 i 个按钮的图标图片，返回路径。
-        优先：备注文字图标 → 用户按钮图 → 默认圆角按钮图。"""
+        优先：该按钮自定义图片 → 全局按钮图片 → 备注文字图标 → 默认圆角按钮图；
+        最后将统一按钮边框图片叠加到成品上。"""
         dest_name = f"swpbtn_{ns}_{i}.png"
         dest_path = os.path.join(dest_res_dir, dest_name)
+
+        custom = (button.get("image_path") or "").strip()
+        if not custom:
+            custom = (self.button_image or "").strip()
+        if custom and os.path.isfile(custom):
+            shutil.copy2(custom, dest_path)
+            return self._apply_button_border_image(dest_path)
 
         comment = (button.get("comment") or "").strip()
         if self.use_remark_as_icon and comment:
@@ -719,12 +1039,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 opacity=self.button_opacity,
             )
             if generated:
-                return generated
-
-        custom = (self.button_image or "").strip()
-        if custom and os.path.isfile(custom):
-            shutil.copy2(custom, dest_path)
-            return dest_path
+                return self._apply_button_border_image(generated)
 
         if PIL_AVAILABLE:
             try:
@@ -743,14 +1058,14 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                     draw.rectangle([0, 0, 383, 63], fill=bg_rgb + (btn_alpha,),
                                    outline=bd_rgb + (btn_alpha,))
                 img.save(dest_path)
-                return dest_path
+                return self._apply_button_border_image(dest_path)
             except Exception as e:
                 print(f"生成默认按钮图片失败: {e}")
 
         fallback = os.path.join(source_asset_dir, "0.png")
         if os.path.exists(fallback):
             shutil.copy2(fallback, dest_path)
-            return dest_path
+            return self._apply_button_border_image(dest_path)
         return None
 
     def _generate_background_image(self, dest_path, panel_w, panel_h, use_existing=False):
@@ -866,6 +1181,8 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             print("未检测到任何物体切换节点 / [KeySwap_*] 配置，跳过面板生成")
             return False
         num_buttons = len(buttons)
+        buttons_per_row = max(1, min(int(self.buttons_per_row or 1), num_buttons))
+        num_rows = max(1, int(math.ceil(num_buttons / float(buttons_per_row))))
 
         # 2. 复制资源（shader + 背景图 + 按钮图）
         try:
@@ -905,23 +1222,29 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                     pass
             bg_aspect = (bg_img_w / bg_img_h) if (bg_img_w and bg_img_h) else None
 
-            # 生成每个按钮图标，并按「按钮高度×各图片宽高比」计算渲染宽度（保持图片比例不变形）
+            # 生成每个按钮图标；宽度为 0 时按图片比例自动计算，否则使用统一宽度。
             btn_w_list = []
             max_btn_w = 0.0
             for i, b in enumerate(buttons, start=1):
                 img_path = self._ensure_button_image(dest_res_dir, ns, i, source_asset_dir, b)
-                btn_w_i = btn_h * 3.0 * SCREEN_RATIO_CORRECTION  # 缺省按 3:1 比例
-                if img_path and PIL_AVAILABLE:
-                    try:
-                        with PILImage.open(img_path) as img:
-                            w, h = img.size
-                            if h > 0:
-                                btn_w_i = btn_h * (w / h) * SCREEN_RATIO_CORRECTION
-                    except Exception:
-                        pass
+                btn_w_i = float(self.button_width or 0.0)
+                if btn_w_i <= 0.0:
+                    btn_w_i = btn_h * 3.0 * SCREEN_RATIO_CORRECTION  # 缺省按 3:1 比例
+                    if img_path and PIL_AVAILABLE:
+                        try:
+                            with PILImage.open(img_path) as img:
+                                w, h = img.size
+                                if h > 0:
+                                    btn_w_i = btn_h * (w / h) * SCREEN_RATIO_CORRECTION
+                        except Exception:
+                            pass
                 btn_w_list.append(btn_w_i)
                 if btn_w_i > max_btn_w:
                     max_btn_w = btn_w_i
+            column_widths = [0.0 for _ in range(buttons_per_row)]
+            for i, btn_w_i in enumerate(btn_w_list):
+                column_widths[i % buttons_per_row] = max(column_widths[i % buttons_per_row], btn_w_i)
+            grid_width = sum(column_widths) + max(0, (buttons_per_row - 1) * self.button_column_spacing)
         except Exception as e:
             print(f"准备和复制资源文件时出错: {e}")
             return False
@@ -938,25 +1261,24 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             if '[Present]' in sections and any(self.DUP_GUARD in l for l in sections['[Present]']):
                 print("检测到旧格式的物体切换面板配置（无标识标记）。请先重新导出一次 mod 以生成带标识的新配置。")
                 return False
+        self._remove_gui_only_guards(sections, ns)
 
         # 4. 生成面板配置（面板背景宽度按「面板高度×背景图片宽高比」推导，保持背景比例）
         btn_h = self.button_height
 
-        top_bottom_padding = 0.03
-        spacing = 0.02
-        total_button_height = num_buttons * btn_h
-        total_spacing_height = max(0, (num_buttons - 1) * spacing)
-        parent_height = total_button_height + total_spacing_height + (top_bottom_padding * 2)
-        # 面板最小高度：自动计算高度过小时使用设置值
+        top_padding = self.button_top_padding
+        bottom_padding = 0.03
+        side_padding = 0.02
+        total_button_height = num_rows * btn_h
+        total_spacing_height = max(0, (num_rows - 1) * self.button_row_spacing)
+        parent_height = total_button_height + total_spacing_height + top_padding + bottom_padding
         parent_height = max(parent_height, self.panel_min_height)
 
-        # 面板背景尺寸：高度 = 按钮堆叠高度；宽度 = 面板高度 × 实际背景图宽高比（严格按所选图片自动计算）
-        # 若无法读取背景图比例，则退化为仅包住最宽按钮（不采用任何固定比例）
         if bg_aspect:
             derived_bg_width = parent_height * bg_aspect * SCREEN_RATIO_CORRECTION
-            adjusted_panel_bg_width = max(derived_bg_width, max_btn_w + 0.04)
+            adjusted_panel_bg_width = max(derived_bg_width, grid_width + (side_padding * 2))
         else:
-            adjusted_panel_bg_width = max_btn_w + 0.04
+            adjusted_panel_bg_width = grid_width + (side_padding * 2)
 
         # 生成/处理面板背景（圆角+边框）：无论是否自定义背景图都生效
         bg_custom = (self.background_image or "").strip()
@@ -976,9 +1298,20 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
         # 每个按钮固定行位置（相对父级高度）
         fixed_rel_y = []
-        for i in range(1, num_buttons + 1):
-            offset_y = top_bottom_padding + (i - 1) * (btn_h + spacing) + (btn_h / 2)
+        fixed_rel_x = []
+        grid_left = side_padding
+        if self.button_align == 'RIGHT':
+            grid_left = adjusted_panel_bg_width - side_padding - grid_width
+        elif self.button_align == 'CENTER':
+            grid_left = (adjusted_panel_bg_width - grid_width) * 0.5
+
+        for i in range(num_buttons):
+            row_index = i // buttons_per_row
+            col_index = i % buttons_per_row
+            offset_y = top_padding + row_index * (btn_h + self.button_row_spacing) + (btn_h / 2)
             fixed_rel_y.append(offset_y / parent_height)
+            offset_x = grid_left + sum(column_widths[:col_index]) + (col_index * self.button_column_spacing) + ((column_widths[col_index] - btn_w_list[i]) / 2.0)
+            fixed_rel_x.append(offset_x / adjusted_panel_bg_width)
 
         constants_additions = []
         present_additions = []
@@ -999,8 +1332,12 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 f"global ${ns}_btn_width{i} = {btn_w_list[i-1]:.4f}",
                 f"; @@{self.PANEL_TAG}:btn_height_{i}@@",
                 f"global ${ns}_btn_height{i} = {btn_h:.4f}",
+                f"global ${ns}_btn_render_width{i}",
+                f"global ${ns}_btn_render_height{i}",
                 f"; @@{self.PANEL_TAG}:fixed_rel_y_{i}@@",
                 f"global ${ns}_fixed_rel_y{i} = {fixed_rel_y[i-1]:.4f}",
+                f"; @@{self.PANEL_TAG}:fixed_rel_x_{i}@@",
+                f"global ${ns}_fixed_rel_x{i} = {fixed_rel_x[i-1]:.4f}",
                 f"global ${ns}_rel_y{i}",
                 f"global ${ns}_btn_x{i}", f"global ${ns}_btn_y{i}", f"global ${ns}_btn_pressed{i} = 0",
             ])
@@ -1016,12 +1353,15 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             f"global persist ${ns}_zoom0 = {self.panel_default_scale:.2f}",
             f"global ${ns}_norm_width0", f"global ${ns}_norm_height0",
             f"global ${ns}_btn_click_processed = 0",
+            f"; @@{self.PANEL_TAG}:gui_only@@",
+            f"global ${ns}_gui_only = {1 if self.gui_only else 0}",
         ])
         # 确保每个切换变量已声明（若 ini 中已存在会自动去重）
         for b in buttons:
-            var_line = f"global persist {b['var_name']} = 0"
-            if var_line not in constants_additions:
-                constants_additions.append(var_line)
+            for var_name in (b.get("var_names") or [b["var_name"]]):
+                var_line = f"global persist {var_name} = 0"
+                if var_line not in constants_additions:
+                    constants_additions.append(var_line)
         constants_additions.append(self.BLOCK_END.format(ns=ns))
 
         detect_lines = []
@@ -1077,7 +1417,14 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
         # 每个按钮的循环切换 CommandList（等价于按下对应 KeySwap 按键）
         for i, b in enumerate(buttons, start=1):
-            other_sections[f"[CommandListSwap{i}_{ns}]"] = self._cycle_command_lines(b["var_name"], b["option_count"])
+            command_lines = []
+            var_names = b.get("var_names") or [b["var_name"]]
+            option_counts = b.get("option_counts") or [b["option_count"]]
+            for sub_index, (var_name, option_count) in enumerate(zip(var_names, option_counts), start=1):
+                sub_name = f"CommandListSwap{i}_{sub_index}_{ns}"
+                other_sections[f"[{sub_name}]"] = self._cycle_command_lines(var_name, option_count)
+                command_lines.append(f"run = {sub_name}")
+            other_sections[f"[CommandListSwap{i}_{ns}]"] = command_lines
 
         # ---- Present 逻辑（全部使用命名空间变量，与其它面板隔离）----
         present_additions.append(f"post ${ns}_ui_active = 0")
@@ -1085,6 +1432,10 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         present_additions.append("    ; --- 1. 尺寸计算 ---")
         present_additions.append(f"    ${ns}_norm_width0 = ${ns}_base_width0 * ${ns}_zoom0")
         present_additions.append(f"    ${ns}_norm_height0 = ${ns}_base_height0 * ${ns}_zoom0")
+        for i in range(1, num_buttons + 1):
+            # Keep each button's ratio to the panel constant at every zoom level.
+            present_additions.append(f"    ${ns}_btn_render_width{i} = ${ns}_btn_width{i} * ${ns}_zoom0")
+            present_additions.append(f"    ${ns}_btn_render_height{i} = ${ns}_btn_height{i} * ${ns}_zoom0")
 
         present_additions.append("\n    ; --- 2. 位置初始化 ---")
         present_additions.append(f"    if ${ns}_img0_x == 0 && ${ns}_img0_y == 0")
@@ -1094,21 +1445,16 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
         present_additions.append("\n    ; --- 3. 计算按钮位置 ---")
         for i in range(1, num_buttons + 1):
-            present_additions.append(f"    ${ns}_rel_y{i} = (${ns}_fixed_rel_y{i} * ${ns}_norm_height0) - (${ns}_btn_height{i} / 2)")
+            present_additions.append(f"    ${ns}_rel_y{i} = (${ns}_fixed_rel_y{i} * ${ns}_norm_height0) - (${ns}_btn_render_height{i} / 2)")
             present_additions.append(f"    ; @@{self.PANEL_TAG}:btn_align_{i}@@")
-            if self.button_align == 'LEFT':
-                present_additions.append(f"    ${ns}_btn_x{i} = ${ns}_img0_x + 0.02")
-            elif self.button_align == 'RIGHT':
-                present_additions.append(f"    ${ns}_btn_x{i} = ${ns}_img0_x + ${ns}_norm_width0 - ${ns}_btn_width{i} - 0.02")
-            else:
-                present_additions.append(f"    ${ns}_btn_x{i} = ${ns}_img0_x + (${ns}_norm_width0 - ${ns}_btn_width{i}) * 0.5")
+            present_additions.append(f"    ${ns}_btn_x{i} = ${ns}_img0_x + (${ns}_fixed_rel_x{i} * ${ns}_norm_width0)")
             present_additions.append(f"    ${ns}_btn_y{i} = ${ns}_img0_y + ${ns}_rel_y{i}")
 
         present_additions.append("\n    ; --- 4. 按钮按下/弹起检测 ---")
         present_additions.append(f"    ${ns}_btn_click_processed = 0")
         present_additions.append(f"    if ${ns}_mouse_clicked && ${ns}_is_dragging == 0")
         for i in range(1, num_buttons + 1):
-            present_additions.append(f"        if cursor_x > ${ns}_btn_x{i} && cursor_x < ${ns}_btn_x{i} + ${ns}_btn_width{i} && cursor_y > ${ns}_btn_y{i} && cursor_y < ${ns}_btn_y{i} + ${ns}_btn_height{i}")
+            present_additions.append(f"        if cursor_x > ${ns}_btn_x{i} && cursor_x < ${ns}_btn_x{i} + ${ns}_btn_render_width{i} && cursor_y > ${ns}_btn_y{i} && cursor_y < ${ns}_btn_y{i} + ${ns}_btn_render_height{i}")
             present_additions.append(f"            ${ns}_btn_pressed{i} = 1")
             present_additions.append(f"            ${ns}_btn_click_processed = 1")
             present_additions.append(f"        endif")
@@ -1116,7 +1462,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         present_additions.append(f"        if ${ns}_is_dragging == 0")
         for i in range(1, num_buttons + 1):
             present_additions.append(f"            if ${ns}_btn_pressed{i} == 1")
-            present_additions.append(f"                if cursor_x > ${ns}_btn_x{i} && cursor_x < ${ns}_btn_x{i} + ${ns}_btn_width{i} && cursor_y > ${ns}_btn_y{i} && cursor_y < ${ns}_btn_y{i} + ${ns}_btn_height{i}")
+            present_additions.append(f"                if cursor_x > ${ns}_btn_x{i} && cursor_x < ${ns}_btn_x{i} + ${ns}_btn_render_width{i} && cursor_y > ${ns}_btn_y{i} && cursor_y < ${ns}_btn_y{i} + ${ns}_btn_render_height{i}")
             present_additions.append(f"                    run = CommandListSwap{i}_{ns}")
             present_additions.append(f"                endif")
             present_additions.append(f"                ${ns}_btn_pressed{i} = 0")
@@ -1160,18 +1506,22 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         for i, b in enumerate(buttons, start=1):
             present_additions.append(f"\n    ; 渲染切换按钮{i} ({b['var_name']})")
             present_additions.append(f"    ps-t100 = ResourceSwapButton{i}_{ns}")
-            present_additions.append(f"    x87 = ${ns}_btn_width{i}")
-            present_additions.append(f"    y87 = ${ns}_btn_height{i}")
+            present_additions.append(f"    x87 = ${ns}_btn_render_width{i}")
+            present_additions.append(f"    y87 = ${ns}_btn_render_height{i}")
             present_additions.append(f"    z87 = ${ns}_btn_x{i}")
             present_additions.append(f"    if ${ns}_btn_pressed{i} == 1")
             present_additions.append(f"        w87 = ${ns}_btn_y{i} + 0.002")
-            present_additions.append(f"    else if {b['var_name']} != 0")
+            active_vars = b.get("var_names") or [b["var_name"]]
+            active_condition = " || ".join(f"{var_name} != 0" for var_name in active_vars)
+            present_additions.append(f"    else if {active_condition}")
             present_additions.append(f"        w87 = ${ns}_btn_y{i} + 0.001")
             present_additions.append(f"    else")
             present_additions.append(f"        w87 = ${ns}_btn_y{i}")
             present_additions.append(f"    endif")
             present_additions.append(f"    run = CustomShaderDraw_{ns}")
         present_additions.append("endif")
+
+        self._apply_gui_only_guards(sections, ns, buttons)
 
         shader_def = [
             "hs = null", "ds = null", "gs = null", "cs = null",
@@ -1226,6 +1576,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
 classes = (
     SSMT_SwapPanelEntry,
+    SSMT_SwapPanelButtonEntry,
     SSMT_OT_SwapPanel_ParseObject,
     SSMT_OT_SwapPanel_Scan,
     SSMT_OT_SwapPanel_Refresh,
