@@ -35,6 +35,8 @@ class SSMTNode_Blueprint_Nest(SSMTNodeBase):
         'SSMTNode_PostProcess_ResourceMerge': '资源合并',
         'SSMTNode_PostProcess_BufferCleanup': '缓冲区清理',
         'SSMTNode_PostProcess_MultiFile': '多文件配置',
+        'SSMTNode_PostProcess_DiffuseSwitch': '贴图切换 V5.1',
+        'SSMTNode_PostProcess_SwapPanel': '物体切换面板',
     }
 
     def update_blueprint_name(self, context):
