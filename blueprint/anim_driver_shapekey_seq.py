@@ -283,6 +283,7 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
         self._assign_next_available_index()
         self._ensure_paused_variable_name("shapekey_seq_paused")
         self._ensure_sequence_driver_variable_name()
+        self._mark_play_state_migrated()
 
     def copy(self, node):
         self._assign_next_available_index()
@@ -290,6 +291,7 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
         self.driven_variable = ""
         self._ensure_paused_variable_name("shapekey_seq_paused")
         self._ensure_sequence_driver_variable_name()
+        self._mark_play_state_migrated()
 
     def _ensure_sequence_driver_variable_name(self):
         current_value = str(getattr(self, "driven_variable", "") or "").strip()

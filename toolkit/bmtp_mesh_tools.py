@@ -583,10 +583,15 @@ def _apply_vertex_color_object_mode(
 
     if vc_mode == 'FULL_COLOR':
         # 设计要求：FULL_COLOR 清空原有所有顶点色，只保留本次指定的颜色属性。
-        for old_attr in list(mesh.color_attributes):
-            if mesh.color_attributes.active_color == old_attr:
-                mesh.color_attributes.active_color = None
-            mesh.color_attributes.remove(old_attr)
+        # 注意：Blender 在移除一个自定义数据层后会移动其余层，之前通过
+        # list()/遍历拿到的旧 Attribute 包装器会变成悬垂指针，直接移除会误删
+        # UV 等其他自定义数据层。因此必须按名称逐个重新获取后再移除，并且
+        # 先无条件清空 active_color（对象相等比较对 RNA 包装器不可靠）。
+        mesh.color_attributes.active_color = None
+        for old_name in [a.name for a in mesh.color_attributes]:
+            old_attr = mesh.color_attributes.get(old_name)
+            if old_attr is not None:
+                mesh.color_attributes.remove(old_attr)
 
     color_attr = ensure_color_attribute(
         color_attributes=mesh.color_attributes,

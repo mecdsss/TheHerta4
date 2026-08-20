@@ -444,6 +444,14 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
         except Exception:
             setattr(node, cls.PLAY_STATE_MIGRATION_KEY, True)
 
+    def _mark_play_state_migrated(self):
+        """Mark a freshly-created node as already migrated so the load-time
+        default_play_state flag flip only applies to genuinely old nodes."""
+        try:
+            self[self.PLAY_STATE_MIGRATION_KEY] = True
+        except (AttributeError, TypeError):
+            setattr(self, self.PLAY_STATE_MIGRATION_KEY, True)
+
     @staticmethod
     def _format_global_assignment(variable_name, value, persist=False) -> str:
         scope = "global persist" if persist else "global"

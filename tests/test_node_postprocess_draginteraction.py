@@ -1324,37 +1324,29 @@ class DragNodeEmitTests(unittest.TestCase):
         rb = "\n".join(sections["[CommandListDragShapeKeyVarReadback_testns]"])
         # store 直接读源缓冲（无镜像/克隆）
         self.assertNotIn(" = copy ", rb)
-        # 值仲裁、变量为主：
-        # 1) 变量变化 → prev 跟随 + 沉淀期 + pull=0（不回读）
-        # 2) 沉淀期只等缓冲追平（rb == var 才退出），期间绝不回读
-        # 3) 拖拽激活（变量未变）→ 缓冲为主，pull=1
-        # 4) 缓冲变化（点击联动/释放收敛）→ 缓冲为主，pull=1
-        self.assertIn("store = $ssmtdrag_skact_testns_0, ResourceDragShapeKeyZoneActive_testns, 0", rb)
+        # 变量↔缓冲双向联动（变量为主，与点击计数导出同套仲裁）：
+        # 变量变化 → 本帧不回读，pull=0（同步 CS 随后把变量推回缓冲）；
+        # 变量未变 → 每帧拉回缓冲，pull=1（同步 CS 跳过回声）。
         self.assertIn("store = $ssmtdrag_skrb_testns_0, ResourceDragShapeKeyDrive_testns, 5", rb)
         self.assertIn("if $Freq_A != $ssmtdrag_skprev_testns_0", rb)
         self.assertIn("$ssmtdrag_skprev_testns_0 = $Freq_A", rb)
-        self.assertIn("$ssmtdrag_skcd_testns_0 = 6", rb)
         self.assertIn("$ssmtdrag_skpull_testns_0 = 0", rb)
-        self.assertIn("elif $ssmtdrag_skcd_testns_0 > 0", rb)
-        self.assertIn("if $ssmtdrag_skrb_testns_0 == $Freq_A", rb)
-        self.assertIn("$ssmtdrag_skcd_testns_0 = 0", rb)
-        self.assertIn("elif $ssmtdrag_skact_testns_0 >= 1", rb)
+        self.assertIn("else", rb)
         self.assertIn("$Freq_A = $ssmtdrag_skrb_testns_0", rb)
         self.assertIn("$ssmtdrag_skpull_testns_0 = 1", rb)
-        self.assertIn("elif $ssmtdrag_skrb_testns_0 != $Freq_A", rb)
-        # B 绑定同属区域 0 → 同一标志索引；方向 0 → 驱动槽 0
-        self.assertIn("store = $ssmtdrag_skact_testns_1, ResourceDragShapeKeyZoneActive_testns, 0", rb)
         self.assertIn("store = $ssmtdrag_skrb_testns_1, ResourceDragShapeKeyDrive_testns, 0", rb)
         self.assertIn("$Freq_B = $ssmtdrag_skrb_testns_1", rb)
+        self.assertNotIn("skact", rb)
+        self.assertNotIn("skcd", rb)
 
         constants = "\n".join(sections["[Constants]"])
         self.assertIn("global $ssmtdrag_skheld_testns = 0", constants)
-        self.assertIn("global $ssmtdrag_skact_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skrb_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skprev_testns_0 = 0", constants)
-        self.assertIn("global $ssmtdrag_skcd_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skpull_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skrb_testns_1 = 0", constants)
+        self.assertNotIn("skact", constants)
+        self.assertNotIn("skcd", constants)
 
         # 同步段把 pull 标志打包进 IniParams[83+] 供着色器回声抑制
         cs = "\n".join(sections["[CustomShaderDragShapeKeyVarSync_testns]"])

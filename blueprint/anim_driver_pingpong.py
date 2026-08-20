@@ -154,6 +154,7 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         self.continuous_index_var_initialized = False
         self._ensure_continuous_index_variable_name(context=context)
         self._ensure_initial_visible_continuous_index_variable_name(context=context)
+        self._mark_play_state_migrated()
 
     def copy(self, node):
         self._assign_next_available_index()
@@ -164,6 +165,7 @@ class SSMTNode_AnimDriver_PingPong(SSMTNode_AnimDriver_Base):
         self.continuous_index_var_initialized = False
         self._ensure_continuous_index_variable_name()
         self._ensure_initial_visible_continuous_index_variable_name()
+        self._mark_play_state_migrated()
 
     def _compute_play_interval(self):
         runtime = self._find_runtime_node()

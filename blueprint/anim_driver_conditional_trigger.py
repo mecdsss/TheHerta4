@@ -344,11 +344,13 @@ class SSMTNode_AnimDriver_ConditionalTrigger(SSMTNode_AnimDriver_Base):
         self.width = 350
         self._assign_next_available_index()
         self._ensure_paused_variable_name("cond_trigger_paused")
+        self._mark_play_state_migrated()
 
     def copy(self, node):
         self._assign_next_available_index()
         self.custom_paused_var = ""
         self._ensure_paused_variable_name("cond_trigger_paused")
+        self._mark_play_state_migrated()
 
     def draw_buttons(self, context, layout):
         safe_idx = self._read_safe_index()

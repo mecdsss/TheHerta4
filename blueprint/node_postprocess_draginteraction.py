@@ -3578,43 +3578,27 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 分词器把 ref 当独立 token 交给 GetTarget，ParseTarget 无此分支 →
         # Unknown target: ref，整条 store 行在加载期被静默丢弃（GIMI 实证有效
         # 写法为 store = $health, ps-cb0, 33，裸目标）。
-        # 值仲裁、变量为主（修复「快捷键切换下一瞬间被回读顶掉」）：
-        #   - 变量变化（热键/驱动器步进）→ 不回读，prev 跟随，进入沉淀期；
-        #     沉淀期只等缓冲追平，期间绝不回读——store 有数帧延迟，旧缓冲值
-        #     会把刚切换的变量立刻顶回去（历史 bug 根因）。
-        #   - 变量未变且拖拽激活 → 缓冲为主（回读）。
-        #   - 变量未变且缓冲变化（点击联动/释放收敛）→ 缓冲为主（回读）。
-        #   - 回读帧置 pull 标志：同步 CS 据此跳过「把拉取值推回缓冲」的
-        #     回声，避免拖拽中把带延迟的旧值写回缓冲与拖拽 CS 打架。
+        # 变量↔缓冲双向联动（与点击计数导出同一套「变量为主」仲裁）：
+        #   - 变量变化（热键/动画驱动步进）→ 本帧不回读，pull=0；
+        #     同步 CS 随后把变量写回缓冲，实现「变量 → 缓冲」。
+        #   - 变量未变 → 每帧把缓冲值拉回变量，pull=1；同步 CS 据此跳过
+        #     回声，避免把带 store 延迟的旧值再写回缓冲与拖拽 CS 打架。
+        # 不再使用 ZoneActive 的「拖拽激活即缓冲独占」分支，也不再使用沉淀
+        # 窗口：这两处会把动画驱动刚减下去的值在后续帧重新顶回 1，破坏联动。
         lines = []
         for i, (var_name, slot, zone, _nd_stage) in enumerate(bindings):
-            act = f"$ssmtdrag_skact_{ns}_{i}"
             rb = f"$ssmtdrag_skrb_{ns}_{i}"
             prev = f"$ssmtdrag_skprev_{ns}_{i}"
-            cd = f"$ssmtdrag_skcd_{ns}_{i}"
             pull = f"$ssmtdrag_skpull_{ns}_{i}"
             lines.extend([
-                f"store = {act}, ResourceDragShapeKeyZoneActive_{ns}, {zone}",
                 f"store = {rb}, ResourceDragShapeKeyDrive_{ns}, {slot}",
                 f"if {var_name} != {prev}",
                 f"\t{prev} = {var_name}",
-                f"\t{cd} = 6",
                 f"\t{pull} = 0",
-                f"elif {cd} > 0",
-                f"\t{cd} = {cd} - 1",
-                f"\tif {rb} == {var_name}",
-                f"\t\t{cd} = 0",
-                "\tendif",
-                f"elif {act} >= 1",
-                f"\t{var_name} = {rb}",
-                f"\t{prev} = {rb}",
-                f"\t{pull} = 1",
-                f"elif {rb} != {var_name}",
-                f"\t{var_name} = {rb}",
-                f"\t{prev} = {rb}",
-                f"\t{pull} = 1",
                 "else",
-                f"\t{pull} = 0",
+                f"\t{var_name} = {rb}",
+                f"\t{prev} = {rb}",
+                f"\t{pull} = 1",
                 "endif",
             ])
         sections[sec] = lines
@@ -4250,7 +4234,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"global $ssmtdrag_rmb_hold_fraction_{ns} = 0",
                 f"global $ssmtdrag_rmb_lone_hold_{ns} = 0",
             ])
-        # 变量↔缓冲双向同步辅助变量：激活标志/回读值/变量上一帧/沉淀计数（每绑定一组）
+        # 变量↔缓冲双向同步辅助变量：回读值/变量上一帧/回读回声标志（每绑定一组）
         if getattr(self, "enable_shapekey_drive", False):
             _sync_n = len(self._drag_drive_var_sync_bindings())
             if _sync_n:
@@ -4259,10 +4243,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             globals_to_add.append(f"global $ssmtdrag_seed_pending_{ns} = 0")
             for i in range(_sync_n):
                 globals_to_add.extend([
-                    f"global $ssmtdrag_skact_{ns}_{i} = 0",
                     f"global $ssmtdrag_skrb_{ns}_{i} = 0",
                     f"global $ssmtdrag_skprev_{ns}_{i} = 0",
-                    f"global $ssmtdrag_skcd_{ns}_{i} = 0",
                     f"global $ssmtdrag_skpull_{ns}_{i} = 0",
                 ])
         for comp in components:
