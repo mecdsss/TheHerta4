@@ -57,6 +57,7 @@ class EFMILogParser:
 
     def __init__(self, log_path: str):
         self.log_path = log_path
+        self.base_dir = os.path.dirname(os.path.abspath(log_path))
         # draw_index -> DrawCallInfo
         self.draw_calls: dict[str, dict] = {}
         # (draw_index, stage, slot) -> {"hash", "first_constant", "num_constants"}
@@ -196,16 +197,34 @@ class EFMILogParser:
         return binding.get("hash") if binding else None
 
     def get_deduped_path(self, logical_filename: str) -> str | None:
-        """按根目录逻辑文件名（如 000015-vs-cb1=...buf）查 deduped 实际路径。"""
-        path = self.dump_map.get(logical_filename)
-        if path and os.path.isfile(path):
-            return path
+        """按根目录逻辑文件名（如 000015-vs-cb1=...buf）查 deduped 实际路径。
+
+        log.txt 里记录的 deduped 绝对路径可能是提取时的临时缓存路径（如 E:\\SSMT4缓存文件夹\\...），
+        dump 被挪动后失效。因此：先按 log 记录的路径，失效时用文件名在 dump 目录的
+        deduped/ 子目录兜底定位（deduped 文件名是内容 hash，唯一）。
+        """
+        dst = self.dump_map.get(logical_filename)
+        for candidate in self._deduped_candidates(dst):
+            if os.path.isfile(candidate):
+                return candidate
         # 兜底：按前缀匹配（同 hash 资源可能对应多个逻辑名）
         prefix = logical_filename.split("=", 1)[0] + "="
-        for src, dst in self.dump_map.items():
-            if src.startswith(prefix) and os.path.isfile(dst):
-                return dst
+        for src, dst2 in self.dump_map.items():
+            if src.startswith(prefix):
+                for candidate in self._deduped_candidates(dst2):
+                    if os.path.isfile(candidate):
+                        return candidate
         return None
+
+    def _deduped_candidates(self, dst_path: str | None) -> list[str]:
+        """生成 deduped 候选路径：log 记录的原路径 + dump 目录 deduped/ 下的同名文件。"""
+        candidates = []
+        if dst_path:
+            candidates.append(dst_path)
+            basename = os.path.basename(dst_path)
+            if basename:
+                candidates.append(os.path.join(self.base_dir, "deduped", basename))
+        return candidates
 
     def find_drawcalls_by_ib(
         self,
@@ -305,15 +324,39 @@ class EFMIBoneMapBuilder:
     ) -> dict[int, numpy.ndarray]:
         """计算每个局部骨骼驱动的顶点加权质心（双维度去重的"驱动区域"指纹）。
 
-        原理（用户提出）：骨骼的唯一标识不只是蒙皮矩阵，还有"它驱动哪些顶点"。
-        矩阵相同但驱动顶点区域不同（如手指两节）= 不同骨骼；
-        矩阵相同/近似且驱动顶点区域重合 = 同一骨骼。
-
         返回: {local_vg_id(int): 加权质心 numpy.ndarray(3)}（绑定姿态坐标）。
+        """
+        signatures = EFMIBoneMapBuilder.compute_driven_signatures(
+            position_buf_path, blend_buf_path, submesh_json_dict
+        )
+        return {
+            local: sig["centroid"] for local, sig in signatures.items()
+        }
+
+    @staticmethod
+    def compute_driven_signatures(
+        position_buf_path: str,
+        blend_buf_path: str,
+        submesh_json_dict: dict,
+    ) -> dict[int, dict]:
+        """计算每个局部骨骼的"驱动签名"（三维度去重用）。
+
+        返回 {local_vg_id(int): {
+            "centroid": 加权质心(3,),
+            "bbox_min": 包围盒最小(3,),
+            "bbox_max": 包围盒最大(3,),
+            "vertex_count": 驱动顶点数,
+        }}（绑定姿态坐标）。
+
+        原理（用户提出）：骨骼的可靠标识 = 蒙皮矩阵 + 骨骼标签 + 驱动的顶点组点云
+        （包围盒是否重叠 + 权重聚类核心位置）。同一骨骼跨部件驱动同区域顶点
+        （包围盒重叠、质心接近）；不同骨骼即使矩阵相同，其驱动区域也不同
+        （包围盒不重叠或质心远离）。
         无 BLENDWEIGHTS 元素的类型按"每顶点第一索引权重=1"处理。
         """
+        empty = {}
         if not os.path.isfile(position_buf_path) or not os.path.isfile(blend_buf_path):
-            return {}
+            return empty
 
         # ---- Position 布局（Category=Position 元素，POSITION 在 offset 0，float32 x3）----
         pos_stride = 0
@@ -325,12 +368,12 @@ class EFMIBoneMapBuilder:
                     if str(element.get("SemanticName", "") or "").upper() == "POSITION":
                         has_position = True
         if pos_stride <= 0 or not has_position:
-            return {}
+            return empty
 
         pos_raw = numpy.fromfile(position_buf_path, dtype=numpy.uint8)
         vertex_count = len(pos_raw) // pos_stride
         if vertex_count <= 0:
-            return {}
+            return empty
         positions = (
             pos_raw.reshape(vertex_count, pos_stride)[:, 0:12]
             .copy().view(numpy.float32).reshape(vertex_count, 3)
@@ -379,12 +422,12 @@ class EFMIBoneMapBuilder:
             break
 
         if blend_stride <= 0 or bi_offset is None or not bi_np:
-            return {}
+            return empty
 
         blend_raw = numpy.fromfile(blend_buf_path, dtype=numpy.uint8)
         n = len(blend_raw) // blend_stride
         if n != vertex_count:
-            return {}
+            return empty
         rows = blend_raw.reshape(n, blend_stride)
 
         bi_np_type, bi_channels = bi_np
@@ -403,8 +446,8 @@ class EFMIBoneMapBuilder:
             weights = numpy.zeros((n, bi_channels), dtype=numpy.float32)
             weights[:, 0] = 1.0
 
-        # ---- 每 local 的加权质心 ----
-        accum: dict[int, list] = {}  # local -> [sum_weighted_pos(3), sum_weight]
+        # ---- 每 local 的驱动顶点集合（用于质心 + 包围盒）----
+        accum: dict[int, dict] = {}
         for c in range(indices.shape[1]):
             idx_col = indices[:, c]
             w_col = weights[:, c] if c < weights.shape[1] else weights[:, 0]
@@ -416,19 +459,34 @@ class EFMIBoneMapBuilder:
             v_pos = positions[valid].astype(numpy.float64)
             for local in numpy.unique(v_idx):
                 mask = v_idx == local
-                w_sum = float(v_w[mask].sum())
+                pts = v_pos[mask]
+                ws_ = v_w[mask]
+                w_sum = float(ws_.sum())
                 if w_sum <= 0:
                     continue
-                centroid = (v_pos[mask] * v_w[mask, None]).sum(axis=0) / w_sum
-                if local not in accum:
-                    accum[int(local)] = [numpy.zeros(3, dtype=numpy.float64), 0.0]
-                accum[int(local)][0] += centroid * w_sum
-                accum[int(local)][1] += w_sum
+                centroid = (pts * ws_[:, None]).sum(axis=0) / w_sum
+                entry = accum.setdefault(int(local), {
+                    "weighted_sum": numpy.zeros(3, dtype=numpy.float64),
+                    "weight_total": 0.0,
+                    "bbox_min": numpy.full(3, numpy.inf),
+                    "bbox_max": numpy.full(3, -numpy.inf),
+                    "vertex_count": 0,
+                })
+                entry["weighted_sum"] += centroid * w_sum
+                entry["weight_total"] += w_sum
+                entry["bbox_min"] = numpy.minimum(entry["bbox_min"], pts.min(axis=0))
+                entry["bbox_max"] = numpy.maximum(entry["bbox_max"], pts.max(axis=0))
+                entry["vertex_count"] += int(mask.sum())
 
         return {
-            local: (sums[0] / sums[1]).astype(numpy.float32)
-            for local, sums in accum.items()
-            if sums[1] > 0
+            local: {
+                "centroid": (e["weighted_sum"] / e["weight_total"]).astype(numpy.float32),
+                "bbox_min": e["bbox_min"].astype(numpy.float32),
+                "bbox_max": e["bbox_max"].astype(numpy.float32),
+                "vertex_count": e["vertex_count"],
+            }
+            for local, e in accum.items()
+            if e["weight_total"] > 0
         }
 
     # ------------------------------------------------------------------
@@ -506,37 +564,38 @@ class EFMIBoneMapBuilder:
     def build_vg_maps(
         submesh_skeletons: dict[str, tuple],
         match_tolerance: float = 1e-3,
-        centroid_tolerance: float | None = None,
+        centroid_tolerance: float = 0.05,
+        bbox_overlap_min: float = 0.9,
     ) -> dict[str, dict]:
-        """跨子网格按"骨骼矩阵"去重构建 vg_map（同子网格冲突拒绝）。
+        """跨子网格"三维度"去重构建 vg_map（骨骼标签 + 骨骼矩阵 + 驱动点云）。
 
         参数:
-            unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts[, centroids])
+            unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts[, signatures])
             - skeleton_buffer: (N,12) 蒙皮矩阵
             - vg_count: 局部骨骼数
             - weighted_vertex_counts: 每局部骨骼驱动的顶点数
-            - centroids: 可选，{local: 加权质心(3,)}（双维度增强用，默认不用）
+            - signatures: {local: {centroid, bbox_min, bbox_max, vertex_count}}
+              （compute_driven_signatures 结果，驱动点云特征，可空）
         返回: unique_str -> {local_vg_id(int): global_vg_id(int)}
 
-        去重规则（最终确定，经多轮实测）：
-        同一角色的骨架只有一套，所有子网格（部件）都绑在它上面——
-        - **跨子网格的两个 local 骨骼，矩阵近似（allclose(match_tolerance)）即合并**：
-          它们是同一根骨架骨骼在不同子网格的"投影"，矩阵相同（同姿态）→ 同一骨骼。
-          如 539/493（跨子网格、矩阵差 1.8e-07）合并。
-        - **同一子网格内的两个 local 绝不合并（冲突拒绝）**：它们是骨架上的两根不同骨骼
-          （如手指两节 d6128f13[57]/[58]，即使矩阵完全相同也不能合并，否则"两段变一段"）。
-          且冲突拒绝在**并查集 union 时检查**（组内同子网格最多 1 个 local），可防止
-          链式合并绕过（57→X←58 间接同组）。
-        - 合并语义 = "按矩阵内容去重 + 拼接对齐"（相同对齐、不同拼接、组成大骨架）。
+        三维度去重判据（用户定义），**仅跨部件合并**（同部件的组不可能重叠，绝不合并）：
+        1. **骨骼标签 + 骨骼矩阵**：矩阵签名（量化）粗筛 + allclose(match_tolerance) 容差匹配；
+        2. **骨骼控制的顶点组点云包围盒重叠**：两骨骼驱动的顶点集合的包围盒必须相交
+           （同一骨骼跨部件驱动同区域顶点 → 框重叠；不同骨骼区域不同 → 框不重叠）；
+        3. **权重聚类核心**：加权质心距离 < centroid_tolerance（同区域的核心位置接近）。
+        三个维度全部满足 → 同一骨骼 → 合并。
 
-        为什么不用"驱动顶点质心"作为必需维度：同一骨骼跨子网格驱动的顶点区域本就不同
-        （身体/衣服/头发的同一骨骼附近顶点位置有差异），质心阈值难定，会误拆。同子网格
-        冲突拒绝规则已能可靠区分"同位置功能骨骼"，无需质心。
+        **同部件冲突拒绝**（关键）：并查集 union 时检查，一个全局 id 组里同一子网格
+        最多 1 个 local。防止"同位置功能骨骼"（如手指两节，同部件内矩阵相同）被合并
+        或被链式合并绕过（57→X←58 间接同组）。
 
-        match_tolerance: 跨子网格矩阵合并容差（默认 1e-3；同一骨骼跨 drawcall 的浮点
-        误差一般 <1e-4，1e-3 足够覆盖；冲突拒绝规则兜底防止不同骨骼误并）。
-        centroid_tolerance: 可选。非 None 时跨子网格合并还要求驱动质心距离 < 此值
-        （双维度增强，默认 None=不用质心维度）。
+        合并语义 = "按矩阵内容去重 + 拼接对齐"（相同对齐、不同拼接、组成大骨架）。
+
+        match_tolerance: 矩阵容差（默认 1e-3，跨 drawcall 浮点误差一般 <1e-4）。
+        centroid_tolerance: 权重聚类核心（质心）重合阈值（默认 0.05；同一骨骼跨部件
+        驱动区域的质心差一般 < 0.05，不同骨骼即使同区域其核心也偏离）。
+        bbox_overlap_min: 包围盒重叠率（IoU）下限（默认 0.9；同一骨骼跨部件驱动的
+        顶点集合包围盒几乎完全重合才合并，重叠率不足则视为不同骨骼不合并）。
         """
         # 收集所有骨骼候选
         candidates: list[dict] = []
@@ -546,7 +605,7 @@ class EFMIBoneMapBuilder:
             skeleton_buffer = entry[0]
             vg_count = entry[1]
             weighted_vertex_counts = entry[2] if len(entry) > 2 else None
-            centroids = entry[3] if len(entry) > 3 else {}
+            signatures = entry[3] if len(entry) > 3 else {}
 
             if skeleton_buffer is None or vg_count <= 0:
                 continue
@@ -572,7 +631,7 @@ class EFMIBoneMapBuilder:
                     "global_vg_id": vg_offset + vg_id,
                     "weighted_vertex_count": weighted_count,
                     "bone": bone,
-                    "centroid": centroids.get(vg_id),
+                    "signature": signatures.get(vg_id),
                 })
 
             vg_offset += vg_count
@@ -603,26 +662,49 @@ class EFMIBoneMapBuilder:
 
         mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
 
-        def centroid_dist(a, b):
-            ca, cb = candidates[a]["centroid"], candidates[b]["centroid"]
-            if ca is None or cb is None:
+        def bbox_overlap_ratio(a, b):
+            """两骨骼驱动顶点集合的包围盒重叠率（IoU：交集体积/并集体积）。"""
+            sa, sb = candidates[a].get("signature"), candidates[b].get("signature")
+            if sa is None or sb is None:
                 return None
-            return float(numpy.linalg.norm(ca.astype(numpy.float64) - cb.astype(numpy.float64)))
+            inter_min = numpy.maximum(sa["bbox_min"], sb["bbox_min"])
+            inter_max = numpy.minimum(sa["bbox_max"], sb["bbox_max"])
+            inter_dims = numpy.maximum(inter_max - inter_min, 0.0)
+            inter_vol = float(numpy.prod(inter_dims))
+            vol_a = float(numpy.prod(numpy.maximum(sa["bbox_max"] - sa["bbox_min"], 0.0)))
+            vol_b = float(numpy.prod(numpy.maximum(sb["bbox_max"] - sb["bbox_min"], 0.0)))
+            union_vol = vol_a + vol_b - inter_vol
+            if union_vol <= 0:
+                return 0.0
+            return inter_vol / union_vol
 
         for i in range(n):
             for j in range(i + 1, n):
-                # 同子网格内的 local 绝不直接合并（骨架上的不同骨骼）
+                # 同子网格（同部件）内的 local 绝不合并（用户明确要求：
+                # 同部件的不同组驱动不同区域，不可能重叠，故不参与合并；只有跨部件才合并）
                 if candidates[i]["unique_str"] == candidates[j]["unique_str"]:
                     continue
                 if find(i) == find(j):
                     continue
+
+                # 维度一+二：骨骼标签（矩阵签名）与骨骼矩阵 —— allclose 容差匹配
                 if not numpy.allclose(mats[i], mats[j], atol=match_tolerance, rtol=0.0):
                     continue
-                # 可选的质心维度（默认不用）
-                if centroid_tolerance is not None:
-                    dist = centroid_dist(i, j)
-                    if dist is None or dist >= centroid_tolerance:
+
+                # 维度三：驱动顶点组点云包围盒重叠率 > bbox_overlap_min + 权重聚类核心接近
+                si, sj = candidates[i].get("signature"), candidates[j].get("signature")
+                if si is not None and sj is not None:
+                    # 包围盒重叠率（IoU）必须 > bbox_overlap_min（默认 0.9）
+                    overlap_ratio = bbox_overlap_ratio(i, j)
+                    if overlap_ratio is None or overlap_ratio < bbox_overlap_min:
                         continue
+                    # 权重聚类核心（加权质心）距离
+                    dist = float(numpy.linalg.norm(
+                        si["centroid"].astype(numpy.float64) - sj["centroid"].astype(numpy.float64)
+                    ))
+                    if dist >= centroid_tolerance:
+                        continue
+
                 try_union(i, j)
 
         # 分组
@@ -1020,10 +1102,14 @@ class EFMISkeletonMergeHelper:
             "R8G8B8A8_UINT": ("u1", 4),
             "R8_UINT": ("u1", 1),
             "R16G16B16A16_UINT": ("u2", 4),
+            "R16G16_UINT": ("u2", 2),
             "R16_UINT": ("u2", 1),
             "R32G32B32A32_UINT": ("u4", 4),
+            "R32G32_UINT": ("u4", 2),
             "R32_UINT": ("u4", 1),
             "R32G32B32A32_SINT": ("i4", 4),
+            "R32G32_SINT": ("i4", 2),
+            "R32_SINT": ("i4", 1),
         }
         return layout.get(fmt, (None, 0))
 
@@ -1191,14 +1277,14 @@ class EFMISkeletonMergeHelper:
                 )
                 continue
 
-            # 双维度去重的"驱动顶点质心"（读 Position.buf + Blend.buf 计算每骨骼驱动区域）
+            # 三维度去重的"驱动签名"（读 Position.buf + Blend.buf 计算每骨骼驱动点云特征）
             position_buf_path = os.path.join(os.path.dirname(json_path), bare_name + "-Position.buf")
             try:
-                centroids = EFMIBoneMapBuilder.compute_driven_centroids(
+                centroids = EFMIBoneMapBuilder.compute_driven_signatures(
                     position_buf_path, blend_buf_path, submesh_json
                 )
             except Exception as e:
-                print(f"[EFMI骨骼合并] {unique_str}: 质心计算失败（退化为纯矩阵匹配）: {e}")
+                print(f"[EFMI骨骼合并] {unique_str}: 驱动签名计算失败（退化为纯矩阵匹配）: {e}")
                 centroids = {}
 
             submesh_skeletons[unique_str] = (skeleton_buffer, vg_count, weighted_vertex_counts, centroids)
@@ -1211,6 +1297,8 @@ class EFMISkeletonMergeHelper:
             submesh_json_paths[unique_str] = json_path
 
         if not submesh_skeletons:
+            if skipped > 0:
+                return True, f"全部 {skipped} 个子网格已有骨骼合并缓存（VGMap），无需重新生成。"
             return False, "没有子网格成功生成骨骼数据。"
 
         # 跨子网格去重构建 vg_map
@@ -1264,7 +1352,7 @@ class EFMISkeletonMergeHelper:
 
         return written > 0, (
             f"已为 {written} 个子网格生成骨骼合并数据"
-            + (f"（跳过已存在 {skipped} 个）" if skipped else "")
+            + (f"（跳过已缓存 {skipped} 个）" if skipped else "")
         )
 
     @classmethod
