@@ -276,5 +276,128 @@ class ChannelCompositePipelineTests(unittest.TestCase):
             self.assertEqual([path.name for path in remaining_files], ["StepA_MatOne.png", "StepB_MatOne.png"])
 
 
+class GeneratedMapDependencyTests(unittest.TestCase):
+    """测试派生贴图依赖图：颜色 → 置换 → 法线 → (置换+法线) → AO，每种贴图只生成一次"""
+
+    @staticmethod
+    def _channel(source_type, source_channel="R", constant_value=0.0, invert=False):
+        return types.SimpleNamespace(
+            source_type=source_type,
+            source_channel=source_channel,
+            constant_value=constant_value,
+            invert=invert,
+        )
+
+    @staticmethod
+    def _rule(channels, **overrides):
+        params = dict(
+            rule_name="DepRule",
+            input_source_mode="BASE_COLOR",
+            input_rule_name="",
+            normal_strength=5.0,
+            normal_blur_radius=0.0,
+            normal_invert_height=False,
+            ao_radius=6,
+            ao_height_scale=16.0,
+            ao_power=1.0,
+        )
+        params.update(overrides)
+        return types.SimpleNamespace(output_channels=channels, **params)
+
+    @staticmethod
+    def _pit_pixels(size=32, background=0.8, pit=0.2):
+        """构造一张中央带凹陷的颜色图（凹陷 = 暗色区域）"""
+        pixels = np.ones((size, size, 4), dtype=np.float32) * background
+        pixels[12:20, 12:20, 0:3] = pit
+        pixels[:, :, 3] = 1.0
+        return pixels
+
+    def test_normal_generated_once_when_multiple_channels_use_it(self):
+        """R/G/B 同时引用法线时，法线贴图只计算一次"""
+        operator = tt_normal_map.TT_OT_execute_channel_composite()
+        processor = tt_normal_map.ChannelProcessor()
+
+        rule = self._rule([
+            self._channel("GENERATED_NORMAL", "R"),
+            self._channel("GENERATED_NORMAL", "G"),
+            self._channel("GENERATED_NORMAL", "B"),
+            self._channel("CONSTANT", "A", constant_value=1.0),
+        ])
+        pixels = self._pit_pixels()
+
+        with mock.patch.object(
+            tt_normal_map.ChannelProcessor, "sobel_xy", wraps=tt_normal_map.ChannelProcessor.sobel_xy
+        ) as sobel_spy:
+            operator._compose_rule_pixels(rule, pixels, 32, 32, processor)
+
+        self.assertEqual(sobel_spy.call_count, 1)
+
+    def test_ao_darkens_cavities_from_geometry(self):
+        """AO 由置换+法线推导：凹陷处遮蔽变暗，平坦处接近 1"""
+        processor = tt_normal_map.ChannelProcessor()
+
+        size = 32
+        height = np.ones((size, size), dtype=np.float32) * 0.8
+        height[12:20, 12:20] = 0.2
+        normal = (
+            np.full((size, size), 0.5, dtype=np.float32),
+            np.full((size, size), 0.5, dtype=np.float32),
+            np.ones((size, size), dtype=np.float32),
+        )
+
+        ao = processor.generate_ao_from_geometry(height, normal, radius=6, height_scale=16.0, power=1.0)
+
+        self.assertGreater(float(ao[2, 2]), 0.99)
+        self.assertLess(float(ao[16, 16]), float(ao[2, 2]))
+        self.assertLess(float(ao[16, 16]), 1.0)
+
+    def test_compose_normal_xy_plus_ao_example(self):
+        """端到端：R=法线X、G=法线Y、B=AO —— 法线与 AO 沿依赖链各算一次再取通道"""
+        operator = tt_normal_map.TT_OT_execute_channel_composite()
+        processor = tt_normal_map.ChannelProcessor()
+
+        rule = self._rule([
+            self._channel("GENERATED_NORMAL", "R"),
+            self._channel("GENERATED_NORMAL", "G"),
+            self._channel("GENERATED_AO"),
+            self._channel("CONSTANT", "A", constant_value=1.0),
+        ])
+        pixels = self._pit_pixels()
+
+        output = operator._compose_rule_pixels(rule, pixels, 32, 32, processor)
+
+        reference = tt_normal_map.RuleMapGenerator(processor, pixels, 32, 32, rule)
+        normal_x, normal_y, _normal_z = reference.get("NORMAL")
+        expected_ao = reference.get("AO")
+
+        self.assertTrue(np.allclose(output[:, :, 0], normal_x))
+        self.assertTrue(np.allclose(output[:, :, 1], normal_y))
+        self.assertTrue(np.allclose(output[:, :, 2], expected_ao))
+        self.assertTrue(np.allclose(output[:, :, 3], 1.0))
+
+        # 语义校验：合成结果里凹陷区域的 AO 通道确实更暗
+        self.assertLess(float(output[16, 16, 2]), float(output[2, 2, 2]))
+
+    def test_height_channel_is_processed_displacement(self):
+        """置换通道输出的是含反转/模糊处理后的高度（法线的上游产物）"""
+        operator = tt_normal_map.TT_OT_execute_channel_composite()
+        processor = tt_normal_map.ChannelProcessor()
+
+        pixels = np.zeros((4, 4, 4), dtype=np.float32)
+        pixels[:, :, 0] = 0.25
+        pixels[:, :, 1] = 0.25
+        pixels[:, :, 2] = 0.25
+        pixels[:, :, 3] = 1.0
+
+        rule = self._rule(
+            [self._channel("GENERATED_HEIGHT")] * 3 + [self._channel("CONSTANT", "A", constant_value=1.0)],
+            normal_invert_height=True,
+        )
+        output = operator._compose_rule_pixels(rule, pixels, 4, 4, processor)
+
+        luminance = 0.299 * 0.25 + 0.587 * 0.25 + 0.114 * 0.25
+        self.assertTrue(np.allclose(output[:, :, 0], 1.0 - luminance, atol=1e-6))
+
+
 if __name__ == "__main__":
     unittest.main()

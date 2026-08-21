@@ -197,12 +197,88 @@ class ChannelProcessor:
 
     @staticmethod
     def generate_ao(pixels, radius=10, power=1.5):
+        """旧的亮度对比伪 AO（保留兼容；新管线的 AO 走 generate_ao_from_geometry）"""
         luminance = ChannelProcessor.extract_channel(pixels, "LUMINANCE")
         if SCIPY_AVAILABLE and radius > 0:
             blurred = ndimage.uniform_filter(luminance, size=radius * 2 + 1)
             ao = np.minimum(luminance / (blurred + 1e-6), 1.0)
         else:
             ao = luminance
+        return np.power(np.clip(ao, 0.0, 1.0), power)
+
+    @staticmethod
+    def _shift_with_edge(data, offset_y, offset_x):
+        """把数组平移 (offset_y, offset_x) 像素，空出区域用边缘值填充"""
+        height, width = data.shape
+        result = np.empty_like(data)
+
+        src_y0 = max(0, -offset_y)
+        src_y1 = min(height, height - offset_y)
+        dst_y0 = max(0, offset_y)
+        dst_y1 = min(height, height + offset_y)
+        src_x0 = max(0, -offset_x)
+        src_x1 = min(width, width - offset_x)
+        dst_x0 = max(0, offset_x)
+        dst_x1 = min(width, width + offset_x)
+
+        result[dst_y0:dst_y1, dst_x0:dst_x1] = data[src_y0:src_y1, src_x0:src_x1]
+
+        if dst_y0 > 0:
+            result[:dst_y0, :] = result[dst_y0:dst_y0 + 1, :]
+        if dst_y1 < height:
+            result[dst_y1:, :] = result[dst_y1 - 1:dst_y1, :]
+        if dst_x0 > 0:
+            result[:, :dst_x0] = result[:, dst_x0:dst_x0 + 1]
+        if dst_x1 < width:
+            result[:, dst_x1:] = result[:, dst_x1 - 1:dst_x1]
+        return result
+
+    @staticmethod
+    def generate_ao_from_geometry(height_data, normal_map, radius=16, height_scale=16.0, power=1.0, directions=8):
+        """地平线式高度场 AO：由置换（高度）+ 法线共同推导。
+
+        逐方向从每个像素向外步进采样，取最大仰角作为地平线角，
+        余弦项给出该方向的天空可见度；法线朝向决定各方向的权重
+        （表面朝向哪个方向，那个方向的遮蔽对该像素影响更大）。
+        height_scale 把 0-1 高度差换算成像素单位，控制遮蔽强度。
+        """
+        normal_x, normal_y, _normal_z = normal_map
+        ndx = normal_x * 2.0 - 1.0
+        ndy = normal_y * 2.0 - 1.0
+
+        radius = max(1, int(round(radius)))
+        ao_accum = np.zeros_like(height_data)
+        weight_accum = np.zeros_like(height_data)
+
+        for k in range(directions):
+            angle = 2.0 * np.pi * k / directions
+            dir_x = float(np.cos(angle))
+            dir_y = float(np.sin(angle))
+
+            horizon = np.zeros_like(height_data)
+            last_offset = None
+            for step in range(1, radius + 1):
+                offset_x = int(round(dir_x * step))
+                offset_y = int(round(dir_y * step))
+                if (offset_y, offset_x) == last_offset:
+                    continue
+                last_offset = (offset_y, offset_x)
+
+                shifted = ChannelProcessor._shift_with_edge(height_data, offset_y, offset_x)
+                distance = float(np.hypot(offset_y, offset_x))
+                if distance <= 0:
+                    continue
+                elevation = (shifted - height_data) * height_scale / distance
+                np.maximum(horizon, elevation, out=horizon)
+
+            theta = np.arctan(horizon)
+            sky_visibility = np.cos(np.clip(theta, 0.0, np.pi / 2.0))
+
+            weight = np.maximum(ndx * dir_x + ndy * dir_y, 0.0) + 0.1
+            ao_accum += sky_visibility * weight
+            weight_accum += weight
+
+        ao = ao_accum / np.maximum(weight_accum, 1e-6)
         return np.power(np.clip(ao, 0.0, 1.0), power)
 
     @staticmethod
@@ -254,6 +330,95 @@ class ChannelProcessor:
                     - padded[y + 1, x + 2]
                 ) * strength * 0.25 + 0.5
         return np.clip(detail, 0.0, 1.0)
+
+
+class RuleMapGenerator:
+    """单条合成规则输入上的派生贴图工厂：按依赖链惰性生成并缓存。
+
+    依赖链（上游先生成，下游引用上游结果）：
+
+        输入图 ──LUMINANCE──▶ HEIGHT（置换：含反转 + 模糊降噪）
+                                  │
+                                  ├── Sobel + strength ──▶ NORMAL（XYZ 三元组）
+                                  │
+                                  ├── 颜色分析 ──▶ ROUGHNESS / METALLIC / GLOSSINESS /
+                                  │                SPECULAR / EMISSION / DETAIL
+                                  │
+                                  └── HEIGHT + NORMAL ──▶ AO（地平线式高度场遮蔽）
+
+    同一次规则执行中每种贴图只计算一次：例如 R/G 都要法线时，
+    NORMAL 只生成一回，两个通道各自取分量。
+    """
+
+    def __init__(self, processor, pixels, width, height, rule):
+        self.processor = processor
+        self.pixels = pixels
+        self.width = width
+        self.height = height
+        self.rule = rule
+        self._cache = {}
+
+    def get(self, kind):
+        if kind not in self._cache:
+            self._cache[kind] = self._generate(kind)
+        return self._cache[kind]
+
+    def _generate(self, kind):
+        processor = self.processor
+        rule = self.rule
+
+        if kind == "HEIGHT":
+            grayscale = processor.extract_channel(self.pixels, "LUMINANCE")
+            if getattr(rule, "normal_invert_height", False):
+                grayscale = 1.0 - grayscale
+            return processor.blur_height_data(grayscale, getattr(rule, "normal_blur_radius", 1.0))
+
+        if kind == "NORMAL":
+            height = self.get("HEIGHT")
+            dx, dy = processor.sobel_xy(height)
+            strength = max(getattr(rule, "normal_strength", 5.0), 0.01)
+            z = np.ones_like(dx) / strength
+            length = np.sqrt(dx ** 2 + dy ** 2 + z ** 2)
+            length = np.maximum(length, 1e-6)
+            normal_x = (-dx / length + 1.0) * 0.5
+            normal_y = (-dy / length + 1.0) * 0.5
+            normal_z = z / length
+            return normal_x, normal_y, normal_z
+
+        if kind == "AO":
+            height = self.get("HEIGHT")
+            normal = self.get("NORMAL")
+            return processor.generate_ao_from_geometry(
+                height,
+                normal,
+                radius=getattr(rule, "ao_radius", 16),
+                height_scale=getattr(rule, "ao_height_scale", 16.0),
+                power=getattr(rule, "ao_power", 1.0),
+            )
+
+        if kind == "ROUGHNESS":
+            return processor.generate_roughness(self.pixels)
+        if kind == "METALLIC":
+            return processor.generate_metallic(self.pixels)
+        if kind == "GLOSSINESS":
+            return processor.generate_glossiness(self.pixels)
+        if kind == "SPECULAR":
+            return processor.generate_specular(self.pixels)
+        if kind == "EMISSION":
+            return processor.generate_emission(self.pixels)
+        if kind == "DETAIL":
+            return processor.generate_detail(self.pixels)
+        return None
+
+    def get_channel(self, kind, channel):
+        """从已生成的贴图中取出一个通道分量（法线按 R/G/B 取 X/Y/Z，灰度图任意通道同名返回）"""
+        data = self.get(kind)
+        if data is None:
+            return None
+        if kind == "NORMAL":
+            component = {"R": data[0], "G": data[1], "B": data[2]}
+            return component.get(channel, data[2])
+        return data
 
 
 class TT_OT_channel_composite_add_preset(bpy.types.Operator):
@@ -515,13 +680,14 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
         return base_pixels, width, height
 
     def _compose_rule_pixels(self, rule, base_pixels, width, height, processor):
+        map_generator = RuleMapGenerator(processor, base_pixels, width, height, rule)
         channels_data = [None, None, None, None]
 
         for i, ch_config in enumerate(rule.output_channels):
             if i >= 4:
                 break
 
-            ch_data = self._resolve_channel(ch_config, base_pixels, width, height, processor, rule)
+            ch_data = self._resolve_channel(ch_config, base_pixels, width, height, processor, rule, map_generator)
             if ch_config.invert and ch_data is not None:
                 ch_data = 1.0 - ch_data
             channels_data[i] = ch_data if ch_data is not None else np.zeros((height, width), dtype=np.float32)
@@ -546,43 +712,40 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
         bpy.data.images.remove(blender_img)
         return str(output_path), output
 
-    def _resolve_channel(self, ch_config, base_pixels, width, height, processor, rule):
+    def _resolve_channel(self, ch_config, base_pixels, width, height, processor, rule, map_generator=None):
         source_type = ch_config.source_type
 
         if source_type == "CONSTANT":
             return np.full((height, width), ch_config.constant_value, dtype=np.float32)
         if source_type == "IMAGE_CHANNEL":
             return processor.extract_channel(base_pixels, ch_config.source_channel)
-        if source_type == "GENERATED_NORMAL":
-            grayscale = processor.extract_channel(base_pixels, "LUMINANCE")
-            normal_x, normal_y, normal_z = processor.generate_normal_map_advanced(
-                grayscale,
-                strength=rule.normal_strength,
-                blur_radius=rule.normal_blur_radius,
-                invert=rule.normal_invert_height,
-            )
-            channel_map = {"R": normal_x, "G": normal_y, "B": normal_z}
-            return channel_map.get(ch_config.source_channel, normal_z)
-        if source_type == "GENERATED_ROUGHNESS":
-            return processor.generate_roughness(base_pixels, invert=ch_config.invert)
-        if source_type == "GENERATED_AO":
-            return processor.generate_ao(base_pixels)
-        if source_type == "GENERATED_METALLIC":
-            return processor.generate_metallic(base_pixels)
         if source_type == "GRAYSCALE":
             return processor.extract_channel(base_pixels, "LUMINANCE")
         if source_type == "INVERT":
             return 1.0 - processor.extract_channel(base_pixels, "LUMINANCE")
-        if source_type == "GENERATED_GLOSSINESS":
-            return processor.generate_glossiness(base_pixels)
-        if source_type == "GENERATED_SPECULAR":
-            return processor.generate_specular(base_pixels)
-        if source_type == "GENERATED_EMISSION":
-            return processor.generate_emission(base_pixels)
-        if source_type == "GENERATED_DETAIL":
-            return processor.generate_detail(base_pixels)
+
+        # 派生贴图统一走依赖图：HEIGHT → NORMAL → AO 等，按需生成、只算一次
+        if map_generator is None:
+            map_generator = RuleMapGenerator(processor, base_pixels, width, height, rule)
+
+        if source_type == "GENERATED_NORMAL":
+            return map_generator.get_channel("NORMAL", ch_config.source_channel)
         if source_type == "GENERATED_HEIGHT":
-            return processor.generate_height_from_color(base_pixels)
+            return map_generator.get("HEIGHT")
+        if source_type == "GENERATED_AO":
+            return map_generator.get("AO")
+        if source_type == "GENERATED_ROUGHNESS":
+            return map_generator.get("ROUGHNESS")
+        if source_type == "GENERATED_METALLIC":
+            return map_generator.get("METALLIC")
+        if source_type == "GENERATED_GLOSSINESS":
+            return map_generator.get("GLOSSINESS")
+        if source_type == "GENERATED_SPECULAR":
+            return map_generator.get("SPECULAR")
+        if source_type == "GENERATED_EMISSION":
+            return map_generator.get("EMISSION")
+        if source_type == "GENERATED_DETAIL":
+            return map_generator.get("DETAIL")
         return None
 
     def _create_composite_material(self, material_name, composite_image_path):

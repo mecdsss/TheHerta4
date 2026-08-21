@@ -807,6 +807,10 @@ class TT_ChannelCompositePanel(bpy.types.Panel):
                     elif ch.source_type == 'GENERATED_NORMAL':
                         ch_row.prop(rule, "normal_strength", slider=True, text="强度")
                         ch_row.prop(rule, "normal_blur_radius", slider=True, text="模糊")
+                    elif ch.source_type == 'GENERATED_AO':
+                        ch_row.prop(rule, "ao_radius", text="半径")
+                        ch_row.prop(rule, "ao_height_scale", slider=True, text="高度比例")
+                        ch_row.prop(rule, "ao_power", slider=True, text="对比度")
                     
                     ch_row.prop(ch, "invert", toggle=True, text="反转")
                 

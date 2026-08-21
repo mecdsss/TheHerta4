@@ -28,7 +28,7 @@ class TT_ChannelSource(bpy.types.PropertyGroup):
             ('GENERATED_HEIGHT', "高度图", "从颜色图推导的高度信息"),
             ('GENERATED_ROUGHNESS', "粗糙度", "从颜色图计算粗糙度（亮→光滑，暗→粗糙）"),
             ('GENERATED_GLOSSINESS', "光泽度", "粗糙度的反义词"),
-            ('GENERATED_AO', "环境光遮蔽", "模拟AO效果（暗部遮蔽更强）"),
+            ('GENERATED_AO', "环境光遮蔽", "由置换+法线计算的地平线式 AO（凹陷处遮蔽更强）"),
             ('GENERATED_METALLIC', "金属度", "基于颜色分析检测金属区域"),
             ('GENERATED_SPECULAR', "高光强度", "镜面反射强度"),
             ('GENERATED_EMISSION', "自发光", "检测过亮的自发光区域"),
@@ -111,6 +111,27 @@ class TT_CompositeRule(bpy.types.PropertyGroup):
         name="反转高度",
         description="生成法线时反转高度方向",
         default=False
+    )
+    ao_radius: bpy.props.IntProperty(
+        name="AO 采样半径",
+        description="地平线式 AO 向外步进采样的最大距离（像素）",
+        default=16,
+        min=1,
+        max=128
+    )
+    ao_height_scale: bpy.props.FloatProperty(
+        name="AO 高度比例",
+        description="把 0-1 高度差换算成像素单位计算遮蔽仰角，值越大遮蔽越强",
+        default=16.0,
+        min=0.1,
+        max=128.0
+    )
+    ao_power: bpy.props.FloatProperty(
+        name="AO 对比度",
+        description="对 AO 结果施加的幂次，值越大遮蔽区域越暗",
+        default=1.0,
+        min=0.1,
+        max=4.0
     )
 
 
