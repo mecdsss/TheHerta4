@@ -536,19 +536,29 @@ class EFMIBoneMapBuilder:
         except Exception:
             return None
 
-        # 取第一个非零骨骼段（主骨骼段）
-        for offset_value in skeleton_offsets:
-            offset = int(offset_value)
-            if not offset:
-                continue
-            data_offset = offset + 3
+        # 读取一个骨骼段（256 骨骼 × 12 floats）
+        def _read_segment(base_offset: int) -> numpy.ndarray | None:
+            if not base_offset:
+                return None
+            data_offset = base_offset + 3  # GLOBAL_RESERVED_ROWS = 3
             skeleton_raw = pool_data[data_offset:data_offset + _BONE_SEGMENT_FLOAT4]
             usable = (len(skeleton_raw) // 3) * 3
             if usable == 0:
-                continue
-            skeleton = skeleton_raw[:usable].reshape(-1, _BONE_MATRIX_FLOATS)
-            return skeleton
-        return None
+                return None
+            return skeleton_raw[:usable].reshape(-1, _BONE_MATRIX_FLOATS)
+
+        current = _read_segment(int(skeleton_offsets[0]))
+        previous = _read_segment(int(skeleton_offsets[1])) if len(skeleton_offsets) > 1 else None
+
+        if current is None and previous is None:
+            return None
+        if current is None:
+            current = numpy.zeros_like(previous)
+        if previous is None:
+            previous = numpy.zeros_like(current)
+
+        # 两帧拼接：(N, 12) 当前 + (N, 12) 上一帧 → (N, 24) 签名
+        return numpy.concatenate([current, previous], axis=1)
 
     def _find_cb_slot(self, draw_index: str, cb_hash: str) -> int:
         for (idx, stage, slot), binding in self.parser.cb_bindings.items():
@@ -563,7 +573,7 @@ class EFMIBoneMapBuilder:
     @staticmethod
     def build_vg_maps(
         submesh_skeletons: dict[str, tuple],
-        match_tolerance: float = 1e-3,
+        match_tolerance: float = 0.0,
         tight_matrix_tolerance: float = 1e-5,
         centroid_tolerance: float = 0.03,
     ) -> dict[str, dict]:
@@ -593,11 +603,12 @@ class EFMIBoneMapBuilder:
         - 驱动点云（包围盒/质心）会把"同一骨骼跨部件驱动区域本就不同"的误拆。
         唯一可靠的是"同部件不合并 + 跨部件矩阵容差合并"这一语义规则。
 
-        match_tolerance: 跨子网格矩阵合并容差（默认 1e-3；同一骨骼跨 drawcall 的浮点
-        误差一般 <1e-4，1e-3 足够覆盖；冲突拒绝规则兜底防止不同骨骼误并）。
-        centroid_tolerance / bbox_overlap_min: 可选的点云判据（**默认 None 关闭**）。
-        实测发现点云会把"同一骨骼跨部件驱动区域本就不同"的误拆，故默认不启用；
-        仅在明确需要时用（同时设两者才生效）。
+        match_tolerance: 跨子网格矩阵合并容差，**默认 0.0 = 精确匹配**（矩阵逐元素完全
+        相同才合并，与参考插件 EFMI-Tools 一致）。用户最终决定：任何容差/质心维度都可能
+        误并（矩阵差无法区分"同骨骼浮点误差"与"同位置不同骨骼"），故默认精确匹配——
+        漏合并无害（蒙皮仍正确），误合并有害（功能错误/模型变形）。
+        tight_matrix_tolerance / centroid_tolerance: 仅在 match_tolerance > 0 时生效的
+        权重中心聚类分层判据（可选增强，默认不用）。
         """
         # 收集所有骨骼候选
         candidates: list[dict] = []
@@ -698,15 +709,14 @@ class EFMIBoneMapBuilder:
                     continue
 
                 matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
-                # 矩阵差超过粗筛容差 → 不合并
-                if matrix_diff >= match_tolerance:
+                # 矩阵必须 100% 匹配（精确匹配，match_tolerance=0.0 默认）：
+                # 矩阵差 > match_tolerance → 不合并
+                if matrix_diff > match_tolerance:
                     continue
 
-                # 分层判据（用户要求加入权重中心聚类）：
-                # - 矩阵差 < tight_matrix_tolerance（浮点误差级）→ 直接合并（几乎确定同一骨骼）
-                # - 矩阵差在 [tight, match_tolerance)（密集区）→ 需权重中心（质心）接近才合并，
-                #   防止权重密集处不同骨骼（矩阵接近）被误并
-                if matrix_diff >= tight_matrix_tolerance:
+                # 仅在启用容差（match_tolerance>0）且矩阵差超过浮点误差级时，
+                # 用权重中心（质心）聚类确认（密集区防误并）。默认精确匹配下不触发。
+                if match_tolerance > 0 and matrix_diff > tight_matrix_tolerance:
                     dist = centroid_dist(i, j)
                     if dist is None or dist >= centroid_tolerance:
                         continue
