@@ -335,6 +335,14 @@
 - [x] Blender headless 端到端复测 [PASS]，INI 结构验证正确（14 段串联齐全）
 - [ ] **游戏内实测（待用户）**：启动游戏加载 mod，验证骨骼合并生效（模型正常显示/骨骼不错乱）；若异常，排查 Apply 在静态单实例下的语义（$draw_call_instance_id=0、空间识别池默认值）
 
+### 阶段 7：去重算法修正（容差聚类，已完成并复测 [PASS]）
+- [x] **用户发现去重问题**：精确 tuple 匹配对浮点敏感，大量"矩阵近似相同（差 1e-7~1e-4）"的骨骼未合并（例：539 与 493 矩阵差 1.8e-07 本应同一骨骼却被分成两个 id；容差 1e-4 下 171 组矩阵相同骨骼中 157 组被分配不同 id）
+- [x] `build_vg_maps` 改为**容差聚类（并查集连通分量）**：矩阵 allclose(atol=1e-4) 的骨骼合并为同一 canonical（取组内权重顶点数最多者），`match_tolerance=1e-4` 可调
+- [x] **drawcall 反查兜底**：ComponentName_DrawCallIndexList.json 被 SSMT4 重置（仅剩 1 条）时，`EFMILogParser.find_drawcalls_by_ib` 从 dump 按 ib hash + index_count + first_index 反查 drawcall（验证：同 ib 的 000020 vs 000071 骨骼段完全相同，反查可靠）
+- [x] 效果：唯一全局骨骼 id 596→**255**（多合并 341 根），跨子网格共享骨骼 47→**162**，539/493 合并为 44；162/162 共享骨骼在 Blender 里同名（合并 100% 生效）
+- [x] 误合并检查：169 组同 id 骨骼中 168 组矩阵差全在容差内，唯一 1.47e-4 的 gid 419（30 部件共享的核心骨骼，属正常）
+- [x] Blender headless 端到端复测 [PASS]（导入 509 组/导出 INI 全校验 OK/Blend buffer 14 个）
+
 ### 阶段 5（明确不做，备忘）
 - ~~LOD BlendRemap~~（用户：不需要 LOD 相关内容）
 - ~~shapekey 批次导出~~（用户：保留现有 INI 格式）

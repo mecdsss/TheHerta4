@@ -42,6 +42,7 @@ class EFMILogParser:
 
     _DRAW_PREFIX_RE = re.compile(r"^(\d{6}) (.*)$")
     _DUMP_RE = re.compile(r"^3DMigoto Dumping Buffer (.+) -> (.+)$")
+    _IB_FILE_RE = re.compile(r"^(\d{6})-ib=([0-9a-f]{8})")
     _CB_BIND_RE = re.compile(
         r"^(\d+): resource=0x[0-9A-Fa-f]+ hash=([0-9a-f]{8}) "
         r"first_constant=(\d+) num_constants=(\d+)$"
@@ -206,6 +207,43 @@ class EFMILogParser:
                 return dst
         return None
 
+    def find_drawcalls_by_ib(
+        self,
+        draw_ib: str,
+        index_count: int | None = None,
+        first_index: int | None = None,
+    ) -> list[str]:
+        """按 IB hash（+可选 index_count/first_index）反查 drawcall 索引列表。
+
+        从 dump 文件名（`{idx}-ib=<hash>...`）解析 drawcall -> ib hash 映射，
+        再按 DrawIndexedInstanced 的 index_count/first_index 过滤。
+        用于 ComponentName_DrawCallIndexList.json 缺失/被重置时的兜底。
+        """
+        draw_ib = str(draw_ib or "").strip().lower()
+        if not draw_ib:
+            return []
+        candidates = []
+        for src in self.dump_map.keys():
+            match = self._IB_FILE_RE.match(src)
+            if match and match.group(2) == draw_ib:
+                candidates.append(match.group(1))
+        candidates = sorted(set(candidates))
+        if index_count is None and first_index is None:
+            return candidates
+
+        matched = []
+        for idx in candidates:
+            dc = self.draw_calls.get(idx)
+            if dc is None:
+                continue
+            if index_count is not None and dc.get("index_count") != index_count:
+                continue
+            if first_index is not None and dc.get("start_index") != first_index:
+                continue
+            matched.append(idx)
+        # 精确匹配失败时回退到全部候选（提取切分可能与 draw 参数不完全一致）
+        return matched if matched else candidates
+
 
 class EFMIBoneMapBuilder:
     """构建 EFMI 子网格的骨骼合并映射（vg_map / vg_offset / vg_count）。"""
@@ -333,14 +371,23 @@ class EFMIBoneMapBuilder:
     @staticmethod
     def build_vg_maps(
         submesh_skeletons: dict[str, tuple[numpy.ndarray, int, numpy.ndarray]],
+        match_tolerance: float = 1e-4,
     ) -> dict[str, dict]:
-        """跨子网格按骨骼矩阵去重构建 vg_map。
+        """跨子网格按骨骼矩阵去重构建 vg_map（容差聚类）。
 
         参数: unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts)
         返回: unique_str -> {local_vg_id(int): global_vg_id(int)}
+
+        说明：早期版本用精确 tuple 匹配去重，但同一根骨骼在不同 drawcall 的蒙皮矩阵
+        存在 1e-7~1e-4 的浮点误差，导致大量应合并的骨骼被漏掉（例如矩阵差 1.8e-07 的
+        539/493 被分成两个 id）。改为**容差聚类**（连通分量）：矩阵 allclose(atol) 的
+        骨骼合并为同一 canonical（取组内权重顶点数最多者）。
+
+        match_tolerance: 矩阵判定相同的绝对容差（默认 1e-4；蒙皮矩阵的跨 drawcall
+        浮点误差一般在 1e-6 量级，1e-4 足以覆盖且远小于不同骨骼的姿态差）。
         """
-        # bone_data(tuple) -> [candidate...]
-        bone_candidates: dict[tuple, list[dict]] = {}
+        # 收集所有骨骼候选
+        candidates: list[dict] = []
         vg_offset = 0
 
         for unique_str, (skeleton_buffer, vg_count, weighted_vertex_counts) in submesh_skeletons.items():
@@ -354,40 +401,64 @@ class EFMIBoneMapBuilder:
                 continue
 
             for vg_id in range(vg_count):
-                bone_data = tuple(skeleton_buffer[vg_id].tolist())
+                bone = skeleton_buffer[vg_id]
                 # 跳过全零骨骼（无效数据）
-                if all(v == 0 for v in bone_data):
+                if numpy.all(bone == 0):
                     continue
                 weighted_count = (
                     int(weighted_vertex_counts[vg_id])
                     if vg_id < len(weighted_vertex_counts)
                     else 0
                 )
-                bone_candidates.setdefault(bone_data, []).append({
+                candidates.append({
                     "unique_str": unique_str,
                     "local_vg_id": vg_id,
                     "global_vg_id": vg_offset + vg_id,
                     "weighted_vertex_count": weighted_count,
+                    "bone": bone,
                 })
 
             vg_offset += vg_count
 
-        # 第二遍：每唯一骨骼选权重顶点数最多的候选作 canonical
-        bone_sources: dict[tuple, dict] = {}
-        for bone_data, candidates in bone_candidates.items():
-            bone_sources[bone_data] = max(
-                candidates,
-                key=lambda c: c["weighted_vertex_count"],
-            )
+        n = len(candidates)
+        if n == 0:
+            return {}
 
-        # 第三遍：建立实际映射
+        # 容差聚类（并查集连通分量）：矩阵 allclose(atol) 的骨骼合并
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if find(i) == find(j):
+                    continue
+                if numpy.allclose(mats[i], mats[j], atol=match_tolerance, rtol=0.0):
+                    union(i, j)
+
+        # 分组
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+
+        # 每组 canonical = 权重顶点数最多的候选
         vg_maps: dict[str, dict] = {}
-        for bone_data, candidates in bone_candidates.items():
-            source = bone_sources[bone_data]
-            for candidate in candidates:
-                vg_maps.setdefault(candidate["unique_str"], {})[
-                    candidate["local_vg_id"]
-                ] = source["global_vg_id"]
+        for root, members in groups.items():
+            canonical_idx = max(members, key=lambda i: candidates[i]["weighted_vertex_count"])
+            canonical_global = candidates[canonical_idx]["global_vg_id"]
+            for i in members:
+                cand = candidates[i]
+                vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
 
         return vg_maps
 
@@ -626,7 +697,7 @@ class EFMISkeletonMergeHelper:
             submesh_dir = os.path.dirname(os.path.dirname(json_path))  # TYPE_ 的上一级 = 子网格目录
             blend_buf_path = os.path.join(os.path.dirname(json_path), bare_name + "-Blend.buf")
 
-            # 子网格 -> drawcall 索引（优先角色级映射，其次 LOD 目录映射）
+            # 子网格 -> drawcall 索引（优先角色级映射，其次 LOD 目录映射，最后 dump 反查兜底）
             drawcall_index_list: list[str] = []
             lod_dir = os.path.dirname(submesh_dir)
             role_mapping = cls.load_drawcall_index_list(lod_dir)
@@ -634,6 +705,26 @@ class EFMISkeletonMergeHelper:
             if not drawcall_index_list:
                 role_mapping_root = cls.load_drawcall_index_list(workspace_root)
                 drawcall_index_list = role_mapping_root.get(os.path.basename(submesh_dir), [])
+
+            # 兜底：ComponentName 映射缺失/被重置时，从 dump 按 ib hash + index_count + first_index 反查
+            if not drawcall_index_list:
+                submesh_name = os.path.basename(submesh_dir)
+                parts = submesh_name.split("-")
+                if len(parts) >= 3:
+                    try:
+                        draw_ib = parts[0]
+                        index_count = int(parts[1])
+                        first_index = int(parts[2])
+                        drawcall_index_list = parser.find_drawcalls_by_ib(
+                            draw_ib, index_count, first_index
+                        )
+                        if drawcall_index_list:
+                            print(
+                                f"[EFMI骨骼合并] {unique_str}: ComponentName 缺失，"
+                                f"已从 dump 反查 drawcall {drawcall_index_list[:3]}"
+                            )
+                    except (ValueError, IndexError):
+                        pass
 
             if not drawcall_index_list:
                 print(f"[EFMI骨骼合并] 跳过 {unique_str}: 未找到 drawcall 映射")
