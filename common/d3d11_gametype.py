@@ -129,6 +129,67 @@ class D3D11GameType:
             new_dict[categoryname] = category_stride
         return new_dict
 
+    def widen_blendindices(self, new_format: str = "R16G16B16A16_UINT") -> bool:
+        """将 BLENDINDICES 元素升宽（用于 EFMI 骨骼合并场景）。
+
+        修改运行时副本的元素 Format/ByteWidth，并联动重算 AlignedByteOffset 与
+        CategoryStrideDict（get_total_structured_dtype 为动态计算，自动生效）。
+        已是 R32 系或目标格式时无需处理。
+
+        Returns:
+            是否发生了升宽修改。
+        """
+        element_name = None
+        for name in self.OrderedFullElementList:
+            if name.startswith("BLENDINDICES"):
+                element_name = name
+                break
+        if element_name is None:
+            return False
+
+        element = self.ElementNameD3D11ElementDict.get(element_name)
+        if element is None:
+            return False
+
+        current_format = str(getattr(element, "Format", "") or "").upper()
+        new_format = str(new_format or "").upper()
+        if current_format == new_format:
+            return False
+        # R32 系已足够宽，无需升宽
+        if current_format in ("R32G32B32A32_UINT", "R32G32B32A32_SINT", "R32G32B32A32_FLOAT"):
+            return False
+
+        old_width = int(getattr(element, "ByteWidth", 0) or 0)
+        new_width = {
+            "R16G16B16A16_UINT": 8,
+            "R16_UINT": 2,
+        }.get(new_format)
+        if new_width is None or old_width <= 0:
+            return False
+
+        element.Format = new_format
+        element.ByteWidth = new_width
+
+        # 重算 AlignedByteOffset（按元素顺序累加）
+        aligned_byte_offset = 0
+        for d3d11_element in self.D3D11ElementList:
+            d3d11_element.AlignedByteOffset = aligned_byte_offset
+            aligned_byte_offset = aligned_byte_offset + int(d3d11_element.ByteWidth)
+
+        # 重算 CategoryStrideDict
+        self.CategoryStrideDict = {}
+        for d3d11_element in self.D3D11ElementList:
+            self.CategoryStrideDict[d3d11_element.Category] = (
+                self.CategoryStrideDict.get(d3d11_element.Category, 0)
+                + int(d3d11_element.ByteWidth)
+            )
+
+        print(
+            f"[D3D11GameType] BLENDINDICES 升宽: {current_format} -> {new_format} "
+            f"(ByteWidth {old_width} -> {new_width})"
+        )
+        return True
+
     def get_blendindices_count_wwmi(self) -> int:
         """获取 WWMI 游戏的混合索引数量（给 WWMI 准备，其它逻辑不兼容）
 

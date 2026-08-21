@@ -1,0 +1,379 @@
+# EFMI 导入/导出升级计划书
+
+> 状态：**调研完成，方案待用户确认** · 最后更新：调研闭环后
+> 目标：把 EFMI-Tools（SpectrumQT，明日方舟：终末地模组工具）中「骨骼合并（Merged Skeleton）」等能力，按当前项目 TheHerta4 的 SSMT 架构合并、优化、升级到本项目的 EFMI 导入/导出链路。
+> 依据：两份子代理深度报告（`docs/efmi-tools-参考插件报告存档.md`、`reports/efmi_pipeline_report.md`）+ 本计划书调研阶段对 SSMT4 提取端、EFMI 数据类型配置、实际工作空间与 FrameAnalysis dump 的实证核对。
+> 原则：**先彻底搞清楚两边的数据来源与流程，再动手**。本计划书即「搞清楚」的产物，也是后续实施的唯一依据。
+
+---
+
+## 1. 背景与目标
+
+### 1.1 双方插件
+
+| | 参考插件 | 当前项目 |
+|---|---|---|
+| 名称 | EFMI-Tools（v0.6.2 / efmi v1.4.1） | TheHerta4（SSMT 系） |
+| 位置 | `J:\QQ缓存\文件\EFMI-Tools` | `E:\代码\TheHerta4` |
+| 游戏 | 明日方舟：终末地（Arknights: Endfield） | 多游戏类型，含 EFMI（终末地） |
+| 数据来源 | EFMI 提取端 dump 的整对象目录（Metadata.json + Component N.fmt/.vb/.ib） | SSMT 工作空间（子网格 json + 分类 buffer），可反查提取数据（NTEMI 已验证） |
+| 特色 | 骨骼合并（Merged Skeleton）、LOD BlendRemap、shapekey 批次、Jinja2 模板 ini | 蓝图节点工作流、跨 IB（骨骼跨 IB）、着色器替换、分支 GUI |
+
+### 1.2 目标
+
+1. 把参考插件的「骨骼合并」能力合并进当前项目的 EFMI 导入/导出。
+2. 修复当前 EFMI 导出的已知断路（ENCODEDDATA 隐患）。
+3. 数据补齐遵循当前项目惯例：**工作空间优先，缺什么从提取数据反查，并把拿到的数据复制回工作空间缓存**（NTEMI 已验证的模式）。
+4. 不破坏现有 EFMI 工作流（蓝图、跨 IB、着色器替换、HTMI 映射）与其它游戏类型。
+
+### 1.3 用户已拍板的决策（2026-08 确认）
+
+- **范围**：全量 —— ENCODEDDATA 导出修复 + BLENDINDICES 升宽 + EFMI 骨骼合并导入收尾（空组清理/校验）+ 导出前顶点组预处理。
+- **宽度策略**：EFMI 合并骨架场景下 BLENDINDICES 无条件升宽（对齐参考插件合并模式约定）。
+- **LOD BlendRemap**：暂不移植（当前 EFMI 链路无 LOD buffer 概念，加载端约定未确认）。
+- **数据补齐方式**：工作空间缺数据时从提取数据反查，复制回工作空间缓存（用户明确要求）。
+
+### 1.4 决策确认记录（2026-08 二次确认）
+
+| 决策点 | 结论 |
+|---|---|
+| 升宽目标格式 | **`R16G16B16A16_UINT`**（参考插件正统约定；配套 INI `vb2->ElementFormat(BLENDINDICES,0)=R16G16B16A16_UINT` 强制读取；加载端可更新到支持 EFMIv1 运行时，但本方案不依赖其新机制，ElementFormat 是 3Dmigoto 基础语法） |
+| 骨骼数据来源 | **方案 A：Blender 侧反查**（读 FrameAnalysisPath.json → 分析 Zmd dump cb4 骨骼矩阵 → 生成 VGMap 写回工作空间 json + 复制骨骼 buffer 到 ModImpRuntime 缓存） |
+| 行为开关 | **复用 `import_merged_vgmap()`**（默认 True，与现有 WWMI 语义一致） |
+| INI 体系 | **保留现有 TheHerta4 INI 格式**（TextureOverride 静态绑定 + Resource 段 + 跨 IB + 着色器替换），**不照搬**参考插件的 EFMIv1 运行时绘制体系（Object_ReadConfig/Component_DrawInstances/空间识别） |
+| LOD / BlendRemap / shapekey 池 / 运行时 MergedSkeleton 段 | **明确不做**（用户：不需要 LOD 相关内容，尽可能保留现有 INI 格式） |
+| 加载器 | 用户确认可更新（当前 Zmd Core/EFMI 是旧版，缺 EFMIv1 全量 API）；但本方案仅用 ElementFormat 基础语法，加载器更新与否不影响落地 |
+
+> ⚠️ **调研修正（已确认）**：用户早前拍板"无条件 R16"→ 后改为 BI16 型 R32（基于"加载端不认 R16"前提）→ 现确认加载端可更新，**最终改回参考插件正统的 `R16G16B16A16_UINT`**（导出 buffer 16 位 + INI ElementFormat 强制 16 位读取）。
+
+---
+
+## 2. 两套管线对比总览
+
+| 环节 | 参考插件 EFMI-Tools | 当前项目 TheHerta4(EFMI) | 差异/缺口 |
+|---|---|---|---|
+| 数据来源 | 整对象目录：Metadata.json + Component N.fmt/.vb/.ib（自带 vg_map，v4+） | SSMT 工作空间：`<drawib>-<component>-<n>/TYPE_<gametype>/{json,buf,ib}`；json 无 VGMap | 当前缺骨骼合并数据 |
+| 提取端 | 自带提取流程（帧 dump → RawObject → MigotoObjectBuilder → build_vg_map） | SSMT4 提取端 `efmi3.rs`（**不生成 VGMap/VGOffset/BoneMatrix**；WWMI/NTEMI 提取端有完整实现可参照） | 提取端缺口 |
+| 导入 | 按 component 建 mesh；MERGED 用 vg_map 重映射（vg_remap 查找表）+ 删空组 + 版本校验 | 按 drawcall 建对象；json VGMap + import_merged_vgmap 双条件才走全局映射（EFMI 现状不满足）；空组清理不含 EFMI | 缺 EFMI 骨骼合并导入 |
+| 导出 | ObjectMerger join 整模（VG 全局索引化：补缺/剔 ignore/越界/改名 str(index)）→ 按 .fmt 切 buffer | 每对象独立 SubMeshModel → 分类 buffer；`blend index = 顶点组列表 index`；无跨子网格重映射 | 缺导出侧骨骼合并 |
+| BLENDINDICES 宽度 | Merged 强制 min=max=2（R16 系，含 stride 重算） | BI4=R8G8B8A8_UINT >255 **两处 Fatal**；BI16=R32G32B32A32_UINT；`_allow_wide_blendindices_for_remap` 仅 WWMI/NTEMI | 待升级 |
+| ENCODEDDATA | 完整编解码（TBN 三路 → 10-10-10-2 打包） | 解码已有（TBNCodec）；**导出分支被注释 = 断路隐患**（当前类型无此元素不触发） | 待修复 |
+| 空组/ignore/补缺 | 导出前 fill_gaps + 剔除 + 改名 | 蓝图有手动节点（node_vertex_group_process），EFMI 流程未自动串联 | 待升级 |
+| LOD | LOD buffer + BlendRemap 表（mod 端骨骼导入 CS） | 无 | 暂缓 |
+| 反查机制 | 无此概念（数据自带） | NTEMI 有完整闭环（FrameAnalysisPath.json → deduped 反查 → ModImpRuntime 复制缓存 → 骨骼合并后处理）；**EFMI 不消费** | 待移植 |
+
+---
+
+## 3. 参考插件 EFMI-Tools 流程详解
+
+**完整报告见 `docs/efmi-tools-参考插件报告存档.md`（含全部文件:行号）。本节为要点浓缩。**
+
+### 3.1 数据来源
+
+- `object_source_folder` = 一个对象的源目录：`Metadata.json` + 每组件 `Component N.fmt/.vb/.ib` + 贴图 + `TextureUsage.json`。
+- 由插件自带提取流程从 3DMigoto 风格帧 dump 生成（`extract_frame_data/` → `object_extractor/`：RawObjectExtractor 按 DrawIndexedInstanced 调用收集 → MigotoObjectBuilder 组装组件/贴图/vg_map）。
+- **Metadata.json 关键字段**：`format_version`（v4 才有 vg_map）、`weigthing_type`（EXPLICITLY_WEIGHTED/IMPLICITLY_WEIGHTED/NOT_WEIGHTED）、`rotation`、`components[]`（每个含 `vg_offset/vg_count/vg_map`（local→global）、`cpu_posed`、`lods[]`（含 `vg_map`（full→lod，方向相反）、`vb_formats`））、`shapekeys`、`export_format`。
+- **vg_map 生成**（提取端 `migoto_object_builder.py:386-522`）：跳过 CPU-posed → 从 instance config CB 读骨骼偏移 → vs-t0 纹理读每骨骼 4×3 矩阵 → **按矩阵内容去重**（相同骨骼矩阵合并为同一全局 id）→ 三遍扫描选 canonical → 写 `vg_map[local]=global`。
+
+### 3.2 导入
+
+`EFMI_Import` → `import_object`：校验（MERGED 需 v4 + Explicit 权重）→ 逐组件：`vg_remap = np.array(list(vg_map.values()))`（仅 MERGED + dedupe_bones + 非 cpu_posed）→ `DataModelEFMI.set_data`：ENCODEDDATA0 解码（10-10-10-2 → 八面体法线）→ 各语义 converter（mirror/rotate/flip_texcoord_v/**converter_apply_lookup(vg_remap)**）→ BlenderDataImporter 建网格/UV/顶点组（组名 = 全局 id 序号）。最后 `skip_empty_vertex_groups and MERGED` → 删空组（按 index 倒序，保持剩余组 index 不变）。
+
+### 3.3 导出
+
+`EFMI_Export` → `ModExporter.export_mod`：读 Metadata → 校验 → 逐组件：
+1. **ObjectMerger**（骨骼合并核心）：按 `component[_ -]*(\d+)` 正则挑对象 → 复制 TEMP → transform_apply → 应用修改器（保留 shapekey）→ 三角化 → **fill_gaps 补缺组 → 删 ignore/越界组（index >= Σvg_count）→ 全部改名 str(vg.index)** → join 成 TEMP_EXPORT_OBJECT。
+2. **build_data_buffers**：buffers_format 来自 `export_format + Component N.fmt + LOD vb_formats`；`get_data` 注入 TBN 临时语义（Tangent1/BitangentSign1/Normal1）→ `export_data`（**Merged 时 `force_compatible_buffers_format(Blendindices, min=2, max=2)` 强制 16 位**；IB min 2B）→ ENCODEDDATA0 打包（flip_texcoord_v 时 tangents *= -1）→ build_buffers（BLENDWEIGHTS 归一化/量化）。
+3. **LOD**：PerComponent 模式重映射 LOD VB2；Merged 模式生成 `VB2_LODx_BlendRemap`（R16_UINT 表，长度=全模 vg_count，供 mod 端骨骼导入 CS）。
+4. **shapekey**：每 127 个一批，BatchConfigs/VertexIds/VertexOffsets 三 buffer。
+5. **ini**：Jinja2 模板，Merged Skeleton 段注册 VertexGroupOffsets/Counts/LodRemaps，并强制 `vb2->ElementFormat(BLENDINDICES,0)=R16G16B16A16_UINT`。
+
+### 3.4 骨骼合并最小闭环
+
+① 提取端生成 vg_map/vg_offset/vg_count + format_version=4 → ② 导入端 converter_apply_lookup 重映射 → ③ 导出端 VG 全局索引化（改名 str(index)+join）+ 强制升宽 → ④（可选）LOD BlendRemap 表 + ini 注册。
+
+### 3.5 可移植清单（按价值排序）
+
+| 能力 | 参考插件实现 | 当前项目对应 | 移植价值 |
+|---|---|---|---|
+| vg_map 骨骼去重生成 | migoto_object_builder.py:386-522 | 无（SSMT4 提取端 wwmi.rs 有等价实现） | **高**（骨骼合并数据源头） |
+| 导入 vg_remap 重映射 | data_model.py:105-108 + data_importer | mesh_create_helper.import_vertex_groups 已有等价 | 已具备 |
+| 导出 VG 全局索引化 | object_merger.py:224-252 | 蓝图节点手动版 | **高** |
+| blend 升宽 | force_compatible_buffers_format | `_allow_wide_blendindices_for_remap`（仅 WWMI/NTEMI） | **高** |
+| 删空组 | vertex_groups.py:18-32 | VertexGroupUtils.remove_unused_vertex_groups（EFMI 未启用） | 中 |
+| LOD BlendRemap | blender_export.py:267-292 | 无 | 暂缓（用户已定） |
+
+---
+
+## 4. 当前项目 TheHerta4 EFMI 流程详解
+
+**完整报告见 `reports/efmi_pipeline_report.md`（含全部文件:行号与 16 个 EFMI 数据类型表）。本节为要点浓缩。**
+
+### 4.1 数据来源：SSMT 工作空间
+
+- 路径：`<SSMTWorkFolder>\WorkSpace\<Game>\<ws>\`（本机 `K:\SSMT-Package-master\WorkSpace\EFMI\<角色>\`，如 佩丽卡 含 LOD0/LOD1）。
+- 结构：`Import.json`（`LODn.<drawib>-<component>-<n>` → gametype 名）→ `LODn/<name>/TYPE_<WorkGameType>/{json,buf,ib}`；`Config/FrameAnalysisPath.json`（**SSMT4 已为 EFMI 记录提取数据路径**）+ `Config/Tabs/ws-tab-*.json`（含 frameAnalysisFolderPath、modelRows）。
+- 子网格 json（SubmeshJson）：CategoryBufferList（每类 buffer 的 D3D11ElementList）、IndexBufferList、`VGCount/VGOffset/VGMap`（**EFMI 实况：0/0/缺省**）、`BoneMatrixFileName`（EFMI 无）、VertexOffset/Count、ShapeKeysInfo（EFMI 全空）。
+- 数据类型（`%LOCALAPPDATA%\SSMT4GlobalConfigs\GameType\EFMI\*.json`，16 个）：
+  - N4 系：`NORMAL = R32_UINT`（10-10-10-2 打包，走 TBNCodec 编解码）；
+  - N12 系：`NORMAL = R32G32B32_FLOAT`（非压缩）；
+  - Blend：**BI4 系 `BLENDINDICES = R8G8B8A8_UINT`（4 通道，>255 Fatal）**；**BI16 系 `R32G32B32A32_UINT`**；BW8 系 `BLENDWEIGHTS = R16G16B16A16_UNORM`、BI16 系 `R32G32B32A32_FLOAT`；
+  - **所有类型均无 ENCODEDDATA 元素**。
+
+### 4.2 NTEMI 反查机制（升级要复刻的样板）
+
+1. **FrameAnalysis 定位**：`_resolve_frame_analysis_dir`（ntemi_importer.py:99）读 `Config/FrameAnalysisPath.json` 的 `frameAnalysisFolderPath`，兜底扫 `Config/Tabs/ws-tab-*.json`；`_load_frame_analysis_dir_map`（:124）按 drawIB → FrameAnalysis 映射（一个 drawIB 可对应不同 dump）。
+2. **反查内容**：FrameAnalysis 的 `deduped/` 按 CategoryHash 模糊匹配原始 vb/ib buffer（`:841-853`），IB 按 `ib-format=..-first=..-count=..` 匹配 txt，vb1-layout、pre-CS/bind-pose 位置流（`_resolve_root_vb0_path`, :766）。
+3. **复制缓存回工作空间**：`localize_runtime_path_props`（runtime_cache.py:103）——源在 FrameAnalysis（工作空间外）→ `shutil.copy2` 到 `<submesh>/ModImpRuntime/`，文件名冲突重命名，对象属性改写为本地路径；配套 `prefix_property_cache.py` 按对象名前缀快照 modimp_* 属性（改名/复制后恢复）。
+4. **骨骼合并后处理**：`_perform_bone_merge_postprocess`（ntemi_importer.py:969）委托外部包 `E:\代码\mod_importer-main`：`discover_yihuan_model`（解析 log.txt + deduped 文件名正则 → DetectedModelBundle，含每 draw 切片与 producer dispatch）→ `analyze_yihuan_frame_stages` → `_build_bone_merge_map`（operators.py:1237：**每 dispatch 骨骼数 = cs-t0 buf 字节数/48**，按 dispatch 顺序累加全局偏移 → entries{region_hash, first_index, index_count, local_bone, global_bone}）→ `_apply_bone_merge_map_to_objects`（:1692：把纯数字名顶点组改名/权重合并为全局 id，冲突则 ADD 合并；查不到 raise）。
+5. **导出侧配套**：`_sort_export_vertex_groups_by_name`（mod_importer operators.py:767）——改名式合并后必须按名字排序，保证 index == 全局 id。
+
+### 4.3 EFMI 导入流程（现状）
+
+`ImprotFromWorkSpaceFull`（非 NTEMI 分支）→ 逐子网格 `SSMTImportHelper.create_mesh_from_json` → `MeshCreateHelper.create_mesh_object`：
+- 坐标：axis_conversion(-Z, Y)；EFMI rotation=(0,0,0)（不翻转三角形、不缩放）。
+- 元素处理：POSITION/COLOR/BLENDINDICES（65535→-1）/BLENDWEIGHT（缺时补 1,0,0,0）/TEXCOORD（v 翻转）/NORMAL（**EFMI R32_UINT → TBNCodec.decode_octahedral_r32_uint**）/ENCODEDDATA（EFMI 分支解码，当前类型无此元素）。
+- **顶点组导入**（import_vertex_groups, :356）：component 非空（json VGMap + import_merged_vgmap 双条件）→ 全局 id 映射（vg_map 命中 → 全局；未命中 → vg_offset+local）；否则按局部索引 0..N 建组。**EFMI 现状无 VGMap → 走局部索引路径**。
+- 空组删除仅 WWMI/NTEMI（:267-269）。
+
+### 4.4 EFMI 导出流程（现状）
+
+- 路由：`export_parallel.py:131` / `direct_export.py:146`（**HTMI 也映射到 ExportEFMI**）→ `ExportEFMI`。
+- `SubMeshModel.calc_buffer`：读子网格 json → d3d11_game_type（可被蓝图 DataType 节点覆盖）→ 同 unique_str 对象 join → 权重归一化（v3 两次归一化）→ EFMI 空间变换 → `parse_elementname_data_dict`：
+  - NORMAL R32_UINT EFMI 分支：`TBNCodec.encode_efmi_tools_r32_uint_from_tbn(flip_texcoord_v=True, flip_bitangent_sign=True)`；
+  - **ENCODEDDATA 导出断路**（元素存在则 NORMAL/TANGENT/BINORMAL 跳过 + ENCODEDDATA 分支被注释 → Fatal；当前类型不触发）；
+  - BLENDINDICES：**`g.group`（顶点组列表 index）**；R8 >255 两处 Fatal（`_allow_wide_blendindices_for_remap` 仅 WWMI/NTEMI）。
+- `calc_index_vertex_buffer_wwmi_v2`：loop 字节去重 → 按 CategoryStrideDict 切分类 buffer；IB 固定 R32_UINT；EFMI 不翻转三角形。
+- INI：每子网格 `[TextureOverride_<unique>]`（hash/match_first_index/match_index_count/handling=skip/run=CommandList\EFMIv1\OverrideTextures/ib/vb0-3/贴图/drawindexedinstanced）+ `[Resource_*]`（stride 来自 CategoryStrideDict）+ 跨 IB/着色器替换/分支 GUI。
+- 预处理：`blueprint/preprocess.py` 逐对象副本（应用约束/修改器/三角化/变换），**无跨对象骨骼合并**。
+
+### 4.5 实证结论（本计划书调研新增）
+
+1. **SSMT4 EFMI 提取端（efmi3.rs）不生成任何骨骼合并数据**：无 VGMap/VGOffset/BoneMatrix 逻辑（对比 wwmi.rs:798-847、ntemi.rs:708-720 有完整实现：BoneMatrix.buf 按矩阵去重构建 vg_map、merged_vg_offset 跨子网格累加）。
+2. **真实 EFMI 工作空间 json 无 VGMap**（佩丽卡/洛茜全部样本 `VGCount:0, VGOffset:0`，无 VGMap 字段，VertexOffset/IndexOffset 全 0）。
+3. **EFMI 的 FrameAnalysis 数据存在且含骨骼矩阵**：`K:\SSMT-Package-master\3Dmigoto\Zmd\FrameAnalysis-2026-05-19-224322`（6353 个文件，deduped/ 4.8GB），其中 `deduped/256f909d-cb4.txt`（22MB）等 **cb4 常量缓冲 = 骨骼矩阵数据**（与 WWMI 提取端用的 `{index}-vs-cb4=` 同源）；根目录 `.buf` 是 0 字节占位，真实数据在 deduped/ 的 `.txt`。→ **反查方案数据源充足**。
+4. EFMI 工作空间 `Config/FrameAnalysisPath.json` 指向的旧 dump（2026-03-31）已删，现存 2026-05-19 —— 读取必须 isdir 校验 + 多候选回退。
+5. 可复用现成组件：`runtime_cache.py`（ModImpRuntime 复制缓存）、`prefix_property_cache.py`（属性快照）、`_resolve_frame_analysis_dir`（定位）、`mod_importer-main`（骨骼合并实现参考）、SSMT4 `wwmi.rs`（BoneMatrix 去重算法参考）。
+
+---
+
+## 5. 差异分析与缺口清单
+
+### 5.1 缺口清单（P0-P3）
+
+| # | 缺口 | 现状位置 | 等级 |
+|---|---|---|---|
+| G1 | **ENCODEDDATA 导出断路（隐患）** | obj_buffer_helper.py:541-575（分支注释） | P0 |
+| G2 | **EFMI BLENDINDICES 无升宽**：BI4(R8) >255 两处 Fatal | obj_buffer_helper.py:80-84, 413-438, 610-622 | P0 |
+| G3 | **骨骼合并数据缺失**：提取端不产、工作空间无 VGMap | SSMT4 efmi3.rs / 工作空间 json | P0（数据源头） |
+| G4 | **EFMI 不消费 FrameAnalysisPath.json**（反查定位缺失） | ui_func_import_ssmt.py（非 NTEMI 分支） | P1 |
+| G5 | **EFMI 无 ModImpRuntime 复制缓存**（数据不回写工作空间） | 可复用 runtime_cache.py | P1 |
+| G6 | **EFMI 导入无骨骼合并后处理**（BoneMergeMap 等价物） | 参考 mod_importer operators.py:1237,1692 | P1 |
+| G7 | **EFMI 空组清理未启用** | mesh_create_helper.py:267-269 | P1 |
+| G8 | **导出前顶点组预处理未串联**（fill gaps/ignore 剔除/按名排序） | 蓝图节点手动版（node_vertex_group_process.py） | P1 |
+| G9 | 顶点组 index vs 名字漂移风险（改名式合并后必须排序） | vertexgroup_utils.py:692（用 g.group） | P1（配套 G6） |
+| G10 | LOD BlendRemap 缺失 | 无 | **不做**（用户：不需要 LOD 相关内容） |
+| G11 | shapekey 批次导出缺失 | 无（EFMI json ShapeKeysInfo 全空） | **不做**（用户：保留现有 INI 格式） |
+
+### 5.2 已具备/不需做的
+
+- 导入 vg_remap 映射逻辑已存在（import_vertex_groups 的 component 分支）——只需喂数据。
+- TBN 编解码已存在且与参考插件等价（TBNCodec）。
+- 跨 IB、着色器替换、分支 GUI 等 TheHerta4 独有特性保持不动。
+- 不需要照搬 ObjectMerger 的 join（当前每对象独立导出，骨骼合并在当前架构 = 全局索引直通 + 升宽 + 名字/排序纪律）。
+
+---
+
+## 6. 升级方案设计
+
+### 6.1 架构原则
+
+1. **不照搬 ObjectMerger 的 join**：当前每 drawcall 独立导出；骨骼合并在当前架构等价于「全局骨骼索引直通」。需要做的：导入时用全局 id 建组（喂 VGMap 数据）→ 导出前保证组名=全局 id 且按名排序 → blend 升宽。
+2. **数据补齐走反查 + 复制回工作空间**（用户明确要求）：EFMI 导入时读 `Config/FrameAnalysisPath.json` → 定位 Zmd dump → 分析骨骼（cb4 矩阵，参照 wwmi.rs 去重算法）→ 生成 `vg_map/vg_offset/vg_count` → **写回工作空间子网格 json 缓存**（下次直接可用）；原始骨骼 buffer 按 NTEMI 模式复制到 `ModImpRuntime/`。
+3. **开关与默认值**：骨骼合并相关行为挂在现有 `import_merged_vgmap()` 下，默认不改变现有非骨骼合并工作流；新增开关仅在需要时开启。
+4. **游戏类型隔离**：所有改动限定 EFMI 分支（或通用 Helper 供 NTEMI/WWMI 复用）；兼容 HTMI → EFMI 映射。
+5. **不引入外部包依赖**：骨骼合并逻辑参照 `mod_importer-main` 但**自研实现进 TheHerta4**（避免运行时依赖 `E:\代码\mod_importer-main`）。
+
+### 6.2 数据流设计（升级后 EFMI 链路）
+
+```
+[提取端 SSMT4 efmi3.rs]（可选后续：补齐 VGMap 生成，参照 wwmi.rs）
+        │ 现状：不产骨骼数据
+        ▼
+[SSMT 工作空间] 子网格 json（无 VGMap）
+        │
+        ▼ ① 导入（ImprotFromWorkSpaceFull EFMI 分支）
+[Blender 插件] 逐子网格：
+   a. 读子网格 json（CategoryBufferList 等）
+   b. ★反查：读 Config/FrameAnalysisPath.json → Zmd FrameAnalysis
+      → 按 drawib/region 定位 cb4 骨骼矩阵（deduped/*-cb4.txt）
+      → 按矩阵内容去重生成 vg_map/vg_offset/vg_count（参照 wwmi.rs 算法）
+      → ★写回工作空间 json 缓存 + 复制骨骼 buffer 到 ModImpRuntime/（参照 runtime_cache.py）
+   c. 若 json 有 VGMap 且 import_merged_vgmap() → import_vertex_groups 全局 id 建组
+   d. EFMI 加入空组清理列表
+        │
+        ▼ ② 导出（ExportEFMI）
+[Blender 插件] 每 SubMeshModel：
+   a. 导出前顶点组预处理（可选开关）：fill gaps / 剔 ignore / 按数字名排序
+   b. ★BLENDINDICES 升宽：合并骨架场景 R8G8B8A8_UINT → R16G16B16A16_UINT（运行时改 gametype 元素），
+      同步 CategoryStrideDict 与 INI Resource stride
+   c. ★INI 变化（仅两处）：Resource_Blend stride 更新 + TextureOverride 段加
+      `vb2->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_UINT`（见 §6.6）
+   d. ★ENCODEDDATA 导出分支接通（若未来类型含 ENCODEDDATA）
+   e. 其余（跨 IB/着色器替换/贴图）不变
+        │
+        ▼
+[Mod 输出] buffers + INI
+```
+
+### 6.3 升宽策略（已确认：R16G16B16A16_UINT）
+
+- **目标格式 `R16G16B16A16_UINT`**（参考插件正统：导出时 `force_compatible_buffers_format(min=2,max=2)` 把 BLENDINDICES 统一为 16 位，stride 同步缩放）。
+- SSMT4 体系无现成 R16 系 EFMI 类型（BI4=`R8G8B8A8_UINT`、BI16=`R32G32B32A32_UINT`）→ 升宽在**导出时动态修改 gametype 元素**（运行时副本，不落盘改配置）：BLENDINDICES Format/ByteWidth/Stride → R16G16B16A16_UINT/8B。
+- 触发条件（已确认）：`logic_name == EFMI 且 import_merged_vgmap() 开启`。合并模式下无条件升宽（全局索引可能超 255），不做 VGCount 阈值判断。
+- 联动修改：
+  - `parse_elementname_data_dict` 的 R8 分支对 EFMI+合并场景允许 cast 到 uint16（替代现有 Fatal）；
+  - `convert_to_element_vertex_ndarray` 打包前 uint8 检查随之放宽（≤65535）；
+  - INI `[Resource_*_Blend]` 的 stride 用新的 CategoryStrideDict（自动联动，见 §6.6）；
+  - INI 每个含 Blend 的 TextureOverride 段输出 `vb2->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_UINT`（见 §6.6）。
+
+### 6.6 INI 变化规格（骨骼合并后，现有 INI 格式下）★用户关注点
+
+**结论：现有 INI 体系下，骨骼合并只带来两处必要变化，无新增 section、无新增 CustomShader/HLSL、无新增 $变量/标签。**
+
+1. **`[Resource_<unique>_Blend]` 的 stride 变化**：BLENDINDICES 从 `R8G8B8A8_UINT`（4B）→ `R16G16B16A16_UINT`（8B）后，Blend 类别 stride 由 CategoryStrideDict 自动更新（如 BW8_BI4：4+4=8B → 4+8=12B；BI4 无权重：4B → 8B）。导出 Blend.buf 字节数同步变大。**与游戏 shader 声明的 input layout（4×8bit）不一致，必须配合第 2 点。**
+2. **每个含 Blend 的 TextureOverride 段加一行**：
+   ```
+   vb2->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_UINT
+   ```
+   作用：3Dmigoto 在 draw 时按 16 位重新解释 vb2 的 BLENDINDICES 元素，使 16 位数据与游戏 shader 读取方式对齐（HLSL 侧 BLENDINDICES 为 uint4 语义，8→16 位只是数据宽度变化）。参考插件同样用此招（`mod.ini.j2:491`）。**不加这行，升宽后的整模会错位撕裂。**（ElementFormat 是 3Dmigoto 基础语法，旧版加载器同样支持。）
+
+**明确不需要的（对比参考插件）**：
+- `[Constants] global $bones_count`、`$\EFMIv1\bones_count/instance_count/custom_mesh_scale`、`Callback_MergedSkeleton_ConnectComponent` —— 运行时绘制体系专属；
+- `[Pool_MergedSkeleton_*]` 5 个池、`[ResourceMergedSkeletonDataRW]`、`[CommandListInitializeMergedSkeleton]`、`[CommandList_MergedSkeleton_ConnectComponent]` —— 运行时 MergedSkeleton 机制（用户确认不做）；
+- `Pool_ShapeKeyedPositionsRW` 等 shapekey 池 —— 不做；
+- `$object_detected/$mod_enabled/RegisterMod` 对象检测流程 —— 现有 INI 由 TextureOverride 挂钩，无需引入。
+
+**顶点组处理与 INI 的关系**：全部在数据侧（导入建组/导出预处理），INI 无对应标签；参考插件的 `ignore` 顶点组命名约定可作为 EFMI 自动预处理的可选规则（剔 ignore 组），非 INI 内容。
+
+### 6.4 反查方案（G3/G4/G5/G6）—— 需要用户确认的大决策
+
+**方案 A（推荐）：Blender 插件侧反查**（用户明示的路线）
+- 导入 EFMI 工作空间时，对每个子网格：读 FrameAnalysisPath → 定位 dump → 分析该 drawib 的骨骼（cb4 矩阵；按 wwmi.rs 的"矩阵字节去重"算法）→ 生成 vg_map 写回工作空间 json + 复制骨骼 buffer 到 ModImpRuntime。
+- 优点：不动 SSMT4（Rust/注入器），纯 Blender 插件改动；数据进工作空间缓存，一劳永逸；完全符合用户"拿完复制到工作空间"的要求。
+- 难点：EFMI dump 的骨骼 buffer 布局需勘察确认（cb4 是 vs-cb4 还是 cs-cb4；矩阵是 4x3 float 还是 3x16 字节行；与 NTEMI 的 cs-t0/48B 不同）；需要自研 BoneMergeMap 生成（可参照 mod_importer 与 wwmi.rs）。
+- 风险：EFMI 是 GPU-PreSkinning 混合渲染（"全局只有一个 Buffer"），骨骼矩阵可能不在 vs-cb4 而在别的槽位 —— **实施第一步必须先勘察 dump**。
+
+**方案 B：改 SSMT4 提取端 efmi3.rs**
+- 参照 wwmi.rs/ntemi.rs 在提取时生成 VGMap/VGOffset/VGCount/BoneMatrix.buf 并写入工作空间 json。
+- 优点：数据在源头补齐，Blender 侧只用现有 import_vertex_groups 路径；与 WWMI/NTEMI 语义完全一致。
+- 缺点：SSMT4 是独立 Rust/Tauri 仓库（`E:\代码\SSMT4-Alpha-main`），需要重新编译注入器/后端；本次任务仓库是 Blender 插件 —— 跨仓库改动需要用户确认。
+- 可两者兼做：A 先落地（Blender 侧兜底 + 缓存），B 作为后续（提取端根治）。
+
+### 6.5 导出侧顶点组预处理（G8/G9）
+
+新增 EFMI 专用导出前置步骤（开关控制，默认随 import_merged_vgmap 联动）：
+1. `fill_gaps`：按数字名补缺（VertexGroupUtils.fill_vertex_group_gaps 已有，vertexgroup_utils.py:395）；
+2. 剔除名字含 `ignore` 或超出 `json.VGCount` 的组（参照参考插件 object_merger.py:234-237）；
+3. **按数字名排序**（参照 mod_importer `_sort_export_vertex_groups_by_name`），保证 `g.group == 全局 id`（v3 提取用 g.group）。
+4. 与蓝图手动节点（node_vertex_group_process）并存：自动处理仅 EFMI 骨骼合并模式生效，手动节点流程不动。
+
+---
+
+## 7. 实施步骤（分阶段）
+
+### 阶段 0：勘察与闭环（本计划书）
+- [x] 参考插件全流程报告（`docs/efmi-tools-参考插件报告存档.md`）
+- [x] 当前项目 EFMI 流程 + NTEMI 反查机制报告（`reports/efmi_pipeline_report.md`）
+- [x] SSMT4 提取端/数据类型/工作空间/FrameAnalysis 实证
+- [ ] 用户确认本计划书（§6.3 升宽目标、§6.4 反查方案 A/B、开关语义）
+
+### 阶段 1：P0 修复（不依赖新数据，可立即做）
+- [x] G2 BLENDINDICES 升宽：`d3d11_gametype.widen_blendindices()`（R8→R16G16B16A16_UINT，ByteWidth 4→8，dtype/CategoryStrideDict/AlignedByteOffset 联动，幂等，R32 系跳过）+ `submesh_model.calc_buffer` 接入（EFMI + import_merged_vgmap）+ `blendindices_widened` 标记
+- [x] INI 变化（§6.6）：合并模式 → `$\EFMIv1\component_id` + `run = CommandList_MergedSkeleton_ConnectComponent`；非合并模式 → ElementFormat 单行（stride 经 CategoryStrideDict 自动联动）
+- [x] G1 ENCODEDDATA 导出接通：`obj_buffer_helper._parse_encodeddata`（TBNCodec.encode_efmi_tools_r32_uint_from_tbn），替换被注释代码
+
+### 阶段 2：P1 导入侧骨骼合并（已完成核心，实测通过）
+- [x] G4 反查定位：`EFMISkeletonMergeHelper.resolve_frame_analysis_dir`（FrameAnalysisPath.json → tabs → migoto 目录最新 FrameAnalysis-* 多候选回退）
+- [x] G3 骨骼数据生成：`common/efmi_skeleton.py`（EFMILogParser 解析 log.txt draw/cb/srv/dump 绑定 + EFMIBoneMapBuilder 骨骼段读取[instance config fc=10960 `[5][0:2]` 偏移 → vs-t0 池 256×12 矩阵] + 跨子网格矩阵去重 vg_map + vg_offset 累加）→ 写回 json（VGMap/VGOffset/VGCount）+ 复制骨骼池到 ModImpRuntime/
+- [x] G6 导入接入：`ui_func_import_ssmt.ImprotFromWorkSpaceFull` EFMI 分支导入前预生成（不阻断导入）
+- [x] G7 空组清理：EFMI 加入列表 + 删后按名排序（`mesh_create_helper.py`）
+- [x] 实测（"测试"工作空间 + 05-19 dump）：14/14 子网格成功，596 条映射（96.8% 去重），矩阵一致性 3/3 通过，VGOffset 累加 Σ=596 正确
+
+### 阶段 3：P1 导出侧骨骼合并收尾（已完成，INI 文本结构实测通过）
+- [x] G8 导出前顶点组预处理：`submesh_model._prepare_efmi_merged_skeleton_vertex_groups`（补缺[export_add_missing_vertex_groups 开关] → 按名排序 → 删 ignore 组 → 改名 str(index) 紧凑化）
+- [x] G9 运行时 Merged Skeleton INI 段：`efmi._add_merged_skeleton_section`（Constants[$component_count/$bones_count/$max_instance_count/$merged_skeleton_initialized] + 5 Pool + ResourceMergedSkeletonDataRW + CommandList_MergedSkeleton_ConnectComponent + CommandListInitializeMergedSkeleton[vg_offset/vg_count 注册，LodRemaps 全 null]）+ 节序加入 MergedSkeleton
+- [x] 升宽后 dtype/stride/INI 一致性：CategoryStrideDict 自动联动验证通过
+
+### 阶段 4：验证与回归（Blender headless 端到端 [PASS]）
+- [x] 反查（log 解析/骨骼读取/vg_map/去重）：佩丽卡 + "测试"工作空间 dry-run，矩阵一致性 3/3
+- [x] 写回（json VGMap/VGOffset/VGCount + ModImpRuntime）：14/14 子网格，VGOffset 累加 Σ=596 正确
+- [x] 升宽（dtype/stride/幂等/R32 跳过）：独立验证通过
+- [x] INI Merged Skeleton 段结构：mock 文本 57 行全结构通过
+- [x] **Blender 5.0.1 headless 端到端**（"测试"工作空间 + 05-19 dump，settings 切换脚本驱动）：
+  - 导入：14 网格对象，596 组，全局最大骨骼 id 595，json 14 个含 VGMap
+  - 导出：INI 全校验 OK（ConnectComponent/AttachComponent/ElementFormat R16/$bones_count/$component_count/vg_offset 注册/InitializeMergedSkeleton）；ElementFormat 行 1 + ConnectComponent run 14 + component_id 赋值 14
+  - buffer：14 个 Blend.buf 全部 16B/顶点（BW8 8B + BI16 8B，升宽生效）
+  - 脚本：`.dbg/bl_efmi_headless_validate.py`（Blender 内）+ `.dbg/run_efmi_headless_validation.ps1`（驱动，含 settings 备份/切换/恢复）
+  - 结果：[PASS] 全部验证通过
+
+### 阶段 5：与参考插件 EFMI-Tools 对照验证（已通过）
+- [x] 参考插件装入 Blender 5.0 addons（`EFMI-Tools`）并跑通 extract_frame_data → import_object → export_mod
+- [x] **原始 blend 数据 100% 一致**（th 工作空间 Blend.buf vs 参考插件 Component11.vb：828 顶点索引/权重/分布/逐顶点全同）→ 数据源头一致
+- [x] **去重后骨骼数 14/14 完全一致**（40/94/43/149/59/17/5/45/10/12/68/20/15/19）→ 骨骼段读取 + 矩阵去重等价
+- [x] **th 导出索引结构 = 原始**（th 导入导出保真，分布 {2:84,3:459,4:285} 与原始一致）
+- [x] 顶点数 14/14 一致、权重量化值大部分一致（量化实现差异）
+- [x] INI 结构对照：两边 MergedSkeleton 段 + ElementFormat R16 + vg_offset 注册
+- 差异说明（均合理非错误）：① 全局骨骼 id 编号不同（分配顺序：th 子网格序 vs ref 组件 Y 序，各自 vg_offset 自洽，CS 按全局 id 直接索引）；② 参考插件导出分布 ≠ 原始（其导入导出链自身行为，th 更贴近原始）；③ 参考插件多提取的 Component 13/Weighted 4043 为场景物，不属该角色，已排除
+- **结论：升级没有问题，骨骼合并数据与参考插件语义等价**
+
+### 阶段 6：加载器核对与骨骼合并调用方式修正（路线B，已完成）
+- [x] 加载器已更新（Core\EFMI，2026-08-21）：MergedSkeleton.ini + Shaders/（BoneDataInitializer/BoneDataImporter_RollingBuffer+ConstantBuffer/InstanceConfigOverrider）+ SpatialIdentification.ini，配置 cfg_ms_* 与生成公式一致
+- [x] **发现并修正调用方式问题**：TheHerta4 静态绑定体系下 `run = ConnectComponent` 不会被运行时调用（正确方式是 Callback + Component_DrawInstances 运行时流程）；按用户决策选**路线B（静态绑定手动串联）**，跨 IB 暂不考虑、保留着色器替换/形态键等现有体系
+- [x] TextureOverride 段改为手动串联（每含 Blend 子网格，14 处）：
+  `$\EFMIv1\component_id` + `$\EFMIv1\instance_count = 1`（保证 Apply 的 instance_data_index=component_id，避免共用 UpdateFrame[0]）+ `$\EFMIv1\custom_mesh_scale = 1.0` + `run Component_ReadConfig`（检测 instance config cb 窗口）+ `run ConnectComponent` + `run MergedSkeleton_DetectBoneDataSource` + `run MergedSkeleton_Apply`，位于 ib/vb 绑定与 drawindexedinstanced **之前**（先覆盖 vs-t0/cb 再绘制）
+- [x] Blender headless 端到端复测 [PASS]，INI 结构验证正确（14 段串联齐全）
+- [ ] **游戏内实测（待用户）**：启动游戏加载 mod，验证骨骼合并生效（模型正常显示/骨骼不错乱）；若异常，排查 Apply 在静态单实例下的语义（$draw_call_instance_id=0、空间识别池默认值）
+
+### 阶段 5（明确不做，备忘）
+- ~~LOD BlendRemap~~（用户：不需要 LOD 相关内容）
+- ~~shapekey 批次导出~~（用户：保留现有 INI 格式）
+- ~~运行时 MergedSkeleton 段 / 空间识别 / RegisterMod 流程~~（用户：保留现有 INI 格式）
+- ~~SSMT4 提取端 efmi3.rs 补齐 VGMap（方案 B）~~（方案 A 已够用，视后续需要再议）
+
+---
+
+## 8. 风险与验证
+
+| 风险 | 等级 | 缓解 |
+|---|---|---|
+| R16 升宽后与游戏 shader 读取方式不匹配 | 高 | 必须输出 ElementFormat 行（§6.6）；与参考插件已验证路径一致；保留开关可回退 |
+| EFMI dump 骨骼 buffer 布局与预期不符（GPU 混合渲染） | 高 | 阶段 2 第一步勘察（读 deduped/*-cb4.txt 结构）后再写生成逻辑 |
+| 反查依赖的 dump 被删（实测旧 dump 已删） | 中 | isdir 校验 + 多候选回退 + 数据缓存进工作空间后不再依赖 dump |
+| 改动影响其它游戏类型 | 中 | 全部限 EFMI 分支；全量 tests/ 回归 |
+| 顶点组改名/排序破坏用户手动分组 | 中 | 开关默认随 import_merged_vgmap；仅 EFMI 合并模式自动处理；手动节点流程不动 |
+| TBN 重编码不可逆（切线角信息丢失） | 低 | 现状已如此，非本次引入；如出现闪烁再评估 |
+| 写回工作空间 json 污染提取端数据 | 低 | 只增不删字段（VGMap/VGOffset/VGCount/BoneMatrixFileName），提取端重导会覆盖 |
+| 参考插件运行时机制未照搬导致能力差距（多实例/换装/LOD 骨骼切换） | 低（用户已接受） | 用户明确保留现有 INI 格式；骨骼合并以数据侧实现 |
+
+---
+
+## 9. 决策记录（实施前已拍板）
+
+| # | 问题 | 决策 | 影响 |
+|---|---|---|---|
+| D1 | 升宽目标格式 | **BI16 型 `R32G32B32A32_UINT`** | §6.3 按此实施；与现有 BI16 类型一致，加载端可识别 |
+| D2 | 骨骼数据生成方案 | **方案 A：Blender 侧反查 + 写回工作空间** | §6.4 按 A 实施；SSMT4 不动 |
+| D3 | 行为开关 | **复用 `import_merged_vgmap()`** | 导入/导出骨骼合并 + 升宽均随此开关（默认 True） |
+| D4 | 骨骼 buffer 缓存位置 | 照 NTEMI 模式 `ModImpRuntime/`（实施时确认） | §6.2 数据流 |
+| D5 | dump 勘察 | 阶段 2 第一步读 `K:\SSMT-Package-master\3Dmigoto\Zmd\FrameAnalysis-2026-05-19-224322\deduped\*-cb4.txt`（只读） | 决定 BoneMergeMap 生成细节 |
+
+---
+
+## 10. 参考资料
+
+- 参考插件报告：`docs/efmi-tools-参考插件报告存档.md`（子代理A）
+- 当前项目报告：`reports/efmi_pipeline_report.md`（子代理B）
+- 提取端：`E:\代码\SSMT4-Alpha-main\src-tauri\src\extract_new\{efmi3,wwmi,ntemi}.rs`、`src\workspace\submesh_json.rs`、`src\config\path_manager.rs`
+- 外部参考实现：`E:\代码\mod_importer-main\operators.py`（_build_bone_merge_map:1237、_apply_bone_merge_map_to_objects:1692、_bone_count_from_t0_path:1077、_sort_export_vertex_groups_by_name:767）、`core\discovery.py`
+- 实证数据：`K:\SSMT-Package-master\WorkSpace\EFMI\佩丽卡`、`K:\SSMT-Package-master\3Dmigoto\Zmd\FrameAnalysis-2026-05-19-224322`、`%LOCALAPPDATA%\SSMT4GlobalConfigs\GameType\EFMI\*.json`

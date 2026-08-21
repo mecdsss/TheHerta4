@@ -489,6 +489,33 @@ class ObjBufferHelper:
             SSMTErrorUtils.raise_fatal("未知的BLENDWEIGHTS格式")
 
     @staticmethod
+    def _parse_encodeddata(mesh_loops, mesh_loops_length, d3d11_element):
+        """EFMI ENCODEDDATA 元素导出：将 loop 级 TBN 打包为 R10G10B10A2_UINT。
+
+        与 EFMI-Tools 参考实现一致：flip_texcoord_v 时切线取反、flip_bitangent_sign 时符号取反，
+        然后 octahedral 法线 + 角度切线 + 符号位打包为 R32_UINT。
+        """
+        normals = numpy.empty(mesh_loops_length * 3, dtype=numpy.float32)
+        mesh_loops.foreach_get("normal", normals)
+        normals = normals.reshape(-1, 3)
+
+        tangents = numpy.empty(mesh_loops_length * 3, dtype=numpy.float32)
+        mesh_loops.foreach_get("tangent", tangents)
+        tangents = tangents.reshape(-1, 3)
+
+        bitangent_signs = numpy.empty(mesh_loops_length, dtype=numpy.float32)
+        mesh_loops.foreach_get("bitangent_sign", bitangent_signs)
+
+        encoded = TBNCodec.encode_efmi_tools_r32_uint_from_tbn(
+            normals,
+            tangents,
+            bitangent_signs,
+            flip_texcoord_v=True,
+            flip_bitangent_sign=True,
+        )
+        return encoded.reshape(-1, 1)
+
+    @staticmethod
     def parse_elementname_data_dict(mesh:bpy.types.Mesh, d3d11_game_type:D3D11GameType):
         '''
         - 注意这里是从mesh.loops中获取数据，而不是从mesh.vertices中获取数据
@@ -567,12 +594,16 @@ class ObjBufferHelper:
             elif d3d11_element_name.startswith('BLENDWEIGHT'):
                 data = ObjBufferHelper._parse_blendweight(blendweights_dict, d3d11_element)
 
-            # elif d3d11_element_name == 'ENCODEDDATA':
-            #     if GlobalConfig.logic_name == LogicName.EFMI:
-            #         data = ObjBufferHelper._parse_encoded_tbn(mesh_loops, mesh_loops_length, d3d11_element)
-            #     else:
-            #         print(f"警告: ENCODEDDATA 元素仅在 EFMI 格式中支持，当前游戏类型: {GlobalConfig.logic_name}")
-            #         data = None
+            elif d3d11_element_name.startswith('ENCODEDDATA'):
+                if GlobalConfig.logic_name == LogicName.EFMI:
+                    data = ObjBufferHelper._parse_encodeddata(
+                        mesh_loops,
+                        mesh_loops_length,
+                        d3d11_element,
+                    )
+                else:
+                    print(f"警告: ENCODEDDATA 元素仅在 EFMI 格式中支持，当前游戏类型: {GlobalConfig.logic_name}")
+                    data = None
 
             if data is not None:
                 original_elementname_data_dict[d3d11_element_name] = data

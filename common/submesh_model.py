@@ -10,6 +10,7 @@ from ..utils.timer_utils import TimerUtils
 from ..utils.shapekey_utils import ShapeKeyUtils
 from .logic_name import LogicName
 from .global_config import GlobalConfig
+from .global_properties import GlobalProterties
 from .d3d11_gametype import D3D11GameType
 from .submesh_metadata import SubmeshMetadataResolver
 from ..blueprint.export_helper import BlueprintExportHelper
@@ -45,6 +46,12 @@ class SubMeshModel:
     vertex_count:int = field(init=False, default=0)
     index_count:int = field(init=False, default=0)
 
+    # EFMI 骨骼合并升宽标记：BLENDINDICES 已从 8 位升到 16 位（导出 INI 需输出 ElementFormat 行）
+    blendindices_widened:bool = field(init=False, default=False)
+    # EFMI 骨骼合并元数据（由 SubmeshMetadata 透传）
+    vg_offset:int = field(init=False, default=0)
+    vg_count:int = field(init=False, default=0)
+
     # 读取工作空间中的 Import.json 选择数据类型目录，再从对应的 SubmeshJson 获取 d3d11GameType
     d3d11_game_type:D3D11GameType = field(init=False,repr=False,default=None)
 
@@ -75,6 +82,23 @@ class SubMeshModel:
         self.d3d11_game_type = submesh_metadata.d3d11_game_type
         self.match_cs = getattr(submesh_metadata, "match_cs", "") or ""
         self.match_uav_bytes = int(getattr(submesh_metadata, "match_uav_bytes", 0) or 0)
+        # EFMI 骨骼合并元数据（反查写回；无则 0/空，合并段输出时据此校验）
+        self.vg_offset = int(getattr(submesh_metadata, "vg_offset", 0) or 0)
+        self.vg_count = int(getattr(submesh_metadata, "vg_count", 0) or 0)
+
+        # EFMI 骨骼合并：合并骨架场景下 BLENDINDICES 无条件升宽到 16 位
+        # （全局骨骼索引可能超过 255；INI 侧由 ExportEFMI 输出 ElementFormat 行配套）
+        self.blendindices_widened = False
+        if (
+            self.d3d11_game_type is not None
+            and GlobalConfig.logic_name == LogicName.EFMI
+            and GlobalProterties.import_merged_vgmap()
+        ):
+            try:
+                self.blendindices_widened = self.d3d11_game_type.widen_blendindices()
+            except Exception as e:
+                print(f"[SubMeshModel] BLENDINDICES 升宽失败（忽略，按原格式导出）: {e}")
+                self.blendindices_widened = False
 
         TimerUtils.start_stage("数据哈希预计算")
         object_hashes, source_obj_list = self._precompute_object_hashes()
@@ -264,6 +288,18 @@ class SubMeshModel:
 
         TimerUtils.end_stage("对象处理与合并")
 
+        # EFMI 骨骼合并导出前顶点组预处理（对齐参考插件 ObjectMerger 纪律）：
+        # fill gaps -> 剔除 ignore/越界组 -> 全部重命名为 str(index)（紧凑化），
+        # 使导出 blend 索引 = 紧凑索引，运行时 CS 用 vg_offset/vg_count 翻译。
+        if (
+            GlobalConfig.logic_name == LogicName.EFMI
+            and GlobalProterties.import_merged_vgmap()
+        ):
+            try:
+                self._prepare_efmi_merged_skeleton_vertex_groups(submesh_merged_obj)
+            except Exception as e:
+                print(f"[EFMI骨骼合并] 顶点组预处理失败（忽略，按原样导出）: {e}")
+
         obj_buffer_result = ExportUtils.build_unity_obj_buffer_result(
             obj=submesh_merged_obj,
             d3d11_game_type=self.d3d11_game_type,
@@ -297,6 +333,72 @@ class SubMeshModel:
         )
 
         self._deduplicate_draw_calls()
+
+    @staticmethod
+    def _fill_vertex_group_gaps(obj):
+        """按数字名补缺顶点组（参考 EFMI-Tools fill_gaps_in_vertex_groups）。
+
+        把 [0, 3, 4, 6] 这样的名字补齐为连续数字名（新增 1、2、5），
+        不依赖 active_object，直接操作给定对象。
+        """
+        existing = set()
+        for vg in obj.vertex_groups:
+            name = str(vg.name)
+            if name.isdigit():
+                existing.add(int(name))
+        if not existing:
+            return
+        for i in range(max(existing) + 1):
+            if i not in existing:
+                obj.vertex_groups.new(name=str(i))
+        # 排序由后续紧凑化重命名前的 index 语义处理；此处仅补缺。
+
+    def _prepare_efmi_merged_skeleton_vertex_groups(self, obj):
+        """EFMI 骨骼合并导出前顶点组预处理（对齐参考插件 ObjectMerger.finalize_temp_objects_data）。
+
+        步骤：
+        1.（可选）按数字名补缺顶点组（受 export_add_missing_vertex_groups 开关控制）；
+        2. 剔除名字含 'ignore' 或超出范围（名字数字 >= 上限）的组；
+           上限优先取反查写回的 json VGCount，否则取数字名最大值 + 1；
+        3. 全部组重命名为 str(vg.index)（紧凑化），使导出 blend 索引 = 紧凑索引。
+        """
+        if obj is None or obj.type != 'MESH':
+            return
+        if not obj.vertex_groups:
+            return
+
+        # 1. 补缺（按数字名补缺到最大数字，对齐参考插件 fill_gaps_in_vertex_groups）
+        try:
+            if GlobalProterties.export_add_missing_vertex_groups():
+                self._fill_vertex_group_gaps(obj)
+        except Exception as e:
+            print(f"[EFMI骨骼合并] 补缺顶点组失败（跳过补缺）: {e}")
+
+        # 2. 按名字排序，使 index 顺序与数字名一致（补缺后 index 与数字名错位，需先排序）
+        try:
+            prev_active = bpy.context.view_layer.objects.active
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.vertex_group_sort()
+            if prev_active is not None:
+                bpy.context.view_layer.objects.active = prev_active
+        except Exception as e:
+            print(f"[EFMI骨骼合并] 顶点组排序失败（继续）: {e}")
+
+        # 3. 剔除 ignore 组
+        # 说明：不做数字越界删除——组名为全局骨骼 id（去重 canonical 后可能小于本组件 vg_offset，
+        # 或大于本组件 vg_offset+vg_count），用局部 vg_count 做上限会误删共享骨骼。
+        # 参考插件的越界删除针对"组件整模内全局 id >= Σvg_count"的场景，
+        # 当前架构每子网格独立导出，保守起见不删数字名组。
+        remove_list = [
+            vg for vg in obj.vertex_groups
+            if 'ignore' in str(vg.name).lower()
+        ]
+        for vg in remove_list:
+            obj.vertex_groups.remove(vg)
+
+        # 4. 紧凑化重命名（导出 blend 索引 = 紧凑索引）
+        for vg in obj.vertex_groups:
+            vg.name = str(vg.index)
 
     def _ensure_target_shape_key_union(self, target_obj: bpy.types.Object, source_objs: list[bpy.types.Object]):
         objects = [

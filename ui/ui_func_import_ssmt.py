@@ -174,6 +174,29 @@ def ImprotFromWorkSpaceFull(self, context):
         self.report({'ERROR'}, "当前工作空间未找到可导入的子模型目录。")
         return False
 
+    # EFMI 骨骼合并数据预生成：导入前把 FrameAnalysis 反查的 VGMap 写回工作空间 json，
+    # 使导入流程走全局骨骼索引（json 有 VGMap 且 import_merged_vgmap 开启时自动生效）。
+    if (
+        GlobalConfig.logic_name == LogicName.EFMI
+        and GlobalProterties.import_merged_vgmap()
+    ):
+        try:
+            from ..common.efmi_skeleton import EFMISkeletonMergeHelper
+            import_keys = [target["import_key"] for target in import_targets]
+            ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=GlobalConfig.path_workspace_folder(),
+                unique_str_list=import_keys,
+            )
+            print(f"[EFMI骨骼合并] {message}")
+            if ok:
+                self.report({'INFO'}, message)
+            else:
+                print(f"[EFMI骨骼合并] 未生成骨骼数据：{message}")
+        except Exception as e:
+            import traceback
+            print(f"[EFMI骨骼合并] 预生成失败（不阻断导入）: {e}")
+            traceback.print_exc()
+
     foldername_gametypename_dict = {}
     imported_objects = []
     import_records = []

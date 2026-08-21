@@ -37,6 +37,9 @@ class M_SectionType:
     # 着色器替换相关Section类型
     ShaderReplace = "ShaderReplace"
 
+    # EFMI 骨骼合并（Merged Skeleton）相关Section类型
+    MergedSkeleton = "MergedSkeleton"
+
 
 class M_IniSection:
     def __init__(self,section_type:M_SectionType) -> None:
@@ -154,6 +157,8 @@ class M_IniBuilder:
         self.__append_section_line(M_SectionType.Key)
 
         self.__append_section_line(M_SectionType.Constants)
+
+        self.__append_section_line(M_SectionType.MergedSkeleton)
 
         self.__append_section_line(M_SectionType.Present)
 

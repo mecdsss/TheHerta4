@@ -267,6 +267,18 @@ class MeshCreateHelper:
         if GlobalConfig.logic_name == LogicName.WWMI or GlobalConfig.logic_name == LogicName.NTEMI:
             if GlobalProterties.import_skip_empty_vertex_groups():
                 VertexGroupUtils.remove_unused_vertex_groups(obj)
+        elif GlobalConfig.logic_name == LogicName.EFMI:
+            if GlobalProterties.import_skip_empty_vertex_groups():
+                # 删除空顶点组会重排组 index，而导出按组 index 取骨骼 id。
+                # EFMI 骨骼合并模式下组名=全局骨骼 id，删空组后必须按名称排序，
+                # 使 index == 全局骨骼 id（与参考插件 Merged Skeleton 的排序纪律一致）。
+                try:
+                    VertexGroupUtils.remove_unused_vertex_groups(obj)
+                    if obj.vertex_groups:
+                        bpy.context.view_layer.objects.active = obj
+                        bpy.ops.object.vertex_group_sort()
+                except Exception as e:
+                    print(f"EFMI 空顶点组清理失败（忽略）: {e}")
 
         import_collection.objects.link(obj)
         ObjUtils.select_obj(obj)

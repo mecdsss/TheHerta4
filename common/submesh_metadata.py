@@ -88,6 +88,10 @@ class SubmeshMetadata:
     category_hash_dict: dict = field(init=False, default_factory=dict)
     texture_markup_info_list: list = field(init=False, default_factory=list)
     part_name: str = field(init=False, default="")
+    # EFMI 骨骼合并元数据（由反查写回 json；无则默认 0/空）
+    vg_offset: int = field(init=False, default=0)
+    vg_count: int = field(init=False, default=0)
+    vg_map: dict = field(init=False, default_factory=dict)
 
     def __post_init__(self):
         """初始化后处理"""
@@ -110,6 +114,10 @@ class SubmeshMetadata:
             or self.submesh_json_dict.get("ComponentName")
             or self.unique_str
         )
+        # EFMI 骨骼合并元数据（反查写回的 VGOffset/VGCount/VGMap）
+        self.vg_offset = int(self.submesh_json_dict.get("VGOffset", 0) or 0)
+        self.vg_count = int(self.submesh_json_dict.get("VGCount", 0) or 0)
+        self.vg_map = dict(self.submesh_json_dict.get("VGMap", {}) or {})
         self.d3d11_game_type = self._build_d3d11_game_type()
 
     def _build_d3d11_game_type(self) -> D3D11GameType:

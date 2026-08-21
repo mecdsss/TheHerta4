@@ -551,8 +551,131 @@ class ExportEFMI:
                     return drawib_model
             return None
 
+    def _get_merged_skeleton_component_info(self):
+        """收集 EFMI 骨骼合并（Merged Skeleton）组件信息。
+
+        按 vg_offset 排序分配 component_id；仅收集 vg_count > 0（反查已写回）的子网格。
+        """
+        components = []
+        if GlobalProterties.import_merged_vgmap():
+            for submesh_model in self.submesh_model_list:
+                vg_count = int(getattr(submesh_model, "vg_count", 0) or 0)
+                if vg_count > 0:
+                    components.append({
+                        "unique_str": submesh_model.unique_str,
+                        "vg_offset": int(getattr(submesh_model, "vg_offset", 0) or 0),
+                        "vg_count": vg_count,
+                    })
+        components.sort(key=lambda c: c["vg_offset"])
+        component_id_dict = {
+            comp["unique_str"]: index for index, comp in enumerate(components)
+        }
+        return components, component_id_dict
+
+    def _add_merged_skeleton_section(self, ini_builder):
+        """生成 EFMI 骨骼合并（Merged Skeleton）INI 段（对齐参考插件 mod.ini.j2:441-516）。
+
+        内容：Constants（$component_count/$bones_count/$max_instance_count/$merged_skeleton_initialized）
+        + 5 个 Pool + ResourceMergedSkeletonDataRW + CommandList_MergedSkeleton_ConnectComponent
+        （守卫初始化 + 绑定 pools + AttachComponent + ElementFormat 16 位）+
+        CommandListInitializeMergedSkeleton（逐组件写 vg_offset/vg_count，LodRemaps 全 null）。
+        """
+        components = self.merged_skeleton_components
+        if not components:
+            return
+
+        component_count = len(components)
+        bones_count = sum(comp["vg_count"] for comp in components)
+        max_instance_count = 8  # 与参考插件 cfg.max_instance_count 一致
+
+        section = M_IniSection(M_SectionType.MergedSkeleton)
+
+        section.append("[Constants]")
+        section.append(f"global $component_count = {component_count}")
+        section.append(f"global $bones_count = {bones_count}")
+        section.append(f"global $max_instance_count = {max_instance_count}")
+        section.append("global $merged_skeleton_initialized = 0")
+        section.new_line()
+
+        section.append("[Pool_MergedSkeleton_Component_VertexGroupOffsets]")
+        section.append("pool_size = $component_count")
+        section.new_line()
+
+        section.append("[Pool_MergedSkeleton_Component_VertexGroupCounts]")
+        section.append("pool_size = $component_count")
+        section.new_line()
+
+        section.append("[Pool_MergedSkeleton_Component_LodRemaps]")
+        section.append("pool_size = $component_count * $\\EFMIv1\\cfg_ms_max_lod_level_count")
+        section.new_line()
+
+        section.append("[Pool_MergedSkeleton_Instance_UpdateFrame]")
+        section.append("pool_size = $component_count * $max_instance_count")
+        section.new_line()
+
+        section.append("[Pool_MergedSkeleton_Instance_LodLevel]")
+        section.append("pool_size = $component_count * $max_instance_count")
+        section.new_line()
+
+        section.append("[ResourceMergedSkeletonDataRW]")
+        section.append("type = RWBuffer")
+        section.append("format = R32G32B32A32_FLOAT")
+        section.append(
+            "array = ($\\EFMIv1\\cfg_ms_implicit_bones_count + $\\EFMIv1\\cfg_ms_skeletons_count "
+            "* $bones_count * $max_instance_count) * $\\EFMIv1\\cfg_ms_bone_entry_size"
+        )
+        section.new_line()
+
+        section.append("[CommandList_MergedSkeleton_ConnectComponent]")
+        section.append("if !$merged_skeleton_initialized")
+        section.append("    $merged_skeleton_initialized = 1")
+        section.append("    run = CommandListInitializeMergedSkeleton")
+        section.append("endif")
+        section.append("Pool\\EFMIv1\\Input_MergedSkeleton_Component_VertexGroupOffsets = ref Pool_MergedSkeleton_Component_VertexGroupOffsets")
+        section.append("Pool\\EFMIv1\\Input_MergedSkeleton_Component_VertexGroupCounts = ref Pool_MergedSkeleton_Component_VertexGroupCounts")
+        section.append("Pool\\EFMIv1\\Input_MergedSkeleton_Component_LodRemaps = ref Pool_MergedSkeleton_Component_LodRemaps")
+        section.append("Pool\\EFMIv1\\Input_MergedSkeleton_Instance_UpdateFrame = ref Pool_MergedSkeleton_Instance_UpdateFrame")
+        section.append("Pool\\EFMIv1\\Input_MergedSkeleton_Instance_LodLevel = ref Pool_MergedSkeleton_Instance_LodLevel")
+        section.append("Resource\\EFMIv1\\Output_MergedSkeleton = ref ResourceMergedSkeletonDataRW")
+        section.append("run = CommandList\\EFMIv1\\MergedSkeleton_AttachComponent")
+        section.append("; Force 16-bit VG IDs (Merged Skeleton may have more than 256 bones)")
+        blend_slot = "vb2"
+        for submesh_model in self.submesh_model_list:
+            if submesh_model.d3d11_game_type is not None:
+                blend_slot = submesh_model.d3d11_game_type.CategoryExtractSlotDict.get("Blend", "vb2")
+                break
+        section.append(f"{blend_slot}->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_UINT")
+        section.new_line()
+
+        section.append("[CommandListInitializeMergedSkeleton]")
+        section.append("Resource\\EFMIv1\\OutputMergedSkeleton_Template = ref ResourceMergedSkeletonDataRW")
+        section.append("run = CommandList\\EFMIv1\\InitializeMergedSkeleton")
+        section.append("local $lod_level_count = $\\EFMIv1\\cfg_ms_max_lod_level_count")
+        section.append("local $component_id")
+        for component_id, comp in enumerate(components):
+            section.append(f"$component_id = {component_id}")
+            section.append(f"$Pool_MergedSkeleton_Component_VertexGroupOffsets[$component_id] = {comp['vg_offset']}")
+            section.append(f"$Pool_MergedSkeleton_Component_VertexGroupCounts[$component_id] = {comp['vg_count']}")
+            section.append("Pool_MergedSkeleton_Component_LodRemaps[$component_id*$lod_level_count+0] = null")
+        section.new_line()
+
+        ini_builder.append_section(section)
+
+
     def generate_ini_file(self):
         ini_builder = M_IniBuilder()
+
+        # EFMI 骨骼合并（Merged Skeleton）组件信息初始化
+        self.merged_skeleton_components, self.merged_skeleton_component_id_dict = (
+            self._get_merged_skeleton_component_info()
+        )
+        self.has_merged_skeleton = len(self.merged_skeleton_components) > 0
+        if self.has_merged_skeleton:
+            print(
+                f"[EFMI骨骼合并] 合并骨架: {len(self.merged_skeleton_components)} 个组件, "
+                f"共 {sum(c['vg_count'] for c in self.merged_skeleton_components)} 根骨骼"
+            )
+
         drawib_drawibmodel_dict = {
             drawib_model.draw_ib: drawib_model
             for drawib_model in self.drawib_model_list
@@ -599,6 +722,33 @@ class ExportEFMI:
             texture_override_ib_section.append("match_first_index = " + submesh_model.match_first_index)
             texture_override_ib_section.append("match_index_count = " + submesh_model.match_index_count)
             texture_override_ib_section.append("handling = skip")
+
+            # EFMI 骨骼合并升宽配套：
+            # - 合并模式：静态绑定下手动串联骨骼合并管线（路线B，无需运行时绘制体系）：
+            #     设 component_id/instance_count/custom_mesh_scale
+            #     → Component_ReadConfig（检测 instance config cb 窗口）
+            #     → ConnectComponent（初始化守卫 + Pool 绑定 + AttachComponent）
+            #     → DetectBoneDataSource → Apply（导入骨骼 + 覆盖 instance config/vs-t0）
+            #   之后按原流程绑定 ib/vb 并 drawindexedinstanced。
+            # - 非合并模式：仅输出 ElementFormat 行（数据侧升宽，无运行时挂载）
+            if getattr(submesh_model, "blendindices_widened", False):
+                component_id = self.merged_skeleton_component_id_dict.get(submesh_model.unique_str)
+                if self.has_merged_skeleton and component_id is not None:
+                    texture_override_ib_section.append(f"$\\EFMIv1\\component_id = {component_id}")
+                    # 静态单实例语义：instance_count=1，保证 Apply 里 instance_data_index = component_id
+                    # （避免所有组件共用 UpdateFrame[0] 导致只有首个组件导入骨骼）
+                    texture_override_ib_section.append("$\\EFMIv1\\instance_count = 1")
+                    # BonesImporter 的 CustomComponentMeshScale 输入（未缩放）
+                    texture_override_ib_section.append("$\\EFMIv1\\custom_mesh_scale = 1.0")
+                    texture_override_ib_section.append("run = CommandList\\EFMIv1\\Component_ReadConfig")
+                    texture_override_ib_section.append("run = CommandList_MergedSkeleton_ConnectComponent")
+                    texture_override_ib_section.append("run = CommandList\\EFMIv1\\MergedSkeleton_DetectBoneDataSource")
+                    texture_override_ib_section.append("run = CommandList\\EFMIv1\\MergedSkeleton_Apply")
+                else:
+                    blend_slot = submesh_model.d3d11_game_type.CategoryExtractSlotDict.get("Blend", "vb2")
+                    texture_override_ib_section.append(
+                        f"{blend_slot}->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_UINT"
+                    )
 
             if is_target_ib:
                 texture_override_ib_section.append("analyse_options = deferred_ctx_immediate dump_rt dump_cb dump_vb dump_ib buf txt dds dump_tex dds symlink")
@@ -804,6 +954,10 @@ class ExportEFMI:
                 shader_replace_object_info_map=self.shader_replace_object_info_map,
                 draw_call_offset_map=M_IniHelper.build_draw_call_offset_map(self.drawib_model_list),
             )
+
+        # EFMI 骨骼合并（Merged Skeleton）段：在保存前追加（对齐参考插件运行时挂载机制）
+        if self.has_merged_skeleton:
+            self._add_merged_skeleton_section(ini_builder)
 
         ini_filepath = os.path.join(GlobalConfig.path_generate_mod_folder(), GlobalConfig.get_workspace_name() + ".ini")
         ini_builder.save_to_file(ini_filepath)
