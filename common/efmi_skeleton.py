@@ -536,29 +536,19 @@ class EFMIBoneMapBuilder:
         except Exception:
             return None
 
-        # 读取一个骨骼段（256 骨骼 × 12 floats）
-        def _read_segment(base_offset: int) -> numpy.ndarray | None:
-            if not base_offset:
-                return None
-            data_offset = base_offset + 3  # GLOBAL_RESERVED_ROWS = 3
+        # 取第一个非零骨骼段（current 主骨骼段，单帧）
+        for offset_value in skeleton_offsets:
+            offset = int(offset_value)
+            if not offset:
+                continue
+            data_offset = offset + 3  # GLOBAL_RESERVED_ROWS = 3
             skeleton_raw = pool_data[data_offset:data_offset + _BONE_SEGMENT_FLOAT4]
             usable = (len(skeleton_raw) // 3) * 3
             if usable == 0:
-                return None
-            return skeleton_raw[:usable].reshape(-1, _BONE_MATRIX_FLOATS)
-
-        current = _read_segment(int(skeleton_offsets[0]))
-        previous = _read_segment(int(skeleton_offsets[1])) if len(skeleton_offsets) > 1 else None
-
-        if current is None and previous is None:
-            return None
-        if current is None:
-            current = numpy.zeros_like(previous)
-        if previous is None:
-            previous = numpy.zeros_like(current)
-
-        # 两帧拼接：(N, 12) 当前 + (N, 12) 上一帧 → (N, 24) 签名
-        return numpy.concatenate([current, previous], axis=1)
+                continue
+            skeleton = skeleton_raw[:usable].reshape(-1, _BONE_MATRIX_FLOATS)
+            return skeleton
+        return None
 
     def _find_cb_slot(self, draw_index: str, cb_hash: str) -> int:
         for (idx, stage, slot), binding in self.parser.cb_bindings.items():
@@ -577,48 +567,38 @@ class EFMIBoneMapBuilder:
         tight_matrix_tolerance: float = 1e-5,
         centroid_tolerance: float = 0.03,
     ) -> dict[str, dict]:
-        """跨子网格按"骨骼矩阵"去重构建 vg_map（同子网格冲突拒绝）。
+        """跨子网格按骨骼矩阵**字节级（bitwise）判等**去重构建 vg_map（ZZMI 风格）。
 
         参数:
             unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts[, signatures])
-            - skeleton_buffer: (N,12) 蒙皮矩阵
-            - vg_count: 局部骨骼数
-            - weighted_vertex_counts: 每局部骨骼驱动的顶点数
-            - signatures: 可选，{local: {centroid, bbox_min, bbox_max, vertex_count}}
-              （点云特征，仅当 centroid_tolerance/bbox_overlap_min 非 None 时使用）
-        返回: unique_str -> {local_vg_id(int): global_vg_id(int)}
+        返回: (vg_maps, vg_offsets)
+            - vg_maps: unique_str -> {local_vg_id(int): global_vg_id(int)}
+            - vg_offsets: unique_str -> 该子网格在合并骨架中的起始槽位（与去重同序分配）
 
-        去重规则（最终确定，经多轮实测与签名/矩阵/点云多方案对比）：
-        同一角色的骨架只有一套，所有子网格（部件）都绑在它上面——
-        - **跨子网格的两个 local 骨骼，矩阵近似（allclose(match_tolerance)）即合并**：
-          同一根骨架骨骼在不同子网格的"投影"，矩阵相同（同姿态）→ 同一骨骼。
-        - **同一子网格内的两个 local 绝不合并（冲突拒绝）**：骨架上的两根不同骨骼
-          （如手指两节，即使矩阵完全相同也不能合并）。并查集 union 时检查
-          （组内同子网格最多 1 个 local），防链式合并绕过（57→X←58）。
+        规则（对齐 ZZMI `zzmi_skeleton.py` 实测效果很好的方案，用户拍板采用）：
+        - **同一子网格（同部件）内部绝不去重**（同 key 只来自更靠前的其它部件才合并）；
+        - **跨部件严格 bitwise（numpy tobytes 字节级）判等，禁用浮点容差**；
+        - canonical 槽位 = 按 unique_str 排序后首次出现处的槽位（确定性分配）；
+        - 合并语义 = "按矩阵内容去重 + 拼接对齐"（相同对齐、不同拼接、组成大骨架）。
 
-        为什么不靠"签名/点云"维度（实测结论）：
-        - 骨骼池绝对索引（段偏移+local）不能作签名——同一骨骼在不同部件的段里是
-          池里的多个副本（位置不同）。
-        - 矩阵量化签名/allclose 无法区分"同骨骼浮点误差"与"同位置不同骨骼"。
-        - 驱动点云（包围盒/质心）会把"同一骨骼跨部件驱动区域本就不同"的误拆。
-        唯一可靠的是"同部件不合并 + 跨部件矩阵容差合并"这一语义规则。
+        与之前各方案的对比（实测结论）：
+        - 精确匹配（array_equal）≈ bitwise，但本实现直接 tobytes 判等更明确；
+        - 容差会误并"同位置功能骨骼"（手指两段差1.79e-07），点云会误拆"同骨骼跨部件
+          驱动区域不同"，两帧签名在无多帧数据时不现实——故回到单帧 bitwise + 同部件不去重。
 
-        match_tolerance: 跨子网格矩阵合并容差，**默认 0.0 = 精确匹配**（矩阵逐元素完全
-        相同才合并，与参考插件 EFMI-Tools 一致）。用户最终决定：任何容差/质心维度都可能
-        误并（矩阵差无法区分"同骨骼浮点误差"与"同位置不同骨骼"），故默认精确匹配——
-        漏合并无害（蒙皮仍正确），误合并有害（功能错误/模型变形）。
-        tight_matrix_tolerance / centroid_tolerance: 仅在 match_tolerance > 0 时生效的
-        权重中心聚类分层判据（可选增强，默认不用）。
+        match_tolerance / tight_matrix_tolerance / centroid_tolerance: 保留参数（历史
+        方案遗留），当前 bitwise 实现不使用。
         """
-        # 收集所有骨骼候选
-        candidates: list[dict] = []
-        vg_offset = 0
+        # bone_key(bytes) -> (unique_str, global_slot)
+        slot_of: dict[bytes, tuple[str, int]] = {}
+        vg_maps: dict[str, dict] = {}
+        vg_offsets: dict[str, int] = {}
+        offset = 0
 
-        for unique_str, entry in submesh_skeletons.items():
+        for unique_str in sorted(submesh_skeletons.keys()):
+            entry = submesh_skeletons[unique_str]
             skeleton_buffer = entry[0]
             vg_count = entry[1]
-            weighted_vertex_counts = entry[2] if len(entry) > 2 else None
-            signatures = entry[3] if len(entry) > 3 else {}
 
             if skeleton_buffer is None or vg_count <= 0:
                 continue
@@ -629,115 +609,29 @@ class EFMIBoneMapBuilder:
                 )
                 continue
 
-            for vg_id in range(vg_count):
-                bone = skeleton_buffer[vg_id]
+            vg_offsets[unique_str] = offset
+            vg_map: dict[int, int] = {}
+            for local_id in range(vg_count):
+                bone = skeleton_buffer[local_id]
+                # 全零骨骼（无效数据）：占本部件自己的槽位，不参与跨部件合并
                 if numpy.all(bone == 0):
-                    continue
-                weighted_count = (
-                    int(weighted_vertex_counts[vg_id])
-                    if weighted_vertex_counts is not None and vg_id < len(weighted_vertex_counts)
-                    else 0
-                )
-                candidates.append({
-                    "unique_str": unique_str,
-                    "local_vg_id": vg_id,
-                    "global_vg_id": vg_offset + vg_id,
-                    "weighted_vertex_count": weighted_count,
-                    "bone": bone,
-                    "signature": signatures.get(vg_id),
-                })
-
-            vg_offset += vg_count
-
-        n = len(candidates)
-        if n == 0:
-            return {}
-
-        parent = list(range(n))
-        # 每组包含的子网格集合（用于"同子网格冲突拒绝"）
-        group_submeshes: list[set] = [{candidates[i]["unique_str"]} for i in range(n)]
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def try_union(a, b):
-            ra, rb = find(a), find(b)
-            if ra == rb:
-                return
-            # 冲突拒绝：合并后某子网格在同组会有 >1 个 local → 拒绝
-            if group_submeshes[ra] & group_submeshes[rb]:
-                return
-            parent[ra] = rb
-            group_submeshes[rb] = group_submeshes[ra] | group_submeshes[rb]
-
-        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
-
-        def bbox_overlap_ratio(a, b):
-            """两骨骼驱动顶点集合的包围盒重叠率（IoU：交集体积/并集体积）。"""
-            sa, sb = candidates[a].get("signature"), candidates[b].get("signature")
-            if sa is None or sb is None:
-                return None
-            inter_min = numpy.maximum(sa["bbox_min"], sb["bbox_min"])
-            inter_max = numpy.minimum(sa["bbox_max"], sb["bbox_max"])
-            inter_dims = numpy.maximum(inter_max - inter_min, 0.0)
-            inter_vol = float(numpy.prod(inter_dims))
-            vol_a = float(numpy.prod(numpy.maximum(sa["bbox_max"] - sa["bbox_min"], 0.0)))
-            vol_b = float(numpy.prod(numpy.maximum(sb["bbox_max"] - sb["bbox_min"], 0.0)))
-            union_vol = vol_a + vol_b - inter_vol
-            if union_vol <= 0:
-                return 0.0
-            return inter_vol / union_vol
-
-        def centroid_dist(a, b):
-            sa, sb = candidates[a].get("signature"), candidates[b].get("signature")
-            if sa is None or sb is None:
-                return None
-            return float(numpy.linalg.norm(
-                sa["centroid"].astype(numpy.float64) - sb["centroid"].astype(numpy.float64)
-            ))
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                # 同子网格（同部件）内的 local 绝不合并（用户明确要求：
-                # 同部件的不同组驱动不同区域，不可能重叠，故不参与合并；只有跨部件才合并）
-                if candidates[i]["unique_str"] == candidates[j]["unique_str"]:
-                    continue
-                if find(i) == find(j):
+                    vg_map[local_id] = offset + local_id
                     continue
 
-                matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
-                # 矩阵必须 100% 匹配（精确匹配，match_tolerance=0.0 默认）：
-                # 矩阵差 > match_tolerance → 不合并
-                if matrix_diff > match_tolerance:
-                    continue
+                bone_key = bone.tobytes()
+                hit = slot_of.get(bone_key)
+                if hit is not None and hit[0] != unique_str:
+                    # 跨部件命中：合并到首次出现部件的 canonical 槽位
+                    vg_map[local_id] = hit[1]
+                else:
+                    # 新骨骼（或同部件重复，不合并）：占用本部件自己的槽位
+                    slot_of[bone_key] = (unique_str, offset + local_id)
+                    vg_map[local_id] = offset + local_id
 
-                # 仅在启用容差（match_tolerance>0）且矩阵差超过浮点误差级时，
-                # 用权重中心（质心）聚类确认（密集区防误并）。默认精确匹配下不触发。
-                if match_tolerance > 0 and matrix_diff > tight_matrix_tolerance:
-                    dist = centroid_dist(i, j)
-                    if dist is None or dist >= centroid_tolerance:
-                        continue
+            vg_maps[unique_str] = vg_map
+            offset += vg_count
 
-                try_union(i, j)
-
-        # 分组
-        groups: dict[int, list[int]] = {}
-        for i in range(n):
-            groups.setdefault(find(i), []).append(i)
-
-        # 每组 canonical = 权重顶点数最多的候选
-        vg_maps: dict[str, dict] = {}
-        for root, members in groups.items():
-            canonical_idx = max(members, key=lambda i: candidates[i]["weighted_vertex_count"])
-            canonical_global = candidates[canonical_idx]["global_vg_id"]
-            for i in members:
-                cand = candidates[i]
-                vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
-
-        return vg_maps
+        return vg_maps, vg_offsets
 
 
 class EFMISkeletonMergeHelper:
@@ -1066,8 +960,8 @@ class EFMISkeletonMergeHelper:
                 return True, f"全部 {skipped} 个子网格已有骨骼合并缓存（VGMap），无需重新生成。"
             return False, "没有子网格成功生成骨骼数据。"
 
-        # 跨子网格去重构建 vg_map
-        vg_maps = EFMIBoneMapBuilder.build_vg_maps(submesh_skeletons)
+        # 跨子网格去重构建 vg_map（返回 vg_offsets，与去重同序分配，保证一致）
+        vg_maps, vg_offsets = EFMIBoneMapBuilder.build_vg_maps(submesh_skeletons)
 
         # 写回工作空间 json + 复制骨骼池缓存
         written = 0
@@ -1084,12 +978,8 @@ class EFMISkeletonMergeHelper:
             if not vg_map:
                 continue
 
-            # VGOffset = 该子网格在全局骨架中的起始（按跨子网格累加顺序）
-            vg_offset = 0
-            for other_str, other_entry in submesh_skeletons.items():
-                if other_str == unique_str:
-                    break
-                vg_offset += other_entry[1]
+            # VGOffset = 该子网格在全局骨架中的起始（取去重时分配的槽位，保证与 vg_map 一致）
+            vg_offset = vg_offsets.get(unique_str, 0)
 
             submesh_json["VGCount"] = vg_count
             submesh_json["VGOffset"] = vg_offset
