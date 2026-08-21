@@ -42,32 +42,31 @@ spec.loader.exec_module(dds_conversion)
 
 
 class DDSConversionTests(unittest.TestCase):
-    """测试 DDS 转换工具的纹理类型检测和格式解析"""
+    """测试 DDS 转换工具的格式解析与值保留转换策略"""
 
-    def test_color_texture_uses_srgb_input_flag(self):
-        """测试漫反射贴图使用 --srgb-in 标志，法线贴图不使用"""
-        self.assertIn("--srgb-in", dds_conversion._texconv_colorspace_flags("DiffuseMap"))
-        self.assertIn("--ignore-srgb", dds_conversion._texconv_colorspace_flags("NormalMap"))
+    def test_flags_always_ignore_srgb(self):
+        """所有贴图一律按原始数值读取（--ignore-srgb），不做色彩空间变换"""
+        self.assertEqual(["--ignore-srgb"], dds_conversion._texconv_colorspace_flags())
 
-    def test_custom_rule_keeps_real_texture_type_for_srgb_decision(self):
-        """测试自定义规则下纹理类型仍正确用于 sRGB 判断"""
+    def test_custom_rule_format_is_authoritative(self):
+        """自定义规则命中：格式完全由规则决定，不再按文件名推断类型"""
         props = types.SimpleNamespace(
             dds_use_custom_rules=True,
             dds_rules=[
                 types.SimpleNamespace(
                     enabled=True,
                     pattern=r"(?i)(?:^|[_\-. ])DiffuseMap(?:[_\-. ]|$)",
-                    format="bc7_unorm_srgb",
+                    format="r8g8b8a8_unorm",
                 )
             ],
         )
-        texture_type, dds_format, _matched_by = dds_conversion.resolve_dds_target("DiffuseMap_Body.png", props)
-        self.assertEqual(texture_type, "DiffuseMap")
-        self.assertEqual(dds_format, "bc7_unorm_srgb")
-        self.assertIn("--srgb-in", dds_conversion._texconv_colorspace_flags(texture_type))
+        texture_type, dds_format, matched_by = dds_conversion.resolve_dds_target("DiffuseMap_Body.png", props)
+        self.assertEqual(texture_type, "custom")
+        self.assertEqual(dds_format, "r8g8b8a8_unorm")
+        self.assertEqual(matched_by, r"(?i)(?:^|[_\-. ])DiffuseMap(?:[_\-. ]|$)")
 
-    def test_custom_rules_use_first_recognized_marker_as_texture_type(self):
-        """测试命中自定义规则时，texture_type 仍按文件名中最先出现的已知段落识别"""
+    def test_custom_rule_ignores_filename_keywords(self):
+        """文件名含多个已知类型关键词时，不影响自定义规则的判定结果"""
         props = types.SimpleNamespace(
             dds_use_custom_rules=True,
             dds_rules=[
@@ -91,10 +90,9 @@ class DDSConversionTests(unittest.TestCase):
         texture_type, dds_format, matched_by = dds_conversion.resolve_dds_target(
             "NormalMap_DiffuseMap_high.png", props
         )
-        self.assertEqual(texture_type, "NormalMap")
+        self.assertEqual(texture_type, "custom")
         self.assertEqual(dds_format, "bc7_unorm_srgb")
         self.assertEqual(matched_by, r"(?i)(?:^|[_\-. ])DiffuseMap_high(?:[_\-. ]|$)")
-        self.assertIn("--ignore-srgb", dds_conversion._texconv_colorspace_flags(texture_type))
 
     def test_default_rules_pick_first_matching_keyword(self):
         """测试文件名同时包含 NormalMap 和 DiffuseMap 时，取最先出现的匹配规则"""
@@ -113,12 +111,20 @@ class DDSConversionTests(unittest.TestCase):
         self.assertEqual(dds_format, "r8g8b8a8_unorm")
 
     def test_default_rules_recognize_ttlmap(self):
-        """测试 TTLMap 前缀与 FXMap 一样按遮罩格式识别（bc7_unorm，非 sRGB）"""
+        """测试 TTLMap 前缀与 FXMap 一样按遮罩格式识别（bc7_unorm）"""
         props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
         texture_type, dds_format, _matched_by = dds_conversion.resolve_dds_target("TTLMap_BaseTex.png", props)
         self.assertEqual(texture_type, "TTLMap")
         self.assertEqual(dds_format, "bc7_unorm")
-        self.assertIn("--ignore-srgb", dds_conversion._texconv_colorspace_flags(texture_type))
+        self.assertIn("--ignore-srgb", dds_conversion._texconv_colorspace_flags())
+
+    def test_unmatched_falls_back_to_default_format(self):
+        """未命中任何规则时走默认 bc7_unorm"""
+        props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
+        texture_type, dds_format, matched_by = dds_conversion.resolve_dds_target("UnknownMask.png", props)
+        self.assertEqual(texture_type, "default")
+        self.assertEqual(dds_format, "bc7_unorm")
+        self.assertEqual(matched_by, "Default")
 
 
 if __name__ == "__main__":

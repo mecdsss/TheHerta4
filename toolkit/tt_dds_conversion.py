@@ -72,7 +72,6 @@ DDS_DEFAULT_RULES = [
 ]
 
 _SUPPORTED_SOURCE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tif", ".tiff"}
-_SRGB_TEXTURE_TYPES = {"DiffuseMap", "LightMap", "RampMap", "HighLightMap", "Glowmap"}
 
 
 def find_texconv():
@@ -131,43 +130,18 @@ def _format_is_srgb(dds_format: str) -> bool:
     return "_srgb" in str(dds_format or "").strip().lower()
 
 
-def _texture_type_expects_srgb(texture_type: str) -> bool | None:
-    if texture_type == "default":
-        return None
-    return texture_type in _SRGB_TEXTURE_TYPES
+def _texconv_colorspace_flags() -> list[str]:
+    """输入贴图一律按原始数值读取（--ignore-srgb）：渲染器/导出流程写出的
+    PNG 装的就是最终值，转换只更换容器格式、不改变数值，保证转换前后颜色一致。
+    （实测验证：渲染器输出的 PNG 为原始值直出，并非 sRGB 编码；用 --srgb-in
+    会被误做一次 sRGB->线性解码，导致整体变暗。）"""
+    return ["--ignore-srgb"]
 
 
-def _infer_texture_type_from_rule_pattern(pattern: str, filename: str) -> str:
-    candidates = [rule["texture_type"] for rule in DDS_DEFAULT_RULES]
-    haystacks = _get_match_targets(filename)
-    best_type = "custom"
-    best_start = float("inf")
-    for candidate in candidates:
-        needle = candidate.lower()
-        for haystack in haystacks:
-            idx = str(haystack or "").lower().find(needle)
-            if idx != -1 and idx < best_start:
-                best_start = idx
-                best_type = candidate
-    return best_type
-
-
-def _texconv_colorspace_flags(texture_type: str) -> list[str]:
-    expected_srgb = _texture_type_expects_srgb(texture_type)
-    if expected_srgb is True:
-        return ["--srgb-in"]
-    if expected_srgb is False:
-        return ["--ignore-srgb"]
-    return []
-
-
-def _apply_image_colorspace(image, texture_type: str):
-    expected_srgb = _texture_type_expects_srgb(texture_type)
+def _apply_image_colorspace(image, dds_format: str):
+    """Blender 内的显示色彩空间跟随输出文件的实际编码。"""
     try:
-        if expected_srgb is True:
-            image.colorspace_settings.name = "sRGB"
-        elif expected_srgb is False:
-            image.colorspace_settings.name = "Non-Color"
+        image.colorspace_settings.name = "sRGB" if _format_is_srgb(dds_format) else "Non-Color"
     except Exception:
         pass
 
@@ -183,8 +157,9 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
             try:
                 if _pattern_matches(pattern, filename):
                     rule_format = str(getattr(rule, "format", "") or "").strip()
-                    texture_type = _infer_texture_type_from_rule_pattern(pattern, filename)
-                    return texture_type, rule_format or "bc7_unorm", pattern
+                    # 自定义规则完全由用户说了算：pattern 只负责识别名称，
+                    # format 决定输出格式，不再从文件名推断类型做色彩空间干预
+                    return "custom", rule_format or "bc7_unorm", pattern
             except re.error:
                 continue
 
@@ -213,7 +188,7 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
 class TT_OT_convert_to_dds(bpy.types.Operator):
     bl_idname = "toolkit.tt_convert_to_dds"
     bl_label = "批量转换为 .dds"
-    bl_description = "使用 texconv.exe 将输出目录中的贴图转换或重编码为目标 DDS 格式，并更新图片引用"
+    bl_description = "使用 texconv.exe 将输出目录中的贴图转换或重编码为目标 DDS 格式，并更新图片引用。按原始数值直接转换（--ignore-srgb），不做色彩空间变换，保证颜色不变"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -245,7 +220,6 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
         converted_files_count = 0
         skipped_files_count = 0
         skipped_unmatched_dds_count = 0
-        color_space_mismatches = []
 
         blend_dir = os.path.normpath(bpy.path.abspath("//"))
 
@@ -275,12 +249,8 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
                 if not dds_format:
                     dds_format = "bc7_unorm"
 
-                expected_srgb = _texture_type_expects_srgb(texture_type)
-                if expected_srgb is not None and expected_srgb != _format_is_srgb(dds_format):
-                    color_space_mismatches.append((filename, texture_type, dds_format))
-
                 command = [texconv_executable, "-f", dds_format]
-                command.extend(_texconv_colorspace_flags(texture_type))
+                command.extend(_texconv_colorspace_flags())
                 command.extend(["-o", root, "-y", old_path])
 
                 try:
@@ -304,7 +274,7 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
                     self.report({"WARNING"}, f"转换文件 {filename} 失败: {process.stderr}")
                     continue
 
-                conversion_map[old_path] = (new_path, texture_type)
+                conversion_map[old_path] = (new_path, dds_format)
                 converted_files_count += 1
 
                 if props.dds_delete_originals and old_path != new_path:
@@ -326,10 +296,10 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
             try:
                 abs_filepath = os.path.normpath(bpy.path.abspath(image.filepath_raw))
                 if abs_filepath in conversion_map:
-                    new_path, texture_type = conversion_map[abs_filepath]
+                    new_path, dds_format = conversion_map[abs_filepath]
                     image.filepath = new_path
                     image.reload()
-                    _apply_image_colorspace(image, texture_type)
+                    _apply_image_colorspace(image, dds_format)
                     updated_images_count += 1
             except Exception as exc:
                 self.report({"WARNING"}, f"更新图片 '{image.name}' 的路径时出错: {exc}")
@@ -343,16 +313,6 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
             self.report(
                 {"INFO"},
                 f"跳过了 {skipped_unmatched_dds_count} 个未命中任何 DDS 规则的现有 DDS 文件。",
-            )
-        if color_space_mismatches:
-            preview = "；".join(
-                f"{filename} -> {texture_type}/{dds_format}"
-                for filename, texture_type, dds_format in color_space_mismatches[:3]
-            )
-            suffix = "；..." if len(color_space_mismatches) > 3 else ""
-            self.report(
-                {"WARNING"},
-                f"{len(color_space_mismatches)} 个贴图的 DDS 格式与贴图类型颜色空间不匹配，可能导致颜色变化：{preview}{suffix}",
             )
         return {"FINISHED"}
 
