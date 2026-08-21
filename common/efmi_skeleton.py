@@ -371,21 +371,102 @@ class EFMIBoneMapBuilder:
     @staticmethod
     def build_vg_maps(
         submesh_skeletons: dict[str, tuple[numpy.ndarray, int, numpy.ndarray]],
-        match_tolerance: float = 1e-4,
+        match_tolerance: float = 0.0,
     ) -> dict[str, dict]:
-        """跨子网格按骨骼矩阵去重构建 vg_map（容差聚类）。
+        """跨子网格按骨骼矩阵去重构建 vg_map。
 
         参数: unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts)
         返回: unique_str -> {local_vg_id(int): global_vg_id(int)}
 
-        说明：早期版本用精确 tuple 匹配去重，但同一根骨骼在不同 drawcall 的蒙皮矩阵
-        存在 1e-7~1e-4 的浮点误差，导致大量应合并的骨骼被漏掉（例如矩阵差 1.8e-07 的
-        539/493 被分成两个 id）。改为**容差聚类**（连通分量）：矩阵 allclose(atol) 的
-        骨骼合并为同一 canonical（取组内权重顶点数最多者）。
+        去重策略（重要，勿随意放宽）：
+        默认 **精确匹配**（match_tolerance=0.0，矩阵逐元素完全相同才合并），与
+        EFMI-Tools 参考插件一致。原因：**矩阵差无法区分"同一骨骼的浮点误差"与
+        "不同骨骼的恰好重合"**——例如同一角色手指的两节骨骼（d6128f13[57]/[58]）
+        矩阵差仅 1.79e-07（几乎相同但语义完全不同），一旦用容差合并就会"两段变一段"，
+        丢失独立动画能力；而 539/493（差 1.8e-07）也属于同类"极接近但应分开"的情况。
+        参考插件用精确匹配正是为此：**漏合并无害（蒙皮仍正确，骨骼缓冲略大），
+        误合并有害（功能错误）**。
 
-        match_tolerance: 矩阵判定相同的绝对容差（默认 1e-4；蒙皮矩阵的跨 drawcall
-        浮点误差一般在 1e-6 量级，1e-4 足以覆盖且远小于不同骨骼的姿态差）。
+        match_tolerance > 0 时改用容差聚类（并查集连通分量，allclose(atol) 合并）。
+        仅在明确知道目标数据"同一骨骼矩阵必有浮点误差、且不存在矩阵接近的不同骨骼"
+        时才放宽（默认勿用）。
         """
+        # 收集所有骨骼候选
+        candidates: list[dict] = []
+        vg_offset = 0
+
+        for unique_str, (skeleton_buffer, vg_count, weighted_vertex_counts) in submesh_skeletons.items():
+            if skeleton_buffer is None or vg_count <= 0:
+                continue
+            if len(skeleton_buffer) < vg_count:
+                print(
+                    f"[EFMI骨骼合并] 警告: {unique_str} 骨骼段仅 {len(skeleton_buffer)} 根骨骼，"
+                    f"但声明了 {vg_count} 个顶点组，跳过该子网格参与合并。"
+                )
+                continue
+
+            for vg_id in range(vg_count):
+                bone = skeleton_buffer[vg_id]
+                # 跳过全零骨骼（无效数据）
+                if numpy.all(bone == 0):
+                    continue
+                weighted_count = (
+                    int(weighted_vertex_counts[vg_id])
+                    if vg_id < len(weighted_vertex_counts)
+                    else 0
+                )
+                candidates.append({
+                    "unique_str": unique_str,
+                    "local_vg_id": vg_id,
+                    "global_vg_id": vg_offset + vg_id,
+                    "weighted_vertex_count": weighted_count,
+                    "bone": bone,
+                })
+
+            vg_offset += vg_count
+
+        n = len(candidates)
+        if n == 0:
+            return {}
+
+        # 容差聚类（并查集连通分量）：矩阵 allclose(atol) 的骨骼合并。
+        # match_tolerance=0.0 时 allclose(atol=0) 等价于逐元素完全相同（精确匹配）。
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if find(i) == find(j):
+                    continue
+                if numpy.allclose(mats[i], mats[j], atol=match_tolerance, rtol=0.0):
+                    union(i, j)
+
+        # 分组
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+
+        # 每组 canonical = 权重顶点数最多的候选
+        vg_maps: dict[str, dict] = {}
+        for root, members in groups.items():
+            canonical_idx = max(members, key=lambda i: candidates[i]["weighted_vertex_count"])
+            canonical_global = candidates[canonical_idx]["global_vg_id"]
+            for i in members:
+                cand = candidates[i]
+                vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
+
+        return vg_maps
         # 收集所有骨骼候选
         candidates: list[dict] = []
         vg_offset = 0
