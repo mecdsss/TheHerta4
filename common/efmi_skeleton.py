@@ -564,8 +564,8 @@ class EFMIBoneMapBuilder:
     def build_vg_maps(
         submesh_skeletons: dict[str, tuple],
         match_tolerance: float = 1e-3,
-        centroid_tolerance: float | None = None,
-        bbox_overlap_min: float | None = None,
+        tight_matrix_tolerance: float = 1e-5,
+        centroid_tolerance: float = 0.03,
     ) -> dict[str, dict]:
         """跨子网格按"骨骼矩阵"去重构建 vg_map（同子网格冲突拒绝）。
 
@@ -680,6 +680,14 @@ class EFMIBoneMapBuilder:
                 return 0.0
             return inter_vol / union_vol
 
+        def centroid_dist(a, b):
+            sa, sb = candidates[a].get("signature"), candidates[b].get("signature")
+            if sa is None or sb is None:
+                return None
+            return float(numpy.linalg.norm(
+                sa["centroid"].astype(numpy.float64) - sb["centroid"].astype(numpy.float64)
+            ))
+
         for i in range(n):
             for j in range(i + 1, n):
                 # 同子网格（同部件）内的 local 绝不合并（用户明确要求：
@@ -689,279 +697,21 @@ class EFMIBoneMapBuilder:
                 if find(i) == find(j):
                     continue
 
-                # 维度一+二：骨骼标签（矩阵签名）与骨骼矩阵 —— allclose 容差匹配
-                if not numpy.allclose(mats[i], mats[j], atol=match_tolerance, rtol=0.0):
+                matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
+                # 矩阵差超过粗筛容差 → 不合并
+                if matrix_diff >= match_tolerance:
                     continue
 
-                # 维度三（可选，默认关闭）：驱动点云包围盒重叠率 + 权重聚类核心。
-                # 注意：点云判据会把"同一骨骼跨部件驱动区域本就不同"的误拆，
-                # 默认不启用（centroid_tolerance/bbox_overlap_min 为 None 时跳过）。
-                if centroid_tolerance is not None or bbox_overlap_min is not None:
-                    si, sj = candidates[i].get("signature"), candidates[j].get("signature")
-                    if si is not None and sj is not None:
-                        if bbox_overlap_min is not None:
-                            overlap_ratio = bbox_overlap_ratio(i, j)
-                            if overlap_ratio is None or overlap_ratio < bbox_overlap_min:
-                                continue
-                        if centroid_tolerance is not None:
-                            dist = float(numpy.linalg.norm(
-                                si["centroid"].astype(numpy.float64) - sj["centroid"].astype(numpy.float64)
-                            ))
-                            if dist >= centroid_tolerance:
-                                continue
+                # 分层判据（用户要求加入权重中心聚类）：
+                # - 矩阵差 < tight_matrix_tolerance（浮点误差级）→ 直接合并（几乎确定同一骨骼）
+                # - 矩阵差在 [tight, match_tolerance)（密集区）→ 需权重中心（质心）接近才合并，
+                #   防止权重密集处不同骨骼（矩阵接近）被误并
+                if matrix_diff >= tight_matrix_tolerance:
+                    dist = centroid_dist(i, j)
+                    if dist is None or dist >= centroid_tolerance:
+                        continue
 
                 try_union(i, j)
-
-        # 分组
-        groups: dict[int, list[int]] = {}
-        for i in range(n):
-            groups.setdefault(find(i), []).append(i)
-
-        # 每组 canonical = 权重顶点数最多的候选
-        vg_maps: dict[str, dict] = {}
-        for root, members in groups.items():
-            canonical_idx = max(members, key=lambda i: candidates[i]["weighted_vertex_count"])
-            canonical_global = candidates[canonical_idx]["global_vg_id"]
-            for i in members:
-                cand = candidates[i]
-                vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
-
-        return vg_maps
-        # 收集所有骨骼候选
-        candidates: list[dict] = []
-        vg_offset = 0
-
-        for unique_str, entry in submesh_skeletons.items():
-            skeleton_buffer = entry[0]
-            vg_count = entry[1]
-            weighted_vertex_counts = entry[2] if len(entry) > 2 else None
-            centroids = entry[3] if len(entry) > 3 else {}
-
-            if skeleton_buffer is None or vg_count <= 0:
-                continue
-            if len(skeleton_buffer) < vg_count:
-                print(
-                    f"[EFMI骨骼合并] 警告: {unique_str} 骨骼段仅 {len(skeleton_buffer)} 根骨骼，"
-                    f"但声明了 {vg_count} 个顶点组，跳过该子网格参与合并。"
-                )
-                continue
-
-            for vg_id in range(vg_count):
-                bone = skeleton_buffer[vg_id]
-                if numpy.all(bone == 0):
-                    continue
-                weighted_count = (
-                    int(weighted_vertex_counts[vg_id])
-                    if weighted_vertex_counts is not None and vg_id < len(weighted_vertex_counts)
-                    else 0
-                )
-                candidates.append({
-                    "unique_str": unique_str,
-                    "local_vg_id": vg_id,
-                    "global_vg_id": vg_offset + vg_id,
-                    "weighted_vertex_count": weighted_count,
-                    "bone": bone,
-                    "centroid": centroids.get(vg_id),
-                })
-
-            vg_offset += vg_count
-
-        n = len(candidates)
-        if n == 0:
-            return {}
-
-        parent = list(range(n))
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[ra] = rb
-
-        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
-
-        def centroid_dist(a, b):
-            ca, cb = candidates[a]["centroid"], candidates[b]["centroid"]
-            if ca is None or cb is None:
-                return None  # 缺质心数据，无法判断
-            return float(numpy.linalg.norm(ca.astype(numpy.float64) - cb.astype(numpy.float64)))
-
-        # 第一遍：矩阵完全相同（diff=0）→ 必合并（同一份数据）
-        for i in range(n):
-            for j in range(i + 1, n):
-                if find(i) == find(j):
-                    continue
-                if numpy.array_equal(mats[i], mats[j]):
-                    union(i, j)
-
-        # 第二遍：矩阵近似 + 驱动质心重合 → 合并
-        for i in range(n):
-            for j in range(i + 1, n):
-                if find(i) == find(j):
-                    continue
-                if not numpy.allclose(mats[i], mats[j], atol=match_tolerance, rtol=0.0):
-                    continue
-                dist = centroid_dist(i, j)
-                if dist is None:
-                    continue  # 缺质心数据时，矩阵近似不合并（保守）
-                if dist < centroid_tolerance:
-                    union(i, j)
-
-        # 分组
-        groups: dict[int, list[int]] = {}
-        for i in range(n):
-            groups.setdefault(find(i), []).append(i)
-
-        # 每组 canonical = 权重顶点数最多的候选
-        vg_maps: dict[str, dict] = {}
-        for root, members in groups.items():
-            canonical_idx = max(members, key=lambda i: candidates[i]["weighted_vertex_count"])
-            canonical_global = candidates[canonical_idx]["global_vg_id"]
-            for i in members:
-                cand = candidates[i]
-                vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
-
-        return vg_maps
-        # 收集所有骨骼候选
-        candidates: list[dict] = []
-        vg_offset = 0
-
-        for unique_str, (skeleton_buffer, vg_count, weighted_vertex_counts) in submesh_skeletons.items():
-            if skeleton_buffer is None or vg_count <= 0:
-                continue
-            if len(skeleton_buffer) < vg_count:
-                print(
-                    f"[EFMI骨骼合并] 警告: {unique_str} 骨骼段仅 {len(skeleton_buffer)} 根骨骼，"
-                    f"但声明了 {vg_count} 个顶点组，跳过该子网格参与合并。"
-                )
-                continue
-
-            for vg_id in range(vg_count):
-                bone = skeleton_buffer[vg_id]
-                # 跳过全零骨骼（无效数据）
-                if numpy.all(bone == 0):
-                    continue
-                weighted_count = (
-                    int(weighted_vertex_counts[vg_id])
-                    if vg_id < len(weighted_vertex_counts)
-                    else 0
-                )
-                candidates.append({
-                    "unique_str": unique_str,
-                    "local_vg_id": vg_id,
-                    "global_vg_id": vg_offset + vg_id,
-                    "weighted_vertex_count": weighted_count,
-                    "bone": bone,
-                })
-
-            vg_offset += vg_count
-
-        n = len(candidates)
-        if n == 0:
-            return {}
-
-        # 容差聚类（并查集连通分量）：矩阵 allclose(atol) 的骨骼合并。
-        # match_tolerance=0.0 时 allclose(atol=0) 等价于逐元素完全相同（精确匹配）。
-        parent = list(range(n))
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[ra] = rb
-
-        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
-        for i in range(n):
-            for j in range(i + 1, n):
-                if find(i) == find(j):
-                    continue
-                if numpy.allclose(mats[i], mats[j], atol=match_tolerance, rtol=0.0):
-                    union(i, j)
-
-        # 分组
-        groups: dict[int, list[int]] = {}
-        for i in range(n):
-            groups.setdefault(find(i), []).append(i)
-
-        # 每组 canonical = 权重顶点数最多的候选
-        vg_maps: dict[str, dict] = {}
-        for root, members in groups.items():
-            canonical_idx = max(members, key=lambda i: candidates[i]["weighted_vertex_count"])
-            canonical_global = candidates[canonical_idx]["global_vg_id"]
-            for i in members:
-                cand = candidates[i]
-                vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
-
-        return vg_maps
-        # 收集所有骨骼候选
-        candidates: list[dict] = []
-        vg_offset = 0
-
-        for unique_str, (skeleton_buffer, vg_count, weighted_vertex_counts) in submesh_skeletons.items():
-            if skeleton_buffer is None or vg_count <= 0:
-                continue
-            if len(skeleton_buffer) < vg_count:
-                print(
-                    f"[EFMI骨骼合并] 警告: {unique_str} 骨骼段仅 {len(skeleton_buffer)} 根骨骼，"
-                    f"但声明了 {vg_count} 个顶点组，跳过该子网格参与合并。"
-                )
-                continue
-
-            for vg_id in range(vg_count):
-                bone = skeleton_buffer[vg_id]
-                # 跳过全零骨骼（无效数据）
-                if numpy.all(bone == 0):
-                    continue
-                weighted_count = (
-                    int(weighted_vertex_counts[vg_id])
-                    if vg_id < len(weighted_vertex_counts)
-                    else 0
-                )
-                candidates.append({
-                    "unique_str": unique_str,
-                    "local_vg_id": vg_id,
-                    "global_vg_id": vg_offset + vg_id,
-                    "weighted_vertex_count": weighted_count,
-                    "bone": bone,
-                })
-
-            vg_offset += vg_count
-
-        n = len(candidates)
-        if n == 0:
-            return {}
-
-        # 容差聚类（并查集连通分量）：矩阵 allclose(atol) 的骨骼合并
-        parent = list(range(n))
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[ra] = rb
-
-        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
-        for i in range(n):
-            for j in range(i + 1, n):
-                if find(i) == find(j):
-                    continue
-                if numpy.allclose(mats[i], mats[j], atol=match_tolerance, rtol=0.0):
-                    union(i, j)
 
         # 分组
         groups: dict[int, list[int]] = {}
