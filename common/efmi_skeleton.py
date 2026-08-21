@@ -564,38 +564,40 @@ class EFMIBoneMapBuilder:
     def build_vg_maps(
         submesh_skeletons: dict[str, tuple],
         match_tolerance: float = 1e-3,
-        centroid_tolerance: float = 0.05,
-        bbox_overlap_min: float = 0.9,
+        centroid_tolerance: float | None = None,
+        bbox_overlap_min: float | None = None,
     ) -> dict[str, dict]:
-        """跨子网格"三维度"去重构建 vg_map（骨骼标签 + 骨骼矩阵 + 驱动点云）。
+        """跨子网格按"骨骼矩阵"去重构建 vg_map（同子网格冲突拒绝）。
 
         参数:
             unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts[, signatures])
             - skeleton_buffer: (N,12) 蒙皮矩阵
             - vg_count: 局部骨骼数
             - weighted_vertex_counts: 每局部骨骼驱动的顶点数
-            - signatures: {local: {centroid, bbox_min, bbox_max, vertex_count}}
-              （compute_driven_signatures 结果，驱动点云特征，可空）
+            - signatures: 可选，{local: {centroid, bbox_min, bbox_max, vertex_count}}
+              （点云特征，仅当 centroid_tolerance/bbox_overlap_min 非 None 时使用）
         返回: unique_str -> {local_vg_id(int): global_vg_id(int)}
 
-        三维度去重判据（用户定义），**仅跨部件合并**（同部件的组不可能重叠，绝不合并）：
-        1. **骨骼标签 + 骨骼矩阵**：矩阵签名（量化）粗筛 + allclose(match_tolerance) 容差匹配；
-        2. **骨骼控制的顶点组点云包围盒重叠**：两骨骼驱动的顶点集合的包围盒必须相交
-           （同一骨骼跨部件驱动同区域顶点 → 框重叠；不同骨骼区域不同 → 框不重叠）；
-        3. **权重聚类核心**：加权质心距离 < centroid_tolerance（同区域的核心位置接近）。
-        三个维度全部满足 → 同一骨骼 → 合并。
+        去重规则（最终确定，经多轮实测与签名/矩阵/点云多方案对比）：
+        同一角色的骨架只有一套，所有子网格（部件）都绑在它上面——
+        - **跨子网格的两个 local 骨骼，矩阵近似（allclose(match_tolerance)）即合并**：
+          同一根骨架骨骼在不同子网格的"投影"，矩阵相同（同姿态）→ 同一骨骼。
+        - **同一子网格内的两个 local 绝不合并（冲突拒绝）**：骨架上的两根不同骨骼
+          （如手指两节，即使矩阵完全相同也不能合并）。并查集 union 时检查
+          （组内同子网格最多 1 个 local），防链式合并绕过（57→X←58）。
 
-        **同部件冲突拒绝**（关键）：并查集 union 时检查，一个全局 id 组里同一子网格
-        最多 1 个 local。防止"同位置功能骨骼"（如手指两节，同部件内矩阵相同）被合并
-        或被链式合并绕过（57→X←58 间接同组）。
+        为什么不靠"签名/点云"维度（实测结论）：
+        - 骨骼池绝对索引（段偏移+local）不能作签名——同一骨骼在不同部件的段里是
+          池里的多个副本（位置不同）。
+        - 矩阵量化签名/allclose 无法区分"同骨骼浮点误差"与"同位置不同骨骼"。
+        - 驱动点云（包围盒/质心）会把"同一骨骼跨部件驱动区域本就不同"的误拆。
+        唯一可靠的是"同部件不合并 + 跨部件矩阵容差合并"这一语义规则。
 
-        合并语义 = "按矩阵内容去重 + 拼接对齐"（相同对齐、不同拼接、组成大骨架）。
-
-        match_tolerance: 矩阵容差（默认 1e-3，跨 drawcall 浮点误差一般 <1e-4）。
-        centroid_tolerance: 权重聚类核心（质心）重合阈值（默认 0.05；同一骨骼跨部件
-        驱动区域的质心差一般 < 0.05，不同骨骼即使同区域其核心也偏离）。
-        bbox_overlap_min: 包围盒重叠率（IoU）下限（默认 0.9；同一骨骼跨部件驱动的
-        顶点集合包围盒几乎完全重合才合并，重叠率不足则视为不同骨骼不合并）。
+        match_tolerance: 跨子网格矩阵合并容差（默认 1e-3；同一骨骼跨 drawcall 的浮点
+        误差一般 <1e-4，1e-3 足够覆盖；冲突拒绝规则兜底防止不同骨骼误并）。
+        centroid_tolerance / bbox_overlap_min: 可选的点云判据（**默认 None 关闭**）。
+        实测发现点云会把"同一骨骼跨部件驱动区域本就不同"的误拆，故默认不启用；
+        仅在明确需要时用（同时设两者才生效）。
         """
         # 收集所有骨骼候选
         candidates: list[dict] = []
@@ -691,19 +693,22 @@ class EFMIBoneMapBuilder:
                 if not numpy.allclose(mats[i], mats[j], atol=match_tolerance, rtol=0.0):
                     continue
 
-                # 维度三：驱动顶点组点云包围盒重叠率 > bbox_overlap_min + 权重聚类核心接近
-                si, sj = candidates[i].get("signature"), candidates[j].get("signature")
-                if si is not None and sj is not None:
-                    # 包围盒重叠率（IoU）必须 > bbox_overlap_min（默认 0.9）
-                    overlap_ratio = bbox_overlap_ratio(i, j)
-                    if overlap_ratio is None or overlap_ratio < bbox_overlap_min:
-                        continue
-                    # 权重聚类核心（加权质心）距离
-                    dist = float(numpy.linalg.norm(
-                        si["centroid"].astype(numpy.float64) - sj["centroid"].astype(numpy.float64)
-                    ))
-                    if dist >= centroid_tolerance:
-                        continue
+                # 维度三（可选，默认关闭）：驱动点云包围盒重叠率 + 权重聚类核心。
+                # 注意：点云判据会把"同一骨骼跨部件驱动区域本就不同"的误拆，
+                # 默认不启用（centroid_tolerance/bbox_overlap_min 为 None 时跳过）。
+                if centroid_tolerance is not None or bbox_overlap_min is not None:
+                    si, sj = candidates[i].get("signature"), candidates[j].get("signature")
+                    if si is not None and sj is not None:
+                        if bbox_overlap_min is not None:
+                            overlap_ratio = bbox_overlap_ratio(i, j)
+                            if overlap_ratio is None or overlap_ratio < bbox_overlap_min:
+                                continue
+                        if centroid_tolerance is not None:
+                            dist = float(numpy.linalg.norm(
+                                si["centroid"].astype(numpy.float64) - sj["centroid"].astype(numpy.float64)
+                            ))
+                            if dist >= centroid_tolerance:
+                                continue
 
                 try_union(i, j)
 
