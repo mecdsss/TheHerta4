@@ -563,42 +563,46 @@ class EFMIBoneMapBuilder:
     @staticmethod
     def build_vg_maps(
         submesh_skeletons: dict[str, tuple],
-        match_tolerance: float = 0.0,
+        match_tolerance: float = 1e-3,
         tight_matrix_tolerance: float = 1e-5,
-        centroid_tolerance: float = 0.03,
-    ) -> dict[str, dict]:
-        """跨子网格按骨骼矩阵**字节级（bitwise）判等**去重构建 vg_map（ZZMI 风格）。
+        centroid_tolerance: float = 0.05,
+    ) -> tuple[dict[str, dict], dict[str, int]]:
+        """跨子网格"先矩阵、后权重中心"分层去重构建 vg_map（同部件不去重）。
 
         参数:
             unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts[, signatures])
+            - signatures: {local: {centroid, bbox_min, bbox_max, vertex_count}}（驱动点云特征）
         返回: (vg_maps, vg_offsets)
             - vg_maps: unique_str -> {local_vg_id(int): global_vg_id(int)}
             - vg_offsets: unique_str -> 该子网格在合并骨架中的起始槽位（与去重同序分配）
 
-        规则（对齐 ZZMI `zzmi_skeleton.py` 实测效果很好的方案，用户拍板采用）：
-        - **同一子网格（同部件）内部绝不去重**（同 key 只来自更靠前的其它部件才合并）；
-        - **跨部件严格 bitwise（numpy tobytes 字节级）判等，禁用浮点容差**；
-        - canonical 槽位 = 按 unique_str 排序后首次出现处的槽位（确定性分配）；
-        - 合并语义 = "按矩阵内容去重 + 拼接对齐"（相同对齐、不同拼接、组成大骨架）。
+        分层判据（用户拍板：首先看骨骼矩阵，然后看权重中心；同部件不去重）：
+        1. **同部件（同子网格）内的 local 绝不合并**（冲突拒绝：并查集 union 时检查，
+           组内同部件最多 1 个 local，防链式合并绕过）；
+        2. **矩阵差 < tight_matrix_tolerance（浮点误差级）→ 直接合并**（矩阵几乎相同
+           基本确定同一骨骼，无需质心）；
+        3. **矩阵差在 [tight, match_tolerance)（明显接近）→ 需权重中心（加权质心）
+           距离 < centroid_tolerance 才合并**（密集区防误并的关键：矩阵接近但驱动
+           顶点中心不同的，不合并）；
+        4. **矩阵差 >= match_tolerance → 不合并**。
 
-        与之前各方案的对比（实测结论）：
-        - 精确匹配（array_equal）≈ bitwise，但本实现直接 tobytes 判等更明确；
-        - 容差会误并"同位置功能骨骼"（手指两段差1.79e-07），点云会误拆"同骨骼跨部件
-          驱动区域不同"，两帧签名在无多帧数据时不现实——故回到单帧 bitwise + 同部件不去重。
-
-        match_tolerance / tight_matrix_tolerance / centroid_tolerance: 保留参数（历史
-        方案遗留），当前 bitwise 实现不使用。
+        参数（可实测调整）:
+            tight_matrix_tolerance: 浮点误差级阈值（默认 1e-5），小于它直接合并。
+            match_tolerance: 矩阵粗筛上限（默认 1e-3），超过则不合并。
+            centroid_tolerance: 权重中心（质心）重合阈值（默认 0.05），仅对矩阵中等
+            接近的对生效。密集区误并 → 调小（0.01~0.03）；该并没并 → 调大（0.1~0.2）。
         """
-        # bone_key(bytes) -> (unique_str, global_slot)
-        slot_of: dict[bytes, tuple[str, int]] = {}
-        vg_maps: dict[str, dict] = {}
-        vg_offsets: dict[str, int] = {}
+        # 收集所有骨骼候选
+        candidates: list[dict] = []
         offset = 0
+        vg_offsets: dict[str, int] = {}
 
         for unique_str in sorted(submesh_skeletons.keys()):
             entry = submesh_skeletons[unique_str]
             skeleton_buffer = entry[0]
             vg_count = entry[1]
+            weighted_vertex_counts = entry[2] if len(entry) > 2 else None
+            signatures = entry[3] if len(entry) > 3 else {}
 
             if skeleton_buffer is None or vg_count <= 0:
                 continue
@@ -610,26 +614,92 @@ class EFMIBoneMapBuilder:
                 continue
 
             vg_offsets[unique_str] = offset
-            vg_map: dict[int, int] = {}
-            for local_id in range(vg_count):
-                bone = skeleton_buffer[local_id]
-                # 全零骨骼（无效数据）：占本部件自己的槽位，不参与跨部件合并
+            for vg_id in range(vg_count):
+                bone = skeleton_buffer[vg_id]
                 if numpy.all(bone == 0):
-                    vg_map[local_id] = offset + local_id
+                    continue
+                weighted_count = (
+                    int(weighted_vertex_counts[vg_id])
+                    if weighted_vertex_counts is not None and vg_id < len(weighted_vertex_counts)
+                    else 0
+                )
+                candidates.append({
+                    "unique_str": unique_str,
+                    "local_vg_id": vg_id,
+                    "global_vg_id": offset + vg_id,
+                    "weighted_vertex_count": weighted_count,
+                    "bone": bone,
+                    "signature": signatures.get(vg_id),
+                })
+            offset += vg_count
+
+        n = len(candidates)
+        if n == 0:
+            return {}, {}
+
+        parent = list(range(n))
+        # 每组包含的子网格集合（用于"同部件冲突拒绝"）
+        group_submeshes: list[set] = [{candidates[i]["unique_str"]} for i in range(n)]
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def try_union(a, b):
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return
+            # 冲突拒绝：合并后某子网格在同组会有 >1 个 local → 拒绝
+            if group_submeshes[ra] & group_submeshes[rb]:
+                return
+            parent[ra] = rb
+            group_submeshes[rb] = group_submeshes[ra] | group_submeshes[rb]
+
+        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
+
+        def centroid_dist(a, b):
+            sa, sb = candidates[a].get("signature"), candidates[b].get("signature")
+            if sa is None or sb is None:
+                return None
+            return float(numpy.linalg.norm(
+                sa["centroid"].astype(numpy.float64) - sb["centroid"].astype(numpy.float64)
+            ))
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                # 同部件（同子网格）内的 local 绝不合并
+                if candidates[i]["unique_str"] == candidates[j]["unique_str"]:
+                    continue
+                if find(i) == find(j):
                     continue
 
-                bone_key = bone.tobytes()
-                hit = slot_of.get(bone_key)
-                if hit is not None and hit[0] != unique_str:
-                    # 跨部件命中：合并到首次出现部件的 canonical 槽位
-                    vg_map[local_id] = hit[1]
-                else:
-                    # 新骨骼（或同部件重复，不合并）：占用本部件自己的槽位
-                    slot_of[bone_key] = (unique_str, offset + local_id)
-                    vg_map[local_id] = offset + local_id
+                matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
+                # 矩阵差 >= 粗筛容差 → 不合并
+                if matrix_diff >= match_tolerance:
+                    continue
+                # 矩阵差 >= 浮点误差级（明显接近但非完全相同）→ 需权重中心接近才合并
+                if matrix_diff >= tight_matrix_tolerance:
+                    dist = centroid_dist(i, j)
+                    if dist is None or dist >= centroid_tolerance:
+                        continue
 
-            vg_maps[unique_str] = vg_map
-            offset += vg_count
+                try_union(i, j)
+
+        # 分组
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+
+        # 每组 canonical = 权重顶点数最多的候选
+        vg_maps: dict[str, dict] = {}
+        for root, members in groups.items():
+            canonical_idx = max(members, key=lambda i: candidates[i]["weighted_vertex_count"])
+            canonical_global = candidates[canonical_idx]["global_vg_id"]
+            for i in members:
+                cand = candidates[i]
+                vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
 
         return vg_maps, vg_offsets
 
