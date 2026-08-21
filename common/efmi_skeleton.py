@@ -297,6 +297,140 @@ class EFMIBoneMapBuilder:
         ).reshape(vertex_count, component_count)
         return indices.astype(numpy.uint32, copy=False)
 
+    @staticmethod
+    def compute_driven_centroids(
+        position_buf_path: str,
+        blend_buf_path: str,
+        submesh_json_dict: dict,
+    ) -> dict[int, numpy.ndarray]:
+        """计算每个局部骨骼驱动的顶点加权质心（双维度去重的"驱动区域"指纹）。
+
+        原理（用户提出）：骨骼的唯一标识不只是蒙皮矩阵，还有"它驱动哪些顶点"。
+        矩阵相同但驱动顶点区域不同（如手指两节）= 不同骨骼；
+        矩阵相同/近似且驱动顶点区域重合 = 同一骨骼。
+
+        返回: {local_vg_id(int): 加权质心 numpy.ndarray(3)}（绑定姿态坐标）。
+        无 BLENDWEIGHTS 元素的类型按"每顶点第一索引权重=1"处理。
+        """
+        if not os.path.isfile(position_buf_path) or not os.path.isfile(blend_buf_path):
+            return {}
+
+        # ---- Position 布局（Category=Position 元素，POSITION 在 offset 0，float32 x3）----
+        pos_stride = 0
+        has_position = False
+        for category_buffer in submesh_json_dict.get("CategoryBufferList", []):
+            for element in category_buffer.get("D3D11ElementList", []):
+                if str(element.get("Category", "") or "").strip().lower() == "position":
+                    pos_stride += int(element.get("ByteWidth", 0) or 0)
+                    if str(element.get("SemanticName", "") or "").upper() == "POSITION":
+                        has_position = True
+        if pos_stride <= 0 or not has_position:
+            return {}
+
+        pos_raw = numpy.fromfile(position_buf_path, dtype=numpy.uint8)
+        vertex_count = len(pos_raw) // pos_stride
+        if vertex_count <= 0:
+            return {}
+        positions = (
+            pos_raw.reshape(vertex_count, pos_stride)[:, 0:12]
+            .copy().view(numpy.float32).reshape(vertex_count, 3)
+        )
+
+        # ---- Blend 布局（BLENDINDICES + BLENDWEIGHTS offset/格式）----
+        blend_stride = 0
+        bi_offset = None
+        bi_np = None
+        bw_offset = None
+        bw_np = None
+        bw_div = 1.0
+        for category_buffer in submesh_json_dict.get("CategoryBufferList", []):
+            elements = category_buffer.get("D3D11ElementList", [])
+            is_blend = any(
+                str(e.get("Category", "") or "").strip().lower() == "blend"
+                for e in elements
+            )
+            if not is_blend:
+                continue
+            off = 0
+            for element in elements:
+                width = int(element.get("ByteWidth", 0) or 0)
+                blend_stride += width
+                semantic = str(element.get("SemanticName", "") or "").upper()
+                fmt = str(element.get("Format", "") or "").upper()
+                if semantic == "BLENDINDICES":
+                    bi_offset = off
+                    bi_np = {
+                        "R8G8B8A8_UINT": ("u1", 4), "R8_UINT": ("u1", 1),
+                        "R16G16B16A16_UINT": ("u2", 4), "R16_UINT": ("u2", 1),
+                        "R32G32B32A32_UINT": ("u4", 4), "R32_UINT": ("u4", 1),
+                        "R32G32B32A32_SINT": ("i4", 4),
+                    }.get(fmt)
+                elif semantic.startswith("BLENDWEIGHT"):
+                    bw_offset = off
+                    if fmt == "R16G16B16A16_UNORM":
+                        bw_np, bw_div = ("u2", 4), 65535.0
+                    elif fmt == "R32G32B32A32_FLOAT":
+                        bw_np, bw_div = ("f4", 4), 1.0
+                    elif fmt == "R32G32_FLOAT":
+                        bw_np, bw_div = ("f4", 2), 1.0
+                    elif fmt == "R8G8B8A8_UNORM":
+                        bw_np, bw_div = ("u1", 4), 255.0
+                off += width
+            break
+
+        if blend_stride <= 0 or bi_offset is None or not bi_np:
+            return {}
+
+        blend_raw = numpy.fromfile(blend_buf_path, dtype=numpy.uint8)
+        n = len(blend_raw) // blend_stride
+        if n != vertex_count:
+            return {}
+        rows = blend_raw.reshape(n, blend_stride)
+
+        bi_np_type, bi_channels = bi_np
+        indices = numpy.frombuffer(
+            rows[:, bi_offset:bi_offset + (bi_channels * numpy.dtype(bi_np_type).itemsize)].tobytes(),
+            dtype=numpy.dtype(bi_np_type),
+        ).reshape(n, bi_channels).astype(numpy.int64)
+
+        if bw_offset is not None and bw_np:
+            bw_np_type, bw_channels = bw_np
+            weights = numpy.frombuffer(
+                rows[:, bw_offset:bw_offset + (bw_channels * numpy.dtype(bw_np_type).itemsize)].tobytes(),
+                dtype=numpy.dtype(bw_np_type),
+            ).reshape(n, bw_channels).astype(numpy.float32) / bw_div
+        else:
+            weights = numpy.zeros((n, bi_channels), dtype=numpy.float32)
+            weights[:, 0] = 1.0
+
+        # ---- 每 local 的加权质心 ----
+        accum: dict[int, list] = {}  # local -> [sum_weighted_pos(3), sum_weight]
+        for c in range(indices.shape[1]):
+            idx_col = indices[:, c]
+            w_col = weights[:, c] if c < weights.shape[1] else weights[:, 0]
+            valid = (w_col > 0) & (idx_col >= 0) & (idx_col != 0xFFFF)
+            if not numpy.any(valid):
+                continue
+            v_idx = idx_col[valid]
+            v_w = w_col[valid].astype(numpy.float64)
+            v_pos = positions[valid].astype(numpy.float64)
+            for local in numpy.unique(v_idx):
+                mask = v_idx == local
+                w_sum = float(v_w[mask].sum())
+                if w_sum <= 0:
+                    continue
+                centroid = (v_pos[mask] * v_w[mask, None]).sum(axis=0) / w_sum
+                if local not in accum:
+                    accum[int(local)] = [numpy.zeros(3, dtype=numpy.float64), 0.0]
+                accum[int(local)][0] += centroid * w_sum
+                accum[int(local)][1] += w_sum
+
+        return {
+            local: (sums[0] / sums[1]).astype(numpy.float32)
+            for local, sums in accum.items()
+            if sums[1] > 0
+        }
+
     # ------------------------------------------------------------------
     # 骨骼矩阵读取
     # ------------------------------------------------------------------
@@ -370,27 +504,137 @@ class EFMIBoneMapBuilder:
 
     @staticmethod
     def build_vg_maps(
-        submesh_skeletons: dict[str, tuple[numpy.ndarray, int, numpy.ndarray]],
-        match_tolerance: float = 0.0,
+        submesh_skeletons: dict[str, tuple],
+        match_tolerance: float = 1e-3,
+        centroid_tolerance: float = 0.02,
     ) -> dict[str, dict]:
-        """跨子网格按骨骼矩阵去重构建 vg_map。
+        """跨子网格按"骨骼矩阵 + 驱动顶点质心"双维度去重构建 vg_map。
 
-        参数: unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts)
+        参数:
+            unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts, centroids)
+            - skeleton_buffer: (N,12) 蒙皮矩阵
+            - vg_count: 局部骨骼数
+            - weighted_vertex_counts: 每局部骨骼驱动的顶点数
+            - centroids: {local_vg_id: 加权质心(3,)}（compute_driven_centroids 结果，可空）
         返回: unique_str -> {local_vg_id(int): global_vg_id(int)}
 
-        去重策略（重要，勿随意放宽）：
-        默认 **精确匹配**（match_tolerance=0.0，矩阵逐元素完全相同才合并），与
-        EFMI-Tools 参考插件一致。原因：**矩阵差无法区分"同一骨骼的浮点误差"与
-        "不同骨骼的恰好重合"**——例如同一角色手指的两节骨骼（d6128f13[57]/[58]）
-        矩阵差仅 1.79e-07（几乎相同但语义完全不同），一旦用容差合并就会"两段变一段"，
-        丢失独立动画能力；而 539/493（差 1.8e-07）也属于同类"极接近但应分开"的情况。
-        参考插件用精确匹配正是为此：**漏合并无害（蒙皮仍正确，骨骼缓冲略大），
-        误合并有害（功能错误）**。
+        双维度去重策略（用户提出的"模拟驱动"思路）：
+        - **矩阵完全相同（diff=0）→ 必合并**（同一份数据，不经质心检查）。
+        - **矩阵近似（diff < match_tolerance）且驱动质心重合（距离 < centroid_tolerance）→ 合并**：
+          如 539/493（矩阵差 1.8e-07、驱动区域重合）合并。
+        - **矩阵近似但驱动质心不同 → 不合并**：
+          如手指两节 d6128f13[57]/[58]（矩阵差 1.79e-07 但驱动不同区域），
+          精确匹配无法区分时靠质心维度保护，避免"两段变一段"。
+        - 矩阵差 >= match_tolerance → 不合并。
 
-        match_tolerance > 0 时改用容差聚类（并查集连通分量，allclose(atol) 合并）。
-        仅在明确知道目标数据"同一骨骼矩阵必有浮点误差、且不存在矩阵接近的不同骨骼"
-        时才放宽（默认勿用）。
+        与单纯矩阵去重的对比：矩阵差无法区分"同骨骼浮点误差"与"不同骨骼恰好重合"，
+        驱动质心提供"骨骼驱动的顶点区域"这一语义维度，从而兼顾（该合并的合并、
+        该分开的分开）。
+
+        match_tolerance: 矩阵粗筛容差（默认 1e-3，宽松——主判据交给质心）。
+        centroid_tolerance: 质心重合阈值（默认 0.02；真同一骨骼跨子网格的驱动区域
+        质心差一般 < 0.01~0.02，不同骨骼即使矩阵相同其驱动区域质心差一般 > 0.02）。
         """
+        # 收集所有骨骼候选
+        candidates: list[dict] = []
+        vg_offset = 0
+
+        for unique_str, entry in submesh_skeletons.items():
+            skeleton_buffer = entry[0]
+            vg_count = entry[1]
+            weighted_vertex_counts = entry[2] if len(entry) > 2 else None
+            centroids = entry[3] if len(entry) > 3 else {}
+
+            if skeleton_buffer is None or vg_count <= 0:
+                continue
+            if len(skeleton_buffer) < vg_count:
+                print(
+                    f"[EFMI骨骼合并] 警告: {unique_str} 骨骼段仅 {len(skeleton_buffer)} 根骨骼，"
+                    f"但声明了 {vg_count} 个顶点组，跳过该子网格参与合并。"
+                )
+                continue
+
+            for vg_id in range(vg_count):
+                bone = skeleton_buffer[vg_id]
+                if numpy.all(bone == 0):
+                    continue
+                weighted_count = (
+                    int(weighted_vertex_counts[vg_id])
+                    if weighted_vertex_counts is not None and vg_id < len(weighted_vertex_counts)
+                    else 0
+                )
+                candidates.append({
+                    "unique_str": unique_str,
+                    "local_vg_id": vg_id,
+                    "global_vg_id": vg_offset + vg_id,
+                    "weighted_vertex_count": weighted_count,
+                    "bone": bone,
+                    "centroid": centroids.get(vg_id),
+                })
+
+            vg_offset += vg_count
+
+        n = len(candidates)
+        if n == 0:
+            return {}
+
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
+
+        def centroid_dist(a, b):
+            ca, cb = candidates[a]["centroid"], candidates[b]["centroid"]
+            if ca is None or cb is None:
+                return None  # 缺质心数据，无法判断
+            return float(numpy.linalg.norm(ca.astype(numpy.float64) - cb.astype(numpy.float64)))
+
+        # 第一遍：矩阵完全相同（diff=0）→ 必合并（同一份数据）
+        for i in range(n):
+            for j in range(i + 1, n):
+                if find(i) == find(j):
+                    continue
+                if numpy.array_equal(mats[i], mats[j]):
+                    union(i, j)
+
+        # 第二遍：矩阵近似 + 驱动质心重合 → 合并
+        for i in range(n):
+            for j in range(i + 1, n):
+                if find(i) == find(j):
+                    continue
+                if not numpy.allclose(mats[i], mats[j], atol=match_tolerance, rtol=0.0):
+                    continue
+                dist = centroid_dist(i, j)
+                if dist is None:
+                    continue  # 缺质心数据时，矩阵近似不合并（保守）
+                if dist < centroid_tolerance:
+                    union(i, j)
+
+        # 分组
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+
+        # 每组 canonical = 权重顶点数最多的候选
+        vg_maps: dict[str, dict] = {}
+        for root, members in groups.items():
+            canonical_idx = max(members, key=lambda i: candidates[i]["weighted_vertex_count"])
+            canonical_global = candidates[canonical_idx]["global_vg_id"]
+            for i in members:
+                cand = candidates[i]
+                vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
+
+        return vg_maps
         # 收集所有骨骼候选
         candidates: list[dict] = []
         vg_offset = 0
@@ -842,7 +1086,17 @@ class EFMISkeletonMergeHelper:
                 )
                 continue
 
-            submesh_skeletons[unique_str] = (skeleton_buffer, vg_count, weighted_vertex_counts)
+            # 双维度去重的"驱动顶点质心"（读 Position.buf + Blend.buf 计算每骨骼驱动区域）
+            position_buf_path = os.path.join(os.path.dirname(json_path), bare_name + "-Position.buf")
+            try:
+                centroids = EFMIBoneMapBuilder.compute_driven_centroids(
+                    position_buf_path, blend_buf_path, submesh_json
+                )
+            except Exception as e:
+                print(f"[EFMI骨骼合并] {unique_str}: 质心计算失败（退化为纯矩阵匹配）: {e}")
+                centroids = {}
+
+            submesh_skeletons[unique_str] = (skeleton_buffer, vg_count, weighted_vertex_counts, centroids)
             submesh_meta[unique_str] = {
                 "json_path": json_path,
                 "submesh_dir": submesh_dir,
@@ -859,7 +1113,9 @@ class EFMISkeletonMergeHelper:
 
         # 写回工作空间 json + 复制骨骼池缓存
         written = 0
-        for unique_str, (skeleton_buffer, vg_count, _w) in submesh_skeletons.items():
+        for unique_str, entry in submesh_skeletons.items():
+            skeleton_buffer = entry[0]
+            vg_count = entry[1]
             meta = submesh_meta[unique_str]
             json_path = meta["json_path"]
             submesh_json = JsonUtils.LoadFromFile(json_path)
@@ -872,10 +1128,10 @@ class EFMISkeletonMergeHelper:
 
             # VGOffset = 该子网格在全局骨架中的起始（按跨子网格累加顺序）
             vg_offset = 0
-            for other_str, (_, other_count, _w2) in submesh_skeletons.items():
+            for other_str, other_entry in submesh_skeletons.items():
                 if other_str == unique_str:
                     break
-                vg_offset += other_count
+                vg_offset += other_entry[1]
 
             submesh_json["VGCount"] = vg_count
             submesh_json["VGOffset"] = vg_offset
