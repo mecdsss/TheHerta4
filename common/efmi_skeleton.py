@@ -576,7 +576,7 @@ class EFMIBoneMapBuilder:
         match_tolerance: float = 1e-3,
         centroid_tolerance: float = 0.02,
         bbox_overlap_min: float = 0.3,
-        vote_threshold: int = 3,
+        vote_threshold: int = 2,
     ) -> tuple[dict[str, dict], dict[str, int]]:
         """跨子网格"权重扩散评估 + 多维度投票"去重构建 vg_map（同部件不去重）。
 
@@ -698,27 +698,34 @@ class EFMIBoneMapBuilder:
         def _sig(idx):
             return candidates[idx].get("signature")
 
-        def evaluate_dimensions(i, j) -> int:
-            """评估各维度，返回通过的维度数（投票）。"""
+        def evaluate_dimensions(i, j, matrix_diff: float) -> int:
+            """评估各维度，返回通过的维度数（投票）。
+
+            4 个维度（用户拍板）：矩阵、权重中心、包围盒重叠率、扩散覆盖。
+            矩阵作为投票维度之一（不是硬否决）。
+            """
             si, sj = _sig(i), _sig(j)
             passed = 0
 
-            # 维度 4：扩散覆盖（扩散矢量球相交）—— 需要签名
+            # 维度 1：矩阵（allclose 容差匹配）
+            if matrix_diff < match_tolerance:
+                passed += 1
+
             if si is not None and sj is not None:
                 ci = si["centroid"].astype(numpy.float64)
                 cj = sj["centroid"].astype(numpy.float64)
                 dist = float(numpy.linalg.norm(ci - cj))
 
-                # 维度 2：权重中心（质心）接近
+                # 维度 2：权重中心（加权质心）接近
                 if dist < centroid_tolerance:
                     passed += 1
 
-                # 维度 4：扩散覆盖（矢量球相交）
+                # 维度 3：扩散覆盖（权重扩散矢量球相交）
                 spread_sum = float(si.get("spread", 0.0) + sj.get("spread", 0.0))
                 if spread_sum > 0 and dist < spread_sum:
                     passed += 1
 
-                # 维度 3：包围盒重叠率
+                # 维度 4：驱动点云包围盒重叠率（IoU）
                 inter_min = numpy.maximum(si["bbox_min"], sj["bbox_min"])
                 inter_max = numpy.minimum(si["bbox_max"], sj["bbox_max"])
                 inter_dims = numpy.maximum(inter_max - inter_min, 0.0)
@@ -727,20 +734,6 @@ class EFMIBoneMapBuilder:
                 vol_j = float(numpy.prod(numpy.maximum(sj["bbox_max"] - sj["bbox_min"], 0.0)))
                 union_vol = vol_i + vol_j - inter_vol
                 if union_vol > 0 and (inter_vol / union_vol) >= bbox_overlap_min:
-                    passed += 1
-
-                # 维度 5：驱动顶点数比例（0.5~2 认为成比例）
-                ci_cnt = si.get("vertex_count", 0)
-                cj_cnt = sj.get("vertex_count", 0)
-                if ci_cnt > 0 and cj_cnt > 0:
-                    ratio = max(ci_cnt, cj_cnt) / min(ci_cnt, cj_cnt)
-                    if ratio <= 2.0:
-                        passed += 1
-
-                # 维度 6：平均权重接近（权重强度分布相似，差 < 0.2）
-                mi = si.get("mean_weight", 0.0)
-                mj = sj.get("mean_weight", 0.0)
-                if abs(mi - mj) < 0.2:
                     passed += 1
 
             return passed
@@ -754,15 +747,9 @@ class EFMIBoneMapBuilder:
                     continue
 
                 matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
-                # 矩阵差 >= 硬筛容差 → 直接不合并（矩阵是必要条件，不参与投票）
-                if matrix_diff >= match_tolerance:
-                    continue
-
-                # 矩阵近似 → 多维度投票（通过数 >= vote_threshold 即合并）
-                votes = evaluate_dimensions(i, j)
-                # 矩阵完全相同的对，矩阵本身也记一票（等价于"矩阵维度通过"）
-                if matrix_diff < 1e-5:
-                    votes += 1
+                # 多维度投票（矩阵/质心/包围盒/扩散覆盖，通过数 >= vote_threshold 即合并；
+                # 矩阵是投票维度之一，不是硬否决）
+                votes = evaluate_dimensions(i, j, matrix_diff)
                 if votes >= vote_threshold:
                     try_union(i, j)
 
