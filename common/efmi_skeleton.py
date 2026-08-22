@@ -446,7 +446,7 @@ class EFMIBoneMapBuilder:
             weights = numpy.zeros((n, bi_channels), dtype=numpy.float32)
             weights[:, 0] = 1.0
 
-        # ---- 每 local 的驱动顶点集合（用于质心 + 包围盒）----
+        # ---- 每 local 的驱动顶点集合（质心 + 包围盒 + 扩散半径 + 权重强度）----
         accum: dict[int, dict] = {}
         for c in range(indices.shape[1]):
             idx_col = indices[:, c]
@@ -464,30 +464,40 @@ class EFMIBoneMapBuilder:
                 w_sum = float(ws_.sum())
                 if w_sum <= 0:
                     continue
-                centroid = (pts * ws_[:, None]).sum(axis=0) / w_sum
                 entry = accum.setdefault(int(local), {
                     "weighted_sum": numpy.zeros(3, dtype=numpy.float64),
                     "weight_total": 0.0,
+                    "weighted_sq_pos": 0.0,  # Σ w_i |p_i|²（用于扩散半径）
                     "bbox_min": numpy.full(3, numpy.inf),
                     "bbox_max": numpy.full(3, -numpy.inf),
                     "vertex_count": 0,
                 })
-                entry["weighted_sum"] += centroid * w_sum
+                entry["weighted_sum"] += (pts * ws_[:, None]).sum(axis=0)
                 entry["weight_total"] += w_sum
+                entry["weighted_sq_pos"] += float((ws_ * (pts ** 2).sum(axis=1)).sum())
                 entry["bbox_min"] = numpy.minimum(entry["bbox_min"], pts.min(axis=0))
                 entry["bbox_max"] = numpy.maximum(entry["bbox_max"], pts.max(axis=0))
                 entry["vertex_count"] += int(mask.sum())
 
-        return {
-            local: {
-                "centroid": (e["weighted_sum"] / e["weight_total"]).astype(numpy.float32),
+        result = {}
+        for local, e in accum.items():
+            if e["weight_total"] <= 0:
+                continue
+            centroid = e["weighted_sum"] / e["weight_total"]
+            # 扩散半径：加权 RMS 半径 spread² = Σw|p|²/Σw - |c|²
+            mean_sq = e["weighted_sq_pos"] / e["weight_total"]
+            var = max(float(mean_sq - float((centroid ** 2).sum())), 0.0)
+            spread = float(numpy.sqrt(var))
+            result[local] = {
+                "centroid": centroid.astype(numpy.float32),
                 "bbox_min": e["bbox_min"].astype(numpy.float32),
                 "bbox_max": e["bbox_max"].astype(numpy.float32),
                 "vertex_count": e["vertex_count"],
+                "spread": spread,  # 扩散矢量球半径（权重强度衰减的扩散路径范围）
+                "weight_total": float(e["weight_total"]),  # 权重强度
+                "mean_weight": float(e["weight_total"]) / max(e["vertex_count"], 1),
             }
-            for local, e in accum.items()
-            if e["weight_total"] > 0
-        }
+        return result
 
     # ------------------------------------------------------------------
     # 骨骼矩阵读取
@@ -564,10 +574,193 @@ class EFMIBoneMapBuilder:
     def build_vg_maps(
         submesh_skeletons: dict[str, tuple],
         match_tolerance: float = 1e-3,
-        tight_matrix_tolerance: float = 1e-5,
         centroid_tolerance: float = 0.02,
         bbox_overlap_min: float = 0.3,
+        vote_threshold: int = 2,
     ) -> tuple[dict[str, dict], dict[str, int]]:
+        """跨子网格"权重扩散评估 + 多维度投票"去重构建 vg_map（同部件不去重）。
+
+        参数:
+            unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts[, signatures])
+            - signatures: {local: {centroid, bbox_min/max, vertex_count, spread, weight_total}}
+        返回: (vg_maps, vg_offsets)
+
+        去重机制（用户拍板的"权重扩散评估"）：
+        每个骨骼的权重中心构建一个符合其权重强度与扩散衰减的"矢量球"
+        （半径 = 加权 RMS 扩散半径 spread）。当骨骼 A 的扩散球覆盖到另一部件的骨骼 B
+        （质心距离 < spread_A + spread_B）时，对该对做多维度评估：
+
+        **多维度投票（通过数 >= vote_threshold 即合并，默认 2）**：
+        1. **矩阵** allclose(match_tolerance=1e-3)；
+        2. **权重中心**（加权质心）距离 < centroid_tolerance（0.02）；
+        3. **驱动点云包围盒**重叠率（IoU）> bbox_overlap_min（0.3）；
+        4. **扩散覆盖**：权重扩散矢量球相交（质心距离 < spread_A + spread_B）；
+        5. **驱动顶点数比例**在 [0.5, 2]（同一骨骼跨部件驱动顶点数成比例）；
+        6. **平均权重**接近（权重强度分布相似）。
+
+        **同部件冲突拒绝**（硬性规则）：并查集 union 时检查，组内同部件最多 1 个 local，
+        防"同位置功能骨骼"（如手指两节）合并及链式绕过。
+
+        与之前"全部必须"的判据不同：投票制允许单一维度失效时其它维度兜底，
+        更鲁棒（应对"矩阵/质心/包围盒任一维度都可能有噪声"的现实数据）。
+
+        参数（可实测调整）:
+            vote_threshold: 通过数阈值（默认 2，范围 2~3）。误并多→调大到 3；误拆多→调小到 2。
+            match_tolerance: 矩阵硬筛上限（默认 1e-3，超过直接不合并、不参与投票）。
+            centroid_tolerance / bbox_overlap_min: 各维度子阈值。
+        """
+        # 收集所有骨骼候选
+        candidates: list[dict] = []
+        offset = 0
+        vg_offsets: dict[str, int] = {}
+
+        for unique_str in sorted(submesh_skeletons.keys()):
+            entry = submesh_skeletons[unique_str]
+            skeleton_buffer = entry[0]
+            vg_count = entry[1]
+            weighted_vertex_counts = entry[2] if len(entry) > 2 else None
+            signatures = entry[3] if len(entry) > 3 else {}
+
+            if skeleton_buffer is None or vg_count <= 0:
+                continue
+            if len(skeleton_buffer) < vg_count:
+                print(
+                    f"[EFMI骨骼合并] 警告: {unique_str} 骨骼段仅 {len(skeleton_buffer)} 根骨骼，"
+                    f"但声明了 {vg_count} 个顶点组，跳过该子网格参与合并。"
+                )
+                continue
+
+            vg_offsets[unique_str] = offset
+            for vg_id in range(vg_count):
+                bone = skeleton_buffer[vg_id]
+                if numpy.all(bone == 0):
+                    continue
+                weighted_count = (
+                    int(weighted_vertex_counts[vg_id])
+                    if weighted_vertex_counts is not None and vg_id < len(weighted_vertex_counts)
+                    else 0
+                )
+                candidates.append({
+                    "unique_str": unique_str,
+                    "local_vg_id": vg_id,
+                    "global_vg_id": offset + vg_id,
+                    "weighted_vertex_count": weighted_count,
+                    "bone": bone,
+                    "signature": signatures.get(vg_id),
+                })
+            offset += vg_count
+
+        n = len(candidates)
+        if n == 0:
+            return {}, {}
+
+        parent = list(range(n))
+        group_submeshes: list[set] = [{candidates[i]["unique_str"]} for i in range(n)]
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def try_union(a, b):
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return
+            # 冲突拒绝：合并后某子网格在同组会有 >1 个 local → 拒绝
+            if group_submeshes[ra] & group_submeshes[rb]:
+                return
+            parent[ra] = rb
+            group_submeshes[rb] = group_submeshes[ra] | group_submeshes[rb]
+
+        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
+
+        def _sig(idx):
+            return candidates[idx].get("signature")
+
+        def evaluate_dimensions(i, j) -> int:
+            """评估各维度，返回通过的维度数（投票）。"""
+            si, sj = _sig(i), _sig(j)
+            passed = 0
+
+            # 维度 4：扩散覆盖（扩散矢量球相交）—— 需要签名
+            if si is not None and sj is not None:
+                ci = si["centroid"].astype(numpy.float64)
+                cj = sj["centroid"].astype(numpy.float64)
+                dist = float(numpy.linalg.norm(ci - cj))
+
+                # 维度 2：权重中心（质心）接近
+                if dist < centroid_tolerance:
+                    passed += 1
+
+                # 维度 4：扩散覆盖（矢量球相交）
+                spread_sum = float(si.get("spread", 0.0) + sj.get("spread", 0.0))
+                if spread_sum > 0 and dist < spread_sum:
+                    passed += 1
+
+                # 维度 3：包围盒重叠率
+                inter_min = numpy.maximum(si["bbox_min"], sj["bbox_min"])
+                inter_max = numpy.minimum(si["bbox_max"], sj["bbox_max"])
+                inter_dims = numpy.maximum(inter_max - inter_min, 0.0)
+                inter_vol = float(numpy.prod(inter_dims))
+                vol_i = float(numpy.prod(numpy.maximum(si["bbox_max"] - si["bbox_min"], 0.0)))
+                vol_j = float(numpy.prod(numpy.maximum(sj["bbox_max"] - sj["bbox_min"], 0.0)))
+                union_vol = vol_i + vol_j - inter_vol
+                if union_vol > 0 and (inter_vol / union_vol) >= bbox_overlap_min:
+                    passed += 1
+
+                # 维度 5：驱动顶点数比例（0.5~2 认为成比例）
+                ci_cnt = si.get("vertex_count", 0)
+                cj_cnt = sj.get("vertex_count", 0)
+                if ci_cnt > 0 and cj_cnt > 0:
+                    ratio = max(ci_cnt, cj_cnt) / min(ci_cnt, cj_cnt)
+                    if ratio <= 2.0:
+                        passed += 1
+
+                # 维度 6：平均权重接近（权重强度分布相似，差 < 0.2）
+                mi = si.get("mean_weight", 0.0)
+                mj = sj.get("mean_weight", 0.0)
+                if abs(mi - mj) < 0.2:
+                    passed += 1
+
+            return passed
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                # 同部件（同子网格）内的 local 绝不合并
+                if candidates[i]["unique_str"] == candidates[j]["unique_str"]:
+                    continue
+                if find(i) == find(j):
+                    continue
+
+                matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
+                # 矩阵差 >= 硬筛容差 → 直接不合并（矩阵是必要条件，不参与投票）
+                if matrix_diff >= match_tolerance:
+                    continue
+
+                # 矩阵近似 → 多维度投票（通过数 >= vote_threshold 即合并）
+                votes = evaluate_dimensions(i, j)
+                # 矩阵完全相同的对，矩阵本身也记一票（等价于"矩阵维度通过"）
+                if matrix_diff < 1e-5:
+                    votes += 1
+                if votes >= vote_threshold:
+                    try_union(i, j)
+
+        # 分组
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+
+        # 每组 canonical = 权重顶点数最多的候选
+        vg_maps: dict[str, dict] = {}
+        for root, members in groups.items():
+            canonical_idx = max(members, key=lambda i: candidates[i]["weighted_vertex_count"])
+            canonical_global = candidates[canonical_idx]["global_vg_id"]
+            for i in members:
+                cand = candidates[i]
+                vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
+
+        return vg_maps, vg_offsets
         """跨子网格"先矩阵、后权重中心"分层去重构建 vg_map（同部件不去重）。
 
         参数:
