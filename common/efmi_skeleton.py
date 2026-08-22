@@ -565,7 +565,8 @@ class EFMIBoneMapBuilder:
         submesh_skeletons: dict[str, tuple],
         match_tolerance: float = 1e-3,
         tight_matrix_tolerance: float = 1e-5,
-        centroid_tolerance: float = 0.05,
+        centroid_tolerance: float = 0.02,
+        bbox_overlap_min: float = 0.3,
     ) -> tuple[dict[str, dict], dict[str, int]]:
         """跨子网格"先矩阵、后权重中心"分层去重构建 vg_map（同部件不去重）。
 
@@ -589,8 +590,11 @@ class EFMIBoneMapBuilder:
         参数（可实测调整）:
             tight_matrix_tolerance: 浮点误差级阈值（默认 1e-5），小于它直接合并。
             match_tolerance: 矩阵粗筛上限（默认 1e-3），超过则不合并。
-            centroid_tolerance: 权重中心（质心）重合阈值（默认 0.05），仅对矩阵中等
-            接近的对生效。密集区误并 → 调小（0.01~0.03）；该并没并 → 调大（0.1~0.2）。
+            centroid_tolerance: 权重中心（质心）重合阈值（默认 **0.02**，用户拍板降低
+            以减少密集区误并），仅对矩阵中等接近的对生效。
+            bbox_overlap_min: 驱动点云包围盒重叠率（IoU）下限（默认 **0.3**，新维度），
+            密集区不同骨骼即使质心近，其驱动区域包围盒形状/位置也不同 → 用重叠率
+            进一步区分。误并仍多 → 调大到 0.5~0.7；误拆多 → 调小到 0.1~0.2。
         """
         # 收集所有骨骼候选
         candidates: list[dict] = []
@@ -667,6 +671,22 @@ class EFMIBoneMapBuilder:
                 sa["centroid"].astype(numpy.float64) - sb["centroid"].astype(numpy.float64)
             ))
 
+        def bbox_overlap_ratio(a, b):
+            """两骨骼驱动顶点集合包围盒的重叠率（IoU：交集体积/并集体积）。"""
+            sa, sb = candidates[a].get("signature"), candidates[b].get("signature")
+            if sa is None or sb is None:
+                return None
+            inter_min = numpy.maximum(sa["bbox_min"], sb["bbox_min"])
+            inter_max = numpy.minimum(sa["bbox_max"], sb["bbox_max"])
+            inter_dims = numpy.maximum(inter_max - inter_min, 0.0)
+            inter_vol = float(numpy.prod(inter_dims))
+            vol_a = float(numpy.prod(numpy.maximum(sa["bbox_max"] - sa["bbox_min"], 0.0)))
+            vol_b = float(numpy.prod(numpy.maximum(sb["bbox_max"] - sb["bbox_min"], 0.0)))
+            union_vol = vol_a + vol_b - inter_vol
+            if union_vol <= 0:
+                return 0.0
+            return inter_vol / union_vol
+
         for i in range(n):
             for j in range(i + 1, n):
                 # 同部件（同子网格）内的 local 绝不合并
@@ -679,10 +699,16 @@ class EFMIBoneMapBuilder:
                 # 矩阵差 >= 粗筛容差 → 不合并
                 if matrix_diff >= match_tolerance:
                     continue
-                # 矩阵差 >= 浮点误差级（明显接近但非完全相同）→ 需权重中心接近才合并
+                # 矩阵差 >= 浮点误差级（明显接近但非完全相同）→ 需权重中心 + 包围盒重叠确认
                 if matrix_diff >= tight_matrix_tolerance:
+                    # 权重中心（加权质心）距离
                     dist = centroid_dist(i, j)
                     if dist is None or dist >= centroid_tolerance:
+                        continue
+                    # 驱动点云包围盒重叠率（新维度）：密集区不同骨骼即使质心近，
+                    # 其驱动区域的包围盒形状/位置也不同 → 用重叠率进一步区分
+                    overlap = bbox_overlap_ratio(i, j)
+                    if overlap is None or overlap < bbox_overlap_min:
                         continue
 
                 try_union(i, j)
