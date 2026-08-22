@@ -656,8 +656,8 @@ class EFMIBoneMapBuilder:
 
         parent = list(range(n))
         group_submeshes: list[set] = [{candidates[i]["unique_str"]} for i in range(n)]
-        # 每组的代表成员（canonical，取权重顶点数最多者）索引，用于防链式质心检查
-        group_canonical: list[int] = list(range(n))
+        # 每组的所有成员索引（用于"完全图判定"：新成员必须与组内所有成员两两通过）
+        group_members: list[list[int]] = [[i] for i in range(n)]
 
         def find(x):
             while parent[x] != x:
@@ -666,7 +666,6 @@ class EFMIBoneMapBuilder:
             return x
 
         def centroid_dist(a, b):
-            """两骨骼驱动顶点的加权质心距离（防链式检查用）。"""
             sa = candidates[a].get("signature")
             sb = candidates[b].get("signature")
             if sa is None or sb is None:
@@ -675,27 +674,29 @@ class EFMIBoneMapBuilder:
                 sa["centroid"].astype(numpy.float64) - sb["centroid"].astype(numpy.float64)
             ))
 
-        def try_union(a, b, skip_anti_chain: bool = False):
+        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
+
+        def passes(i, j) -> bool:
+            """完整判定（两两独立）：矩阵/质心/包围盒/扩散覆盖 4 维度投票 >= vote_threshold。"""
+            matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
+            return evaluate_dimensions(i, j, matrix_diff) >= vote_threshold
+
+        def try_union(a, b):
             ra, rb = find(a), find(b)
             if ra == rb:
                 return
             # 冲突拒绝：合并后某子网格在同组会有 >1 个 local → 拒绝
             if group_submeshes[ra] & group_submeshes[rb]:
                 return
-            # 防链式：两组的 canonical（代表骨骼）质心距离不能太远，否则拒绝
-            # （防止 A~B、B~C 导致 A、C 质心很远却被链式合并到同组）。
-            # 阈值取宽松值（2×centroid_tolerance 且至少 0.1），只挡明显链式漂移；
-            # 矩阵完全相同（diff≈0）的对跳过此检查（几乎确定同一骨骼，链式风险可忽略）。
-            if not skip_anti_chain:
-                dist = centroid_dist(group_canonical[ra], group_canonical[rb])
-                anti_chain_limit = max(2.0 * centroid_tolerance, 0.1)
-                if dist is not None and dist >= anti_chain_limit:
-                    return
+            # 完全图判定（用户定义）：b 组每个成员必须与 a 组每个成员都两两判定通过，
+            # 才能并入（C 要与 A 且 B 都通过，才能连进 {A,B} 组）——防止关联判定/链式漂移
+            for mi in group_members[ra]:
+                for mj in group_members[rb]:
+                    if not passes(mi, mj):
+                        return
             parent[ra] = rb
             group_submeshes[rb] = group_submeshes[ra] | group_submeshes[rb]
-            # 更新 canonical 为两组中权重顶点数更多的代表
-            if candidates[group_canonical[rb]]["weighted_vertex_count"] < candidates[group_canonical[ra]]["weighted_vertex_count"]:
-                group_canonical[rb] = group_canonical[ra]
+            group_members[rb] = group_members[ra] + group_members[rb]
 
         mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
 
@@ -772,168 +773,6 @@ class EFMIBoneMapBuilder:
                 vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
 
         return vg_maps, vg_offsets
-        """跨子网格"先矩阵、后权重中心"分层去重构建 vg_map（同部件不去重）。
-
-        参数:
-            unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts[, signatures])
-            - signatures: {local: {centroid, bbox_min, bbox_max, vertex_count}}（驱动点云特征）
-        返回: (vg_maps, vg_offsets)
-            - vg_maps: unique_str -> {local_vg_id(int): global_vg_id(int)}
-            - vg_offsets: unique_str -> 该子网格在合并骨架中的起始槽位（与去重同序分配）
-
-        分层判据（用户拍板：首先看骨骼矩阵，然后看权重中心；同部件不去重）：
-        1. **同部件（同子网格）内的 local 绝不合并**（冲突拒绝：并查集 union 时检查，
-           组内同部件最多 1 个 local，防链式合并绕过）；
-        2. **矩阵差 < tight_matrix_tolerance（浮点误差级）→ 直接合并**（矩阵几乎相同
-           基本确定同一骨骼，无需质心）；
-        3. **矩阵差在 [tight, match_tolerance)（明显接近）→ 需权重中心（加权质心）
-           距离 < centroid_tolerance 才合并**（密集区防误并的关键：矩阵接近但驱动
-           顶点中心不同的，不合并）；
-        4. **矩阵差 >= match_tolerance → 不合并**。
-
-        参数（可实测调整）:
-            tight_matrix_tolerance: 浮点误差级阈值（默认 1e-5），小于它直接合并。
-            match_tolerance: 矩阵粗筛上限（默认 1e-3），超过则不合并。
-            centroid_tolerance: 权重中心（质心）重合阈值（默认 **0.02**，用户拍板降低
-            以减少密集区误并），仅对矩阵中等接近的对生效。
-            bbox_overlap_min: 驱动点云包围盒重叠率（IoU）下限（默认 **0.3**，新维度），
-            密集区不同骨骼即使质心近，其驱动区域包围盒形状/位置也不同 → 用重叠率
-            进一步区分。误并仍多 → 调大到 0.5~0.7；误拆多 → 调小到 0.1~0.2。
-        """
-        # 收集所有骨骼候选
-        candidates: list[dict] = []
-        offset = 0
-        vg_offsets: dict[str, int] = {}
-
-        for unique_str in sorted(submesh_skeletons.keys()):
-            entry = submesh_skeletons[unique_str]
-            skeleton_buffer = entry[0]
-            vg_count = entry[1]
-            weighted_vertex_counts = entry[2] if len(entry) > 2 else None
-            signatures = entry[3] if len(entry) > 3 else {}
-
-            if skeleton_buffer is None or vg_count <= 0:
-                continue
-            if len(skeleton_buffer) < vg_count:
-                print(
-                    f"[EFMI骨骼合并] 警告: {unique_str} 骨骼段仅 {len(skeleton_buffer)} 根骨骼，"
-                    f"但声明了 {vg_count} 个顶点组，跳过该子网格参与合并。"
-                )
-                continue
-
-            vg_offsets[unique_str] = offset
-            for vg_id in range(vg_count):
-                bone = skeleton_buffer[vg_id]
-                if numpy.all(bone == 0):
-                    continue
-                weighted_count = (
-                    int(weighted_vertex_counts[vg_id])
-                    if weighted_vertex_counts is not None and vg_id < len(weighted_vertex_counts)
-                    else 0
-                )
-                candidates.append({
-                    "unique_str": unique_str,
-                    "local_vg_id": vg_id,
-                    "global_vg_id": offset + vg_id,
-                    "weighted_vertex_count": weighted_count,
-                    "bone": bone,
-                    "signature": signatures.get(vg_id),
-                })
-            offset += vg_count
-
-        n = len(candidates)
-        if n == 0:
-            return {}, {}
-
-        parent = list(range(n))
-        # 每组包含的子网格集合（用于"同部件冲突拒绝"）
-        group_submeshes: list[set] = [{candidates[i]["unique_str"]} for i in range(n)]
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def try_union(a, b):
-            ra, rb = find(a), find(b)
-            if ra == rb:
-                return
-            # 冲突拒绝：合并后某子网格在同组会有 >1 个 local → 拒绝
-            if group_submeshes[ra] & group_submeshes[rb]:
-                return
-            parent[ra] = rb
-            group_submeshes[rb] = group_submeshes[ra] | group_submeshes[rb]
-
-        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
-
-        def centroid_dist(a, b):
-            sa, sb = candidates[a].get("signature"), candidates[b].get("signature")
-            if sa is None or sb is None:
-                return None
-            return float(numpy.linalg.norm(
-                sa["centroid"].astype(numpy.float64) - sb["centroid"].astype(numpy.float64)
-            ))
-
-        def bbox_overlap_ratio(a, b):
-            """两骨骼驱动顶点集合包围盒的重叠率（IoU：交集体积/并集体积）。"""
-            sa, sb = candidates[a].get("signature"), candidates[b].get("signature")
-            if sa is None or sb is None:
-                return None
-            inter_min = numpy.maximum(sa["bbox_min"], sb["bbox_min"])
-            inter_max = numpy.minimum(sa["bbox_max"], sb["bbox_max"])
-            inter_dims = numpy.maximum(inter_max - inter_min, 0.0)
-            inter_vol = float(numpy.prod(inter_dims))
-            vol_a = float(numpy.prod(numpy.maximum(sa["bbox_max"] - sa["bbox_min"], 0.0)))
-            vol_b = float(numpy.prod(numpy.maximum(sb["bbox_max"] - sb["bbox_min"], 0.0)))
-            union_vol = vol_a + vol_b - inter_vol
-            if union_vol <= 0:
-                return 0.0
-            return inter_vol / union_vol
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                # 同部件（同子网格）内的 local 绝不合并
-                if candidates[i]["unique_str"] == candidates[j]["unique_str"]:
-                    continue
-                if find(i) == find(j):
-                    continue
-
-                matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
-                # 矩阵差 >= 粗筛容差 → 不合并
-                if matrix_diff >= match_tolerance:
-                    continue
-                # 矩阵差 >= 浮点误差级（明显接近但非完全相同）→ 需权重中心 + 包围盒重叠确认
-                if matrix_diff >= tight_matrix_tolerance:
-                    # 权重中心（加权质心）距离
-                    dist = centroid_dist(i, j)
-                    if dist is None or dist >= centroid_tolerance:
-                        continue
-                    # 驱动点云包围盒重叠率（新维度）：密集区不同骨骼即使质心近，
-                    # 其驱动区域的包围盒形状/位置也不同 → 用重叠率进一步区分
-                    overlap = bbox_overlap_ratio(i, j)
-                    if overlap is None or overlap < bbox_overlap_min:
-                        continue
-
-                try_union(i, j)
-
-        # 分组
-        groups: dict[int, list[int]] = {}
-        for i in range(n):
-            groups.setdefault(find(i), []).append(i)
-
-        # 每组 canonical = 权重顶点数最多的候选
-        vg_maps: dict[str, dict] = {}
-        for root, members in groups.items():
-            canonical_idx = max(members, key=lambda i: candidates[i]["weighted_vertex_count"])
-            canonical_global = candidates[canonical_idx]["global_vg_id"]
-            for i in members:
-                cand = candidates[i]
-                vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
-
-        return vg_maps, vg_offsets
-
-
 class EFMISkeletonMergeHelper:
     """EFMI 骨骼合并总流程：定位 FrameAnalysis -> 解析 log -> 构建映射 -> 写回工作空间。"""
 
