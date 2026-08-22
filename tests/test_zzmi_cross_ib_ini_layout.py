@@ -78,8 +78,30 @@ _install_module(
         forbid_auto_texture_ini=lambda: True,
         zzz_use_slot_fix=lambda: False,
         generate_branch_mod_gui=lambda: False,
+        import_merged_vgmap=lambda: False,
     ),
 )
+
+# zzmi.py 依赖链：bpy（假）+ 真实 bpy-free 模块按文件加载
+_install_module("bpy")
+
+
+def _load_real_module(qualname, relpath):
+    path = Path(__file__).resolve().parents[1] / relpath
+    spec = importlib.util.spec_from_file_location(qualname, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[qualname] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_load_real_module(f"{PKG}.utils.json_utils", "utils/json_utils.py")
+_load_real_module(f"{PKG}.utils.tbn_codec", "utils/tbn_codec.py")
+_load_real_module(f"{PKG}.utils.format_utils", "utils/format_utils.py")
+_load_real_module(f"{PKG}.utils.ssmt_error_utils", "utils/ssmt_error_utils.py")
+_load_real_module(f"{PKG}.common.m_key", "common/m_key.py")
+_load_real_module(f"{PKG}.common.object_prefix_helper", "common/object_prefix_helper.py")
+_load_real_module(f"{PKG}.common.draw_call_model", "common/draw_call_model.py")
 _install_module(
     f"{PKG}.common.global_key_count_helper",
     GlobalKeyCountHelper=types.SimpleNamespace(generated_mod_number=0),

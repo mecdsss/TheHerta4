@@ -288,17 +288,24 @@ class SubMeshModel:
 
         TimerUtils.end_stage("对象处理与合并")
 
-        # EFMI 骨骼合并导出前顶点组预处理（对齐参考插件 ObjectMerger 纪律）：
-        # fill gaps -> 剔除 ignore/越界组 -> 全部重命名为 str(index)（紧凑化），
-        # 使导出 blend 索引 = 紧凑索引，运行时 CS 用 vg_offset/vg_count 翻译。
-        if (
-            GlobalConfig.logic_name == LogicName.EFMI
-            and GlobalProterties.import_merged_vgmap()
-        ):
+        # 骨骼合并导出前顶点组预处理（对齐参考插件 ObjectMerger 纪律）：
+        # 使导出 blend 索引 = 全局骨骼 id（排序后 index == 数字组名）。
+        # EFMI 无条件（复选框开即启用）；ZZMI 额外要求反查已写回（vg_count > 0），
+        # 复选框关闭或无反查数据时完全保持旧逻辑。
+        run_merged_skeleton_preprocess = False
+        if GlobalProterties.import_merged_vgmap():
+            if GlobalConfig.logic_name == LogicName.EFMI:
+                run_merged_skeleton_preprocess = True
+            elif GlobalConfig.logic_name == LogicName.ZZMI and self.vg_count > 0:
+                run_merged_skeleton_preprocess = True
+        if run_merged_skeleton_preprocess:
             try:
-                self._prepare_efmi_merged_skeleton_vertex_groups(submesh_merged_obj)
+                if GlobalConfig.logic_name == LogicName.ZZMI:
+                    self._prepare_zzmi_merged_skeleton_vertex_groups(submesh_merged_obj)
+                else:
+                    self._prepare_merged_skeleton_vertex_groups(submesh_merged_obj)
             except Exception as e:
-                print(f"[EFMI骨骼合并] 顶点组预处理失败（忽略，按原样导出）: {e}")
+                print(f"[骨骼合并] 顶点组预处理失败（忽略，按原样导出）: {e}")
 
         obj_buffer_result = ExportUtils.build_unity_obj_buffer_result(
             obj=submesh_merged_obj,
@@ -353,14 +360,16 @@ class SubMeshModel:
                 obj.vertex_groups.new(name=str(i))
         # 排序由后续紧凑化重命名前的 index 语义处理；此处仅补缺。
 
-    def _prepare_efmi_merged_skeleton_vertex_groups(self, obj):
-        """EFMI 骨骼合并导出前顶点组预处理（对齐参考插件 ObjectMerger.finalize_temp_objects_data）。
+    def _prepare_merged_skeleton_vertex_groups(self, obj):
+        """骨骼合并导出前顶点组预处理（对齐参考插件 ObjectMerger.finalize_temp_objects_data）。
 
+        EFMI/ZZMI 合并骨架模式共用：组名 = 全局骨骼 id。
         步骤：
         1.（可选）按数字名补缺顶点组（受 export_add_missing_vertex_groups 开关控制）；
-        2. 剔除名字含 'ignore' 或超出范围（名字数字 >= 上限）的组；
-           上限优先取反查写回的 json VGCount，否则取数字名最大值 + 1；
-        3. 全部组重命名为 str(vg.index)（紧凑化），使导出 blend 索引 = 紧凑索引。
+        2. 按名字排序，使 index 顺序与数字名一致；
+        3. 剔除名字含 'ignore' 的组（不做数字越界删除：组名为全局骨骼 id，
+           可能小于本组件 vg_offset 或大于 vg_offset+vg_count，局部上限会误删共享骨骼）；
+        4. 全部组重命名为 str(vg.index)（紧凑化），使导出 blend 索引 = 全局骨骼 id。
         """
         if obj is None or obj.type != 'MESH':
             return
@@ -399,6 +408,50 @@ class SubMeshModel:
         # 4. 紧凑化重命名（导出 blend 索引 = 紧凑索引）
         for vg in obj.vertex_groups:
             vg.name = str(vg.index)
+
+    def _prepare_zzmi_merged_skeleton_vertex_groups(self, obj):
+        """ZZMI 合并骨架导出前顶点组预处理（组名 = 全局骨骼 id，连续性是关键不变量）。
+
+        与 EFMI 版的差异（修复"删空组→后续部件集体错位消失"）：
+        1. **无条件补缺**到最大数字名（不受 export_add_missing_vertex_groups 门控——
+           ZZMI 合并模式下组号连续是正确性前提，不是可选项）；
+        2. **不剔除任何组**（ignore 组也不删：删任意中间组都会让后续组号 -1 移位，
+           全局骨骼 id 全部错位；需要隐藏部件请用其它方式）；
+        3. 按名排序 + 重命名 str(index)（补缺+排序后此为安全恒等操作）；
+        4. 自检：非数字组名只警告；空组正常（无顶点引用的骨骼，无害）。
+        """
+        if obj is None or obj.type != 'MESH':
+            return
+        if not obj.vertex_groups:
+            return
+
+        # 1. 无条件补缺（先补缺，保证数字名 0..max 连续）
+        try:
+            self._fill_vertex_group_gaps(obj)
+        except Exception as e:
+            print(f"[ZZMI骨骼合并] 补缺顶点组失败（继续）: {e}")
+
+        # 2. 按名排序（Blender 自然排序，数字名按数值排），使 index == 数字名
+        try:
+            prev_active = bpy.context.view_layer.objects.active
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.vertex_group_sort()
+            if prev_active is not None:
+                bpy.context.view_layer.objects.active = prev_active
+        except Exception as e:
+            print(f"[ZZMI骨骼合并] 顶点组排序失败（继续）: {e}")
+
+        # 3. 恒等重命名（补缺 + 排序后 index == 数字名，此行仅为兜底保险）
+        for vg in obj.vertex_groups:
+            vg.name = str(vg.index)
+
+        # 4. 自检与告警
+        non_numeric = [str(vg.name) for vg in obj.vertex_groups if not str(vg.name).isdigit()]
+        if non_numeric:
+            print(
+                f"[ZZMI骨骼合并] 警告: {obj.name} 存在非数字顶点组 {non_numeric[:8]}"
+                f"（共 {len(non_numeric)} 个），它们不会被当作骨骼导出"
+            )
 
     def _ensure_target_shape_key_union(self, target_obj: bpy.types.Object, source_objs: list[bpy.types.Object]):
         objects = [

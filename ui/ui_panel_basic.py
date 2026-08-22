@@ -70,6 +70,43 @@ class SSMT_OT_ToggleIgnoreTextureAlpha(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SSMT_OT_ClearMergedSkeletonCache(bpy.types.Operator):
+    bl_idname = "ssmt.clear_merged_skeleton_cache"
+    bl_label = "清除骨骼合并VGMap缓存"
+    bl_description = (
+        "删除当前工作空间所有子网格 json 的 VGMap/VGOffset/VGCount 缓存；"
+        "去重策略变更后旧缓存会被幂等跳过，清除后下次一键导入将按当前策略重新生成。"
+        "EFMI（终末地）/ ZZMI（绝区零）模式下可用"
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return GlobalConfig.logic_name in (LogicName.EFMI, LogicName.ZZMI)
+
+    def execute(self, context):
+        if GlobalConfig.logic_name not in (LogicName.EFMI, LogicName.ZZMI):
+            self.report({'ERROR'}, "仅 EFMI（终末地）/ ZZMI（绝区零）模式下可用")
+            return {'CANCELLED'}
+
+        from ..common.efmi_skeleton import EFMISkeletonMergeHelper
+        workspace_root = GlobalConfig.path_workspace_folder()
+        if not workspace_root or not os.path.isdir(workspace_root):
+            self.report({'ERROR'}, "当前工作空间目录无效，无法清理")
+            return {'CANCELLED'}
+
+        cleaned, scanned = EFMISkeletonMergeHelper.clear_vgmap_cache(workspace_root)
+        if cleaned > 0:
+            message = (
+                f"已清除 {cleaned} 个子网格的骨骼合并缓存（VGMap/VGOffset/VGCount），"
+                "下次一键导入将重新生成"
+            )
+        else:
+            message = f"扫描了 {scanned} 个 json，没有需要清理的 VGMap 缓存"
+        print(f"[骨骼合并] {message}")
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+
 class PanelBasicInformation(bpy.types.Panel):
     bl_label = "基础信息"
     bl_idname = "VIEW3D_PT_SSMT4_Basic_Information"
@@ -276,11 +313,18 @@ class PanelBasicInformation(bpy.types.Panel):
                 parallel_box.label(text=f"当前生效路径: {display_path}")
                 parallel_box.label(text=message, icon='CHECKMARK' if is_valid else 'ERROR')
 
-        if GlobalConfig.logic_name == LogicName.WWMI:
+        # 骨骼合并复选框（import_merged_vgmap，「使用融合统一顶点组」）：
+        # WWMI（融合统一顶点组）/ ZZMI / EFMI（骨骼合并，Merged Skeleton）共用同一把开关；
+        # 勾选 = 导入全局顶点组、导出走合并骨架；不勾选 = 完全维持原路线（见 ZZMI骨骼合并计划书.md §5.1）。
+        if GlobalConfig.logic_name in (LogicName.WWMI, LogicName.ZZMI, LogicName.EFMI):
             layout.prop(global_properties, "import_merged_vgmap")
 
         if GlobalConfig.logic_name == LogicName.WWMI or GlobalConfig.logic_name == LogicName.NTEMI:
             layout.prop(global_properties, "import_skip_empty_vertex_groups")
+
+        # 骨骼合并（EFMI/ZZMI）：一键清除子网格 json 里缓存的 VGMap（去重策略变更后强制重生成）
+        if GlobalConfig.logic_name in (LogicName.EFMI, LogicName.ZZMI):
+            layout.operator(SSMT_OT_ClearMergedSkeletonCache.bl_idname, icon='TRASH')
 
 
 def register():
@@ -288,11 +332,13 @@ def register():
     bpy.utils.register_class(SSMT4RefreshWorkspaceList)
     bpy.utils.register_class(SSMT_OT_ToggleUseNormalMap)
     bpy.utils.register_class(SSMT_OT_ToggleIgnoreTextureAlpha)
+    bpy.utils.register_class(SSMT_OT_ClearMergedSkeletonCache)
     bpy.utils.register_class(PanelBasicInformation)
 
 
 def unregister():
     bpy.utils.unregister_class(PanelBasicInformation)
+    bpy.utils.unregister_class(SSMT_OT_ClearMergedSkeletonCache)
     bpy.utils.unregister_class(SSMT_OT_ToggleIgnoreTextureAlpha)
     bpy.utils.unregister_class(SSMT_OT_ToggleUseNormalMap)
     bpy.utils.unregister_class(SSMT4RefreshWorkspaceList)

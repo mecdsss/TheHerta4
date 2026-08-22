@@ -15,12 +15,16 @@ EFMI（明日方舟：终末地）骨骼合并支持模块
   （instance config），其 first_constant 窗口第 6 个 float4 的 xy 分量（uint32 位型）为骨骼矩阵段偏移；
   骨骼矩阵存于 vs-t0（compute 蒙皮输出 u0 共享），每骨骼 12 floats（4x3 矩阵）。
 - `build_merged_skeleton_vg_map`：跨子网格按骨骼矩阵内容去重，构建 local->global 的
-  vg_map / vg_offset / vg_count。
+  vg_map / vg_offset / vg_count（矩阵硬门控 + 质心确认，_DEDUP_ENABLED 控制总开关）。
 
 产出：
 - 每个子网格 json 写回 `VGMap` / `VGOffset` / `VGCount`（缓存，幂等；提取端重导可覆盖）。
 - 骨骼池 buffer 复制到 `<submesh>/ModImpRuntime/<bare>-BoneMatrix.buf`（参照 NTEMI 缓存模式）。
 """
+
+# 注解延迟求值（PEP 563）：避免类定义期解析 numpy.ndarray 等注解，
+# 防止在 sys.modules['numpy'] 被 stub 的进程（如全量 unittest discover）中导入失败。
+from __future__ import annotations
 
 import os
 import re
@@ -35,6 +39,16 @@ _BONE_MATRIX_FLOATS = 12
 _BONE_SEGMENT_FLOAT4 = 256 * 3
 # instance config 中骨骼段偏移所在的 float4 行（第 6 行）
 _INSTANCE_CONFIG_BONE_OFFSET_ROW = 5
+
+# 跨子网格骨骼去重总开关。
+# 分层判据（矩阵硬门控 + 质心确认）：矩阵 diff >= match_tolerance 永不合并；
+# bitwise 相同直接合并；近似需加权质心重合确认。
+# 注意：2026-08 曾实测误判（390/393 案例）而临时整体关闭；后查明当时观测数据
+# 被陈旧缓存污染（网格与 json 账本不一致），现已随官方运行时架构重写一并恢复。
+# 其后的"多维度投票"判据（几何维度可推翻矩阵不一致）经"测试"工作空间 08-10 dump
+# 实测产生 42 组矩阵不可兼容的误并（195 组中），已废止并回到分层判据。
+# 再遇误判先查数据一致性（清除 VGMap 缓存重导），再考虑关开关。
+_DEDUP_ENABLED = True
 
 
 class EFMILogParser:
@@ -339,7 +353,7 @@ class EFMIBoneMapBuilder:
         blend_buf_path: str,
         submesh_json_dict: dict,
     ) -> dict[int, dict]:
-        """计算每个局部骨骼的"驱动签名"（三维度去重用）。
+        """计算每个局部骨骼的"驱动签名"（去重的质心确认 + 调试探针用）。
 
         返回 {local_vg_id(int): {
             "centroid": 加权质心(3,),
@@ -575,39 +589,43 @@ class EFMIBoneMapBuilder:
         submesh_skeletons: dict[str, tuple],
         match_tolerance: float = 1e-3,
         centroid_tolerance: float = 0.02,
-        bbox_overlap_min: float = 0.3,
-        vote_threshold: int = 2,
     ) -> tuple[dict[str, dict], dict[str, int]]:
-        """跨子网格"权重扩散评估 + 多维度投票"去重构建 vg_map（同部件不去重）。
+        """跨子网格"矩阵硬门控 + 质心确认"去重构建 vg_map（同部件不去重）。
+
+        总开关 _DEDUP_ENABLED（当前 True，去重生效）；置 False 时退化为
+        恒等映射（local → vg_offset + local），下方并查集逻辑不执行。
 
         参数:
             unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts[, signatures])
             - signatures: {local: {centroid, bbox_min/max, vertex_count, spread, weight_total}}
+              （仅 centroid 参与判定，其余字段保留供调试/探针）
         返回: (vg_maps, vg_offsets)
 
-        去重机制（用户拍板的"权重扩散评估"）：
-        每个骨骼的权重中心构建一个符合其权重强度与扩散衰减的"矢量球"
-        （半径 = 加权 RMS 扩散半径 spread）。当骨骼 A 的扩散球覆盖到另一部件的骨骼 B
-        （质心距离 < spread_A + spread_B）时，对该对做多维度评估：
+        去重判据（分层，矩阵是必要条件——几何接近无权推翻矩阵不一致）：
+        1. **矩阵 diff >= match_tolerance：永不合并**。
+           实测定案"误合并有害、漏合并无害"（容差误并手指两节导致功能丢失；
+           漏并仅多占槽位，蒙皮仍正确）。
+        2. **矩阵 bitwise 完全相同（diff == 0）：直接合并**（无需签名）。
+        3. **0 < diff < match_tolerance：需加权质心距离 < centroid_tolerance 才合并**。
+           矩阵无法区分"同一骨骼的浮点误差"与"不同骨骼的恰好重合"
+           （539/493 差 1.8e-07 是同一骨骼；手指两节差 1.79e-07 是不同骨骼），
+           驱动质心是第二身份指纹：同骨骼跨部件驱动同区域（质心近），
+           不同骨骼驱动不同区域（质心远）。缺签名时近似矩阵保守不合并。
 
-        **多维度投票（通过数 >= vote_threshold 即合并，默认 2）**：
-        1. **矩阵** allclose(match_tolerance=1e-3)；
-        2. **权重中心**（加权质心）距离 < centroid_tolerance（0.02）；
-        3. **驱动点云包围盒**重叠率（IoU）> bbox_overlap_min（0.3）；
-        4. **扩散覆盖**：权重扩散矢量球相交（质心距离 < spread_A + spread_B）；
-        5. **驱动顶点数比例**在 [0.5, 2]（同一骨骼跨部件驱动顶点数成比例）；
-        6. **平均权重**接近（权重强度分布相似）。
+        废止记录：此前的"多维度投票"（矩阵/质心/包围盒/扩散球 vote>=2）把矩阵
+        降为可输的一票——质心/包围盒/扩散球三个维度都是"驱动点云接近度"的相关度量，
+        会同时通过并推翻矩阵反对票；实测"测试"工作空间 08-10 dump 上 195 个合并组中
+        42 组矩阵差异 > 1e-3（最高 0.27），即"明明不在一起的骨骼被并在一起"，已回退。
 
         **同部件冲突拒绝**（硬性规则）：并查集 union 时检查，组内同部件最多 1 个 local，
         防"同位置功能骨骼"（如手指两节）合并及链式绕过。
 
-        与之前"全部必须"的判据不同：投票制允许单一维度失效时其它维度兜底，
-        更鲁棒（应对"矩阵/质心/包围盒任一维度都可能有噪声"的现实数据）。
+        **完全图判定**：新成员必须与组内所有成员两两通过判据才能并入
+        （C 要与 A 且 B 都通过，才能连进 {A,B} 组），防关联判定/链式漂移。
 
         参数（可实测调整）:
-            vote_threshold: 通过数阈值（默认 2，范围 2~3）。误并多→调大到 3；误拆多→调小到 2。
-            match_tolerance: 矩阵硬筛上限（默认 1e-3，超过直接不合并、不参与投票）。
-            centroid_tolerance / bbox_overlap_min: 各维度子阈值。
+            match_tolerance: 矩阵硬门控上限（默认 1e-3，达到即不合并）。
+            centroid_tolerance: 近似矩阵的质心确认阈值（默认 0.02）。
         """
         # 收集所有骨骼候选
         candidates: list[dict] = []
@@ -654,6 +672,16 @@ class EFMIBoneMapBuilder:
         if n == 0:
             return {}, {}
 
+        if not _DEDUP_ENABLED:
+            # 恒等映射：每根骨骼独占全局槽位（候选收集阶段已按
+            # global_vg_id = vg_offset + local_vg_id 分配），不做任何合并。
+            identity_maps: dict[str, dict] = {}
+            for cand in candidates:
+                identity_maps.setdefault(cand["unique_str"], {})[
+                    cand["local_vg_id"]
+                ] = cand["global_vg_id"]
+            return identity_maps, vg_offsets
+
         parent = list(range(n))
         group_submeshes: list[set] = [{candidates[i]["unique_str"]} for i in range(n)]
         # 每组的所有成员索引（用于"完全图判定"：新成员必须与组内所有成员两两通过）
@@ -665,21 +693,30 @@ class EFMIBoneMapBuilder:
                 x = parent[x]
             return x
 
-        def centroid_dist(a, b):
-            sa = candidates[a].get("signature")
-            sb = candidates[b].get("signature")
-            if sa is None or sb is None:
-                return None
-            return float(numpy.linalg.norm(
-                sa["centroid"].astype(numpy.float64) - sb["centroid"].astype(numpy.float64)
-            ))
-
         mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
 
+        def _sig(idx):
+            return candidates[idx].get("signature")
+
         def passes(i, j) -> bool:
-            """完整判定（两两独立）：矩阵/质心/包围盒/扩散覆盖 4 维度投票 >= vote_threshold。"""
+            """分层判据（两两独立）：矩阵硬门控 + 质心确认。
+
+            - 矩阵 diff >= match_tolerance：永不合并（几何接近无权推翻）；
+            - 矩阵 bitwise 完全相同：直接通过；
+            - 近似：需加权质心距离 < centroid_tolerance（缺签名保守拒绝）。
+            """
             matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
-            return evaluate_dimensions(i, j, matrix_diff) >= vote_threshold
+            if matrix_diff >= match_tolerance:
+                return False
+            if matrix_diff == 0.0:
+                return True
+            si, sj = _sig(i), _sig(j)
+            if si is None or sj is None:
+                return False
+            dist = float(numpy.linalg.norm(
+                si["centroid"].astype(numpy.float64) - sj["centroid"].astype(numpy.float64)
+            ))
+            return dist < centroid_tolerance
 
         def try_union(a, b):
             ra, rb = find(a), find(b)
@@ -698,51 +735,6 @@ class EFMIBoneMapBuilder:
             group_submeshes[rb] = group_submeshes[ra] | group_submeshes[rb]
             group_members[rb] = group_members[ra] + group_members[rb]
 
-        mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
-
-        def _sig(idx):
-            return candidates[idx].get("signature")
-
-        def evaluate_dimensions(i, j, matrix_diff: float) -> int:
-            """评估各维度，返回通过的维度数（投票）。
-
-            4 个维度（用户拍板）：矩阵、权重中心、包围盒重叠率、扩散覆盖。
-            矩阵作为投票维度之一（不是硬否决）。
-            """
-            si, sj = _sig(i), _sig(j)
-            passed = 0
-
-            # 维度 1：矩阵（allclose 容差匹配）
-            if matrix_diff < match_tolerance:
-                passed += 1
-
-            if si is not None and sj is not None:
-                ci = si["centroid"].astype(numpy.float64)
-                cj = sj["centroid"].astype(numpy.float64)
-                dist = float(numpy.linalg.norm(ci - cj))
-
-                # 维度 2：权重中心（加权质心）接近
-                if dist < centroid_tolerance:
-                    passed += 1
-
-                # 维度 3：扩散覆盖（权重扩散矢量球相交）
-                spread_sum = float(si.get("spread", 0.0) + sj.get("spread", 0.0))
-                if spread_sum > 0 and dist < spread_sum:
-                    passed += 1
-
-                # 维度 4：驱动点云包围盒重叠率（IoU）
-                inter_min = numpy.maximum(si["bbox_min"], sj["bbox_min"])
-                inter_max = numpy.minimum(si["bbox_max"], sj["bbox_max"])
-                inter_dims = numpy.maximum(inter_max - inter_min, 0.0)
-                inter_vol = float(numpy.prod(inter_dims))
-                vol_i = float(numpy.prod(numpy.maximum(si["bbox_max"] - si["bbox_min"], 0.0)))
-                vol_j = float(numpy.prod(numpy.maximum(sj["bbox_max"] - sj["bbox_min"], 0.0)))
-                union_vol = vol_i + vol_j - inter_vol
-                if union_vol > 0 and (inter_vol / union_vol) >= bbox_overlap_min:
-                    passed += 1
-
-            return passed
-
         for i in range(n):
             for j in range(i + 1, n):
                 # 同部件（同子网格）内的 local 绝不合并
@@ -751,11 +743,8 @@ class EFMIBoneMapBuilder:
                 if find(i) == find(j):
                     continue
 
-                matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
-                # 多维度投票（矩阵/质心/包围盒/扩散覆盖，通过数 >= vote_threshold 即合并；
-                # 矩阵是投票维度之一，不是硬否决）
-                votes = evaluate_dimensions(i, j, matrix_diff)
-                if votes >= vote_threshold:
+                # 分层判据：矩阵硬门控 + 质心确认
+                if passes(i, j):
                     try_union(i, j)
 
         # 分组
@@ -1148,6 +1137,46 @@ class EFMISkeletonMergeHelper:
             f"已为 {written} 个子网格生成骨骼合并数据"
             + (f"（跳过已缓存 {skipped} 个）" if skipped else "")
         )
+
+    @classmethod
+    def clear_vgmap_cache(cls, workspace_root: str) -> tuple[int, int]:
+        """删除工作空间内所有子网格 json 的 VGMap/VGOffset/VGCount 缓存键。
+
+        用途：去重策略变更（或去重关闭）后，旧策略写回的 VGMap 会被
+        ensure_skeleton_data 的幂等检查跳过而一直残留；清掉后下次导入
+        即按当前策略重新生成。
+        ModImpRuntime/*-BoneMatrix.buf 与 BoneMatrixFileName 不删：
+        那是原始骨骼池拷贝，与去重策略无关，重新生成时会复用/覆写同名文件。
+
+        返回 (清理的子网格 json 数, 扫描的 json 文件总数)。
+        """
+        cleaned = 0
+        scanned = 0
+        if not workspace_root or not os.path.isdir(workspace_root):
+            return cleaned, scanned
+        for dirpath, dirnames, filenames in os.walk(workspace_root):
+            # Config 目录是工作空间配置（FrameAnalysisPath.json / Tabs 等），
+            # 与子网格缓存无关，直接跳过。
+            dirnames[:] = [d for d in dirnames if d != "Config"]
+            for filename in filenames:
+                if not filename.endswith(".json"):
+                    continue
+                path = os.path.join(dirpath, filename)
+                scanned += 1
+                try:
+                    payload = JsonUtils.LoadFromFile(path)
+                except Exception:
+                    continue
+                if not isinstance(payload, dict) or "VGMap" not in payload:
+                    continue
+                for key in ("VGMap", "VGOffset", "VGCount"):
+                    payload.pop(key, None)
+                try:
+                    JsonUtils.SaveToFile(filepath=path, json_dict=payload)
+                    cleaned += 1
+                except Exception as e:
+                    print(f"[EFMI骨骼合并] 清理 VGMap 缓存失败 {path}: {e}")
+        return cleaned, scanned
 
     @classmethod
     def _resolve_skeleton_pool_path(cls, parser: EFMILogParser, draw_index: str) -> str | None:

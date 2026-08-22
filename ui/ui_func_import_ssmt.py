@@ -197,6 +197,32 @@ def ImprotFromWorkSpaceFull(self, context):
             print(f"[EFMI骨骼合并] 预生成失败（不阻断导入）: {e}")
             traceback.print_exc()
 
+    # ZZMI 骨骼合并数据预生成（与 EFMI 同构的分支选项）：
+    # 复选框（import_merged_vgmap，「使用融合统一顶点组」）关闭时完全不执行，保持旧逻辑；
+    # 开启时把 FrameAnalysis 反查的 VGMap/VGOffset/VGCount 写回工作空间 json，
+    # 导入流程经 create_mesh_from_json 的既有双条件路径自动走全局骨骼索引。
+    is_zzmi_merged = (
+        GlobalConfig.logic_name == LogicName.ZZMI
+        and GlobalProterties.import_merged_vgmap()
+    )
+    if is_zzmi_merged:
+        try:
+            from ..common.zzmi_skeleton import ZZMISkeletonMergeHelper
+            import_keys = [target["import_key"] for target in import_targets]
+            ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=GlobalConfig.path_workspace_folder(),
+                unique_str_list=import_keys,
+            )
+            print(f"[ZZMI骨骼合并] {message}")
+            if ok:
+                self.report({'INFO'}, message)
+            else:
+                print(f"[ZZMI骨骼合并] 未生成骨骼数据：{message}")
+        except Exception as e:
+            import traceback
+            print(f"[ZZMI骨骼合并] 预生成失败（不阻断导入）: {e}")
+            traceback.print_exc()
+
     foldername_gametypename_dict = {}
     imported_objects = []
     import_records = []

@@ -7,13 +7,16 @@ from ...common.global_properties import GlobalProterties
 from ...blueprint.export_helper import BlueprintExportHelper
 
 from ...common.buffer_export_helper import BufferExportHelper
+from ...common.draw_call_model import DrawCallModel
 from ...common.global_key_count_helper import GlobalKeyCountHelper
 from ...common.m_ini_helper import M_IniHelper
 from ...common.m_ini_helper_gui import M_IniHelperGUI
 from ...common.m_ini_builder import M_IniBuilder,M_IniSection, M_SectionType
 from .export_helper import ExportHelper
+from ...utils.json_utils import JsonUtils
 from ...utils.timer_utils import TimerUtils
 
+import bpy
 import os
 import re
 import shutil
@@ -27,6 +30,17 @@ class ExportEFMI:
     drawib_model_list:list[DrawIBModel] = field(default_factory=list,init=False)
 
     def __post_init__(self):
+        # EFMI 骨骼合并（复选框开启时）：为「需要生成但没有对象」的部件自动创建
+        # 极限小三角面占位对象（对齐 ZZMI 机制；必须在组装 SubMeshModel 之前注入，
+        # 占位部件才能照常进合并骨架：EntryPoint 照常触发、只画不可见小三角）
+        self._efmi_stub_object_names = []
+        if GlobalProterties.import_merged_vgmap():
+            try:
+                self._efmi_stub_object_names = self._ensure_stub_objects_for_missing_parts()
+            except Exception as e:
+                print(f"[EFMI骨骼合并] 占位小三角面创建失败（继续原流程）: {e}")
+                self._efmi_stub_object_names = []
+
         self.submesh_model_list = ExportHelper.parse_submesh_model_list_from_blueprint_model(self.blueprint_model)
         # EFMI 直接复用已经解析好的 SubMeshModel，避免同一轮导出把几何解析做两遍。
         self.drawib_model_list = ExportHelper.parse_drawib_model_list_from_submesh_model_list(
@@ -55,6 +69,264 @@ class ExportEFMI:
         print(f"[CrossIB EFMI] cross_ib_info_dict={self.cross_ib_info_dict}")
         print(f"[CrossIB EFMI] cross_ib_object_names={self.cross_ib_object_names}")
         print(f"[CrossIB EFMI] cross_ib_mapping_objects={self.cross_ib_mapping_objects}")
+
+    # ------------------------------------------------------------------
+    # 占位小三角面（骨骼合并模式：部件无对象时补齐，对齐 ZZMI 机制）
+    # ------------------------------------------------------------------
+
+    def _ensure_stub_objects_for_missing_parts(self) -> list[str]:
+        """为「需要生成但没有对象」的部件创建极限小三角面占位对象。
+
+        合并骨架模式下用户可自由 join/删改。占位规则（与 ZZMI 一致）：
+        - **部分缺失的 DrawIB**：缺失组件直接补占位（其几何显然被同 DrawIB 的
+          幸存对象接管）；
+        - **整个 DrawIB 缺席**：看它绑定姿势顶点坐标/VGMap 全局骨骼 id 是否被现存
+          对象实际引用——被引用 = 几何被合并进了别的对象 → 全组件补占位（EntryPoint
+          照常触发、画不可见小三角，抑制原版绘制防重影）；零引用 = 用户故意不生成
+          → 不插桩（该 DrawIB 不进 mod，游戏内显示原版）。
+        无反查数据（json 无 VGMap）的缺席 DrawIB 一律不插桩。
+        返回创建的对象名列表（export() 结束后清理）。
+        """
+        workspace_root = GlobalConfig.path_workspace_folder()
+        component_map_path = os.path.join(workspace_root, "LOD0", "DrawIB-Component.json")
+        if not os.path.isfile(component_map_path):
+            return []
+        component_map = JsonUtils.LoadFromFile(component_map_path)
+        if not isinstance(component_map, dict) or not component_map:
+            return []
+
+        ordered = getattr(self.blueprint_model, "ordered_draw_obj_data_model_list", None)
+        if ordered is None:
+            return []
+
+        present = set()
+        for draw_call in ordered:
+            try:
+                unique_str = str(draw_call.get_workspace_unique_str() or "")
+            except Exception:
+                continue
+            if unique_str:
+                present.add(unique_str.split(".", 1)[-1])
+
+        # 自愈：清掉上次导出异常残留的占位对象，避免被当成真实部件
+        for obj in list(bpy.data.objects):
+            if obj.name.startswith("LOD") and obj.get("EFMI_STUB"):
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+        used_group_ids = None  # 惰性计算：首个全缺 DrawIB 需要判定时才算
+        present_positions = None
+
+        created = []
+        for draw_ib, comp_dict in component_map.items():
+            members = sorted(str(v) for v in (comp_dict or {}).values())
+            if not members:
+                continue
+
+            if any(member in present for member in members):
+                # 部分缺失：缺失组件补占位
+                stub_members = [member for member in members if member not in present]
+            else:
+                # 整个 DrawIB 缺席：判定几何是否被合并进其它对象
+                # 主判据 = 顶点坐标存在性（部件独有，无误判）；
+                # 位置数据缺失时回退 VGMap 引用判定。
+                absorbed = False
+                positions = self._load_drawib_bind_positions(draw_ib, workspace_root)
+                if positions is not None and len(positions) > 0:
+                    if present_positions is None:
+                        present_positions = self._collect_present_positions(ordered)
+                    absorbed = self._is_drawib_absorbed_by_geometry(positions, present_positions)
+                else:
+                    if used_group_ids is None:
+                        used_group_ids = self._collect_used_group_ids(ordered)
+                    vg_values = self._load_drawib_vg_values(draw_ib, workspace_root)
+                    absorbed = bool(vg_values and vg_values & used_group_ids)
+
+                if absorbed:
+                    stub_members = members
+                    print(
+                        f"[EFMI骨骼合并] DrawIB {draw_ib} 没有对象，但其几何/骨骼被其它模型引用"
+                        f"（已被合并），全组件补占位小三角面"
+                    )
+                else:
+                    print(f"[EFMI骨骼合并] DrawIB {draw_ib} 无对象且几何未被合并，按用户意图不生成")
+                    continue
+
+            for member in stub_members:
+                obj_name = self._create_stub_object(member)
+                if obj_name:
+                    ordered.append(DrawCallModel(obj_name=obj_name))
+                    created.append(obj_name)
+                    print(
+                        f"[EFMI骨骼合并] 部件 {member} 没有对应对象，"
+                        f"已创建极限小三角面占位（游戏内不可见）"
+                    )
+        return created
+
+    def _load_drawib_vg_values(self, draw_ib: str, workspace_root: str) -> set[int]:
+        """读取 DrawIB 全部组件写回的 VGMap 全局骨骼 id 集合（无数据返回空）。"""
+        values = set()
+        lod0_dir = os.path.join(workspace_root, "LOD0")
+        if not os.path.isdir(lod0_dir):
+            return values
+        for name in os.listdir(lod0_dir):
+            if not name.startswith(draw_ib + "-"):
+                continue
+            submesh_dir = os.path.join(lod0_dir, name)
+            if not os.path.isdir(submesh_dir):
+                continue
+            for type_dir in os.listdir(submesh_dir):
+                if not type_dir.startswith("TYPE_"):
+                    continue
+                json_path = os.path.join(submesh_dir, type_dir, name + ".json")
+                if not os.path.isfile(json_path):
+                    continue
+                payload = JsonUtils.LoadFromFile(json_path)
+                vg_map = payload.get("VGMap") or {}
+                for v in vg_map.values():
+                    try:
+                        values.add(int(v))
+                    except (TypeError, ValueError):
+                        continue
+        return values
+
+    def _load_drawib_bind_positions(self, draw_ib: str, workspace_root: str):
+        """读取 DrawIB 首个组件的绑定姿势顶点坐标（采样，用于几何存在性判定）。"""
+        import numpy
+
+        lod0_dir = os.path.join(workspace_root, "LOD0")
+        if not os.path.isdir(lod0_dir):
+            return None
+        for name in sorted(os.listdir(lod0_dir)):
+            if not name.startswith(draw_ib + "-"):
+                continue
+            submesh_dir = os.path.join(lod0_dir, name)
+            if not os.path.isdir(submesh_dir):
+                continue
+            for type_dir in os.listdir(submesh_dir):
+                if not type_dir.startswith("TYPE_"):
+                    continue
+                type_path = os.path.join(submesh_dir, type_dir)
+                json_path = os.path.join(type_path, name + ".json")
+                pos_path = os.path.join(type_path, name + "-Position.buf")
+                if not os.path.isfile(json_path) or not os.path.isfile(pos_path):
+                    continue
+                payload = JsonUtils.LoadFromFile(json_path)
+                stride = 0
+                for category_buffer in payload.get("CategoryBufferList", []):
+                    for element in category_buffer.get("D3D11ElementList", []):
+                        if str(element.get("Category", "") or "").strip().lower() == "position":
+                            stride += int(element.get("ByteWidth", 0) or 0)
+                if stride <= 0:
+                    return None
+                raw = numpy.fromfile(pos_path, dtype=numpy.uint8)
+                if len(raw) == 0 or len(raw) % stride != 0:
+                    return None
+                verts = raw.reshape(-1, stride)[:, 0:12].copy().view(numpy.float32).reshape(-1, 3)
+                if len(verts) > 256:
+                    sample_idx = numpy.linspace(0, len(verts) - 1, 256).astype(numpy.int64)
+                    verts = verts[sample_idx]
+                return verts
+        return None
+
+    def _collect_present_positions(self, ordered):
+        """收集蓝图内全部对象的顶点坐标（numpy Nx3）。"""
+        import numpy
+
+        chunks = []
+        for draw_call in ordered:
+            try:
+                obj_name = draw_call.get_blender_obj_name()
+            except Exception:
+                continue
+            obj = bpy.data.objects.get(obj_name) if obj_name else None
+            mesh = getattr(obj, "data", None) if obj is not None else None
+            vertices = getattr(mesh, "vertices", None)
+            if not vertices:
+                continue
+            coords = numpy.empty(len(vertices) * 3, dtype=numpy.float32)
+            vertices.foreach_get("co", coords)
+            chunks.append(coords.reshape(-1, 3))
+        if not chunks:
+            return None
+        return numpy.concatenate(chunks, axis=0)
+
+    def _is_drawib_absorbed_by_geometry(self, positions, present_positions) -> bool:
+        """几何存在性判定：该 DrawIB 绑定姿势顶点坐标（采样）有 >=30% 出现在现存
+        对象的网格里（<=1e-4 近似）= 几何被合并进别的对象。
+        """
+        import numpy
+
+        if present_positions is None or len(present_positions) == 0:
+            return False
+        sample = positions.astype(numpy.float64)
+        present = present_positions.astype(numpy.float64)
+        hits = 0
+        chunk = 64
+        for start in range(0, len(sample), chunk):
+            part = sample[start:start + chunk]
+            diff = numpy.abs(part[:, None, :] - present[None, :, :]).max(axis=2)
+            hits += int((diff < 1e-4).any(axis=1).sum())
+        ratio = hits / len(sample)
+        return ratio >= 0.3
+
+    def _collect_used_group_ids(self, ordered) -> set[int]:
+        """收集蓝图内全部对象实际引用（权重>0）的顶点组 id 集合。"""
+        used = set()
+        for draw_call in ordered:
+            try:
+                obj_name = draw_call.get_blender_obj_name()
+            except Exception:
+                continue
+            obj = bpy.data.objects.get(obj_name) if obj_name else None
+            mesh = getattr(obj, "data", None) if obj is not None else None
+            vertices = getattr(mesh, "vertices", None)
+            if vertices is None:
+                continue
+            for vertex in vertices:
+                for group_elem in vertex.groups:
+                    if group_elem.weight > 0:
+                        used.add(group_elem.group)
+        return used
+
+    def _create_stub_object(self, bare_unique_str: str) -> str:
+        """创建占位对象：3 顶点 1 三角面（1e-6 尺度），权重全给组 "0"。"""
+        workspace_unique_str = bare_unique_str
+        if not workspace_unique_str.upper().startswith("LOD"):
+            workspace_unique_str = "LOD0." + workspace_unique_str
+
+        mesh = bpy.data.meshes.new(name="EFMI_STUB_MESH_" + workspace_unique_str)
+        mesh.from_pydata(
+            [(0.0, 0.0, 0.0), (1e-6, 0.0, 0.0), (0.0, 1e-6, 0.0)],
+            [],
+            [(0, 1, 2)],
+        )
+        mesh.update()
+
+        obj = bpy.data.objects.new(name=workspace_unique_str, object_data=mesh)
+        obj["EFMI_STUB"] = 1
+        obj["3DMigoto:WorkspaceUniqueStr"] = workspace_unique_str
+        vertex_group = obj.vertex_groups.new(name="0")
+        vertex_group.add([0, 1, 2], 1.0, 'REPLACE')
+
+        try:
+            bpy.context.collection.objects.link(obj)
+        except Exception:
+            bpy.context.scene.collection.objects.link(obj)
+        return obj.name
+
+    def _cleanup_stub_objects(self):
+        """导出结束后移除占位对象（含 mesh 数据）。"""
+        for obj_name in self._efmi_stub_object_names:
+            obj = bpy.data.objects.get(obj_name)
+            if obj is None:
+                continue
+            mesh = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if mesh is not None and mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+        if self._efmi_stub_object_names:
+            print(f"[EFMI骨骼合并] 已清理 {len(self._efmi_stub_object_names)} 个占位小三角面对象")
+        self._efmi_stub_object_names = []
 
     def generate_buffer_files(self):
         buf_output_folder = GlobalConfig.path_generatemod_buffer_folder()
@@ -572,20 +844,31 @@ class ExportEFMI:
         }
         return components, component_id_dict
 
-    def _add_merged_skeleton_section(self, ini_builder):
-        """生成 EFMI 骨骼合并（Merged Skeleton）INI 段（对齐参考插件 mod.ini.j2:441-516）。
+    def _add_merged_skeleton_section(self, ini_builder, command_lists_section=None):
+        """生成 EFMI 骨骼合并（Merged Skeleton）INI 段（对齐 EFMI 1.4.1 运行时契约）。
 
         内容：Constants（$component_count/$bones_count/$max_instance_count/$merged_skeleton_initialized）
-        + 5 个 Pool + ResourceMergedSkeletonDataRW + CommandList_MergedSkeleton_ConnectComponent
+        + 5 个 Pool + Pool_ObjectSpatialIdentity（空间实例识别输入池）
+        + ResourceMergedSkeletonDataRW + CommandList_MergedSkeleton_ConnectComponent
         （守卫初始化 + 绑定 pools + AttachComponent + ElementFormat 16 位）+
         CommandListInitializeMergedSkeleton（逐组件写 vg_offset/vg_count，LodRemaps 全 null）。
+
+        另向 command_lists_section 追加官方绘制管线粘合层
+        [CommandList_Component_DrawInstances]：命名空间配置赋值（component_count/
+        bones_count/instance_count——运行时只读 EFMIv1 命名空间内的值，漏赋 bones_count
+        会让合并骨骼按 0 根计算）+ Component_ReadConfig + 空间实例识别 +
+        ConnectComponent 回调挂载 + run Component_DrawInstances（运行时接管逐实例
+        迭代与 MergedSkeleton_Apply）。按用户要求不做 DRAW_TYPE 通道门控，全通道生效。
         """
         components = self.merged_skeleton_components
         if not components:
             return
 
         component_count = len(components)
-        bones_count = sum(comp["vg_count"] for comp in components)
+        # 骨骼总数口径修正：取 max(vg_offset + vg_count)。
+        # 导出子集时 vg_offset 是工作空间全局槽位（可能远超导出内 sum(vg_count)），
+        # 合并骨架缓冲与逐实例区域数学必须覆盖组件声明的最大槽位，否则越界空转。
+        bones_count = max(comp["vg_offset"] + comp["vg_count"] for comp in components)
         max_instance_count = 8  # 与参考插件 cfg.max_instance_count 一致
 
         section = M_IniSection(M_SectionType.MergedSkeleton)
@@ -615,6 +898,19 @@ class ExportEFMI:
 
         section.append("[Pool_MergedSkeleton_Instance_LodLevel]")
         section.append("pool_size = $component_count * $max_instance_count")
+        section.new_line()
+
+        # 空间实例识别输入池（官方管线必需：MergedSkeleton_Apply 经
+        # PoolSpatialIdentity_SpatialIds[$draw_call_instance_id] 取实例 id，
+        # 该池只能由 SpatialIdentity_IdentifyComponentInstances 以此池为输入填充）
+        section.append("[Pool_ObjectSpatialIdentity]")
+        section.append("pool_size = $max_instance_count * $\\EFMIv1\\cfg_spatial_instance_load_ratio")
+        section.append("pool_index_type = spatial")
+        section.append("pool_spatial_radius = $\\EFMIv1\\cfg_spatial_base_radius")
+        section.append("pool_expiration_timeout_frames = $\\EFMIv1\\cfg_spatial_expiration_frames")
+        section.append("pool_expiration_reset_elements = $\\EFMIv1\\cfg_spatial_expiration_reset")
+        section.append("pool_expiration_refresh_on_read = $\\EFMIv1\\cfg_spatial_expiration_read_refresh")
+        section.append("pool_variable_default_value = $\\EFMIv1\\cfg_spatial_detault_value")
         section.new_line()
 
         section.append("[ResourceMergedSkeletonDataRW]")
@@ -661,6 +957,91 @@ class ExportEFMI:
 
         ini_builder.append_section(section)
 
+        # 官方绘制管线粘合层：运行时 Component_DrawInstances 逐实例迭代、
+        # 每实例 MergedSkeleton_Apply 后才回调组件绘制（CommandList_Draw_<部件前缀>）。
+        # identification_min_components 默认 4 是按整角色设定的；导出子集（如只有
+        # 2 个组件）时必须下调，否则空间识别永远集不齐组件位数，实例被判 Unknown
+        # 而始终绘制原始网格（表现为"模组完全不生效"）。
+        if command_lists_section is not None:
+            command_lists_section.append("[CommandList_Component_DrawInstances]")
+            command_lists_section.append("handling = skip")
+            command_lists_section.append("$\\EFMIv1\\component_count = $component_count")
+            command_lists_section.append("$\\EFMIv1\\bones_count = $bones_count")
+            command_lists_section.append("$\\EFMIv1\\instance_count = $max_instance_count")
+            command_lists_section.append("run = CommandList\\EFMIv1\\Object_ReadConfig")
+            command_lists_section.append("$\\EFMIv1\\custom_mesh_scale = 1.00")
+            command_lists_section.append(
+                "$\\EFMIv1\\identification_min_components = " + str(min(component_count, 4))
+            )
+            command_lists_section.append("run = CommandList\\EFMIv1\\Component_ReadConfig")
+            command_lists_section.append(
+                "Pool\\EFMIv1\\Input_ObjectSpatialIdentity = ref Pool_ObjectSpatialIdentity"
+            )
+            command_lists_section.append(
+                "run = CommandList\\EFMIv1\\SpatialIdentity_IdentifyComponentInstances"
+            )
+            command_lists_section.append(
+                "CommandList\\EFMIv1\\Callback_MergedSkeleton_ConnectComponent = "
+                "ref CommandList_MergedSkeleton_ConnectComponent"
+            )
+            command_lists_section.append("run = CommandList\\EFMIv1\\Component_DrawInstances")
+            command_lists_section.new_line()
+
+
+    def _append_submesh_draw_bindings(self, section, submesh_model, drawib_model):
+        """子网格绘制绑定：OverrideTextures + ib/vb 缓冲绑定 + 贴图槽位绑定。
+
+        骨骼合并模式下作为 CommandList_Draw_<部件前缀> 的回调主体（运行时逐实例
+        MergedSkeleton_Apply 换绑合并骨架后调用）。非合并模式的 TextureOverrideIB
+        段内仍保留一份内联实现（输出内容相同），未收敛以隔离回归风险。
+        """
+        section.append("run = CommandList\\EFMIv1\\OverrideTextures")
+
+        ib_resource_name = "Resource_" + submesh_model.unique_str.replace("-","_") + "_Index"
+        section.append("ib = " + ib_resource_name)
+
+        for category in submesh_model.category_buffer_dict.keys():
+            category_slot = submesh_model.d3d11_game_type.CategoryExtractSlotDict.get(category,"unknown_slot")
+            category_resource_name = "Resource_" + submesh_model.unique_str.replace("-","_")  + "_" + category
+            section.append(category_slot + " = " + category_resource_name)
+
+        unique_str = submesh_model.unique_str
+        section.append("vb3 = Resource_" + unique_str.replace('-', '_') + "_Position")
+
+        if not GlobalProterties.forbid_auto_texture_ini() and drawib_model is not None:
+            texture_markup_info_list = drawib_model.get_submesh_texture_markup_info_list(submesh_model)
+            if GlobalProterties.use_rabbitfx_slot():
+                for texture_markup_info in texture_markup_info_list:
+                    if not M_IniHelper.is_slot_binding_mark_type(getattr(texture_markup_info, "mark_type", "")):
+                        continue
+                    if texture_markup_info.mark_name == "DiffuseMap":
+                        section.append("Resource\\RabbitFx\\Diffuse = ref " + texture_markup_info.get_resource_name())
+                    elif texture_markup_info.mark_name == "LightMap":
+                        section.append("Resource\\RabbitFx\\LightMap = ref " + texture_markup_info.get_resource_name())
+                    elif texture_markup_info.mark_name == "NormalMap":
+                        section.append("Resource\\RabbitFx\\NormalMap = ref " + texture_markup_info.get_resource_name())
+
+                section.append("run = CommandList\\RabbitFx\\SetTextures")
+
+                for texture_markup_info in texture_markup_info_list:
+                    if not M_IniHelper.is_slot_binding_mark_type(getattr(texture_markup_info, "mark_type", "")):
+                        continue
+                    if texture_markup_info.mark_name in ["DiffuseMap", "LightMap", "NormalMap"]:
+                        pass
+                    else:
+                        slot = texture_markup_info.mark_slot
+                        if slot and not slot.lower().startswith("ps-t"):
+                            num_match = re.search(r'\d+', slot)
+                            if num_match:
+                                slot = "ps-t" + num_match.group()
+                            else:
+                                slot = "ps-t" + slot
+                        section.append(slot + " = " + texture_markup_info.get_resource_name())
+            else:
+                for texture_markup_info in texture_markup_info_list:
+                    if not M_IniHelper.is_slot_binding_mark_type(getattr(texture_markup_info, "mark_type", "")):
+                        continue
+                    section.append(texture_markup_info.mark_slot + " = " + texture_markup_info.get_resource_name())
 
     def generate_ini_file(self):
         ini_builder = M_IniBuilder()
@@ -671,9 +1052,12 @@ class ExportEFMI:
         )
         self.has_merged_skeleton = len(self.merged_skeleton_components) > 0
         if self.has_merged_skeleton:
+            bones_total = max(
+                c["vg_offset"] + c["vg_count"] for c in self.merged_skeleton_components
+            )
             print(
                 f"[EFMI骨骼合并] 合并骨架: {len(self.merged_skeleton_components)} 个组件, "
-                f"共 {sum(c['vg_count'] for c in self.merged_skeleton_components)} 根骨骼"
+                f"全局骨骼槽位 {bones_total} 根"
             )
 
         drawib_drawibmodel_dict = {
@@ -702,6 +1086,10 @@ class ExportEFMI:
 
         texture_override_ib_section = M_IniSection(M_SectionType.TextureOverrideIB)
 
+        # EFMI 骨骼合并：官方运行时架构的组件绘制回调段（CommandList_Draw_<部件前缀>）
+        # 与粘合层（CommandList_Component_DrawInstances，在 _add_merged_skeleton_section 追加）
+        merged_command_lists = M_IniSection(M_SectionType.CommandList)
+
         for submesh_model in self.submesh_model_list:
             drawib_model = drawib_drawibmodel_dict.get(submesh_model.match_draw_ib)
             active_index = draw_ib_active_index_dict.get(submesh_model.match_draw_ib, 0)
@@ -717,38 +1105,73 @@ class ExportEFMI:
             else:
                 current_identifier = submesh_model.match_draw_ib
 
+            # ===== EFMI 骨骼合并组件：EntryPoint + 运行时回调绘制（官方 1.4.1 架构）=====
+            # 按用户要求不做 DRAW_TYPE 通道门控：所有通道均生效。
+            merged_component_id = (
+                self.merged_skeleton_component_id_dict.get(submesh_model.unique_str)
+                if self.has_merged_skeleton
+                else None
+            )
+            if merged_component_id is not None:
+                # 段名用部件前缀（unique_str），与 Resource_<前缀>_* 命名约定一致，
+                # 直接能看出是哪个部件；数字 component_id 仅用于运行时变量。
+                component_prefix = submesh_model.unique_str.replace("-", "_")
+                entrypoint_section_name = "TextureOverride_EntryPoint_" + component_prefix
+                draw_command_name = "CommandList_Draw_" + component_prefix
+                texture_override_ib_section.append("[" + entrypoint_section_name + "]")
+                texture_override_ib_section.append("hash = " + submesh_model.match_draw_ib)
+                texture_override_ib_section.append("match_first_index = " + submesh_model.match_first_index)
+                texture_override_ib_section.append("match_index_count = " + submesh_model.match_index_count)
+                # 原始绘制压制直接放 EntryPoint（本机所有可用 mod 的实证写法）：
+                # 嵌套 CommandList 内的 handling=skip 在部分 3Dmigoto 分支不一定生效，
+                # 粘合层里仍保留一份作为双保险。
+                texture_override_ib_section.append("handling = skip")
+                texture_override_ib_section.append(f"$\\EFMIv1\\component_id = {merged_component_id}")
+                texture_override_ib_section.append("$\\EFMIv1\\gpu_posed = 1")
+                texture_override_ib_section.append(
+                    "CommandList\\EFMIv1\\Callback_Component_DrawCustom = ref " + draw_command_name
+                )
+                texture_override_ib_section.append("run = CommandList_Component_DrawInstances")
+                if len(self.blueprint_model.keyname_mkey_dict.keys()) != 0:
+                    texture_override_ib_section.append("$active" + str(active_index) + " = 1")
+                    if GlobalProterties.generate_branch_mod_gui():
+                        texture_override_ib_section.append("$ActiveCharacter = 1")
+                texture_override_ib_section.new_line()
+
+                if (is_source_ib or is_target_ib) and self.has_cross_ib:
+                    # 跨 IB 重定向管线（录制骨骼/R redirect）与合并骨架互斥：
+                    # 合并骨架下骨骼已统一，组件按自身 IB 直接绘制即可。
+                    print(
+                        f"[EFMI骨骼合并] 警告: {submesh_model.unique_str} 配置了跨 IB；"
+                        "合并骨架模式下跨 IB 重定向不适用，已按自身 IB 直接绘制"
+                    )
+
+                # 组件绘制回调主体：运行时逐实例 Apply（换绑合并骨架）后调用
+                merged_command_lists.append("[" + draw_command_name + "]")
+                self._append_submesh_draw_bindings(
+                    merged_command_lists, submesh_model, drawib_model
+                )
+                self._append_drawindexed_instanced_with_shader_replace(
+                    merged_command_lists,
+                    submesh_model.drawcall_model_list,
+                    None,
+                )
+                merged_command_lists.new_line()
+                continue
+
             texture_override_ib_section.append("[TextureOverride_" + submesh_model.unique_str.replace("-","_") + "]")
             texture_override_ib_section.append("hash = " + submesh_model.match_draw_ib)
             texture_override_ib_section.append("match_first_index = " + submesh_model.match_first_index)
             texture_override_ib_section.append("match_index_count = " + submesh_model.match_index_count)
             texture_override_ib_section.append("handling = skip")
 
-            # EFMI 骨骼合并升宽配套：
-            # - 合并模式：静态绑定下手动串联骨骼合并管线（路线B，无需运行时绘制体系）：
-            #     设 component_id/instance_count/custom_mesh_scale
-            #     → Component_ReadConfig（检测 instance config cb 窗口）
-            #     → ConnectComponent（初始化守卫 + Pool 绑定 + AttachComponent）
-            #     → DetectBoneDataSource → Apply（导入骨骼 + 覆盖 instance config/vs-t0）
-            #   之后按原流程绑定 ib/vb 并 drawindexedinstanced。
-            # - 非合并模式：仅输出 ElementFormat 行（数据侧升宽，无运行时挂载）
+            # EFMI 骨骼合并升宽配套（非组件兜底）：合并组件已在上方走 EntryPoint 分支，
+            # 这里只服务"升宽但无反查数据"的子网格——仅输出 ElementFormat 行（数据侧升宽，无运行时挂载）。
             if getattr(submesh_model, "blendindices_widened", False):
-                component_id = self.merged_skeleton_component_id_dict.get(submesh_model.unique_str)
-                if self.has_merged_skeleton and component_id is not None:
-                    texture_override_ib_section.append(f"$\\EFMIv1\\component_id = {component_id}")
-                    # 静态单实例语义：instance_count=1，保证 Apply 里 instance_data_index = component_id
-                    # （避免所有组件共用 UpdateFrame[0] 导致只有首个组件导入骨骼）
-                    texture_override_ib_section.append("$\\EFMIv1\\instance_count = 1")
-                    # BonesImporter 的 CustomComponentMeshScale 输入（未缩放）
-                    texture_override_ib_section.append("$\\EFMIv1\\custom_mesh_scale = 1.0")
-                    texture_override_ib_section.append("run = CommandList\\EFMIv1\\Component_ReadConfig")
-                    texture_override_ib_section.append("run = CommandList_MergedSkeleton_ConnectComponent")
-                    texture_override_ib_section.append("run = CommandList\\EFMIv1\\MergedSkeleton_DetectBoneDataSource")
-                    texture_override_ib_section.append("run = CommandList\\EFMIv1\\MergedSkeleton_Apply")
-                else:
-                    blend_slot = submesh_model.d3d11_game_type.CategoryExtractSlotDict.get("Blend", "vb2")
-                    texture_override_ib_section.append(
-                        f"{blend_slot}->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_UINT"
-                    )
+                blend_slot = submesh_model.d3d11_game_type.CategoryExtractSlotDict.get("Blend", "vb2")
+                texture_override_ib_section.append(
+                    f"{blend_slot}->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_UINT"
+                )
 
             if is_target_ib:
                 texture_override_ib_section.append("analyse_options = deferred_ctx_immediate dump_rt dump_cb dump_vb dump_ib buf txt dds dump_tex dds symlink")
@@ -890,6 +1313,8 @@ class ExportEFMI:
             texture_override_ib_section.new_line()
 
         ini_builder.append_section(texture_override_ib_section)
+        if self.has_merged_skeleton:
+            ini_builder.append_section(merged_command_lists)
 
         resource_buffer_section = M_IniSection(M_SectionType.ResourceBuffer)
         buffer_folder_name = BlueprintExportHelper.get_current_buffer_folder_name()
@@ -955,9 +1380,10 @@ class ExportEFMI:
                 draw_call_offset_map=M_IniHelper.build_draw_call_offset_map(self.drawib_model_list),
             )
 
-        # EFMI 骨骼合并（Merged Skeleton）段：在保存前追加（对齐参考插件运行时挂载机制）
+        # EFMI 骨骼合并（Merged Skeleton）段：在保存前追加（对齐 EFMI 1.4.1 运行时契约：
+        # 命名空间配置 + 空间实例识别 + ConnectComponent 回调挂载，绘制走官方逐实例管线）
         if self.has_merged_skeleton:
-            self._add_merged_skeleton_section(ini_builder)
+            self._add_merged_skeleton_section(ini_builder, merged_command_lists)
 
         ini_filepath = os.path.join(GlobalConfig.path_generate_mod_folder(), GlobalConfig.get_workspace_name() + ".ini")
         ini_builder.save_to_file(ini_filepath)
@@ -1089,16 +1515,22 @@ class ExportEFMI:
             LOG.warning(f"⚠️ 物体切换节点 INI 集成钩子执行失败: {e}")
 
     def export(self):
-        TimerUtils.start_stage("缓冲文件生成")
-        self.generate_buffer_files()
-        TimerUtils.end_stage("缓冲文件生成")
+        try:
+            TimerUtils.start_stage("缓冲文件生成")
+            self.generate_buffer_files()
+            TimerUtils.end_stage("缓冲文件生成")
 
-        TimerUtils.start_stage("INI配置生成")
-        self.generate_ini_file()
-        TimerUtils.end_stage("INI配置生成")
+            TimerUtils.start_stage("INI配置生成")
+            self.generate_ini_file()
+            TimerUtils.end_stage("INI配置生成")
+        finally:
+            self._cleanup_stub_objects()
 
     def export_buffers_only(self):
         """只导出 Buffer 文件，不生成 INI 配置"""
-        TimerUtils.start_stage("缓冲文件生成")
-        self.generate_buffer_files()
-        TimerUtils.end_stage("缓冲文件生成")
+        try:
+            TimerUtils.start_stage("缓冲文件生成")
+            self.generate_buffer_files()
+            TimerUtils.end_stage("缓冲文件生成")
+        finally:
+            self._cleanup_stub_objects()

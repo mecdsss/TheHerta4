@@ -1,11 +1,15 @@
 import os
 
+import bpy
+
+from ...common.draw_call_model import DrawCallModel
 from ...common.global_config import GlobalConfig
 from ...common.global_key_count_helper import GlobalKeyCountHelper
 from ...common.global_properties import GlobalProterties
 from ...common.m_ini_builder import M_IniBuilder, M_IniSection, M_SectionType
 from ...common.m_ini_helper import M_IniHelper
 from ...common.m_ini_helper_gui import M_IniHelperGUI
+from ...utils.json_utils import JsonUtils
 from ...utils.timer_utils import TimerUtils
 from .unity import ExportUnity
 
@@ -38,6 +42,16 @@ class ExportZZMI(ExportUnity):
     }
 
     def __init__(self, blueprint_model):
+        # ZZMI 骨骼合并（分支选项）：复选框开启时，为「DrawIB 内存在但蓝图里没有对象」
+        # 的部件自动创建极限小三角面占位对象（必须在 super().__init__ 组装模型之前注入）
+        self._zzmi_stub_object_names = []
+        if GlobalProterties.import_merged_vgmap():
+            try:
+                self._zzmi_stub_object_names = self._ensure_stub_objects_for_missing_parts(blueprint_model)
+            except Exception as e:
+                print(f"[ZZMI骨骼合并] 占位小三角面创建失败（继续原流程）: {e}")
+                self._zzmi_stub_object_names = []
+
         super().__init__(blueprint_model)
 
         self.cross_ib_info_dict = blueprint_model.cross_ib_info_dict
@@ -51,9 +65,215 @@ class ExportZZMI(ExportUnity):
         self.shader_replace_object_info_map = getattr(blueprint_model, "shader_replace_object_info_map", {})
         self.has_shader_replace = getattr(blueprint_model, "has_shader_replace", False)
 
+        # ZZMI 骨骼合并（分支选项）：export() 时按复选框 + 反查数据收集组件信息
+        self.merged_skeleton_components = []
+        self.merged_skeleton_component_id_dict = {}
+        self.has_merged_skeleton = False
+
         print(f"[CrossIB ZZMI] 初始化: has_cross_ib={self.has_cross_ib}")
         print(f"[CrossIB ZZMI] cross_ib_info_dict={self._format_cross_ib_info_dict(self.cross_ib_info_dict)}")
         print(f"[CrossIB ZZMI] cross_ib_object_names={self._format_name_set(self.cross_ib_object_names)}")
+
+    # ------------------------------------------------------------------
+    # 占位小三角面（合并骨架模式：部件无对象时不再输出 ib=null）
+    # ------------------------------------------------------------------
+
+    def _ensure_stub_objects_for_missing_parts(self, blueprint_model) -> list[str]:
+        """为「需要生成但没有对象」的部件创建极限小三角面占位对象。
+
+        合并骨架模式下用户可自由 join/删改。占位规则（用户拍板）：
+        - **部分缺失的 DrawIB**：缺失组件直接补占位（其几何显然被同 DrawIB 的
+          幸存对象接管）；
+        - **整个 DrawIB 缺席**：看它 VGMap 里的全局骨骼 id 是否被现存对象的顶点
+          实际引用（权重>0）——被引用 = 几何被合并进了别的对象 → 全组件补占位
+          （游戏内不可见的小三角，抑制原版 draw 防止重影）；零引用 = 用户压根
+          不想生成 → 保持原样不插桩（该 DrawIB 不进入 mod，游戏内显示原版）。
+        无反查数据（json 无 VGMap）的缺席 DrawIB 一律不插桩。
+        返回创建的对象名列表（export() 结束后清理）。
+        """
+        workspace_root = GlobalConfig.path_workspace_folder()
+        component_map_path = os.path.join(workspace_root, "LOD0", "DrawIB-Component.json")
+        if not os.path.isfile(component_map_path):
+            return []
+        component_map = JsonUtils.LoadFromFile(component_map_path)
+        if not isinstance(component_map, dict) or not component_map:
+            return []
+
+        ordered = getattr(blueprint_model, "ordered_draw_obj_data_model_list", None)
+        if ordered is None:
+            return []
+
+        present = set()
+        for draw_call in ordered:
+            try:
+                unique_str = str(draw_call.get_workspace_unique_str() or "")
+            except Exception:
+                continue
+            if unique_str:
+                present.add(unique_str.split(".", 1)[-1])
+
+        # 自愈：清掉上次导出异常残留的占位对象，避免被当成真实部件
+        for obj in list(bpy.data.objects):
+            if obj.name.startswith("LOD") and obj.get("ZZMI_STUB"):
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+        used_group_ids = None  # 惰性计算：首个全缺 DrawIB 需要判定时才算
+
+        created = []
+        for draw_ib, comp_dict in component_map.items():
+            members = sorted(str(v) for v in (comp_dict or {}).values())
+            if not members:
+                continue
+
+            if any(member in present for member in members):
+                # 部分缺失：缺失组件补占位
+                stub_members = [member for member in members if member not in present]
+            else:
+                # 整个 DrawIB 缺席：判定几何是否被合并进其它对象
+                if used_group_ids is None:
+                    used_group_ids = self._collect_used_group_ids(ordered)
+                if self._is_drawib_absorbed(draw_ib, workspace_root, used_group_ids):
+                    stub_members = members
+                    print(
+                        f"[ZZMI骨骼合并] DrawIB {draw_ib} 没有对象，但其全局骨骼被其它模型引用"
+                        f"（几何已被合并），全组件补占位小三角面"
+                    )
+                else:
+                    print(f"[ZZMI骨骼合并] DrawIB {draw_ib} 无对象且骨骼未被引用，按用户意图不生成")
+                    continue
+
+            for member in stub_members:
+                obj_name = self._create_stub_object(member)
+                if obj_name:
+                    ordered.append(DrawCallModel(obj_name=obj_name))
+                    created.append(obj_name)
+                    print(
+                        f"[ZZMI骨骼合并] 部件 {member} 没有对应对象，"
+                        f"已创建极限小三角面占位（游戏内不可见）"
+                    )
+        return created
+
+    def _load_drawib_vg_values(self, draw_ib: str, workspace_root: str) -> set[int]:
+        """读取 DrawIB 全部组件写回的 VGMap 全局骨骼 id 集合（无数据返回空）。"""
+        values = set()
+        lod0_dir = os.path.join(workspace_root, "LOD0")
+        if not os.path.isdir(lod0_dir):
+            return values
+        for name in os.listdir(lod0_dir):
+            if not name.startswith(draw_ib + "-"):
+                continue
+            submesh_dir = os.path.join(lod0_dir, name)
+            if not os.path.isdir(submesh_dir):
+                continue
+            for type_dir in os.listdir(submesh_dir):
+                if not type_dir.startswith("TYPE_"):
+                    continue
+                json_path = os.path.join(submesh_dir, type_dir, name + ".json")
+                if not os.path.isfile(json_path):
+                    continue
+                payload = JsonUtils.LoadFromFile(json_path)
+                vg_map = payload.get("VGMap") or {}
+                for v in vg_map.values():
+                    try:
+                        values.add(int(v))
+                    except (TypeError, ValueError):
+                        continue
+        return values
+
+    def _is_drawib_absorbed(self, draw_ib: str, workspace_root: str, used_group_ids: set[int]) -> bool:
+        """判定整个缺席的 DrawIB 是否被合并进了其它对象。
+
+        判据（用户定义）：该 DrawIB VGMap 的全局骨骼 id 有被现存对象顶点引用（权重>0）。
+        """
+        vg_values = self._load_drawib_vg_values(draw_ib, workspace_root)
+        if not vg_values:
+            return False
+        return bool(vg_values & used_group_ids)
+
+    def _collect_used_group_ids(self, ordered) -> set[int]:
+        """收集蓝图内全部对象实际引用（权重>0）的顶点组 id 集合。"""
+        used = set()
+        for draw_call in ordered:
+            try:
+                obj_name = draw_call.get_blender_obj_name()
+            except Exception:
+                continue
+            obj = bpy.data.objects.get(obj_name) if obj_name else None
+            mesh = getattr(obj, "data", None) if obj is not None else None
+            vertices = getattr(mesh, "vertices", None)
+            if vertices is None:
+                continue
+            for vertex in vertices:
+                for group_elem in vertex.groups:
+                    if group_elem.weight > 0:
+                        used.add(group_elem.group)
+        return used
+
+
+    def _create_stub_object(self, bare_unique_str: str) -> str:
+        """创建占位对象：3 顶点 1 三角面（1e-6 尺度），权重全给组 "0"。"""
+        workspace_unique_str = bare_unique_str
+        if not workspace_unique_str.upper().startswith("LOD"):
+            workspace_unique_str = "LOD0." + workspace_unique_str
+
+        mesh = bpy.data.meshes.new(name="ZZMI_STUB_MESH_" + workspace_unique_str)
+        mesh.from_pydata(
+            [(0.0, 0.0, 0.0), (1e-6, 0.0, 0.0), (0.0, 1e-6, 0.0)],
+            [],
+            [(0, 1, 2)],
+        )
+        mesh.update()
+
+        obj = bpy.data.objects.new(name=workspace_unique_str, object_data=mesh)
+        obj["ZZMI_STUB"] = 1
+        obj["3DMigoto:WorkspaceUniqueStr"] = workspace_unique_str
+        vertex_group = obj.vertex_groups.new(name="0")
+        vertex_group.add([0, 1, 2], 1.0, 'REPLACE')
+
+        try:
+            bpy.context.collection.objects.link(obj)
+        except Exception:
+            bpy.context.scene.collection.objects.link(obj)
+        return obj.name
+
+    def _cleanup_stub_objects(self):
+        """导出结束后移除占位对象（含 mesh 数据）。"""
+        for obj_name in self._zzmi_stub_object_names:
+            obj = bpy.data.objects.get(obj_name)
+            if obj is None:
+                continue
+            mesh = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if mesh is not None and mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+        if self._zzmi_stub_object_names:
+            print(f"[ZZMI骨骼合并] 已清理 {len(self._zzmi_stub_object_names)} 个占位小三角面对象")
+        self._zzmi_stub_object_names = []
+
+    def _collect_merged_skeleton_components(self):
+        """收集 ZZMI 合并骨架组件信息（按 DrawIB 去重，vg_offset 排序）。
+
+        双条件门控：复选框 import_merged_vgmap 开启 且 子网格 json 已由反查写回
+        VGCount > 0（common/zzmi_skeleton.py 的 ensure_skeleton_data）。
+        同 DrawIB 的拆分子网格共享同一 palette/偏移，只取第一个有效值。
+        返回 (components, {draw_ib: component_id})。
+        """
+        components = []
+        if not GlobalProterties.import_merged_vgmap():
+            return components, {}
+        for drawib_model in self.drawib_model_list:
+            for submesh_model in drawib_model.submesh_model_list:
+                vg_count = int(getattr(submesh_model, "vg_count", 0) or 0)
+                if vg_count > 0:
+                    components.append({
+                        "draw_ib": drawib_model.draw_ib,
+                        "vg_offset": int(getattr(submesh_model, "vg_offset", 0) or 0),
+                        "vg_count": vg_count,
+                    })
+                    break
+        components.sort(key=lambda c: (c["vg_offset"], c["draw_ib"]))
+        component_id_dict = {c["draw_ib"]: i for i, c in enumerate(components)}
+        return components, component_id_dict
 
     def _get_submesh_ib_key(self, submesh_model, draw_ib):
         return f"{draw_ib}_{submesh_model.match_first_index}"
@@ -305,8 +525,21 @@ class ExportZZMI(ExportUnity):
 
             draw_category_name = d3d11_game_type.CategoryDrawCategoryDict.get("Blend", None)
             if draw_category_name is not None and category_name == draw_category_name:
+                # ZZMI 骨骼合并（统一上一帧骨架）：先把当帧 palette 保存到 cs-t0，
+                # 再把 vs-t0 换绑为合并骨架（上一帧完整版本，帧内全部件一致），
+                # draw 之后再 attach 本段 palette（供下一帧使用）。
+                merged_component = self.merged_skeleton_component_id_dict.get(draw_ib)
+                if merged_component is not None:
+                    texture_override_vb_section.append("cs-t0 = vs-t0")
+                    texture_override_vb_section.append("vs-t0 = ResourceZZMergedSkeleton")
                 texture_override_vb_section.append("handling = skip")
                 texture_override_vb_section.append("draw = " + str(drawib_model.draw_number) + ", 0")
+                if merged_component is not None:
+                    component = self.merged_skeleton_components[merged_component]
+                    texture_override_vb_section.append("$zz_ms_attach_offset = " + str(component["vg_offset"]))
+                    texture_override_vb_section.append("$zz_ms_attach_count = " + str(component["vg_count"]))
+                    texture_override_vb_section.append("run = CustomShaderZZMIMergedSkeletonAttach")
+                    texture_override_vb_section.append("cs-t0 = null")
                 for so0_source_resource_name in so0_source_resource_names:
                     texture_override_vb_section.append(so0_source_resource_name + " = ref so0")
 
@@ -319,6 +552,61 @@ class ExportZZMI(ExportUnity):
             texture_override_vb_section.new_line()
 
         ini_builder.append_section(texture_override_vb_section)
+
+    def add_merged_skeleton_sections(self, ini_builder: M_IniBuilder):
+        """生成 ZZMI 合并骨架段（按 ZZZ 数据布局从零编写，仅借鉴 EFMI 概念）。
+
+        内容：
+        - [Constants]：$zz_ms_initialized / $zz_ms_attach_offset / $zz_ms_attach_count；
+        - [ResourceZZMergedSkeleton]：RWStructuredBuffer，stride 48（4x3 矩阵/骨骼），
+          array = Σ vg_count（含去重死槽，语义见计划书 §3.3）；
+        - [CustomShaderZZMIMergedSkeletonAttach]：attach CS（deform draw 后调用，
+          把换绑前保存到 cs-t0 的当帧 palette 拷入合并骨架偏移段，供下一帧使用）。
+        """
+        # 骨骼总数口径修正：取 max(vg_offset + vg_count)，与 EFMI 同口径。
+        # 导出子集时 vg_offset 是工作空间全局槽位（可能远超导出内 sum(vg_count)）——
+        # 例如 3 个部件 0~10/11~30/31~50，用户 join 1+3、第 2 个不生成时，
+        # 导出组件为 (offset=0,count=11) + (offset=31,count=20)，sum=31 但 max=51；
+        # 若按 sum 声明 buffer，部件 3 的 attach（offset=31）与顶点引用的全局 id 31~50 全部越界。
+        bones_count = max(c["vg_offset"] + c["vg_count"] for c in self.merged_skeleton_components)
+
+        section = M_IniSection(M_SectionType.MergedSkeleton)
+        section.append("[Constants]")
+        section.append("global $zz_ms_initialized = 0")
+        section.append("global $zz_ms_attach_offset = 0")
+        section.append("global $zz_ms_attach_count = 0")
+        section.new_line()
+
+        section.append("[ResourceZZMergedSkeleton]")
+        section.append("type = RWStructuredBuffer")
+        section.append("stride = 48")
+        section.append("array = " + str(bones_count))
+        section.new_line()
+
+        section.append("[CustomShaderZZMIMergedSkeletonAttach]")
+        section.append("flags = optimization_level3 all_resources_bound skip_validation")
+        section.append("cs = ./res/zzmi_merged_skeleton_attach.hlsl")
+        section.append("x1 = $zz_ms_attach_offset")
+        section.append("y1 = $zz_ms_attach_count")
+        section.append("cs-u0 = ref ResourceZZMergedSkeleton")
+        section.append("Dispatch = 8, 1, 1")
+        section.append("cs-u0 = null")
+        section.new_line()
+
+        ini_builder.append_section(section)
+
+    def _copy_merged_skeleton_shader_to_mod(self):
+        """把 attach CS 着色器复制到生成 Mod 的 res/ 目录。"""
+        import shutil
+
+        addon_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        shader_src = os.path.join(addon_root, "Toolset", "zzmi_merged_skeleton_attach.hlsl")
+        if not os.path.isfile(shader_src):
+            print(f"[ZZMI骨骼合并] 警告: 未找到 attach CS 着色器 {shader_src}")
+            return
+        res_dir = os.path.join(GlobalConfig.path_generate_mod_folder(), "res")
+        os.makedirs(res_dir, exist_ok=True)
+        shutil.copy2(shader_src, os.path.join(res_dir, "zzmi_merged_skeleton_attach.hlsl"))
 
     def add_unity_vs_resource_vb_sections(self, ini_builder: M_IniBuilder, drawib_model):
         super().add_unity_vs_resource_vb_sections(ini_builder=ini_builder, drawib_model=drawib_model)
@@ -505,7 +793,58 @@ class ExportZZMI(ExportUnity):
 
         ini_builder.append_section(texture_override_ib_section)
 
+    def _warn_missing_drawib_parts(self):
+        """检测 DrawIB 内缺失对象的部件（物体被合并/删除/改名导致）并大声报警。
+
+        判定：DrawIBModel 元数据里的部件表（match_first_index_partname_dict）与本次导出
+        实际拿到对象的子网格（submesh_model_list 的 match_first_index）比对。
+        缺失部件会输出空 IB（ib=null）并在游戏内整个消失——必须让用户看见。
+        返回缺失清单 [{draw_ib, missing:[(first_index, part_name)], present:[...]}]。
+        """
+        missing_report = []
+        for drawib_model in self.drawib_model_list:
+            expected = getattr(drawib_model, "match_first_index_partname_dict", {}) or {}
+            if not expected:
+                continue
+            present = set()
+            for submesh_model in drawib_model.submesh_model_list:
+                try:
+                    present.add(int(submesh_model.match_first_index))
+                except (TypeError, ValueError):
+                    continue
+            missing = []
+            for first_index, part_name in sorted(expected.items(), key=lambda kv: int(kv[0])):
+                if int(first_index) not in present:
+                    missing.append((first_index, str(part_name)))
+            if missing:
+                missing_report.append({
+                    "draw_ib": drawib_model.draw_ib,
+                    "missing": missing,
+                    "present_count": len(present),
+                    "expected_count": len(expected),
+                })
+
+        for item in missing_report:
+            missing_names = [name for _fi, name in item["missing"]]
+            print(
+                f"[ZZMI导出] !!! 部件缺失警告: DrawIB {item['draw_ib']} 有 "
+                f"{item['expected_count']} 个部件，但只找到 {item['present_count']} 个的对象，"
+                f"缺失: {missing_names}"
+            )
+            print(
+                "[ZZMI导出] 这些部件将输出空 IB（ib=null）并在游戏内整个消失/报错。"
+                "常见原因：多个物体被合并成一个（只有幸存名字的部件有对象）、对象被删除或改名。"
+                "请为每个部件保留对应对象（合并物体编辑的功能正在规划），或确认你就是要隐藏它们。"
+            )
+        return missing_report
+
     def export(self):
+        try:
+            self._export_impl()
+        finally:
+            self._cleanup_stub_objects()
+
+    def _export_impl(self):
         TimerUtils.start_stage("缓冲文件生成")
         self.generate_buffer_files(GlobalConfig.path_generatemod_buffer_folder())
         TimerUtils.end_stage("缓冲文件生成")
@@ -523,6 +862,24 @@ class ExportZZMI(ExportUnity):
                     break
 
         print(f"[CrossIB ZZMI] export: has_cross_ib={self.has_cross_ib}")
+
+        # ZZMI 骨骼合并：组件信息收集（复选框 + 反查数据双条件；不满足则完全走旧逻辑）
+        self.merged_skeleton_components, self.merged_skeleton_component_id_dict = (
+            self._collect_merged_skeleton_components()
+        )
+        self.has_merged_skeleton = len(self.merged_skeleton_components) > 0
+        if self.has_merged_skeleton:
+            buffer_slots = max(
+                c["vg_offset"] + c["vg_count"] for c in self.merged_skeleton_components
+            )
+            print(
+                f"[ZZMI骨骼合并] 合并骨架: {len(self.merged_skeleton_components)} 个部件, "
+                f"缓冲 {buffer_slots} 槽（max(vg_offset+vg_count)）"
+            )
+
+        # 部件缺失守卫：DrawIB 内若有部件没有任何对应对象（物体被合并/删除/改名），
+        # 该部件会输出空 IB（ib=null）并在游戏内整个消失——大声报警而非静默。
+        self._warn_missing_drawib_parts()
 
         TimerUtils.start_stage("INI配置生成")
         ini_builder = M_IniBuilder()
@@ -554,6 +911,10 @@ class ExportZZMI(ExportUnity):
                 shader_replace_object_info_map=self.shader_replace_object_info_map,
                 draw_call_offset_map=M_IniHelper.build_draw_call_offset_map(self.drawib_model_list),
             )
+
+        if self.has_merged_skeleton:
+            self.add_merged_skeleton_sections(ini_builder)
+            self._copy_merged_skeleton_shader_to_mod()
 
         ini_builder.save_to_file(os.path.join(GlobalConfig.path_generate_mod_folder(), GlobalConfig.get_workspace_name() + ".ini"))
         TimerUtils.end_stage("INI配置生成")

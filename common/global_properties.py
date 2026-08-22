@@ -171,7 +171,7 @@ class GlobalProterties(bpy.types.PropertyGroup):
 
     import_merged_vgmap: bpy.props.BoolProperty(
         name="使用融合统一顶点组",
-        description="导入时是否导入融合后的顶点组 (Unreal的合并顶点组技术会用到)，一般鸣潮Mod需要勾选来降低制作Mod的复杂度",
+        description="导入时是否导入融合后的顶点组 (Unreal的合并顶点组技术会用到)，一般鸣潮Mod需要勾选来降低制作Mod的复杂度；ZZMI/EFMI 模式下同时作为骨骼合并（Merged Skeleton）开关：勾选 = 导入全局顶点组、导出走合并骨架；不勾选 = 完全维持原路线",
         default=True,
     ) # type: ignore
 
