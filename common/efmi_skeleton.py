@@ -675,18 +675,22 @@ class EFMIBoneMapBuilder:
                 sa["centroid"].astype(numpy.float64) - sb["centroid"].astype(numpy.float64)
             ))
 
-        def try_union(a, b):
+        def try_union(a, b, skip_anti_chain: bool = False):
             ra, rb = find(a), find(b)
             if ra == rb:
                 return
             # 冲突拒绝：合并后某子网格在同组会有 >1 个 local → 拒绝
             if group_submeshes[ra] & group_submeshes[rb]:
                 return
-            # 防链式：两组的 canonical（代表骨骼）质心距离必须 < centroid_tolerance，
-            # 否则拒绝（防止 A~B、B~C 导致 A、C 质心很远却被链式合并到同组）
-            dist = centroid_dist(group_canonical[ra], group_canonical[rb])
-            if dist is not None and dist >= centroid_tolerance:
-                return
+            # 防链式：两组的 canonical（代表骨骼）质心距离不能太远，否则拒绝
+            # （防止 A~B、B~C 导致 A、C 质心很远却被链式合并到同组）。
+            # 阈值取宽松值（2×centroid_tolerance 且至少 0.1），只挡明显链式漂移；
+            # 矩阵完全相同（diff≈0）的对跳过此检查（几乎确定同一骨骼，链式风险可忽略）。
+            if not skip_anti_chain:
+                dist = centroid_dist(group_canonical[ra], group_canonical[rb])
+                anti_chain_limit = max(2.0 * centroid_tolerance, 0.1)
+                if dist is not None and dist >= anti_chain_limit:
+                    return
             parent[ra] = rb
             group_submeshes[rb] = group_submeshes[ra] | group_submeshes[rb]
             # 更新 canonical 为两组中权重顶点数更多的代表
