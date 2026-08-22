@@ -576,7 +576,7 @@ class EFMIBoneMapBuilder:
         match_tolerance: float = 1e-3,
         centroid_tolerance: float = 0.02,
         bbox_overlap_min: float = 0.3,
-        vote_threshold: int = 2,
+        vote_threshold: int = 3,
     ) -> tuple[dict[str, dict], dict[str, int]]:
         """跨子网格"权重扩散评估 + 多维度投票"去重构建 vg_map（同部件不去重）。
 
@@ -656,12 +656,24 @@ class EFMIBoneMapBuilder:
 
         parent = list(range(n))
         group_submeshes: list[set] = [{candidates[i]["unique_str"]} for i in range(n)]
+        # 每组的代表成员（canonical，取权重顶点数最多者）索引，用于防链式质心检查
+        group_canonical: list[int] = list(range(n))
 
         def find(x):
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
                 x = parent[x]
             return x
+
+        def centroid_dist(a, b):
+            """两骨骼驱动顶点的加权质心距离（防链式检查用）。"""
+            sa = candidates[a].get("signature")
+            sb = candidates[b].get("signature")
+            if sa is None or sb is None:
+                return None
+            return float(numpy.linalg.norm(
+                sa["centroid"].astype(numpy.float64) - sb["centroid"].astype(numpy.float64)
+            ))
 
         def try_union(a, b):
             ra, rb = find(a), find(b)
@@ -670,8 +682,16 @@ class EFMIBoneMapBuilder:
             # 冲突拒绝：合并后某子网格在同组会有 >1 个 local → 拒绝
             if group_submeshes[ra] & group_submeshes[rb]:
                 return
+            # 防链式：两组的 canonical（代表骨骼）质心距离必须 < centroid_tolerance，
+            # 否则拒绝（防止 A~B、B~C 导致 A、C 质心很远却被链式合并到同组）
+            dist = centroid_dist(group_canonical[ra], group_canonical[rb])
+            if dist is not None and dist >= centroid_tolerance:
+                return
             parent[ra] = rb
             group_submeshes[rb] = group_submeshes[ra] | group_submeshes[rb]
+            # 更新 canonical 为两组中权重顶点数更多的代表
+            if candidates[group_canonical[rb]]["weighted_vertex_count"] < candidates[group_canonical[ra]]["weighted_vertex_count"]:
+                group_canonical[rb] = group_canonical[ra]
 
         mats = numpy.stack([c["bone"] for c in candidates]).astype(numpy.float64)
 
