@@ -223,12 +223,14 @@ if (
    - **换绑**：attach 后把该 pass 的 `vs-t0` 换绑到合并骨架 Resource（SRV 视图按 stride 48 声明）。
    - **与 ZZMIv1 的组合**：ZZMIv1 的 skin commandlist 在同一批 deform draw 上做 vb0-3/ib 的 mod 替换（全局索引 vb2 即经此路径生效）与 ps-tXX 清理，**不触碰 vs-t0**；我方段落只做 palette attach + vs-t0 换绑，职责不重叠。commandlist 先后次序与守卫需游戏内验证（任务 7）。
    - **渲染 draw 不动**：渲染 pass 的 vs-t0（共享 `7dfb0292`）与 vb2 维持 ZZMIv1 现状；渲染 VS 是否消费 vb2 需游戏内观察（风险 R3）。
-4. **ZZZ 运行时挂载点与延迟消除设计（用户拍板：统一延迟一帧 = 无延迟）**：11 份 palette 由 CPU 逐 pass `Map`（WRITE_DISCARD）上传且 ring buffer 复用，**任何时刻全帧不存在完整并存的全套当帧 palette**——合并骨架只能逐 pass 分段 attach。若 attach 后立即换绑蒙皮，会导致「自身骨骼是当帧、跨部件骨骼是上一帧」的帧内不一致。**消除方案：不让任何部件用当帧数据——所有部件统一用上一帧的完整合并骨架**：
-   - 每个 deform pass 的 commandlist 次序：`pre` = 先把该 pass 原始 vs-t0（当前帧 palette）保存到 `cs-t0`，再把 `vs-t0` 换绑为合并骨架（**此时合并骨架里是上一条完整帧序列 attach 的数据，全部同属上一帧，彼此一致**）→ draw 蒙皮；`post` = 运行 attach CS，把 `cs-t0`（本段当前帧 palette）按 vg_offset 连续拷入合并骨架，供**下一帧**使用。
-   - 效果：任意时刻合并骨架都是**完整且同帧**的（上一帧全套），所有部件、所有跨部件引用在帧内严格一致——统一延迟一帧 = 无相对延迟（60fps 下 16ms，无感）。
-   - 代价与边界：角色骨骼动画整体比游戏世界慢一帧（NPC/物理是当帧）；morph/blendshape 顶点数据是当帧而骨骼慢一帧（48625d6d 脸部 blendshape 与骨骼一帧错开，可接受）；首帧/传送后第一帧合并骨架全零（一帧异常后自愈），用 `$merged_skeleton_initialized` 类守卫处理。
-   - 这是 ZZZ per-pass Map + ring buffer 布局下能达到的最优语义（EFMI 共享骨骼池天然当帧一致，不需要此设计）。
-5. **跨部件权重**：合法，无需任何特殊处理（全局骨骼全在合并骨架里，且帧内一致，见上）——这是与降级 B 模式的本质区别。
+4. **ZZZ 运行时挂载点与帧对齐设计（用户拍板：全部数据同帧，整体延迟一帧，杜绝混帧抖动）**：11 份 palette 由 CPU 逐 pass `Map`（WRITE_DISCARD）上传且 ring buffer 复用，**任何时刻全帧不存在完整并存的全套当帧 palette**；cb1（对象→世界变换）只在渲染 draw 才绑得到，而渲染块（000037+）在 deform 块（000001-036）之后。因此：
+    - **"全部当前帧"（零延迟）物理不可行**：deform 时刻当帧全套 palette 不并存（ring 复用）、当帧 cb1 未绑定；跨组校准需全部组 cb1，最后一组的渲染 draw 之前它们从不齐集，而那时前面的部件早已画完。
+    - **定案 = "全部上一帧" + Present 时序 attach**：每个 deform pass：`pre` = 把该 pass 当帧 palette **copy 成持久资源** `ResourceZZPalette_<DrawIB>`（ring buffer 别名撑不到帧尾）→ `vs-t0` 换绑为本组骨架（此时骨架内容是上一帧帧尾完整 attach 的版本，全部同属上一帧）→ draw 蒙皮。渲染 draw 处按组 `copy vs-cb1`（last-wins）。**帧尾 [Present]：逐（部件 × 组）统一 attach**——当帧 palette 副本 × 当帧 cb1 捕获同时在手，一次写出的骨架全部同属当帧，供下一帧使用。
+    - 效果：任意时刻合并骨架都是**完整且同帧**的；无"先跑 pass 覆盖、后跑 pass 读混帧"的帧内渐进覆盖（逐 pass attach 旧设计的每帧抖动源，用户实测）；无"palette 当帧 × cb1 上一帧"的校准混帧（校准差与 palette 同帧）。
+    - 代价与边界：角色骨骼动画整体比游戏世界慢一帧（16ms@60fps，无感）；morph/blendshape 顶点数据是当帧而骨骼慢一帧（48625d6d 脸部 blendshape 与骨骼一帧错开，可接受）；首帧合并骨架全零（一帧异常后自愈）。
+    - 备注：`[Present]` 有双缓冲爆炸前科（R8）——那次是 Present 帧翻转 + 条件换绑的写法问题；本次只在 Present 跑 attach CS（无翻转无换绑），仍需游戏内验证。
+    - 这是 ZZZ per-pass Map + ring buffer 布局下能达到的最优语义（EFMI 共享骨骼池天然当帧一致，不需要此设计）。
+5. **跨部件/跨组权重**：合法——同组直接引用；跨组由校准 attach 把外来骨骼换算进本组空间（各自对象→世界变换正常），帧对齐见上——这是与降级 B 模式的本质区别。
 
 ## 6. 任务拆解（TDD，每步可独立验收）
 

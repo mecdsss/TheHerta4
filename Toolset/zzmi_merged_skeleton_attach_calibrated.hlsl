@@ -18,13 +18,18 @@
 //     Rm' = C_rot × Rm；tm' = C_rot × tm + C_t
 //   世界不变性：U_dst × (M' × p) ≡ U_src × (M × p)。
 //
-// 时序（统一延迟一帧 = 无相对延迟）：本 CS 在该部件 deform draw 之后执行——
-// 蒙皮读取的目标组骨架始终是上一帧完整 attach 完毕的版本。cb1 捕获于上一帧渲染 draw
-// （渲染 draw 在 deform 之后，当帧拿不到），palette 为当帧——校准差为上一帧的根间相对
-// 变换，误差 = 根间相对运动一帧的变化量（除瞬移外不可感知；首帧全零一帧后自愈）。
+// 时序（用户拍板：全部数据同帧，整体延迟一帧，杜绝混帧抖动）：
+// 本 CS 在 [Present]（帧尾）统一执行——当帧 palette 副本（deform draw 处
+// `copy vs-t0` 成持久资源 ResourceZZPalette_<DrawIB>；ring buffer 同帧内会被
+// 后续 pass 重写，别名撑不到帧尾）与当帧 cb1 捕获（渲染 draw 处 copy，last-wins）
+// 此刻同时在手，一次写出的骨架全部同属当帧；下一帧各 deform draw 读到的是
+// 干净的上一帧完整骨架。
+// （被否方案"全部当前帧"在 ZZZ 管线物理不可行：当帧全套 palette 因逐 pass
+// Map + ring 复用从不并存；cb1 只在渲染 draw 才绑得到，而渲染块在 deform 块之后。）
+// 首帧合并骨架全零（一帧异常后自愈）。
 //
-// 调用方语义（每个 deform pass × 每个骨架组各调一次）：
-// - cs-t0 = 本部件当帧 palette（调用方换绑前保存；ring buffer，仅本 draw 块内有效）；
+// 调用方语义（[Present] 里每个部件 × 每个骨架组各调一次）：
+// - cs-t0 = ResourceZZPalette_<DrawIB>（本部件当帧 palette 的持久副本）；
 // - cs-cb1 = 本部件所在组的对象→世界 cb1 捕获（ResourceZZCb1_G<本组>，**常量缓冲槽 b1**）；
 // - cs-cb2 = 目标组的对象→世界 cb1 捕获（ResourceZZCb1_G<目标组>，**常量缓冲槽 b2**）；
 // - cs-u0  = 目标组合并骨架（ResourceZZMergedSkeleton_G<目标组>）；
@@ -39,7 +44,7 @@ struct ZZBone3x4
     float4 r2;
 };
 
-// 当前 deform pass 的 palette（调用方在把 vs-t0 换绑到本组骨架之前保存到 cs-t0）
+// 本部件当帧 palette 的持久副本（deform draw 处 copy vs-t0 写入；ring buffer 同帧即失效）
 StructuredBuffer<ZZBone3x4> src_palette : register(t0);
 // 合并骨架（目标组；同时作为 SRV 换绑到该组各 deform pass 的 vs-t0 供蒙皮读取）
 RWStructuredBuffer<ZZBone3x4> merged_skeleton : register(u0);

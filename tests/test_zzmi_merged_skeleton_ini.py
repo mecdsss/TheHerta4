@@ -322,24 +322,20 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         lines = builder.sections[0].SectionLineList
         return lines
 
-    def test_vb_section_injects_swap_and_attach(self):
+    def test_vb_section_injects_copy_and_swap(self):
         lines = self._build_vb_section(with_merged=True)
         text = "\n".join(lines)
 
-        # 换绑在 draw 之前，逐组校准 attach 在 draw 之后（统一上一帧骨架）
-        idx_save = text.index("cs-t0 = vs-t0")
+        # palette 持久副本在 draw 之前；换绑本组骨架；attach 不在 VB 段（挪到 [Present]）
+        idx_copy = text.index("ResourceZZPalette_b20f90ea = copy vs-t0 unless_null")
         idx_swap = text.index("vs-t0 = ResourceZZMergedSkeleton_G0")
         idx_draw = text.index("draw = 4643, 0")
-        idx_offset = text.index("$zz_ms_attach_offset = 154")
-        idx_count = text.index("$zz_ms_attach_count = 51")
-        idx_run = text.index("run = CustomShaderZZMIMergedSkeletonAttach_C0_G0")
-        idx_clear = text.index("cs-t0 = null")
-        self.assertLess(idx_save, idx_swap)
+        self.assertLess(idx_copy, idx_swap)
         self.assertLess(idx_swap, idx_draw)
-        self.assertLess(idx_draw, idx_offset)
-        self.assertLess(idx_offset, idx_count)
-        self.assertLess(idx_count, idx_run)
-        self.assertLess(idx_run, idx_clear)
+        # VB 段不再做 attach（帧对齐：attach 统一在 [Present] 帧尾执行）
+        self.assertNotIn("run = CustomShaderZZMIMergedSkeletonAttach", text)
+        self.assertNotIn("cs-t0", text)
+        self.assertNotIn("$zz_ms_attach_offset", text)
 
     def test_vb_section_without_merged_stays_legacy(self):
         lines = self._build_vb_section(with_merged=False)
@@ -371,8 +367,13 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("[ResourceZZCb1_G0]", text)
         # 无捕获源（fake 未设 cb1_source_ib）：不出捕获段，attach 段不带 cb1 引用（CS 直拷兜底）
         self.assertNotIn("Cb1Capture", text)
+        # palette 持久副本资源（Present 时序 attach 的输入）
+        self.assertIn("[ResourceZZPalette_a23aa8a3]", text)
+        self.assertIn("[ResourceZZPalette_b20f90ea]", text)
         self.assertIn("[CustomShaderZZMIMergedSkeletonAttach_C0_G0]", text)
         self.assertIn("[CustomShaderZZMIMergedSkeletonAttach_C1_G0]", text)
+        self.assertIn("cs-t0 = ref ResourceZZPalette_a23aa8a3", text)
+        self.assertIn("cs-t0 = ref ResourceZZPalette_b20f90ea", text)
         self.assertIn("cs = ./res/zzmi_merged_skeleton_attach_calibrated.hlsl", text)
         self.assertIn("x1 = $zz_ms_attach_offset", text)
         self.assertIn("y1 = $zz_ms_attach_count", text)
@@ -380,6 +381,15 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("Dispatch = 8, 1, 1", text)
         self.assertNotIn("cs-t1 = ref", text)
         self.assertNotIn("cs-t2 = ref", text)
+        # attach 运行在 [Present]（帧尾统一对齐），且逐 run 前带本部件 offset/count
+        self.assertIn("[Present]", text)
+        present_text = text.split("[Present]")[1]
+        idx_offset = present_text.index("$zz_ms_attach_offset = 0")
+        idx_count = present_text.index("$zz_ms_attach_count = 105")
+        idx_run = present_text.index("run = CustomShaderZZMIMergedSkeletonAttach_C0_G0")
+        self.assertLess(idx_offset, idx_count)
+        self.assertLess(idx_count, idx_run)
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C1_G0", present_text)
     def test_merged_skeleton_sections_per_group(self):
         """校准版：每组一套全宽骨架资源；逐（部件 × 组）attach；有捕获源的组出捕获段。"""
         # 组 0（身体）：a23aa8a3(0,105) + b20f90ea(105,51)，捕获源 = a23aa8a3
@@ -402,9 +412,15 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
 
         self.assertIn("[ResourceZZMergedSkeleton_G0]", text)
         self.assertIn("[ResourceZZMergedSkeleton_G1]", text)
-        # 两组全宽 array = 全局 max(157+11) = 168
-        array_lines = [l for l in builder.sections[0].SectionLineList if l.startswith("array = ")]
-        self.assertEqual(array_lines, ["array = 168", "array = 168"])
+        # 两组全宽 array = 全局 max(157+11) = 168（只数骨架资源的 array 行；
+        # palette 副本资源自带 array=vg_count 行，需排除——骨架段结构：header/type/stride/array）
+        section_lines = builder.sections[0].SectionLineList
+        skeleton_arrays = [
+            section_lines[i + 3]
+            for i, line in enumerate(section_lines)
+            if line.startswith("[ResourceZZMergedSkeleton_G")
+        ]
+        self.assertEqual(skeleton_arrays, ["array = 168", "array = 168"])
         # 组 0 有捕获源（a23aa8a3）-> 捕获段 + attach 带 cs-t1/cs-t2；组 1 无 -> 无捕获段
         self.assertIn("[TextureOverrideIB_a23aa8a3_Cb1Capture_G0]", text)
         self.assertIn("hash = a23aa8a3", text)
@@ -423,8 +439,8 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertNotIn("cs-cb1 = ref", c2_g0)                # C2 属组 1（无捕获源）
         self.assertNotIn("cs-t1 = ref", c2_g0)                 # 不得错绑到 SRV 槽
 
-    def test_vb_section_rebinds_to_own_group_resource_and_runs_all_groups(self):
-        """每个 deform VB 段换绑到本部件所属组的骨架资源，且逐组各跑一次校准 attach。"""
+    def test_vb_section_rebinds_to_own_group_resource(self):
+        """每个 deform VB 段 copy 当帧 palette 成持久副本并换绑本组骨架（attach 在 [Present]）。"""
         model_g1 = _FakeDrawIBModel("64d7d56f", [_FakeSubmesh("LOD0.64d7d56f-900-0", 156, 1, 1)])
         model_g0 = _FakeDrawIBModel("a23aa8a3", [_FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, 0)])
         exporter = _make_exporter([model_g1, model_g0], merged_vgmap=True)
@@ -435,17 +451,23 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         builder0 = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder0, model_g0)
         text0 = "\n".join(builder0.sections[0].SectionLineList)
+        self.assertIn("ResourceZZPalette_a23aa8a3 = copy vs-t0 unless_null", text0)
         self.assertIn("vs-t0 = ResourceZZMergedSkeleton_G0", text0)
-        # a23aa8a3 是组件 0（组 0）；两组各跑一次 attach
-        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C0_G0", text0)
-        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C0_G1", text0)
+        self.assertNotIn("run = CustomShaderZZMIMergedSkeletonAttach", text0)
 
         builder1 = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder1, model_g1)
         text1 = "\n".join(builder1.sections[0].SectionLineList)
+        self.assertIn("ResourceZZPalette_64d7d56f = copy vs-t0 unless_null", text1)
         self.assertIn("vs-t0 = ResourceZZMergedSkeleton_G1", text1)
-        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C1_G0", text1)
-        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C1_G1", text1)
+
+        # 逐（部件 × 组）attach 运行在 [Present]：2 部件 × 2 组 = 4 次
+        builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(builder)
+        present_text = "\n".join(builder.sections[0].SectionLineList).split("[Present]")[1]
+        for cid, draw_ib in ((0, "a23aa8a3"), (1, "64d7d56f")):
+            for g in (0, 1):
+                self.assertIn(f"run = CustomShaderZZMIMergedSkeletonAttach_C{cid}_G{g}", present_text)
 
     def test_merged_skeleton_buffer_covers_offset_gap(self):
         """回归：中间部件缺失时 buffer 必须按 max(vg_offset+vg_count) 声明，而非 sum(vg_count)。
