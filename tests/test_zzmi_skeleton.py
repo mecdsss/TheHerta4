@@ -405,6 +405,20 @@ class TestZZMISkeletonMergeHelper(unittest.TestCase):
                 jsons_by_ib[draw_ib].get("SkeletonGroupCb1SourceIb", ""), expected_source, draw_ib
             )
 
+        # 捕获段匹配键 = 源部件 SO 输出 hash（渲染 draw vb0 恒为游戏 SO 资源，
+        # 不受 mod 换 ib 影响；按原 IB hash 匹配全量合并后永不触发——dump 124705 踩坑）
+        expected_cb1_source_so = {
+            "19086112": "",
+            "454ff522": "9b76d1d7", "48625d6d": "9b76d1d7", "64d7d56f": "9b76d1d7", "b51bdd59": "9b76d1d7",
+            "84618ee0": "840c1713",
+            "a23aa8a3": "01b35c45", "b20f90ea": "01b35c45", "b30db54e": "01b35c45",
+            "add6ff13": "fab82e2f", "d892c658": "fab82e2f",
+        }
+        for draw_ib, expected_so in expected_cb1_source_so.items():
+            self.assertEqual(
+                jsons_by_ib[draw_ib].get("SkeletonGroupCb1SourceSO", ""), expected_so, draw_ib
+            )
+
     def test_idempotent_second_run_skips(self):
         unique_str_list = self._unique_str_list()
         ok1, _ = ZZMISkeletonMergeHelper.ensure_skeleton_data(self.tmp, unique_str_list)

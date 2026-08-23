@@ -55,6 +55,8 @@ class SubMeshModel:
     skeleton_group:int = field(init=False, default=0)
     # ZZMI 校准版：本组 cb1 捕获源部件 DrawIB（缺省 "" = 无捕获源）
     skeleton_group_cb1_source_ib:str = field(init=False, default="")
+    # 本组 cb1 捕获段的 SO 输出 hash（VertexLimitVB）
+    skeleton_group_cb1_source_so:str = field(init=False, default="")
 
     # 读取工作空间中的 Import.json 选择数据类型目录，再从对应的 SubmeshJson 获取 d3d11GameType
     d3d11_game_type:D3D11GameType = field(init=False,repr=False,default=None)
@@ -94,6 +96,10 @@ class SubMeshModel:
         # ZZMI 校准版：本组 cb1 捕获源部件 DrawIB（空串 = 无捕获源）
         self.skeleton_group_cb1_source_ib = str(
             getattr(submesh_metadata, "skeleton_group_cb1_source_ib", "") or ""
+        )
+        # 本组 cb1 捕获段的 SO 输出 hash（VertexLimitVB）
+        self.skeleton_group_cb1_source_so = str(
+            getattr(submesh_metadata, "skeleton_group_cb1_source_so", "") or ""
         )
 
         # EFMI 骨骼合并：合并骨架场景下 BLENDINDICES 无条件升宽到 16 位

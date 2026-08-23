@@ -555,6 +555,7 @@ class ZZMISkeletonMergeHelper:
                 submesh_json.get("VGMap")
                 and "SkeletonGroup" in submesh_json
                 and "SkeletonGroupCb1SourceIb" in submesh_json
+                and "SkeletonGroupCb1SourceSO" in submesh_json
             ):
                 continue  # 该子网格缓存为当前 schema（临时计数，见下）
             stale += 1
@@ -751,7 +752,11 @@ class ZZMISkeletonMergeHelper:
         # 每组的 cb1 捕获源部件（校准用对象变换）：成员中"帧内最后一个渲染 draw 的
         # vs-cb1 是可解析逐部件块"者优先（last-wins 覆盖口径下捕获内容才正确）；
         # 无合格成员 -> 空串（该组运行时 attach 自动退化为直拷 = 分组版行为）。
+        # 同时记录源部件的 VertexLimitVB（SO 输出 hash）——捕获段按 **SO hash**
+        # 匹配（渲染 draw 的 vb0 恒为游戏 SO 资源、不受我方 mod 换 ib 影响；
+        # 按原 IB hash 匹配在全量合并后永不触发，实测 124705 踩坑）。
         group_cb1_source: dict[int, str] = {}
+        group_cb1_source_so: dict[int, str] = {}
         for group_index in sorted(group_members):
             source = ""
             for draw_ib in sorted(group_members[group_index]):
@@ -759,6 +764,15 @@ class ZZMISkeletonMergeHelper:
                     source = draw_ib
                     break
             group_cb1_source[group_index] = source
+            source_so = ""
+            if source:
+                rep_json_path = ready_groups[source]["json_paths"][
+                    ready_groups[source]["representative"]
+                ]
+                rep_json = JsonUtils.LoadFromFile(rep_json_path)
+                if isinstance(rep_json, dict):
+                    source_so = str(rep_json.get("VertexLimitVB", "") or "")
+            group_cb1_source_so[group_index] = source_so
 
         # 写回工作空间 json + 复制 palette 缓存（组内所有子网格写相同结果）
         written = 0
@@ -770,6 +784,7 @@ class ZZMISkeletonMergeHelper:
             vg_count = group["vg_count"]
             skeleton_group = group_of[draw_ib]
             cb1_source_ib = group_cb1_source.get(skeleton_group, "")
+            cb1_source_so = group_cb1_source_so.get(skeleton_group, "")
 
             for unique_str in group["members"]:
                 json_path = group["json_paths"][unique_str]
@@ -783,8 +798,11 @@ class ZZMISkeletonMergeHelper:
                 # 骨架分组（渲染 cb1 对象变换配对）：导出侧把 deform pass 换绑到本组
                 # ResourceZZMergedSkeleton_G<N>；VGMap/VGOffset 为全局骨骼编号（组基址拼接）
                 submesh_json["SkeletonGroup"] = skeleton_group
-                # 本组 cb1 捕获源部件（校准时其渲染 draw 处 copy vs-cb1；空串 = 无捕获源）
+                # 本组 cb1 捕获源部件（其渲染 draw 处 copy vs-cb1；空串 = 无捕获源）
                 submesh_json["SkeletonGroupCb1SourceIb"] = cb1_source_ib
+                # 捕获段匹配键 = 源部件的 SO 输出 hash（渲染 draw 的 vb0 恒为游戏 SO
+                # 资源，不受我方 mod 换 ib 影响；按原 IB hash 匹配全量合并后永不触发）
+                submesh_json["SkeletonGroupCb1SourceSO"] = cb1_source_so
 
                 # 复制 palette buf 到 ModImpRuntime 缓存（NTEMI/EFMI 同款模式）
                 try:

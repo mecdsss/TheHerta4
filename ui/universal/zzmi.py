@@ -276,6 +276,9 @@ class ExportZZMI(ExportUnity):
                         "cb1_source_ib": str(
                             getattr(submesh_model, "skeleton_group_cb1_source_ib", "") or ""
                         ),
+                        "cb1_source_so": str(
+                            getattr(submesh_model, "skeleton_group_cb1_source_so", "") or ""
+                        ),
                     })
                     break
         components.sort(key=lambda c: (c["skeleton_group"], c["vg_offset"], c["draw_ib"]))
@@ -590,16 +593,15 @@ class ExportZZMI(ExportUnity):
           因逐 pass Map + ring 复用从不并存，cb1 只在渲染 draw 才绑得到而渲染
           在 deform 之后。）
         - 每组 cb1 捕获：`ResourceZZCb1_G<N>` 在该组代表部件（json
-          SkeletonGroupCb1SourceIb，其帧内最后一个渲染 draw 的 vs-cb1 是可解析
-          逐部件块）的渲染 draw 处 copy（last-wins，逐帧更新）。
+          SkeletonGroupCb1SourceIb + SkeletonGroupCb1SourceSO）的渲染 draw 处
+          copy vs-cb1（last-wins，逐帧更新）；捕获段按源部件 **SO 输出 hash** 匹配
+          （渲染 draw 的 vb0 恒为游戏 SO 资源、不受 mod 换 ib 影响）。
         """
         section = M_IniSection(M_SectionType.MergedSkeleton)
         section.append("[Constants]")
         section.append("global $zz_ms_initialized = 0")
         section.append("global $zz_ms_attach_offset = 0")
         section.append("global $zz_ms_attach_count = 0")
-        # 校准总开关（A/B 隔离验证：0 = 全部直拷=分组版行为，1 = 外来骨骼校准乘）
-        section.append("global $zz_ms_calibrate = 1")
         section.new_line()
 
         groups = self._merged_skeleton_groups()
@@ -608,12 +610,12 @@ class ExportZZMI(ExportUnity):
         # 同组 3 部件 0~10/11~30/31~50 且中间缺席时 sum=31 但 max=51，按 max 声明）。
         bones_count = max(c["vg_offset"] + c["vg_count"] for c in self.merged_skeleton_components)
 
-        # 每组的 cb1 捕获源部件（取该组组件里声明了捕获源的 DrawIB）
+        # 每组的 cb1 捕获源部件（取该组组件里声明了捕获源 SO hash 的 DrawIB）
         group_cb1_source: dict[int, str] = {}
         for component in self.merged_skeleton_components:
-            source_ib = component.get("cb1_source_ib") or ""
-            if source_ib and component["skeleton_group"] not in group_cb1_source:
-                group_cb1_source[component["skeleton_group"]] = source_ib
+            source_so = component.get("cb1_source_so") or ""
+            if source_so and component["skeleton_group"] not in group_cb1_source:
+                group_cb1_source[component["skeleton_group"]] = source_so
 
         # 每部件 palette 持久副本资源声明（deform VB 段里 copy vs-t0 写入当帧内容）。
         # type=stride 必须显式声明：副本要作为 CS 的 cs-t0（SRV）按
@@ -642,13 +644,16 @@ class ExportZZMI(ExportUnity):
                     f"该组 attach 将直拷（跨组引用该组数据会保持源空间，可能错位）"
                 )
 
-        # cb1 捕获段（TextureOverrideIB：源部件渲染 draw 处 last-wins copy vs-cb1）
+        # cb1 捕获段（TextureOverrideVB 按源部件的 SO 输出 hash 匹配：渲染 draw 的
+        # vb0 恒为游戏 SO 资源（不受我方 mod 换 ib 影响；按原 IB hash 匹配在全量合并后
+        # 永不触发，dump 124705 实测捕获资源只剩垃圾/统一内容导致校准失真）；
+        # 该源部件帧内最后一个渲染 draw 的 vs-cb1 是可解析逐部件块 -> last-wins 正确）
         for skeleton_group in groups:
-            source_ib = group_cb1_source.get(skeleton_group, "")
-            if not source_ib:
+            source_so = group_cb1_source.get(skeleton_group, "")
+            if not source_so:
                 continue
-            section.append(f"[TextureOverrideIB_{source_ib}_Cb1Capture_G{skeleton_group}]")
-            section.append("hash = " + source_ib)
+            section.append(f"[TextureOverrideVB_Cb1Capture_G{skeleton_group}_so{source_so}]")
+            section.append("hash = " + source_so)
             section.append("match_instance_count = 0")
             section.append(f"ResourceZZCb1_G{skeleton_group} = copy vs-cb1 unless_null")
             section.new_line()
@@ -664,7 +669,6 @@ class ExportZZMI(ExportUnity):
                 section.append("cs = ./res/zzmi_merged_skeleton_attach_calibrated.hlsl")
                 section.append("x1 = $zz_ms_attach_offset")
                 section.append("y1 = $zz_ms_attach_count")
-                section.append("z1 = $zz_ms_calibrate")
                 section.append(f"cs-t0 = ref ResourceZZPalette_{component['draw_ib']}")
                 if own_group in group_cb1_source:
                     section.append(f"cs-cb1 = ref ResourceZZCb1_G{own_group}")

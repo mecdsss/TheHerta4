@@ -124,6 +124,10 @@ class SubmeshMetadata:
         self.skeleton_group_cb1_source_ib = str(
             self.submesh_json_dict.get("SkeletonGroupCb1SourceIb", "") or ""
         )
+        # 本组 cb1 捕获段的 SO 输出 hash（渲染 draw vb0 恒为游戏 SO 资源，不受 mod 换 ib 影响）
+        self.skeleton_group_cb1_source_so = str(
+            self.submesh_json_dict.get("SkeletonGroupCb1SourceSO", "") or ""
+        )
         self.d3d11_game_type = self._build_d3d11_game_type()
 
     def _build_d3d11_game_type(self) -> D3D11GameType:

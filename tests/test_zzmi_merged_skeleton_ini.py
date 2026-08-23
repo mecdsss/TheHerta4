@@ -234,13 +234,15 @@ class _FakeGameType:
 
 
 class _FakeSubmesh:
-    def __init__(self, unique_str, vg_offset=0, vg_count=0, skeleton_group=0, cb1_source_ib=""):
+    def __init__(self, unique_str, vg_offset=0, vg_count=0, skeleton_group=0,
+                 cb1_source_ib="", cb1_source_so=""):
         self.unique_str = unique_str
         self.match_first_index = 0
         self.vg_offset = vg_offset
         self.vg_count = vg_count
         self.skeleton_group = skeleton_group
         self.skeleton_group_cb1_source_ib = cb1_source_ib
+        self.skeleton_group_cb1_source_so = cb1_source_so
         self.drawcall_model_list = []
 
 
@@ -360,7 +362,6 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         text = "\n".join(builder.sections[0].SectionLineList)
 
         self.assertIn("global $zz_ms_initialized = 0", text)
-        self.assertIn("global $zz_ms_calibrate = 1", text)
         self.assertIn("[ResourceZZMergedSkeleton_G0]", text)
         self.assertIn("type = RWStructuredBuffer", text)
         self.assertIn("stride = 48", text)
@@ -378,7 +379,6 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("cs = ./res/zzmi_merged_skeleton_attach_calibrated.hlsl", text)
         self.assertIn("x1 = $zz_ms_attach_offset", text)
         self.assertIn("y1 = $zz_ms_attach_count", text)
-        self.assertIn("z1 = $zz_ms_calibrate", text)
         self.assertIn("cs-u0 = ref ResourceZZMergedSkeleton_G0", text)
         self.assertIn("Dispatch = 8, 1, 1", text)
         self.assertNotIn("cs-t1 = ref", text)
@@ -394,12 +394,12 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C1_G0", present_text)
     def test_merged_skeleton_sections_per_group(self):
         """校准版：每组一套全宽骨架资源；逐（部件 × 组）attach；有捕获源的组出捕获段。"""
-        # 组 0（身体）：a23aa8a3(0,105) + b20f90ea(105,51)，捕获源 = a23aa8a3
+        # 组 0（身体）：a23aa8a3(0,105) + b20f90ea(105,51)，捕获源 = a23aa8a3（SO=01b35c45）
         # 组 1（头部）：64d7d56f(156,1) + b51bdd59(157,11)，捕获源 = 48625d6d（本例缺席）
         exporter = _make_exporter(
             [
-                _FakeDrawIBModel("a23aa8a3", [_FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, 0, "a23aa8a3")]),
-                _FakeDrawIBModel("b20f90ea", [_FakeSubmesh("LOD0.b20f90ea-19182-0", 105, 51, 0, "a23aa8a3")]),
+                _FakeDrawIBModel("a23aa8a3", [_FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, 0, "a23aa8a3", "01b35c45")]),
+                _FakeDrawIBModel("b20f90ea", [_FakeSubmesh("LOD0.b20f90ea-19182-0", 105, 51, 0, "a23aa8a3", "01b35c45")]),
                 _FakeDrawIBModel("64d7d56f", [_FakeSubmesh("LOD0.64d7d56f-900-0", 156, 1, 1)]),
                 _FakeDrawIBModel("b51bdd59", [_FakeSubmesh("LOD0.b51bdd59-864-0", 157, 11, 1)]),
             ],
@@ -423,9 +423,10 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
             if line.startswith("[ResourceZZMergedSkeleton_G")
         ]
         self.assertEqual(skeleton_arrays, ["array = 168", "array = 168"])
-        # 组 0 有捕获源（a23aa8a3）-> 捕获段 + attach 带 cs-t1/cs-t2；组 1 无 -> 无捕获段
-        self.assertIn("[TextureOverrideIB_a23aa8a3_Cb1Capture_G0]", text)
-        self.assertIn("hash = a23aa8a3", text)
+        # 组 0 有捕获源（SO=01b35c45）-> 捕获段按 SO hash 匹配 + attach 带 cs-cb1/cs-cb2；
+        # 组 1 无 -> 无捕获段
+        self.assertIn("[TextureOverrideVB_Cb1Capture_G0_so01b35c45]", text)
+        self.assertIn("hash = 01b35c45", text)
         self.assertIn("match_instance_count = 0", text)
         self.assertIn("ResourceZZCb1_G0 = copy vs-cb1 unless_null", text)
         self.assertNotIn("Cb1Capture_G1", text)
