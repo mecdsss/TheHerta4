@@ -20,6 +20,11 @@ EFMI（明日方舟：终末地）骨骼合并支持模块
 产出：
 - 每个子网格 json 写回 `VGMap` / `VGOffset` / `VGCount`（缓存，幂等；提取端重导可覆盖）。
 - 骨骼池 buffer 复制到 `<submesh>/ModImpRuntime/<bare>-BoneMatrix.buf`（参照 NTEMI 缓存模式）。
+
+多 LOD：LOD0 / LOD1 相互独立——各 LOD 用**自己**的 FrameAnalysis dump 提取目录
+（Config/WorkPageTabs.json 的 tab 名即 LOD 名，每个 tab 的
+Config/Tabs/<tabid>.json 记录自己的 frameAnalysisFolderPath）独立计算统一顶点组，
+vg 槽位各自从 0 起，绝不跨 LOD 混算；导出端同样按 LOD 生成多套独立合并骨架配置。
 """
 
 # 注解延迟求值（PEP 563）：避免类定义期解析 numpy.ndarray 等注解，
@@ -830,6 +835,69 @@ class EFMISkeletonMergeHelper:
         return ""
 
     @staticmethod
+    def _parse_lod_name(unique_str: str) -> str:
+        """解析 unique_str 的 LOD 前缀（'LOD0.xxx' -> 'LOD0'；无前缀 -> ''）。
+
+        与 WorkSpaceHelper.parse_lod_unique_str 语义一致，但本模块需保持无 bpy
+        依赖（单测以 stub 包加载），故本地实现。
+        """
+        normalized = str(unique_str or "").strip()
+        if normalized.upper().startswith("LOD") and "." in normalized:
+            dot_idx = normalized.index(".")
+            potential = normalized[:dot_idx]
+            if potential[3:].isdigit():
+                return potential
+        return ""
+
+    @classmethod
+    def resolve_frame_analysis_dirs_by_lod(
+        cls, workspace_root: str
+    ) -> tuple[dict[str, str], str]:
+        """解析每 LOD 的 FrameAnalysis 目录映射 + 默认目录。
+
+        多 LOD 语义（2026-08 实测定案）：不同 LOD 对应各自独立的 dump 提取目录。
+        官方工具按工作页（tab）管理：Config/WorkPageTabs.json 的 tab.name 即 LOD 名
+        （'LOD0'/'LOD1'），每个 tab 在 Config/Tabs/<tabid>.json 里记录自己的
+        frameAnalysisFolderPath（该 LOD 的 dump 提取目录）；而工作空间级
+        Config/FrameAnalysisPath.json 只记录"当前活动 tab"的路径——拿它喂所有 LOD
+        会导致其它 LOD 全部查错目录（实测 LOD0 数据在 tab1 的 dump、LOD1 在 tab2 的
+        dump，用任一单一路径都会漏掉另一侧）。
+
+        返回 (lod_map, default_dir)：
+        - lod_map: {tab/LOD 名 -> FrameAnalysis 目录}（仅收录目录有效的条目）；
+        - default_dir: 现有 resolve_frame_analysis_dir 的解析结果
+          （Config/FrameAnalysisPath.json -> Tabs 扫描 -> 最新 FrameAnalysis-* 兜底），
+          供无 LOD 前缀的子网格与未在 tab 中登记的 LOD 使用。
+        """
+        lod_map: dict[str, str] = {}
+        work_page_path = os.path.join(workspace_root, "Config", "WorkPageTabs.json")
+        tabs_dir = os.path.join(workspace_root, "Config", "Tabs")
+        if os.path.isfile(work_page_path) and os.path.isdir(tabs_dir):
+            try:
+                payload = JsonUtils.LoadFromFile(work_page_path)
+                for tab in payload.get("tabs", []) or []:
+                    tab_name = str(tab.get("name", "") or "").strip()
+                    tab_id = str(tab.get("id", "") or "").strip()
+                    if not tab_name or not tab_id:
+                        continue
+                    tab_file = os.path.join(tabs_dir, tab_id + ".json")
+                    if not os.path.isfile(tab_file):
+                        continue
+                    try:
+                        tab_payload = JsonUtils.LoadFromFile(tab_file)
+                    except Exception:
+                        continue
+                    fa_path = str(
+                        tab_payload.get("frameAnalysisFolderPath", "") or ""
+                    ).strip()
+                    if fa_path and os.path.isdir(fa_path):
+                        lod_map[tab_name] = fa_path
+            except Exception:
+                pass
+        default_dir = cls.resolve_frame_analysis_dir(workspace_root)
+        return lod_map, default_dir
+
+    @staticmethod
     def load_drawcall_index_list(lod_dir: str) -> dict[str, list[str]]:
         """读取 ComponentName_DrawCallIndexList.json（子网格名 -> drawcall 索引列表）。"""
         path = os.path.join(lod_dir, "ComponentName_DrawCallIndexList.json")
@@ -959,28 +1027,86 @@ class EFMISkeletonMergeHelper:
     ) -> tuple[bool, str]:
         """为 EFMI 工作空间的子网格生成并写回骨骼合并数据（幂等）。
 
+        多 LOD 语义（2026-08 实测定案）：LOD0 / LOD1 相互独立——各自对应独立的
+        FrameAnalysis dump 提取目录（Config/WorkPageTabs.json 的 tab 名即 LOD 名，
+        每个 tab 的 Config/Tabs/<tabid>.json 记录自己的 frameAnalysisFolderPath），
+        各自根据自己 dump 的数据生成统一顶点组。因此：
+        1. unique_str_list 按 LOD 前缀分组（无前缀归默认目录）；
+        2. 每组用**自己的 dump** 解析 log 并查找骨骼数据；
+        3. 每组**独立** build_vg_maps：vg_offsets 各自从 0 起，LOD 之间骨骼槽位
+           命名空间互不混用（导出端同样按 LOD 分组生成多套独立合并骨架配置）。
+
         返回 (是否成功, 描述)。
         """
         if not unique_str_list:
             return False, "没有子网格需要处理。"
 
-        frame_analysis_dir = cls.resolve_frame_analysis_dir(workspace_root)
-        if not frame_analysis_dir:
+        lod_map, default_dir = cls.resolve_frame_analysis_dirs_by_lod(workspace_root)
+        if not default_dir and not lod_map:
             return False, (
                 "未找到 FrameAnalysis 目录：请检查工作空间 "
                 f"{os.path.join(workspace_root, 'Config', 'FrameAnalysisPath.json')}"
             )
 
-        log_path = os.path.join(frame_analysis_dir, "log.txt")
-        if not os.path.isfile(log_path):
-            return False, f"FrameAnalysis 缺少 log.txt: {log_path}"
+        # 按 LOD 分组（同 LOD 内保持输入顺序）
+        groups: dict[str, list[str]] = {}
+        for unique_str in unique_str_list:
+            groups.setdefault(cls._parse_lod_name(unique_str), []).append(unique_str)
 
-        parser = EFMILogParser(log_path)
+        group_results: list[str] = []
+        total_written = 0
+        total_skipped = 0
+        for lod_name in sorted(groups.keys()):
+            group_list = groups[lod_name]
+            frame_analysis_dir = lod_map.get(lod_name) or default_dir
+            label = lod_name or "工作空间根目录"
+            if not frame_analysis_dir:
+                print(
+                    f"[EFMI骨骼合并] {label}: 无 FrameAnalysis 目录，"
+                    f"跳过 {len(group_list)} 个子网格"
+                )
+                continue
+            log_path = os.path.join(frame_analysis_dir, "log.txt")
+            if not os.path.isfile(log_path):
+                print(
+                    f"[EFMI骨骼合并] {label}: FrameAnalysis 缺少 log.txt: {log_path}"
+                )
+                continue
+            parser = EFMILogParser(log_path)
+            written, skipped, message = cls._ensure_skeleton_data_for_group(
+                workspace_root=workspace_root,
+                unique_str_list=group_list,
+                parser=parser,
+                force=force,
+            )
+            total_written += written
+            total_skipped += skipped
+            group_results.append(f"{label}: {message}")
+
+        if total_written == 0 and total_skipped == 0:
+            return False, "没有子网格成功生成骨骼数据。"
+        # 全部命中缓存（无新写入）也视为成功，与旧版单组语义一致
+        return (total_written > 0 or total_skipped > 0), "；".join(group_results)
+
+    @classmethod
+    def _ensure_skeleton_data_for_group(
+        cls,
+        workspace_root: str,
+        unique_str_list: list[str],
+        parser: EFMILogParser,
+        force: bool = False,
+    ) -> tuple[int, int, str]:
+        """为单个 LOD 组的子网格生成并写回骨骼合并数据（幂等）。
+
+        返回 (written, skipped, 描述消息)；vg_offsets 在该组内从 0 起分配，
+        与其它 LOD 组完全独立。
+        """
+        if not unique_str_list:
+            return 0, 0, "没有子网格需要处理。"
 
         # 收集每个子网格的信息
         submesh_skeletons: dict[str, tuple] = {}
         submesh_meta: dict[str, dict] = {}
-        submesh_json_paths: dict[str, str] = {}
         skipped = 0
 
         for unique_str in unique_str_list:
@@ -1089,14 +1215,13 @@ class EFMISkeletonMergeHelper:
                 "bare_name": bare_name,
                 "draw_index": drawcall_index_list[0],
             }
-            submesh_json_paths[unique_str] = json_path
 
         if not submesh_skeletons:
             if skipped > 0:
-                return True, f"全部 {skipped} 个子网格已有骨骼合并缓存（VGMap），无需重新生成。"
-            return False, "没有子网格成功生成骨骼数据。"
+                return 0, skipped, f"全部 {skipped} 个子网格已有骨骼合并缓存（VGMap），无需重新生成。"
+            return 0, 0, "没有子网格成功生成骨骼数据。"
 
-        # 跨子网格去重构建 vg_map（返回 vg_offsets，与去重同序分配，保证一致）
+        # 组内跨子网格去重构建 vg_map（组内从 0 起分配槽位，与其它 LOD 组互不影响）
         vg_maps, vg_offsets = EFMIBoneMapBuilder.build_vg_maps(submesh_skeletons)
 
         # 写回工作空间 json + 复制骨骼池缓存
@@ -1114,7 +1239,7 @@ class EFMISkeletonMergeHelper:
             if not vg_map:
                 continue
 
-            # VGOffset = 该子网格在全局骨架中的起始（取去重时分配的槽位，保证与 vg_map 一致）
+            # VGOffset = 该子网格在组内全局骨架中的起始（取去重时分配的槽位，保证与 vg_map 一致）
             vg_offset = vg_offsets.get(unique_str, 0)
 
             submesh_json["VGCount"] = vg_count
@@ -1141,7 +1266,7 @@ class EFMISkeletonMergeHelper:
             except Exception as e:
                 print(f"[EFMI骨骼合并] 写回 json 失败 {unique_str}: {e}")
 
-        return written > 0, (
+        return written, skipped, (
             f"已为 {written} 个子网格生成骨骼合并数据"
             + (f"（跳过已缓存 {skipped} 个）" if skipped else "")
         )
