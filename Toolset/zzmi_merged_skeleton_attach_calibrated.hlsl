@@ -36,9 +36,10 @@
 // - x1 = attach_offset（本部件 palette 在全局骨骼编号中的起始槽位）；
 // - y1 = attach_count（本部件骨骼数）。
 // 校准是恒等安全的：本组 attach 时 src == dst，C = 单位阵，退化为直拷。
-// cb1 捕获无效的帧（16B 垃圾小块/共享数组/未捕获）：保持该槽上一次的有效校准内容
-// 不覆写（抗"有效块↔垃圾"逐帧交替闪跳）；仅当槽位从未被有效写过（全零）时
-// 直拷兜底（避免启动期零矩阵塌原点）。
+// 兜底策略（宁可退化不错校准）：cb1 形态无效（未捕获/首帧/16B 垃圾小块）、
+// 或平移差 >2m（共享数组 0 号记录/别的实例的错误内容——同角色各组间合法差 <1m）、
+// 或总开关 $zz_ms_calibrate=0（A/B 隔离验证）时，一律直拷（跟随源件运动、
+// 常量空间差，不闪跳）。
 
 struct ZZBone3x4
 {
@@ -87,13 +88,6 @@ bool zz_cb1_valid(float4 r0, float4 r1, float4 r2, float4 r3)
     return true;
 }
 
-bool zz_bone_is_zero(ZZBone3x4 b)
-{
-    float4 ones = float4(1.0, 1.0, 1.0, 1.0);
-    float total = dot(abs(b.r0), ones) + dot(abs(b.r1), ones) + dot(abs(b.r2), ones);
-    return total < 1e-6;
-}
-
 [numthreads(64, 1, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID)
 {
@@ -107,17 +101,35 @@ void main(uint3 dispatch_id : SV_DispatchThreadID)
     ZZBone3x4 m = src_palette[bone_index];
     uint slot = (uint)ZZ_ATTACH_OFFSET + bone_index;
 
-    // cb1 任一方无效（未捕获/首帧/16B 垃圾小块/共享数组误入）->
-    // 保持上一次的校准内容（骨架资源是我方持久资源，跨帧保留）：
-    // 无效帧不覆写 = 不抖；仅当槽位还是全零（启动期从未有效校准过）才直拷兜底
-    if (!zz_cb1_valid(zz_cb1_src[0], zz_cb1_src[1], zz_cb1_src[2], zz_cb1_src[3])
-        || !zz_cb1_valid(zz_cb1_dst[0], zz_cb1_dst[1], zz_cb1_dst[2], zz_cb1_dst[3]))
+    // 校准总开关（A/B 隔离验证用；z1 = $zz_ms_calibrate）
+    bool calibrate_enabled = IniParams[1].z > 0.5;
+
+    // cb1 任一方形态无效（未捕获/首帧/16B 垃圾小块）-> 直拷兜底
+    bool src_ok = zz_cb1_valid(zz_cb1_src[0], zz_cb1_src[1], zz_cb1_src[2], zz_cb1_src[3]);
+    bool dst_ok = zz_cb1_valid(zz_cb1_dst[0], zz_cb1_dst[1], zz_cb1_dst[2], zz_cb1_dst[3]);
+    if (!calibrate_enabled || !src_ok || !dst_ok)
     {
-        if (zz_bone_is_zero(merged_skeleton[slot]))
-        {
-            merged_skeleton[slot] = m;  // 启动期兜底直拷（避免零矩阵塌原点）
-        }
-        return;  // 保持上一次校准内容（抗"有效块↔垃圾"逐帧交替导致的闪跳）
+        merged_skeleton[slot] = m;
+        return;
+    }
+
+    // 行向量旋转行（cb1 rows 0-2 的 xyz）；平移 = row 3 的 xyz
+    float3x3 Rs = float3x3(zz_cb1_src[0].xyz, zz_cb1_src[1].xyz, zz_cb1_src[2].xyz);
+    float3x3 Rd = float3x3(zz_cb1_dst[0].xyz, zz_cb1_dst[1].xyz, zz_cb1_dst[2].xyz);
+    float3 t_src = zz_cb1_src[3].xyz;
+    float3 t_dst = zz_cb1_dst[3].xyz;
+
+    // C = U_dst^-1 × U_src（刚体逆 R^-1 = R^T）：C_rot = Rd × Rs^T，C_t = Rd × (t_src - t_dst)
+    float3x3 c_rot = mul(Rd, transpose(Rs));
+    float3 c_t = mul(Rd, t_src - t_dst);
+
+    // 平移差钳制：同一角色各组间合法的对象空间差 <1m 量级（实测头↔体 ≈0.5m）；
+    // 超过 2m 必是共享数组 0 号记录/别的实例的错误内容 -> 直拷兜底（跟随源件运动、
+    // 常量空间差，不闪跳）。宁可退化不错校准。
+    if (length(t_src - t_dst) > 2.0)
+    {
+        merged_skeleton[slot] = m;
+        return;
     }
 
     // 行向量旋转行（cb1 rows 0-2 的 xyz）；平移 = row 3 的 xyz

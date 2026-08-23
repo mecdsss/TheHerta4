@@ -360,6 +360,7 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         text = "\n".join(builder.sections[0].SectionLineList)
 
         self.assertIn("global $zz_ms_initialized = 0", text)
+        self.assertIn("global $zz_ms_calibrate = 1", text)
         self.assertIn("[ResourceZZMergedSkeleton_G0]", text)
         self.assertIn("type = RWStructuredBuffer", text)
         self.assertIn("stride = 48", text)
@@ -377,6 +378,7 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("cs = ./res/zzmi_merged_skeleton_attach_calibrated.hlsl", text)
         self.assertIn("x1 = $zz_ms_attach_offset", text)
         self.assertIn("y1 = $zz_ms_attach_count", text)
+        self.assertIn("z1 = $zz_ms_calibrate", text)
         self.assertIn("cs-u0 = ref ResourceZZMergedSkeleton_G0", text)
         self.assertIn("Dispatch = 8, 1, 1", text)
         self.assertNotIn("cs-t1 = ref", text)

@@ -69,12 +69,20 @@ def load_cb1_transform(floats16):
     return m[:3, :3], m[3, :3]
 
 
-def calibrate_bone(bone12, cb1_src16, cb1_dst16):
-    """HLSL main() 的镜像：返回校准后骨骼 (3,4) 或直拷（cb1 无效时）。"""
+def calibrate_bone(bone12, cb1_src16, cb1_dst16, calibrate_enabled=True, clamp=2.0):
+    """HLSL main() 的镜像：返回校准后骨骼 (3,4) 或直拷（开关关闭/形态无效/平移差超钳制）。
+
+    兜底层级（与 calibrated hlsl 一致）：总开关关闭 -> 直拷；cb1 形态无效 -> 直拷；
+    |t_src - t_dst| > clamp（2m，同角色合法组间差 <1m，共享数组/跨实例内容动辄数米）-> 直拷。
+    """
+    if not calibrate_enabled:
+        return numpy.asarray(bone12, dtype=numpy.float64).reshape(3, 4)
     rs, t_src = load_cb1_transform(cb1_src16)
     rd, t_dst = load_cb1_transform(cb1_dst16)
-    # HLSL 守卫：row3.w == 1（reshape 后 [3,3] 是 w 列…… 注意原 buf 的 w 在 row3[3]）
+    # HLSL 守卫：row3.w == 1（buf 中 row3 = [t, w]，w 在 flat[15]）
     if abs(cb1_src16[15] - 1.0) > 1e-3 or abs(cb1_dst16[15] - 1.0) > 1e-3:
+        return numpy.asarray(bone12, dtype=numpy.float64).reshape(3, 4)
+    if numpy.linalg.norm(t_src - t_dst) > clamp:
         return numpy.asarray(bone12, dtype=numpy.float64).reshape(3, 4)
     c_rot = rd @ rs.T          # Rd × Rs^T
     c_t = rd @ (t_src - t_dst)  # Rd × (t_src - t_dst)
@@ -153,6 +161,34 @@ class CalibrateMathSyntheticTests(unittest.TestCase):
         zero_cb1 = numpy.zeros(16)  # row3.w = 0 -> 无效
         out = calibrate_bone(bone12, zero_cb1, zero_cb1)
         numpy.testing.assert_array_equal(out, bone12.reshape(3, 4))
+
+    def test_calibrate_switch_off_is_direct_copy(self):
+        """总开关关闭 -> 全部直拷（= 分组版行为，A/B 隔离验证用）。"""
+        rng = numpy.random.default_rng(3)
+        rs, ts = self._random_rigid(rng)
+        rd, td = self._random_rigid(rng)
+        cb1_src = self._pack_cb1(rs, ts)
+        cb1_dst = self._pack_cb1(rd, td)
+        bone12 = rng.normal(size=12)
+        out = calibrate_bone(bone12, cb1_src, cb1_dst, calibrate_enabled=False)
+        numpy.testing.assert_array_equal(out, bone12.reshape(3, 4))
+
+    def test_far_transform_clamp_falls_back_to_direct_copy(self):
+        """平移差 >2m（共享数组 0 号记录/别的实例的错误内容）-> 直拷，不错校准。"""
+        rng = numpy.random.default_rng(5)
+        rs, ts = self._random_rigid(rng)
+        rd, td = self._random_rigid(rng)
+        td_far = td + numpy.array([10.0, 0.0, 0.0])  # 相距 10m
+        cb1_src = self._pack_cb1(rs, ts)
+        cb1_dst_far = self._pack_cb1(rd, td_far)
+        bone12 = rng.normal(size=12)
+        out = calibrate_bone(bone12, cb1_src, cb1_dst_far)
+        numpy.testing.assert_array_equal(out, bone12.reshape(3, 4))
+        # 同数据但近距离（0.5m，合法组间差量级）-> 正常校准（结果与直拷不同）
+        td_near = td + numpy.array([0.5, 0.0, 0.0])
+        cb1_dst_near = self._pack_cb1(rd, td_near)
+        out2 = calibrate_bone(bone12, cb1_src, cb1_dst_near)
+        self.assertFalse(numpy.allclose(out2, bone12.reshape(3, 4), atol=1e-6))
 
 
 @unittest.skipUnless(HAVE_DUMP, "提取数据不在本机")

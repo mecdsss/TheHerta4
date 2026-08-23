@@ -598,6 +598,8 @@ class ExportZZMI(ExportUnity):
         section.append("global $zz_ms_initialized = 0")
         section.append("global $zz_ms_attach_offset = 0")
         section.append("global $zz_ms_attach_count = 0")
+        # 校准总开关（A/B 隔离验证：0 = 全部直拷=分组版行为，1 = 外来骨骼校准乘）
+        section.append("global $zz_ms_calibrate = 1")
         section.new_line()
 
         groups = self._merged_skeleton_groups()
@@ -662,6 +664,7 @@ class ExportZZMI(ExportUnity):
                 section.append("cs = ./res/zzmi_merged_skeleton_attach_calibrated.hlsl")
                 section.append("x1 = $zz_ms_attach_offset")
                 section.append("y1 = $zz_ms_attach_count")
+                section.append("z1 = $zz_ms_calibrate")
                 section.append(f"cs-t0 = ref ResourceZZPalette_{component['draw_ib']}")
                 if own_group in group_cb1_source:
                     section.append(f"cs-cb1 = ref ResourceZZCb1_G{own_group}")
