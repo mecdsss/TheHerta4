@@ -48,7 +48,11 @@ _INSTANCE_CONFIG_BONE_OFFSET_ROW = 5
 # 其后的"多维度投票"判据（几何维度可推翻矩阵不一致）经"测试"工作空间 08-10 dump
 # 实测产生 42 组矩阵不可兼容的误并（195 组中），已废止并回到分层判据。
 # 再遇误判先查数据一致性（清除 VGMap 缓存重导），再考虑关开关。
-_DEDUP_ENABLED = True
+# 2026-08-25：应用户要求【临时整体关闭】——用户将手动标注哪些顶点组应当合并，
+# 之后据标注列表反推/拟合判据算法。关闭期间 build_vg_maps 退化为恒等映射
+# （每根骨骼独占全局槽位，local -> vg_offset + local），下方分层判据代码保留不执行。
+# 手动标注完成后须基于结果重推判据再恢复 True；切换前后务必「清除骨骼合并VGMap缓存」再重导。
+_DEDUP_ENABLED = False
 
 
 class EFMILogParser:
@@ -592,8 +596,8 @@ class EFMIBoneMapBuilder:
     ) -> tuple[dict[str, dict], dict[str, int]]:
         """跨子网格"矩阵硬门控 + 质心确认"去重构建 vg_map（同部件不去重）。
 
-        总开关 _DEDUP_ENABLED（当前 True，去重生效）；置 False 时退化为
-        恒等映射（local → vg_offset + local），下方并查集逻辑不执行。
+        总开关 _DEDUP_ENABLED（当前 False：临时整体关闭，等手动标注结果反推判据）；
+        置 False 时退化为恒等映射（local → vg_offset + local），下方并查集逻辑不执行。
 
         参数:
             unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts[, signatures])
@@ -675,6 +679,10 @@ class EFMIBoneMapBuilder:
         if not _DEDUP_ENABLED:
             # 恒等映射：每根骨骼独占全局槽位（候选收集阶段已按
             # global_vg_id = vg_offset + local_vg_id 分配），不做任何合并。
+            print(
+                f"[EFMI骨骼合并] 顶点组去重已全局关闭（_DEDUP_ENABLED=False），"
+                f"{n} 根骨骼全部独占槽位（恒等映射，无任何合并）。"
+            )
             identity_maps: dict[str, dict] = {}
             for cand in candidates:
                 identity_maps.setdefault(cand["unique_str"], {})[

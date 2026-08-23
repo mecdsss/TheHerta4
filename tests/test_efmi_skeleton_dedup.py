@@ -73,6 +73,15 @@ def _entry(bones, sigs=None, weighted=None):
 
 
 class DedupGateTests(unittest.TestCase):
+    def setUp(self):
+        # 模块默认当前为临时整体关闭（用户手动标注顶点组合并期间，见 efmi_skeleton.py
+        # _DEDUP_ENABLED 注释）；本类的判据行为用例显式打开开关，锚定算法行为本身。
+        self._old_dedup_enabled = _efmi._DEDUP_ENABLED
+        _efmi._DEDUP_ENABLED = True
+
+    def tearDown(self):
+        _efmi._DEDUP_ENABLED = self._old_dedup_enabled
+
     def test_matrix_mismatch_never_merges_despite_geometry(self):
         """回归（误并核心）：矩阵完全不同（diff=0.2）+ 几何三维度全贴近 -> 绝不合并。
 
