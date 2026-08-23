@@ -3,10 +3,13 @@
 '''
 import bpy
 import os
+import shutil
 
 from ..common.global_config import GlobalConfig
 from ..common.global_properties import GlobalProterties
 from ..common.logic_name import LogicName
+from ..common.object_prefix_helper import ObjectPrefixHelper
+from ..common.workspace_helper import WorkSpaceHelper
 from ..blueprint.export_helper import BlueprintExportHelper
 
 from ..utils.translate_utils import TR
@@ -107,6 +110,89 @@ class SSMT_OT_ClearMergedSkeletonCache(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
+    """基于当前场景剩余的 IB，删除工作空间中未使用 IB 的文件夹。
+
+    全量提取会在工作空间生成大量无关的 IB 子网格文件夹；用户导入后手动清理
+    （例如 30 个只留 10 个），但工作空间里那 20 个文件夹仍在，下次一键导入会
+    再次全部导入。本算子以当前场景对象（3DMigoto:WorkspaceUniqueStr）为准，
+    找出工作空间里未被场景引用的 IB 文件夹并直接删除，删除后一键导入即不再
+    导入这些 IB。支持多 LOD：按 LOD 前缀精确匹配（LOD0/xxx 只被 LOD0.xxx 保留）。
+    """
+    bl_idname = "ssmt.cleanup_unused_ib"
+    bl_label = "清理未使用IB文件夹"
+    bl_description = (
+        "以当前场景中剩余的 IB（子网格对象）为准，删除工作空间中其余未使用 IB 的文件夹；"
+        "支持多 LOD（按 LOD 前缀匹配），删除后再次一键导入不会导入已删除的 IB"
+    )
+    bl_options = {'REGISTER'}
+
+    def _collect_kept_lod_bare_pairs(self, context) -> set[tuple[str, str]]:
+        kept_pairs = set()
+        for obj in context.scene.objects:
+            unique_str = str(obj.get("3DMigoto:WorkspaceUniqueStr", "") or "").strip()
+            if unique_str:
+                lod_name, bare_name = WorkSpaceHelper.parse_lod_unique_str(unique_str)
+            else:
+                # 兜底：无标记的对象（如 FMT 原始导入）按名称解析前缀
+                prefix_info = ObjectPrefixHelper.extract_prefix_info(getattr(obj, "name", ""))
+                if not prefix_info:
+                    continue
+                prefix_parts = ObjectPrefixHelper.parse_prefix_parts(prefix_info[0])
+                lod_name = prefix_parts.get("lod_name", "")
+                bare_name = prefix_parts.get("bare_unique_str", "")
+            bare_name = str(bare_name or "").strip()
+            if not bare_name:
+                continue
+            kept_pairs.add((str(lod_name or "").upper(), bare_name))
+        return kept_pairs
+
+    def _compute_targets(self, context):
+        workspace_root = GlobalConfig.path_workspace_folder()
+        if not workspace_root or not os.path.isdir(workspace_root):
+            return [], 0
+        kept_pairs = self._collect_kept_lod_bare_pairs(context)
+        targets = WorkSpaceHelper.get_unwanted_submesh_folder_list(kept_pairs)
+        return targets, len(kept_pairs)
+
+    def invoke(self, context, event):
+        targets, _kept_count = self._compute_targets(context)
+        self._targets = targets
+        if not targets:
+            self.report({'INFO'}, "当前场景已包含工作空间中的全部 IB，无需清理")
+            return {'FINISHED'}
+        return context.window_manager.invoke_confirm(self, event)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text=f"将删除 {len(self._targets)} 个未使用的 IB 文件夹：")
+        box = layout.box()
+        for folder_path in self._targets[:10]:
+            box.label(text="· " + os.path.basename(folder_path))
+        if len(self._targets) > 10:
+            box.label(text=f"… 等共 {len(self._targets)} 个")
+        layout.label(text="删除后再次一键导入将不再导入这些 IB", icon='INFO')
+
+    def execute(self, context):
+        targets = getattr(self, "_targets", None)
+        if not targets:
+            targets, _kept_count = self._compute_targets(context)
+            self._targets = targets
+        deleted_count = 0
+        for folder_path in targets:
+            try:
+                shutil.rmtree(folder_path)
+                deleted_count += 1
+            except Exception as e:
+                print(f"[IB清理] 删除失败: {folder_path}，错误: {e}")
+                self.report({'WARNING'}, f"删除失败 {os.path.basename(folder_path)}")
+        print(f"[IB清理] 已按当前场景清理 {deleted_count}/{len(targets)} 个未使用 IB 文件夹")
+        for folder_path in targets:
+            print(f"[IB清理] 已删除: {folder_path}")
+        self.report({'INFO'}, f"已删除 {deleted_count} 个未使用的 IB 文件夹")
+        return {'FINISHED'}
+
+
 class PanelBasicInformation(bpy.types.Panel):
     bl_label = "基础信息"
     bl_idname = "VIEW3D_PT_SSMT4_Basic_Information"
@@ -174,6 +260,9 @@ class PanelBasicInformation(bpy.types.Panel):
             icon='IMAGE_ALPHA',
             depress=GlobalProterties.ignore_texture_alpha(),
         )
+
+        # 基于当前场景剩余的 IB，删除工作空间中未使用 IB 的文件夹
+        layout.operator(SSMT_OT_CleanupUnusedIB.bl_idname, text="清理未使用IB文件夹", icon='TRASH')
 
         workspace_box = layout.box()
         workspace_box.label(text="工作空间来源", icon='FILE_FOLDER')
@@ -333,11 +422,13 @@ def register():
     bpy.utils.register_class(SSMT_OT_ToggleUseNormalMap)
     bpy.utils.register_class(SSMT_OT_ToggleIgnoreTextureAlpha)
     bpy.utils.register_class(SSMT_OT_ClearMergedSkeletonCache)
+    bpy.utils.register_class(SSMT_OT_CleanupUnusedIB)
     bpy.utils.register_class(PanelBasicInformation)
 
 
 def unregister():
     bpy.utils.unregister_class(PanelBasicInformation)
+    bpy.utils.unregister_class(SSMT_OT_CleanupUnusedIB)
     bpy.utils.unregister_class(SSMT_OT_ClearMergedSkeletonCache)
     bpy.utils.unregister_class(SSMT_OT_ToggleIgnoreTextureAlpha)
     bpy.utils.unregister_class(SSMT_OT_ToggleUseNormalMap)

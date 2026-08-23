@@ -209,6 +209,82 @@ class WorkSpaceHelper:
         return WorkSpaceHelper._get_submesh_folderpath_list_from(GlobalConfig.path_workspace_folder())
 
     @staticmethod
+    def get_submesh_folder_records() -> List[Dict[str, str]]:
+        """枚举当前工作空间中所有子网格文件夹及其导入身份键（lod_name + bare_name）。
+
+        枚举范围与一键导入（ui_func_import_ssmt._build_workspace_import_targets）完全一致：
+        - 工作空间根目录直接含子网格文件夹时，只扫根目录；
+        - 根目录按分区组织（子目录含 Config.json）时，扫各分区（含分区内 LOD 子目录）。
+
+        每个记录的身份键与导入对象上的 3DMigoto:WorkspaceUniqueStr 解析结果一致，
+        支持多 LOD 前缀：`LOD0/xxx-1-0` -> lod_name="LOD0"，根目录 `xxx-1-0` -> lod_name=""。
+        """
+        records: List[Dict[str, str]] = []
+        workspace_folder = GlobalConfig.path_workspace_folder()
+        base_paths = WorkSpaceHelper.get_workspace_partition_folderpath_list()
+        if not base_paths:
+            if not workspace_folder or not os.path.isdir(workspace_folder):
+                return records
+            base_paths = [workspace_folder]
+
+        seen_paths = set()
+        for base_path in base_paths:
+            for lod_folder_path in WorkSpaceHelper.get_lod_folderpath_list(base_path):
+                lod_name = os.path.basename(lod_folder_path)
+                for submesh_folder_path in WorkSpaceHelper._get_submesh_folderpath_list_from(lod_folder_path):
+                    if submesh_folder_path in seen_paths:
+                        continue
+                    seen_paths.add(submesh_folder_path)
+                    submesh_folder_name = os.path.basename(submesh_folder_path)
+                    identity_str = WorkSpaceHelper._compose_lod_name(lod_name, submesh_folder_name)
+                    parsed_lod_name, bare_name = WorkSpaceHelper.parse_lod_unique_str(identity_str)
+                    records.append(
+                        {
+                            "folder_path": submesh_folder_path,
+                            "lod_name": parsed_lod_name.upper(),
+                            "bare_name": bare_name,
+                        }
+                    )
+
+            for submesh_folder_path in WorkSpaceHelper._get_submesh_folderpath_list_from(base_path):
+                if submesh_folder_path in seen_paths:
+                    continue
+                seen_paths.add(submesh_folder_path)
+                submesh_folder_name = os.path.basename(submesh_folder_path)
+                parsed_lod_name, bare_name = WorkSpaceHelper.parse_lod_unique_str(submesh_folder_name)
+                records.append(
+                    {
+                        "folder_path": submesh_folder_path,
+                        "lod_name": parsed_lod_name.upper(),
+                        "bare_name": bare_name,
+                    }
+                )
+
+        return records
+
+    @staticmethod
+    def get_unwanted_submesh_folder_list(kept_lod_bare_pairs: set[tuple[str, str]]) -> List[str]:
+        """返回工作空间中不在 kept 保留集合内的子网格文件夹路径列表（按文件夹名排序）。
+
+        kept_lod_bare_pairs：当前场景对象保留下来的 (lod_name, bare_name) 身份键集合，
+        例如 {("LOD0", "aaaabbbb-100-0"), ("", "ccccdddd-200-0")}。
+
+        匹配按 LOD 前缀精确查找：`LOD0/aaaabbbb-100-0` 只会被 ("LOD0", "aaaabbbb-100-0")
+        保留，不会被裸 ("", "aaaabbbb-100-0") 或 ("LOD1", "aaaabbbb-100-0") 保留，
+        避免跨 LOD 误留/误删。调用方可用这些路径直接删除文件夹（shutil.rmtree）。
+        """
+        kept_keys = {
+            (str(lod_name or "").upper().strip(), str(bare_name or "").strip())
+            for lod_name, bare_name in (kept_lod_bare_pairs or set())
+        }
+        unwanted_list = []
+        for record in WorkSpaceHelper.get_submesh_folder_records():
+            if (record["lod_name"], record["bare_name"]) not in kept_keys:
+                unwanted_list.append(record["folder_path"])
+        unwanted_list.sort(key=lambda path: (os.path.basename(path).casefold(), path.casefold()))
+        return unwanted_list
+
+    @staticmethod
     def get_drawib_tabname_dict() -> Dict[str, str]:
         drawib_tabname_dict = {}
 
