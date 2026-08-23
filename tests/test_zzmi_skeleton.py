@@ -352,6 +352,59 @@ class TestZZMISkeletonMergeHelper(unittest.TestCase):
         g_top = jsons["LOD0.64d7d56f-900-0"]["VGMap"]["0"]
         self.assertNotEqual(g_top, g_face_band)
 
+        # 骨架分组（渲染 cb1 对象变换 1:1 配对）：实测 5 组
+        # 身体组 {a23aa8a3, b20f90ea, b30db54e}、头部组 {454ff522, 48625d6d, 64d7d56f, b51bdd59}、
+        # 头发 84618ee0 独立、19086112 独立、{add6ff13, d892c658} 共享同一对象空间
+        group_of = {}
+        for unique_str, _json_path, submesh_json in _list_submesh_jsons(self.tmp):
+            draw_ib = unique_str.split(".", 1)[-1].split("-")[0]
+            self.assertIn("SkeletonGroup", submesh_json, unique_str)
+            group_of[draw_ib] = submesh_json["SkeletonGroup"]
+
+        body = {"a23aa8a3", "b20f90ea", "b30db54e"}
+        head = {"454ff522", "48625d6d", "64d7d56f", "b51bdd59"}
+        self.assertEqual(len({group_of[d] for d in body}), 1)
+        self.assertEqual(len({group_of[d] for d in head}), 1)
+        self.assertEqual(len(set(group_of.values())), 5)
+        self.assertNotEqual(group_of["a23aa8a3"], group_of["454ff522"])
+        self.assertNotEqual(group_of["84618ee0"], group_of["a23aa8a3"])
+        self.assertNotEqual(group_of["19086112"], group_of["a23aa8a3"])
+        # add6ff13 与 d892c658 共享同一对象空间（实测同一 cb1 变换）-> 同组
+        self.assertEqual(group_of["add6ff13"], group_of["d892c658"])
+        self.assertNotEqual(group_of["add6ff13"], group_of["a23aa8a3"])
+        # 同组判定的刚性门控拆分不改变分组：头顶件与头部组同组（同空间，仅锚点不同）
+        self.assertEqual(group_of["64d7d56f"], group_of["454ff522"])
+
+        # 校准版全局骨骼编号（组基址拼接；组序按组内最小 draw_ib）：
+        # G0={19086112}(7) base 0 / G1=头部(23) base 7 / G2={84618ee0}(49) base 30 /
+        # G3=身体(170) base 79 / G4={add6ff13,d892c658}(17) base 249
+        jsons_by_ib = {u.split(".", 1)[-1].split("-")[0]: j for u, _p, j in _list_submesh_jsons(self.tmp)}
+        expected_offsets = {
+            "19086112": 0,
+            "454ff522": 7, "48625d6d": 8, "64d7d56f": 18, "b51bdd59": 19,
+            "84618ee0": 30,
+            "a23aa8a3": 79, "b20f90ea": 184, "b30db54e": 235,
+            "add6ff13": 249, "d892c658": 250,
+        }
+        for draw_ib, expected_offset in expected_offsets.items():
+            self.assertEqual(jsons_by_ib[draw_ib]["VGOffset"], expected_offset, draw_ib)
+
+        # 每组 cb1 捕获源部件（校准用）：其帧内最后一个渲染 draw 的 vs-cb1 是逐部件块
+        # 才合格（捕获段按 DrawIB 触发、last-wins 覆盖生效，最后一击是共享变换数组的
+        # 部件宁可不捕获——19086112 的最后一个 draw（229）绑 2048B 数组，故无捕获源，
+        # 其组 attach 直拷兜底：本组直拷本组骨骼无需校准，外来写入才会受影响）
+        expected_cb1_source = {
+            "19086112": "",
+            "454ff522": "48625d6d", "48625d6d": "48625d6d", "64d7d56f": "48625d6d", "b51bdd59": "48625d6d",
+            "84618ee0": "84618ee0",
+            "a23aa8a3": "a23aa8a3", "b20f90ea": "a23aa8a3", "b30db54e": "a23aa8a3",
+            "add6ff13": "add6ff13", "d892c658": "add6ff13",
+        }
+        for draw_ib, expected_source in expected_cb1_source.items():
+            self.assertEqual(
+                jsons_by_ib[draw_ib].get("SkeletonGroupCb1SourceIb", ""), expected_source, draw_ib
+            )
+
     def test_idempotent_second_run_skips(self):
         unique_str_list = self._unique_str_list()
         ok1, _ = ZZMISkeletonMergeHelper.ensure_skeleton_data(self.tmp, unique_str_list)

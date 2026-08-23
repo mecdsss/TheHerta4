@@ -59,6 +59,52 @@ def _extract_gametype_name(import_folder_path: str) -> str:
     return normalized[index + len(marker):].strip("/").strip()
 
 
+# 骨架组合集的轮换颜色（COLOR_01~08 轮换，便于在大纲视图区分不同组；
+# 直接用字符串字面量而非 CollectionColor 枚举——测试环境 stub 没有完整枚举值）
+_SKELETON_GROUP_COLORS = [
+    "COLOR_02", "COLOR_04", "COLOR_06", "COLOR_03",
+    "COLOR_07", "COLOR_08", "COLOR_05", "COLOR_01",
+]
+
+
+def _zzmi_move_to_skeleton_group_collection(obj, import_key: str, parent_collection) -> None:
+    """ZZMI 分组版骨骼合并：把导入对象移入其骨架组合集（SkeletonGroup_<N>）。
+
+    合集挂在该对象的父合集（LOD 合集）下；对象从原合集移出、链接进组集合。
+    仅在子网格 json 已有 SkeletonGroup 字段（ensure_skeleton_data 分组版写回）时生效；
+    无字段（旧缓存/未生成）保持原合集归属不变。失败不影响导入。
+    """
+    from ..common.zzmi_skeleton import ZZMISkeletonMergeHelper
+
+    workspace_root = GlobalConfig.path_workspace_folder()
+    json_path = ZZMISkeletonMergeHelper._resolve_submesh_json_path(workspace_root, import_key)
+    if not json_path:
+        return
+    submesh_json = JsonUtils.LoadFromFile(json_path)
+    if not isinstance(submesh_json, dict):
+        return
+    skeleton_group = submesh_json.get("SkeletonGroup")
+    if skeleton_group is None:
+        return
+    try:
+        skeleton_group = int(skeleton_group)
+    except (TypeError, ValueError):
+        return
+
+    collection_name = f"SkeletonGroup_{skeleton_group}"
+    group_collection = parent_collection.children.get(collection_name)
+    if group_collection is None:
+        group_collection = CollectionUtils.create_new_collection(
+            collection_name=collection_name,
+            color_tag=_SKELETON_GROUP_COLORS[skeleton_group % len(_SKELETON_GROUP_COLORS)],
+        )
+        parent_collection.children.link(group_collection)
+
+    for coll in list(obj.users_collection):
+        coll.objects.unlink(obj)
+    group_collection.objects.link(obj)
+
+
 def _build_workspace_import_targets(workspace_collection):
     """构建工作空间中所有可导入子模型的迭代器，每个条目包含路径、显示名等信息"""
     partition_folder_paths = WorkSpaceHelper.get_workspace_partition_folderpath_list()
@@ -269,6 +315,17 @@ def ImprotFromWorkSpaceFull(self, context):
 
                 imported_obj.name = display_name
                 imported_obj.data.name = imported_obj.name
+                if is_zzmi_merged:
+                    # 分组版骨骼合并：导入对象按 json SkeletonGroup 归入对应骨架组合集，
+                    # 让"同一对象空间的部件"在大纲视图里聚在一起（跨组不共享骨架）。
+                    try:
+                        _zzmi_move_to_skeleton_group_collection(
+                            imported_obj,
+                            target["import_key"],
+                            target["import_collection"],
+                        )
+                    except Exception as e:
+                        print(f"[ZZMI骨骼合并] 分组合集归组失败（不影响导入）: {e}")
                 imported_objects.append(imported_obj)
                 foldername_gametypename_dict[target["import_key"]] = gametype_name
                 import_records.append(

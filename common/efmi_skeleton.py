@@ -1140,11 +1140,12 @@ class EFMISkeletonMergeHelper:
 
     @classmethod
     def clear_vgmap_cache(cls, workspace_root: str) -> tuple[int, int]:
-        """删除工作空间内所有子网格 json 的 VGMap/VGOffset/VGCount 缓存键。
+        """删除工作空间内所有子网格 json 的 VGMap/VGOffset/VGCount/SkeletonGroup 缓存键。
 
         用途：去重策略变更（或去重关闭）后，旧策略写回的 VGMap 会被
         ensure_skeleton_data 的幂等检查跳过而一直残留；清掉后下次导入
-        即按当前策略重新生成。
+        即按当前策略重新生成。SkeletonGroup 是 ZZMI 分组版字段（EFMI json 没有，
+        一并列出无副作用）。
         ModImpRuntime/*-BoneMatrix.buf 与 BoneMatrixFileName 不删：
         那是原始骨骼池拷贝，与去重策略无关，重新生成时会复用/覆写同名文件。
 
@@ -1169,7 +1170,7 @@ class EFMISkeletonMergeHelper:
                     continue
                 if not isinstance(payload, dict) or "VGMap" not in payload:
                     continue
-                for key in ("VGMap", "VGOffset", "VGCount"):
+                for key in ("VGMap", "VGOffset", "VGCount", "SkeletonGroup"):
                     payload.pop(key, None)
                 try:
                     JsonUtils.SaveToFile(filepath=path, json_dict=payload)

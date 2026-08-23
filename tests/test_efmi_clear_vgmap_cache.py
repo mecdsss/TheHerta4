@@ -54,13 +54,14 @@ class ClearVgmapCacheTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
 
-        # 子网格 json（含完整三键 + 其他无关键）
+        # 子网格 json（含完整三键 + 分组键 + 其他无关键）
         self.submesh_a = self.root / "aaaabbbb-100-0" / "TYPE_GPU-EFMI" / "aaaabbbb-100-0.json"
         _write_json(self.submesh_a, {
             "DrawIB": "aaaabbbb",
             "VGMap": {"0": 0, "1": 5},
             "VGOffset": 0,
             "VGCount": 2,
+            "SkeletonGroup": 1,
             "BoneMatrixFileName": "aaaabbbb-100-0-BoneMatrix.buf",
         })
 
@@ -96,6 +97,8 @@ class ClearVgmapCacheTests(unittest.TestCase):
         self.assertNotIn("VGMap", data_a)
         self.assertNotIn("VGOffset", data_a)
         self.assertNotIn("VGCount", data_a)
+        # ZZMI 分组版的 SkeletonGroup 一并清除（EFMI json 无此键，幂等无副作用）
+        self.assertNotIn("SkeletonGroup", data_a)
         # 无关键保留（BoneMatrixFileName 指向原始骨骼池拷贝，与去重策略无关，不删）
         self.assertEqual(data_a["DrawIB"], "aaaabbbb")
         self.assertEqual(data_a["BoneMatrixFileName"], "aaaabbbb-100-0-BoneMatrix.buf")

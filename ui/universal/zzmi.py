@@ -184,6 +184,7 @@ class ExportZZMI(ExportUnity):
         """判定整个缺席的 DrawIB 是否被合并进了其它对象。
 
         判据（用户定义）：该 DrawIB VGMap 的全局骨骼 id 有被现存对象顶点引用（权重>0）。
+        （校准版为全局骨骼命名空间，跨组引用合法，故按全局集合比对。）
         """
         vg_values = self._load_drawib_vg_values(draw_ib, workspace_root)
         if not vg_values:
@@ -251,11 +252,13 @@ class ExportZZMI(ExportUnity):
         self._zzmi_stub_object_names = []
 
     def _collect_merged_skeleton_components(self):
-        """收集 ZZMI 合并骨架组件信息（按 DrawIB 去重，vg_offset 排序）。
+        """收集 ZZMI 合并骨架组件信息（按 DrawIB 去重，骨架组+vg_offset 排序）。
 
         双条件门控：复选框 import_merged_vgmap 开启 且 子网格 json 已由反查写回
         VGCount > 0（common/zzmi_skeleton.py 的 ensure_skeleton_data）。
         同 DrawIB 的拆分子网格共享同一 palette/偏移，只取第一个有效值。
+        skeleton_group：渲染 cb1 对象变换分组号（json SkeletonGroup 字段），
+        每组一套 ResourceZZMergedSkeleton_G<N>，跨组绝不共享。
         返回 (components, {draw_ib: component_id})。
         """
         components = []
@@ -269,9 +272,13 @@ class ExportZZMI(ExportUnity):
                         "draw_ib": drawib_model.draw_ib,
                         "vg_offset": int(getattr(submesh_model, "vg_offset", 0) or 0),
                         "vg_count": vg_count,
+                        "skeleton_group": int(getattr(submesh_model, "skeleton_group", 0) or 0),
+                        "cb1_source_ib": str(
+                            getattr(submesh_model, "skeleton_group_cb1_source_ib", "") or ""
+                        ),
                     })
                     break
-        components.sort(key=lambda c: (c["vg_offset"], c["draw_ib"]))
+        components.sort(key=lambda c: (c["skeleton_group"], c["vg_offset"], c["draw_ib"]))
         component_id_dict = {c["draw_ib"]: i for i, c in enumerate(components)}
         return components, component_id_dict
 
@@ -526,19 +533,31 @@ class ExportZZMI(ExportUnity):
             draw_category_name = d3d11_game_type.CategoryDrawCategoryDict.get("Blend", None)
             if draw_category_name is not None and category_name == draw_category_name:
                 # ZZMI 骨骼合并（统一上一帧骨架）：先把当帧 palette 保存到 cs-t0，
-                # 再把 vs-t0 换绑为合并骨架（上一帧完整版本，帧内全部件一致），
-                # draw 之后再 attach 本段 palette（供下一帧使用）。
+                # 再把 vs-t0 换绑为**本部件所属骨架组**的合并骨架（palette 与渲染 cb1
+                # 逐物体 1:1 配对；组内上一帧完整版本、帧内一致），
+                # draw 之后对**每个骨架组**各跑一次校准 attach：
+                # 本组直拷、外来组经 cb1 校准乘写入（供下一帧使用）。
                 merged_component = self.merged_skeleton_component_id_dict.get(draw_ib)
-                if merged_component is not None:
+                component = (
+                    self.merged_skeleton_components[merged_component]
+                    if merged_component is not None else None
+                )
+                if component is not None:
+                    skeleton_group = component["skeleton_group"]
                     texture_override_vb_section.append("cs-t0 = vs-t0")
-                    texture_override_vb_section.append("vs-t0 = ResourceZZMergedSkeleton")
+                    texture_override_vb_section.append(
+                        f"vs-t0 = ResourceZZMergedSkeleton_G{skeleton_group}"
+                    )
                 texture_override_vb_section.append("handling = skip")
                 texture_override_vb_section.append("draw = " + str(drawib_model.draw_number) + ", 0")
-                if merged_component is not None:
-                    component = self.merged_skeleton_components[merged_component]
+                if component is not None:
                     texture_override_vb_section.append("$zz_ms_attach_offset = " + str(component["vg_offset"]))
                     texture_override_vb_section.append("$zz_ms_attach_count = " + str(component["vg_count"]))
-                    texture_override_vb_section.append("run = CustomShaderZZMIMergedSkeletonAttach")
+                    for group_index in self._merged_skeleton_groups():
+                        texture_override_vb_section.append(
+                            "run = CustomShaderZZMIMergedSkeletonAttach"
+                            f"_C{merged_component}_G{group_index}"
+                        )
                     texture_override_vb_section.append("cs-t0 = null")
                 for so0_source_resource_name in so0_source_resource_names:
                     texture_override_vb_section.append(so0_source_resource_name + " = ref so0")
@@ -553,23 +572,26 @@ class ExportZZMI(ExportUnity):
 
         ini_builder.append_section(texture_override_vb_section)
 
+    def _merged_skeleton_groups(self) -> list[int]:
+        """当前导出组件涉及的骨架组列表（升序）。"""
+        return sorted({c["skeleton_group"] for c in self.merged_skeleton_components})
+
     def add_merged_skeleton_sections(self, ini_builder: M_IniBuilder):
-        """生成 ZZMI 合并骨架段（按 ZZZ 数据布局从零编写，仅借鉴 EFMI 概念）。
+        """生成 ZZMI 合并骨架段（校准版：全局骨骼命名空间 + 逐组校准骨架）。
 
-        内容：
-        - [Constants]：$zz_ms_initialized / $zz_ms_attach_offset / $zz_ms_attach_count；
-        - [ResourceZZMergedSkeleton]：RWStructuredBuffer，stride 48（4x3 矩阵/骨骼），
-          array = Σ vg_count（含去重死槽，语义见计划书 §3.3）；
-        - [CustomShaderZZMIMergedSkeletonAttach]：attach CS（deform draw 后调用，
-          把换绑前保存到 cs-t0 的当帧 palette 拷入合并骨架偏移段，供下一帧使用）。
+        架构（2026-08-24 用户拍板，详见计划书 §3.3-5/§5.4-3）：
+        - 骨骼 id = 全局编号（组基址拼接组内槽位）；Blender 侧 join 无组号歧义，
+          跨组权重可表达。
+        - 每组一套**全宽**合并骨架 `ResourceZZMergedSkeleton_G<N>`（array = 全局
+          max(vg_offset+vg_count)）：本组骨骼由 attach 直拷，外来骨骼经校准乘
+          （inv(cb1_本组) × cb1_源组 × M）写入——palette 蒙皮到对象空间、渲染 cb1
+          摆到世界，校准保证跨组引用时各自的对象→世界变换正常。
+        - 每组 cb1 捕获：`ResourceZZCb1_G<N>` 在该组代表部件（json
+          SkeletonGroupCb1SourceIb，其帧内最后一个渲染 draw 的 vs-cb1 是可解析
+          逐部件块）的渲染 draw 处 copy vs-cb1（last-wins，逐帧更新）。
+        - 逐（部件 × 组）attach：`CustomShaderZZMIMergedSkeletonAttach_C<i>_G<N>`，
+          CS = zzmi_merged_skeleton_attach_calibrated.hlsl（cb1 无效时直拷兜底）。
         """
-        # 骨骼总数口径修正：取 max(vg_offset + vg_count)，与 EFMI 同口径。
-        # 导出子集时 vg_offset 是工作空间全局槽位（可能远超导出内 sum(vg_count)）——
-        # 例如 3 个部件 0~10/11~30/31~50，用户 join 1+3、第 2 个不生成时，
-        # 导出组件为 (offset=0,count=11) + (offset=31,count=20)，sum=31 但 max=51；
-        # 若按 sum 声明 buffer，部件 3 的 attach（offset=31）与顶点引用的全局 id 31~50 全部越界。
-        bones_count = max(c["vg_offset"] + c["vg_count"] for c in self.merged_skeleton_components)
-
         section = M_IniSection(M_SectionType.MergedSkeleton)
         section.append("[Constants]")
         section.append("global $zz_ms_initialized = 0")
@@ -577,36 +599,81 @@ class ExportZZMI(ExportUnity):
         section.append("global $zz_ms_attach_count = 0")
         section.new_line()
 
-        section.append("[ResourceZZMergedSkeleton]")
-        section.append("type = RWStructuredBuffer")
-        section.append("stride = 48")
-        section.append("array = " + str(bones_count))
-        section.new_line()
+        groups = self._merged_skeleton_groups()
+        # 全宽口径：全局骨骼编号空间的大小 = 全部组件 max(vg_offset+vg_count)
+        # （导出子集时 vg_offset 是工作空间全局槽位，可能远超导出内 sum——
+        # 同组 3 部件 0~10/11~30/31~50 且中间缺席时 sum=31 但 max=51，按 max 声明）。
+        bones_count = max(c["vg_offset"] + c["vg_count"] for c in self.merged_skeleton_components)
 
-        section.append("[CustomShaderZZMIMergedSkeletonAttach]")
-        section.append("flags = optimization_level3 all_resources_bound skip_validation")
-        section.append("cs = ./res/zzmi_merged_skeleton_attach.hlsl")
-        section.append("x1 = $zz_ms_attach_offset")
-        section.append("y1 = $zz_ms_attach_count")
-        section.append("cs-u0 = ref ResourceZZMergedSkeleton")
-        section.append("Dispatch = 8, 1, 1")
-        section.append("cs-u0 = null")
-        section.new_line()
+        # 每组的 cb1 捕获源部件（取该组组件里声明了捕获源的 DrawIB）
+        group_cb1_source: dict[int, str] = {}
+        for component in self.merged_skeleton_components:
+            source_ib = component.get("cb1_source_ib") or ""
+            if source_ib and component["skeleton_group"] not in group_cb1_source:
+                group_cb1_source[component["skeleton_group"]] = source_ib
+
+        for skeleton_group in groups:
+            section.append(f"[ResourceZZMergedSkeleton_G{skeleton_group}]")
+            section.append("type = RWStructuredBuffer")
+            section.append("stride = 48")
+            section.append("array = " + str(bones_count))
+            section.new_line()
+
+            # 本组 cb1 捕获资源（无捕获源 -> 不生成捕获段，attach CS 直拷兜底）
+            source_ib = group_cb1_source.get(skeleton_group, "")
+            section.append(f"[ResourceZZCb1_G{skeleton_group}]")
+            section.new_line()
+            if not source_ib:
+                print(
+                    f"[ZZMI骨骼合并] 警告: 骨架组 G{skeleton_group} 没有 cb1 捕获源部件，"
+                    f"该组 attach 将直拷（跨组引用该组数据会保持源空间，可能错位）"
+                )
+
+        # cb1 捕获段（TextureOverrideIB：源部件渲染 draw 处 last-wins copy vs-cb1）
+        for skeleton_group in groups:
+            source_ib = group_cb1_source.get(skeleton_group, "")
+            if not source_ib:
+                continue
+            section.append(f"[TextureOverrideIB_{source_ib}_Cb1Capture_G{skeleton_group}]")
+            section.append("hash = " + source_ib)
+            section.append("match_instance_count = 0")
+            section.append(f"ResourceZZCb1_G{skeleton_group} = copy vs-cb1 unless_null")
+            section.new_line()
+
+        # 逐（部件 × 组）校准 attach 段
+        for component_id, component in enumerate(self.merged_skeleton_components):
+            own_group = component["skeleton_group"]
+            for skeleton_group in groups:
+                section.append(
+                    f"[CustomShaderZZMIMergedSkeletonAttach_C{component_id}_G{skeleton_group}]"
+                )
+                section.append("flags = optimization_level3 all_resources_bound skip_validation")
+                section.append("cs = ./res/zzmi_merged_skeleton_attach_calibrated.hlsl")
+                section.append("x1 = $zz_ms_attach_offset")
+                section.append("y1 = $zz_ms_attach_count")
+                if own_group in group_cb1_source:
+                    section.append(f"cs-cb1 = ref ResourceZZCb1_G{own_group}")
+                if skeleton_group in group_cb1_source:
+                    section.append(f"cs-cb2 = ref ResourceZZCb1_G{skeleton_group}")
+                section.append(f"cs-u0 = ref ResourceZZMergedSkeleton_G{skeleton_group}")
+                section.append("Dispatch = 8, 1, 1")
+                section.append("cs-u0 = null")
+                section.new_line()
 
         ini_builder.append_section(section)
 
     def _copy_merged_skeleton_shader_to_mod(self):
-        """把 attach CS 着色器复制到生成 Mod 的 res/ 目录。"""
+        """把校准版 attach CS 着色器复制到生成 Mod 的 res/ 目录。"""
         import shutil
 
         addon_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        shader_src = os.path.join(addon_root, "Toolset", "zzmi_merged_skeleton_attach.hlsl")
+        shader_src = os.path.join(addon_root, "Toolset", "zzmi_merged_skeleton_attach_calibrated.hlsl")
         if not os.path.isfile(shader_src):
-            print(f"[ZZMI骨骼合并] 警告: 未找到 attach CS 着色器 {shader_src}")
+            print(f"[ZZMI骨骼合并] 警告: 未找到校准 attach CS 着色器 {shader_src}")
             return
         res_dir = os.path.join(GlobalConfig.path_generate_mod_folder(), "res")
         os.makedirs(res_dir, exist_ok=True)
-        shutil.copy2(shader_src, os.path.join(res_dir, "zzmi_merged_skeleton_attach.hlsl"))
+        shutil.copy2(shader_src, os.path.join(res_dir, "zzmi_merged_skeleton_attach_calibrated.hlsl"))
 
     def add_unity_vs_resource_vb_sections(self, ini_builder: M_IniBuilder, drawib_model):
         super().add_unity_vs_resource_vb_sections(ini_builder=ini_builder, drawib_model=drawib_model)

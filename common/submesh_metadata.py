@@ -118,6 +118,12 @@ class SubmeshMetadata:
         self.vg_offset = int(self.submesh_json_dict.get("VGOffset", 0) or 0)
         self.vg_count = int(self.submesh_json_dict.get("VGCount", 0) or 0)
         self.vg_map = dict(self.submesh_json_dict.get("VGMap", {}) or {})
+        # ZZMI 骨架分组号（渲染 cb1 对象变换配对；缺省 0 = 单骨架旧语义）
+        self.skeleton_group = int(self.submesh_json_dict.get("SkeletonGroup", 0) or 0)
+        # ZZMI 校准版：本组 cb1 捕获源部件 DrawIB（空串 = 无捕获源，attach 退化为直拷）
+        self.skeleton_group_cb1_source_ib = str(
+            self.submesh_json_dict.get("SkeletonGroupCb1SourceIb", "") or ""
+        )
         self.d3d11_game_type = self._build_d3d11_game_type()
 
     def _build_d3d11_game_type(self) -> D3D11GameType:

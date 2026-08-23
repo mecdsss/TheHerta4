@@ -27,7 +27,9 @@ ZZMI（绝区零）骨骼合并支持模块
   重复槽位为死槽（内容恒同，无害）。
 
 产出：
-- 每个子网格 json 写回 `VGMap` / `VGOffset` / `VGCount`（缓存，幂等；force 可重建）；
+- 每个子网格 json 写回 `VGMap` / `VGOffset` / `VGCount`（缓存，幂等；force 可重建）+
+  `SkeletonGroup`（骨架分组号：按渲染 cb1 对象变换分组，palette 与 cb1 逐物体
+  1:1 配对，跨组绝不共享骨架；VGMap/VGOffset 均为组内槽位命名空间）；
 - palette buf 复制到 `<子网格>/ModImpRuntime/<bare>-BoneMatrix.buf`（NTEMI/EFMI 缓存模式）。
 """
 
@@ -67,6 +69,9 @@ class ZZMILogParser:
     _SO_RE = re.compile(r"^SOSetTargets\(NumBuffers:(\d+),")
     _SRV_RE = re.compile(r"^(V|P|C|G|H|D)SSetShaderResources\(StartSlot:(\d+), NumViews:(\d+),")
     _VS_SHADER_RE = re.compile(r"^VSSetShader\(.*\) hash=([0-9a-f]+)$")
+    # vs-cb1 dump 行（渲染 draw 的对象变换 CB；dump 文件名自带 draw 索引与 hash，
+    # 比绑定调用可靠——绑定是持久状态、多数 draw 块里不重发）
+    _CB1_DUMP_RE = re.compile(r"^(\d{6})-vs-cb1=([0-9a-f]{8})-.*\.buf$")
 
     def __init__(self, log_path: str):
         self.log_path = log_path
@@ -74,6 +79,8 @@ class ZZMILogParser:
         #                "vs_t0": hash, "vs_shader": hash,
         #                "vertex_count": int|None, "draw_indexed": dict|None}
         self.draws: dict[str, dict] = {}
+        # 渲染 draw_index -> vs-cb1 dump 实际路径（deduped/*.buf，来自 dump 行）
+        self.render_cb1_dumps: dict[str, str] = {}
         # 逻辑文件名（根目录 dump 文件名）-> deduped 实际路径
         self.dump_map: dict[str, str] = {}
         self._parse()
@@ -186,6 +193,12 @@ class ZZMILogParser:
                     dst_path = dump_match.group(2)
                     if src_name not in self.dump_map:
                         self.dump_map[src_name] = dst_path
+                    # vs-cb1 dump（渲染 draw 的对象变换 CB）：按 draw 索引直接记录路径
+                    cb1_match = self._CB1_DUMP_RE.match(src_name)
+                    if cb1_match and os.path.isfile(dst_path):
+                        draw_key = cb1_match.group(1)
+                        if draw_key not in self.render_cb1_dumps:
+                            self.render_cb1_dumps[draw_key] = dst_path
                     continue
 
     # ------------------------------------------------------------------
@@ -195,6 +208,10 @@ class ZZMILogParser:
     def get_vb_hash(self, draw_index: str, slot: int) -> str:
         info = self.draws.get(draw_index)
         return info["vb"].get(slot, "") if info else ""
+
+    def get_render_cb1_path(self, draw_index: str) -> str | None:
+        """渲染 draw 的 vs-cb1 dump 实际路径（对象变换 CB；未 dump 返回 None）。"""
+        return self.render_cb1_dumps.get(draw_index)
 
     def get_deform_passes(self) -> dict[str, dict]:
         """识别全部 deform pass（pointlist Draw + SO 输出 + vs-t0 palette + vb0）。
@@ -278,6 +295,27 @@ class ZZMIDeformResolver:
         return "", None, ""
 
 
+def assign_skeleton_groups(part_transforms: dict[str, tuple[float, ...] | None]) -> dict[str, int]:
+    """按对象变换（渲染 cb1）把 DrawIB 部件分组：返回 draw_ib -> 骨架组索引。
+
+    规则（用户拍板，2026-08-24）：palette 与 cb1 逐物体 1:1 配对——
+    共享同一对象空间（变换逐位相同）的部件进同一组、共用一套合并骨架；
+    跨组绝不共享（不同空间的矩阵混用会被渲染侧 cb1 摆错位置）。
+    无变换数据的部件独立成组（安全方向）。
+    组索引按组内最小 draw_ib 排序分配（确定性，导入/导出两侧一致）。
+    """
+    key_groups: dict[tuple, list[str]] = {}
+    for draw_ib, transform in part_transforms.items():
+        key = transform if transform is not None else ("__solo__", draw_ib)
+        key_groups.setdefault(key, []).append(draw_ib)
+    ordered_keys = sorted(key_groups.keys(), key=lambda k: min(key_groups[k]))
+    result: dict[str, int] = {}
+    for group_index, key in enumerate(ordered_keys):
+        for draw_ib in key_groups[key]:
+            result[draw_ib] = group_index
+    return result
+
+
 class ZZMIBoneMapBuilder:
     """palette 解析与跨部件 bitwise 去重（同部件绝不去重）。"""
 
@@ -291,6 +329,39 @@ class ZZMIBoneMapBuilder:
                 f"({len(data)} floats)"
             )
         return data.reshape(-1, _BONE_MATRIX_FLOATS)
+
+    @staticmethod
+    def parse_object_transform(cb1_path: str) -> tuple[float, ...] | None:
+        """从渲染 draw 的 vs-cb1 dump 解析对象→世界矩阵，返回 16 floats 元组（分组键）。
+
+        实测布局（FrameAnalysis-2026-08-19-122152 逆向）：逐部件 cb1 块的前 4 个
+        float4 = 3x4 对象变换（rows 0-2 旋转行 w=0、row 3 平移 w=1）。
+        palette 矩阵把顶点蒙皮到该对象空间，渲染 VS 再用本矩阵摆到世界——
+        两者逐物体 1:1 配对，共享同一份变换的部件才共享同一对象空间。
+
+        只接受 ≤512 字节的逐部件块（实测 176/256/464/512B）：>512B 的 cb1 是
+        **多对象共享变换数组**（draw 用 first_constant 窗口索引），rows 0-3 未必是
+        本 draw 的对象，排除。解析失败返回 None（调用方按独立组兜底 = 不共享，安全方向）。
+        """
+        try:
+            if os.path.getsize(cb1_path) > 512:
+                return None
+            data = numpy.fromfile(cb1_path, dtype=numpy.float32)
+        except (OSError, ValueError):
+            return None
+        if len(data) < 16:
+            return None
+        m = data[:16].reshape(4, 4)
+        # w 列形态：旋转行 w=0、平移行 w=1
+        if abs(float(m[3, 3]) - 1.0) > 1e-3:
+            return None
+        if float(numpy.abs(m[:3, 3]).max()) > 1e-3:
+            return None
+        # 旋转行 sanity（允许缩放/镜像，排除纯参数块）
+        row_norms = numpy.linalg.norm(m[:3, :3].astype(numpy.float64), axis=1)
+        if numpy.any((row_norms < 0.05) | (row_norms > 20.0)):
+            return None
+        return tuple(float(x) for x in data[:16])
 
     @staticmethod
     def build_vg_maps(
@@ -435,9 +506,16 @@ class ZZMISkeletonMergeHelper:
         # 第一遍：收集每个子网格信息并按 DrawIB 分组（同 DrawIB 的拆分子网格共享
         # 同一 deform pass / palette / VGMap，只参与一次去重）。
         # drawib -> {"palette", "vg_count", "members": [unique_str...],
-        #            "json_paths": {unique_str: path}, "palette_path", "draw_index"}
+        #            "json_paths": {unique_str: path}, "palette_path", "draw_index",
+        #            "signatures", "transform"}
+        #
+        # 幂等 schema 门控（分组版一致性规则）：VGMap 按"组内槽位"写回，一次导入的
+        # 所有部件必须共享同一次分组计算——不允许"部分部件用缓存、部分部件新算"
+        # （否则两组槽位口径可能不一致）。因此：只要任一目标子网格缺 VGMap 或
+        # 缺 SkeletonGroup 字段（旧缓存/新工作空间），就对全部目标重建；全部齐备
+        # 才整批幂等跳过（快速路径，不解析 dump）。
         groups: dict[str, dict] = {}
-        skipped = 0
+        stale = 0
 
         for unique_str in unique_str_list:
             json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
@@ -447,11 +525,6 @@ class ZZMISkeletonMergeHelper:
 
             submesh_json = JsonUtils.LoadFromFile(json_path)
             if not isinstance(submesh_json, dict):
-                continue
-
-            # 幂等：已有 VGMap 且非强制
-            if submesh_json.get("VGMap") and not force:
-                skipped += 1
                 continue
 
             bare_name = unique_str.split(".", 1)[-1]
@@ -470,14 +543,26 @@ class ZZMISkeletonMergeHelper:
                     "palette_path": "",
                     "draw_index": "",
                     "signatures": {},
+                    "transform": None,
+                    "cb1_last_draw_ok": False,
                     "representative": unique_str,
                 }
                 groups[draw_ib] = group
             group["members"].append(unique_str)
             group["json_paths"][unique_str] = json_path
 
-        if not groups and skipped:
-            return True, f"所有 {skipped} 个子网格均已有骨骼合并数据（幂等跳过）。"
+            if not force and (
+                submesh_json.get("VGMap")
+                and "SkeletonGroup" in submesh_json
+                and "SkeletonGroupCb1SourceIb" in submesh_json
+            ):
+                continue  # 该子网格缓存为当前 schema（临时计数，见下）
+            stale += 1
+
+        up_to_date = len(groups) and stale == 0
+        if up_to_date and not force:
+            total = sum(len(g["members"]) for g in groups.values())
+            return True, f"所有 {total} 个子网格均已有骨骼合并数据（幂等跳过）。"
 
         # 第二遍：逐组反查 deform pass -> palette，读取 Blend.buf 得 vg_count
         for draw_ib, group in groups.items():
@@ -577,17 +662,103 @@ class ZZMISkeletonMergeHelper:
                 print(f"[ZZMI骨骼合并] 提示 {draw_ib}: 驱动签名计算失败（刚性命中对将拆开）: {e}")
                 group["signatures"] = {}
 
+            # 骨架分组键：渲染 draw 的 vs-cb1 对象→世界矩阵（palette 蒙皮到对象空间，
+            # 渲染 VS 用 cb1 摆到世界，两者逐物体 1:1 配对）。取该部件渲染 draw 列表中
+            # 第一个可解析的逐部件 cb1 块；全部失败则 None -> 独立成组（不共享，安全）。
+            for render_draw in sorted(render_draws):
+                cb1_path = parser.get_render_cb1_path(render_draw)
+                if not cb1_path:
+                    continue
+                transform = ZZMIBoneMapBuilder.parse_object_transform(cb1_path)
+                if transform is not None:
+                    group["transform"] = transform
+                    break
+            if group["transform"] is None:
+                print(f"[ZZMI骨骼合并] 提示 {draw_ib}: 未能解析对象变换（渲染 cb1），独立成组")
+
+            # cb1 捕获代表资格（校准版运行时）：捕获段按 DrawIB 触发、帧内"最后一击"
+            # 覆盖生效，所以该部件全拆分子网格的**帧内最后一个渲染 draw** 的 vs-cb1
+            # 必须是可解析的逐部件块（>512B 的共享变换数组不行）。
+            all_render_draws = sorted({str(d) for d in render_draws if str(d).isdigit()})
+            for member in group["members"]:
+                member_json_path = group["json_paths"].get(member)
+                if not member_json_path or member == representative:
+                    continue
+                member_lod_dir = os.path.dirname(os.path.dirname(os.path.dirname(member_json_path)))
+                member_mapping = cls._load_drawcall_index_list(member_lod_dir)
+                member_name = os.path.basename(os.path.dirname(os.path.dirname(member_json_path)))
+                for d in member_mapping.get(member_name, []):
+                    if str(d).isdigit():
+                        all_render_draws.append(str(d))
+            if all_render_draws:
+                last_draw = max(all_render_draws)
+                last_cb1_path = parser.get_render_cb1_path(last_draw)
+                group["cb1_last_draw_ok"] = bool(
+                    last_cb1_path
+                    and ZZMIBoneMapBuilder.parse_object_transform(last_cb1_path) is not None
+                )
+            else:
+                group["cb1_last_draw_ok"] = False
+
         ready_groups = {
             draw_ib: group for draw_ib, group in groups.items() if group["palette"] is not None
         }
         if not ready_groups:
             return False, "没有子网格成功生成骨骼数据。"
 
-        # 跨部件去重（同 DrawIB 组为一个去重单元；附驱动签名供刚性部件质心门控）
-        vg_maps, vg_offsets, total_slots = ZZMIBoneMapBuilder.build_vg_maps(
-            {draw_ib: group["palette"] for draw_ib, group in ready_groups.items()},
-            {draw_ib: group["signatures"] for draw_ib, group in ready_groups.items()},
+        # 第三遍：按对象变换分组（跨组不共享同一空间槽位；校准版运行时中外来骨骼
+        # 经校准乘写入目标组骨架），组内 bitwise + 刚性门控去重得组内槽位；
+        # 然后按组基址拼接成**全局骨骼编号**（Blender 侧全局命名空间，join 无歧义，
+        # 跨组权重可表达；每组运行时骨架为全宽 buffer，本组直拷 + 外来校准写入）。
+        group_of = assign_skeleton_groups(
+            {draw_ib: group["transform"] for draw_ib, group in ready_groups.items()}
         )
+        group_members: dict[int, list[str]] = {}
+        for draw_ib, group_index in group_of.items():
+            group_members.setdefault(group_index, []).append(draw_ib)
+
+        # 组内去重（组内槽位 0 起）
+        local_maps: dict[str, dict] = {}
+        local_offsets: dict[str, int] = {}
+        group_slots: dict[int, int] = {}
+        for group_index in sorted(group_members):
+            members = group_members[group_index]
+            gm, go, total = ZZMIBoneMapBuilder.build_vg_maps(
+                {draw_ib: ready_groups[draw_ib]["palette"] for draw_ib in members},
+                {draw_ib: ready_groups[draw_ib]["signatures"] for draw_ib in members},
+            )
+            local_maps.update(gm)
+            local_offsets.update(go)
+            group_slots[group_index] = total
+
+        # 组基址（组索引升序累加）
+        group_base: dict[int, int] = {}
+        base = 0
+        for group_index in sorted(group_members):
+            group_base[group_index] = base
+            base += group_slots[group_index]
+
+        vg_maps: dict[str, dict] = {}
+        vg_offsets: dict[str, int] = {}
+        for draw_ib in ready_groups:
+            group_index = group_of[draw_ib]
+            vg_offsets[draw_ib] = group_base[group_index] + local_offsets[draw_ib]
+            vg_maps[draw_ib] = {
+                local: group_base[group_index] + slot
+                for local, slot in local_maps[draw_ib].items()
+            }
+
+        # 每组的 cb1 捕获源部件（校准用对象变换）：成员中"帧内最后一个渲染 draw 的
+        # vs-cb1 是可解析逐部件块"者优先（last-wins 覆盖口径下捕获内容才正确）；
+        # 无合格成员 -> 空串（该组运行时 attach 自动退化为直拷 = 分组版行为）。
+        group_cb1_source: dict[int, str] = {}
+        for group_index in sorted(group_members):
+            source = ""
+            for draw_ib in sorted(group_members[group_index]):
+                if ready_groups[draw_ib].get("cb1_last_draw_ok"):
+                    source = draw_ib
+                    break
+            group_cb1_source[group_index] = source
 
         # 写回工作空间 json + 复制 palette 缓存（组内所有子网格写相同结果）
         written = 0
@@ -597,6 +768,8 @@ class ZZMISkeletonMergeHelper:
                 continue
             vg_offset = vg_offsets[draw_ib]
             vg_count = group["vg_count"]
+            skeleton_group = group_of[draw_ib]
+            cb1_source_ib = group_cb1_source.get(skeleton_group, "")
 
             for unique_str in group["members"]:
                 json_path = group["json_paths"][unique_str]
@@ -607,6 +780,11 @@ class ZZMISkeletonMergeHelper:
                 submesh_json["VGCount"] = vg_count
                 submesh_json["VGOffset"] = vg_offset
                 submesh_json["VGMap"] = {str(k): int(v) for k, v in sorted(vg_map.items())}
+                # 骨架分组（渲染 cb1 对象变换配对）：导出侧把 deform pass 换绑到本组
+                # ResourceZZMergedSkeleton_G<N>；VGMap/VGOffset 为全局骨骼编号（组基址拼接）
+                submesh_json["SkeletonGroup"] = skeleton_group
+                # 本组 cb1 捕获源部件（校准时其渲染 draw 处 copy vs-cb1；空串 = 无捕获源）
+                submesh_json["SkeletonGroupCb1SourceIb"] = cb1_source_ib
 
                 # 复制 palette buf 到 ModImpRuntime 缓存（NTEMI/EFMI 同款模式）
                 try:
@@ -630,6 +808,6 @@ class ZZMISkeletonMergeHelper:
 
         return written > 0, (
             f"已为 {written} 个子网格生成骨骼合并数据"
-            f"（{len(ready_groups)} 个部件，合并骨架共 {total_slots} 槽）"
-            + (f"（跳过已存在 {skipped} 个）" if skipped else "")
+            f"（{len(ready_groups)} 个部件 / {len(group_members)} 个骨架组，"
+            f"全局共 {sum(group_slots.values())} 槽）"
         )
