@@ -232,6 +232,7 @@ def ImprotFromWorkSpaceFull(self, context):
             ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
                 workspace_root=GlobalConfig.path_workspace_folder(),
                 unique_str_list=import_keys,
+                lod_group_projection=GlobalProterties.efmi_lod_group_projection(),
             )
             print(f"[EFMI骨骼合并] {message}")
             if ok:

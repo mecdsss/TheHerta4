@@ -925,10 +925,11 @@ class ExportEFMI:
     def _get_merged_skeleton_component_info(self):
         """收集 EFMI 骨骼合并（Merged Skeleton）组件信息。
 
-        多 LOD 语义（2026-08 实测定案）：LOD0 / LOD1 相互独立——构建端各自用
-        自己的 dump 计算、vg 槽位各自从 0 起，导出端按 LOD 分组生成多套独立
-        合并骨架配置。此处组件携带 lod 字段、component_id 按 LOD 组内分配
-        （每 LOD 一套骨架，id 只在组内有意义）。
+        多 LOD 语义：构建端在各自 dump 上先建立原始候选对应，LOD0 执行一次
+        去重，LOD1 按对应关系同步分区；运行时槽位仍各自从 0 起，导出端按 LOD
+        分组生成多套独立合并骨架配置。
+        此处组件携带 lod 字段、component_id 按 LOD 组内分配（每 LOD 一套骨架，
+        id 只在组内有意义）。
         仅收集 vg_count > 0（反查已写回）的子网格。
         """
         components = []
@@ -965,10 +966,9 @@ class ExportEFMI:
         （守卫初始化 + 绑定 pools + AttachComponent + ElementFormat 16 位）+
         CommandListInitializeMergedSkeleton（逐组件写 vg_offset/vg_count，LodRemaps 全 null）。
 
-        多 LOD 语义（2026-08 实测定案）：LOD0 / LOD1 相互独立——各自根据自己
-        dump 的数据生成统一顶点组（构建端 vg 槽位各自从 0 起），导出时可以两个
-        LOD 一起导出，但配置层面每 LOD 一套独立的合并骨架（各自的 Resource/
-        Pool/CommandList/粘合层，互不引用、互不混用）；组件 id 组内分配，
+        多 LOD 语义：LOD0/LOD1 的原始对应先确定 LOD0 基准分区，再同步到 LOD1；
+        导出时仍按 LOD 各自生成独立的 Resource/Pool/CommandList/粘合层，
+        互不引用、互不混用。构建端 vg 槽位依旧各自从 0 起；组件 id 组内分配，
         EntryPoint 只挂本组件所属 LOD 的粘合层。
         无 LOD 前缀的组件（单 LOD/根目录工作空间）后缀为空，与旧版输出完全兼容。
 

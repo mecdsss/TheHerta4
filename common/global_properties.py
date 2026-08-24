@@ -175,6 +175,12 @@ class GlobalProterties(bpy.types.PropertyGroup):
         default=True,
     ) # type: ignore
 
+    efmi_lod_group_projection: bpy.props.BoolProperty(
+        name="EFMI LOD 分组投影",
+        description="EFMI 多 LOD 时先按部件点云建立对应，再将 LOD0 去重分组投影到 LOD1；关闭后 LOD0/LOD1 各自独立进行顶点组去重",
+        default=True,
+    ) # type: ignore
+
     ignore_muted_shape_keys: bpy.props.BoolProperty(
         name="忽略未启用的形态键",
         description="勾选此项后，未勾选启用的形态键在生成Mod时会被忽略，勾选的形态键会参与生成Mod",
@@ -420,6 +426,10 @@ class GlobalProterties(bpy.types.PropertyGroup):
     @classmethod
     def import_merged_vgmap(cls):
         return cls._instance().import_merged_vgmap
+
+    @classmethod
+    def efmi_lod_group_projection(cls):
+        return cls._bool_attr("efmi_lod_group_projection", True)
 
     @classmethod
     def ignore_muted_shape_keys(cls):

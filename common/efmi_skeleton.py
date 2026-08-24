@@ -14,17 +14,21 @@ EFMI（明日方舟：终末地）骨骼合并支持模块
 - `migoto_object_builder.get_skeleton_data`：取顶点阶段 num_constants==4096 的常量缓冲
   （instance config），其 first_constant 窗口第 6 个 float4 的 xy 分量（uint32 位型）为骨骼矩阵段偏移；
   骨骼矩阵存于 vs-t0（compute 蒙皮输出 u0 共享），每骨骼 12 floats（4x3 矩阵）。
-- `build_merged_skeleton_vg_map`：跨子网格按骨骼矩阵内容去重，构建 local->global 的
-  vg_map / vg_offset / vg_count（矩阵硬门控 + 质心确认，_DEDUP_ENABLED 控制总开关）。
+- `build_merged_skeleton_vg_map`：跨子网格按骨骼矩阵内容和接触位置权重扩散去重，
+  构建 local->global 的 vg_map / vg_offset / vg_count（矩阵硬门控 + 扩散确认，
+  _DEDUP_ENABLED 控制总开关）。
 
 产出：
 - 每个子网格 json 写回 `VGMap` / `VGOffset` / `VGCount`（缓存，幂等；提取端重导可覆盖）。
 - 骨骼池 buffer 复制到 `<submesh>/ModImpRuntime/<bare>-BoneMatrix.buf`（参照 NTEMI 缓存模式）。
 
-多 LOD：LOD0 / LOD1 相互独立——各 LOD 用**自己**的 FrameAnalysis dump 提取目录
-（Config/WorkPageTabs.json 的 tab 名即 LOD 名，每个 tab 的
-Config/Tabs/<tabid>.json 记录自己的 frameAnalysisFolderPath）独立计算统一顶点组，
-vg 槽位各自从 0 起，绝不跨 LOD 混算；导出端同样按 LOD 生成多套独立合并骨架配置。
+多 LOD：LOD0 / LOD1 用**自己**的 FrameAnalysis dump 提取目录（Config/WorkPageTabs.json
+的 tab 名即 LOD 名，每个 tab 的 Config/Tabs/<tabid>.json 记录自己的路径）读取原始
+候选；先用部件加权点云一对一配对，再在部件内部按局部权重中心建立对应。默认只在
+LOD0 执行权重扩散去重，LOD1 将该分区投影到自己的原始槽位；关闭分组投影选项时，
+两侧都保留同一份部件对应账本但各自独立去重。LOD0 是基准；LOD1 的有效对应组数
+不得少于 LOD0，额外细分允许存在。导出端仍按 LOD 生成多套独立合并骨架配置，JSON
+另写入 EFMILODCorrespondence 账本供复核。
 """
 
 # 注解延迟求值（PEP 563）：避免类定义期解析 numpy.ndarray 等注解，
@@ -44,20 +48,28 @@ _BONE_MATRIX_FLOATS = 12
 _BONE_SEGMENT_FLOAT4 = 256 * 3
 # instance config 中骨骼段偏移所在的 float4 行（第 6 行）
 _INSTANCE_CONFIG_BONE_OFFSET_ROW = 5
+# 写回 json 的算法版本。旧版只保存 VGMap，没有扩散采样判据，不能继续
+# 作为当前策略的幂等缓存使用；版本不匹配时 ensure_skeleton_data 自动重算。
+_VG_MAP_ALGORITHM_VERSION = 11
+
+# 跨 LOD 原始候选对应层版本。它和 VGMap 算法版本分开记录，便于以后只调整
+# 对应评分而不误把旧的运行时槽位当成新布局。
+_CROSS_LOD_LAYOUT_VERSION = 3
 
 # 跨子网格骨骼去重总开关。
-# 分层判据（矩阵硬门控 + 质心确认）：矩阵 diff >= match_tolerance 永不合并；
-# bitwise 相同直接合并；近似需加权质心重合确认。
+# 分层判据（矩阵硬门控 + 权重扩散确认）：矩阵 diff >= match_tolerance 永不合并；
+# bitwise 相同在缺少扩散字段时兼容直接合并；有扩散字段也要通过接触位置
+# 权重一致性确认；近似矩阵同样做扩散确认。
 # 注意：2026-08 曾实测误判（390/393 案例）而临时整体关闭；后查明当时观测数据
 # 被陈旧缓存污染（网格与 json 账本不一致），现已随官方运行时架构重写一并恢复。
 # 其后的"多维度投票"判据（几何维度可推翻矩阵不一致）经"测试"工作空间 08-10 dump
 # 实测产生 42 组矩阵不可兼容的误并（195 组中），已废止并回到分层判据。
 # 再遇误判先查数据一致性（清除 VGMap 缓存重导），再考虑关开关。
-# 2026-08-25：应用户要求【临时整体关闭】——用户将手动标注哪些顶点组应当合并，
-# 之后据标注列表反推/拟合判据算法。关闭期间 build_vg_maps 退化为恒等映射
-# （每根骨骼独占全局槽位，local -> vg_offset + local），下方分层判据代码保留不执行。
-# 手动标注完成后须基于结果重推判据再恢复 True；切换前后务必「清除骨骼合并VGMap缓存」再重导。
-_DEDUP_ENABLED = False
+# 变更策略或 Position/Blend 数据后，VGMapAlgorithmVersion 会让旧结果自动失效；
+# 也可用面板的清理按钮提前删除缓存。
+# 权重扩散去重是 EFMI 合并模式的默认行为。关闭只用于诊断/回滚；关闭后
+# build_vg_maps 仍返回安全的恒等映射，不会改变原始蒙皮。
+_DEDUP_ENABLED = True
 
 
 class EFMILogParser:
@@ -345,7 +357,7 @@ class EFMIBoneMapBuilder:
         blend_buf_path: str,
         submesh_json_dict: dict,
     ) -> dict[int, numpy.ndarray]:
-        """计算每个局部骨骼驱动的顶点加权质心（双维度去重的"驱动区域"指纹）。
+        """计算每个局部骨骼的驱动签名和权重扩散采样。
 
         返回: {local_vg_id(int): 加权质心 numpy.ndarray(3)}（绑定姿态坐标）。
         """
@@ -362,19 +374,21 @@ class EFMIBoneMapBuilder:
         blend_buf_path: str,
         submesh_json_dict: dict,
     ) -> dict[int, dict]:
-        """计算每个局部骨骼的"驱动签名"（去重的质心确认 + 调试探针用）。
+        """计算每个局部骨骼的"驱动签名"（质心回退 + 权重扩散确认）。
 
         返回 {local_vg_id(int): {
             "centroid": 加权质心(3,),
             "bbox_min": 包围盒最小(3,),
             "bbox_max": 包围盒最大(3,),
             "vertex_count": 驱动顶点数,
+            "diffusion_points": 正权重扩散采样点,
+            "diffusion_weights": 对应原始权重,
+            "diffusion_normals": 点云局部 PCA 表面法向（不可判定时为 NaN）
         }}（绑定姿态坐标）。
 
-        原理（用户提出）：骨骼的可靠标识 = 蒙皮矩阵 + 骨骼标签 + 驱动的顶点组点云
-        （包围盒是否重叠 + 权重聚类核心位置）。同一骨骼跨部件驱动同区域顶点
-        （包围盒重叠、质心接近）；不同骨骼即使矩阵相同，其驱动区域也不同
-        （包围盒不重叠或质心远离）。
+        原理：同一骨骼跨部件驱动时，绑定姿态空间中的权重扩散场会在接触表面
+        保持一致；整体质心可能因为“巨大的平面 + 散落物体”而完全不同，不能
+        单独作为判据。不同骨骼即使几何相邻，接触位置的原始权重通常不一致。
         无 BLENDWEIGHTS 元素的类型按"每顶点第一索引权重=1"处理。
         """
         empty = {}
@@ -469,12 +483,22 @@ class EFMIBoneMapBuilder:
             weights = numpy.zeros((n, bi_channels), dtype=numpy.float32)
             weights[:, 0] = 1.0
 
-        # ---- 每 local 的驱动顶点集合（质心 + 包围盒 + 扩散半径 + 权重强度）----
+        # ---- 每 local 的驱动顶点集合（质心 + 包围盒 + 权重扩散采样）----
+        # 采样不是把整组顶点复制到每个候选的临时对象，而是保留正权重
+        # 的 (position, weight) 对。build_vg_maps 会在接触位置做最近邻
+        # 扩散检测；固定上限保证大型平面不会让跨部件两两比较爆炸。
+        max_diffusion_samples = 256
         accum: dict[int, dict] = {}
         for c in range(indices.shape[1]):
             idx_col = indices[:, c]
             w_col = weights[:, c] if c < weights.shape[1] else weights[:, 0]
-            valid = (w_col > 0) & (idx_col >= 0) & (idx_col != 0xFFFF)
+            valid = (
+                (w_col > 0)
+                & numpy.isfinite(w_col)
+                & (idx_col >= 0)
+                & (idx_col != 0xFFFF)
+                & numpy.isfinite(positions).all(axis=1)
+            )
             if not numpy.any(valid):
                 continue
             v_idx = idx_col[valid]
@@ -494,6 +518,8 @@ class EFMIBoneMapBuilder:
                     "bbox_min": numpy.full(3, numpy.inf),
                     "bbox_max": numpy.full(3, -numpy.inf),
                     "vertex_count": 0,
+                    "points": [],
+                    "weights": [],
                 })
                 entry["weighted_sum"] += (pts * ws_[:, None]).sum(axis=0)
                 entry["weight_total"] += w_sum
@@ -501,6 +527,8 @@ class EFMIBoneMapBuilder:
                 entry["bbox_min"] = numpy.minimum(entry["bbox_min"], pts.min(axis=0))
                 entry["bbox_max"] = numpy.maximum(entry["bbox_max"], pts.max(axis=0))
                 entry["vertex_count"] += int(mask.sum())
+                entry["points"].extend(pts.astype(numpy.float32, copy=False).tolist())
+                entry["weights"].extend(ws_.astype(numpy.float32, copy=False).tolist())
 
         result = {}
         for local, e in accum.items():
@@ -511,6 +539,17 @@ class EFMIBoneMapBuilder:
             mean_sq = e["weighted_sq_pos"] / e["weight_total"]
             var = max(float(mean_sq - float((centroid ** 2).sum())), 0.0)
             spread = float(numpy.sqrt(var))
+            diffusion_points = numpy.asarray(e["points"], dtype=numpy.float32)
+            diffusion_weights = numpy.asarray(e["weights"], dtype=numpy.float32)
+            if len(diffusion_points) > max_diffusion_samples:
+                # 均匀抽样保留整片扩散区域，而不是只取最高权重的中心，
+                # 这样“平面 + 散落物体”的接触边界不会被丢掉。
+                sample_idx = numpy.linspace(
+                    0, len(diffusion_points) - 1, max_diffusion_samples,
+                    dtype=numpy.int64,
+                )
+                diffusion_points = diffusion_points[sample_idx]
+                diffusion_weights = diffusion_weights[sample_idx]
             result[local] = {
                 "centroid": centroid.astype(numpy.float32),
                 "bbox_min": e["bbox_min"].astype(numpy.float32),
@@ -519,8 +558,298 @@ class EFMIBoneMapBuilder:
                 "spread": spread,  # 扩散矢量球半径（权重强度衰减的扩散路径范围）
                 "weight_total": float(e["weight_total"]),  # 权重强度
                 "mean_weight": float(e["weight_total"]) / max(e["vertex_count"], 1),
+                "diffusion_points": diffusion_points,
+                "diffusion_weights": diffusion_weights,
+                "diffusion_radius": EFMIBoneMapBuilder._diffusion_radius(diffusion_points),
+                "diffusion_normals": EFMIBoneMapBuilder._estimate_diffusion_normals(
+                    diffusion_points
+                ),
             }
         return result
+
+    @staticmethod
+    def _diffusion_radius(points: numpy.ndarray) -> float:
+        """估计一个扩散采样的空间影响半径。
+
+        EFMI 的 Position.buf 是绑定姿态空间，网格密度因部件而异；用
+        包围盒尺度/采样数估计局部间距，并限制在合理范围，避免稀疏部件
+        的单个远点把整个场错误连起来。
+        """
+        if len(points) < 2:
+            return 0.05
+        extent = float(numpy.linalg.norm(
+            numpy.max(points, axis=0) - numpy.min(points, axis=0)
+        ))
+        spacing = extent / max(float(numpy.sqrt(len(points))), 1.0)
+        return float(numpy.clip(spacing * 0.25, 0.02, 0.20))
+
+    @staticmethod
+    def _estimate_diffusion_normals(
+        points: numpy.ndarray,
+        neighbor_count: int = 8,
+    ) -> numpy.ndarray:
+        """从点云局部 PCA 估计表面法向；无法判定为表面时返回 NaN。
+
+        这不是网格拓扑法向（Position.buf 不携带面/边连接），但能识别
+        “大腿表面/丝袜表面”这种两层近似平行的点云。线状或体积状点云
+        不会强行套用表面投影规则，继续走原来的接触距离门控。
+        """
+        points = numpy.asarray(points, dtype=numpy.float32)
+        normals = numpy.full((len(points), 3), numpy.nan, dtype=numpy.float32)
+        if len(points) < 4 or points.ndim != 2 or points.shape[1] != 3:
+            return normals
+
+        neighbor_count = max(3, min(int(neighbor_count), len(points) - 1))
+        for point_idx, point in enumerate(points):
+            delta = points - point
+            squared = numpy.sum(delta * delta, axis=1)
+            order = numpy.argsort(squared)
+            neighbors = points[order[1:neighbor_count + 1]]
+            centered = neighbors - numpy.mean(neighbors, axis=0)
+            covariance = centered.T @ centered / max(len(neighbors), 1)
+            try:
+                eigenvalues, eigenvectors = numpy.linalg.eigh(covariance)
+            except numpy.linalg.LinAlgError:
+                continue
+            largest = float(eigenvalues[-1])
+            if largest <= 1e-10:
+                continue
+            # 平面：最小特征值远小于最大值；线：中间特征值也接近 0；
+            # 体积云：三个特征值相近。只接受真正“面状”的局部邻域。
+            if float(eigenvalues[0]) / largest > 0.20:
+                continue
+            if float(eigenvalues[1]) / largest < 0.10:
+                continue
+            normal = eigenvectors[:, 0]
+            length = float(numpy.linalg.norm(normal))
+            if length > 1e-8:
+                normals[point_idx] = (normal / length).astype(numpy.float32)
+        return normals
+
+    @staticmethod
+    def _nearest_diffusion_points(
+        source: numpy.ndarray,
+        target: numpy.ndarray,
+    ) -> tuple[numpy.ndarray, numpy.ndarray]:
+        """返回 source 每个点在 target 中的**全局**最近距离和索引。
+
+        旧版只检查所在均匀网格的相邻 27 个 cell；只要相邻 cell 恰好存在
+        一个候选，就不会扫描更远 cell，即使后者的欧氏距离实际更小。平行层、
+        凹槽边缘和非均匀三角网格都会触发这种漏检。扩散签名最多 256 点，按
+        source 分块做精确向量化最近邻既确定又有界，也比逐点 Python 网格循环快。
+        """
+        if len(source) == 0 or len(target) == 0:
+            return (
+                numpy.full(len(source), numpy.inf, dtype=numpy.float32),
+                numpy.full(len(source), -1, dtype=numpy.int64),
+            )
+        source = numpy.asarray(source, dtype=numpy.float32)
+        target = numpy.asarray(target, dtype=numpy.float32)
+        distances = numpy.empty(len(source), dtype=numpy.float32)
+        indices = numpy.empty(len(source), dtype=numpy.int64)
+        for start in range(0, len(source), 64):
+            chunk = source[start:start + 64]
+            delta = chunk[:, None, :] - target[None, :, :]
+            squared = numpy.sum(delta * delta, axis=2)
+            nearest = numpy.argmin(squared, axis=1)
+            indices[start:start + len(chunk)] = nearest
+            distances[start:start + len(chunk)] = numpy.sqrt(
+                squared[numpy.arange(len(chunk)), nearest]
+            )
+        return distances, indices
+
+    @classmethod
+    def weight_diffusion_similarity(
+        cls,
+        signature_a: dict | None,
+        signature_b: dict | None,
+        distance_tolerance: float = 0.05,
+        weight_tolerance: float = 0.20,
+        min_coverage: float = 0.30,
+        layer_distance: float = 0.15,
+        tangent_tolerance: float = 0.05,
+        normal_alignment: float = 0.70,
+        weak_weight_floor: float = 0.25,
+        min_support_points: int = 2,
+    ) -> bool:
+        """检测两个顶点组在空间接触处是否扩散出一致的权重场。
+
+        每个方向都把本组的正权重点投影到另一组最近的正权重点。普通点云
+        仍要求落在接触半径内；当两边能估计出局部表面法向时，允许沿法向
+        存在一段层间距，并要求切向投影误差小、两层法向平行。这覆盖
+        “大腿表面 + 悬空一小段的丝袜表面”而不要求共享顶点或拓扑连接。
+        最终取覆盖率较高的方向。为避免“强权重点淹没弱权重点”，每个正权重
+        点的评估权重至少达到该方向最大权重的 ``weak_weight_floor``；同时要求
+        至少 ``min_support_points`` 个不同源点与不同目标点匹配。这只是评估用的
+        最低影响，不会修改写回的原始蒙皮权重。
+        """
+        if not signature_a or not signature_b:
+            return False
+        points_a = numpy.asarray(signature_a.get("diffusion_points", []), dtype=numpy.float32)
+        weights_a = numpy.asarray(signature_a.get("diffusion_weights", []), dtype=numpy.float32)
+        points_b = numpy.asarray(signature_b.get("diffusion_points", []), dtype=numpy.float32)
+        weights_b = numpy.asarray(signature_b.get("diffusion_weights", []), dtype=numpy.float32)
+        if (
+            len(points_a) == 0 or len(points_b) == 0
+            or len(points_a) != len(weights_a) or len(points_b) != len(weights_b)
+            or points_a.ndim != 2 or points_b.ndim != 2
+            or points_a.shape[1] != 3 or points_b.shape[1] != 3
+            or weights_a.ndim != 1 or weights_b.ndim != 1
+        ):
+            return False
+
+        radius_a = float(signature_a.get("diffusion_radius", cls._diffusion_radius(points_a)))
+        radius_b = float(signature_b.get("diffusion_radius", cls._diffusion_radius(points_b)))
+        contact_distance = max(float(distance_tolerance), radius_a, radius_b)
+        # 跨层投影有明确上限；没有成对可靠法向时仍走 contact_distance。
+        layer_distance = min(max(float(layer_distance), contact_distance), 0.15)
+        tangent_tolerance = max(float(tangent_tolerance), float(distance_tolerance))
+
+        normals_a = numpy.asarray(
+            signature_a.get("diffusion_normals", cls._estimate_diffusion_normals(points_a)),
+            dtype=numpy.float32,
+        )
+        normals_b = numpy.asarray(
+            signature_b.get("diffusion_normals", cls._estimate_diffusion_normals(points_b)),
+            dtype=numpy.float32,
+        )
+        normals_a_valid = (
+            normals_a.ndim == 2 and normals_a.shape == (len(points_a), 3)
+            and numpy.isfinite(normals_a).all(axis=1)
+        )
+        normals_b_valid = (
+            normals_b.ndim == 2 and normals_b.shape == (len(points_b), 3)
+            and numpy.isfinite(normals_b).all(axis=1)
+        )
+        # 只有两侧都能提供至少一个可靠法向，才打开层间走廊；单侧/局部
+        # 法向缺失的点对继续使用严格接触半径，避免把体积点云当成表面。
+        has_surface_normals = bool(
+            numpy.any(normals_a_valid) and numpy.any(normals_b_valid)
+        )
+
+        def directional(
+            source_points,
+            source_weights,
+            target_points,
+            target_weights,
+            source_normals,
+            target_normals,
+        ):
+            distances, nearest = cls._nearest_diffusion_points(source_points, target_points)
+            # 没有可靠表面法向时保持原来的“真实接触”距离；
+            # 两层表面都有法向时，允许沿法向存在一小段层间距。
+            valid = nearest >= 0
+            if has_surface_normals:
+                source_valid = (
+                    source_normals.ndim == 2
+                    and source_normals.shape == (len(source_points), 3)
+                    and numpy.isfinite(source_normals).all(axis=1)
+                )
+                target_valid_all = (
+                    target_normals.ndim == 2
+                    and target_normals.shape == (len(target_points), 3)
+                    and numpy.isfinite(target_normals).all(axis=1)
+                )
+                target_valid = target_valid_all[nearest.clip(min=0)]
+                paired_surface = source_valid & target_valid
+                allowed_distance = numpy.where(
+                    paired_surface,
+                    layer_distance,
+                    contact_distance,
+                )
+                valid &= distances <= allowed_distance
+                if numpy.any(source_valid | target_valid):
+                    displacement = target_points[nearest.clip(min=0)] - source_points
+                    if numpy.any(source_valid):
+                        source_normal = numpy.where(
+                            numpy.isfinite(source_normals), source_normals, 0.0
+                        )
+                        normal_component = numpy.sum(displacement * source_normal, axis=1)
+                        tangent = displacement - normal_component[:, None] * source_normal
+                        valid &= (~source_valid) | (numpy.linalg.norm(tangent, axis=1) <= tangent_tolerance)
+                    if numpy.any(target_valid):
+                        paired_target_normals = target_normals[nearest.clip(min=0)]
+                        target_normal = numpy.where(
+                            numpy.isfinite(paired_target_normals), paired_target_normals, 0.0
+                        )
+                        target_component = numpy.sum(displacement * target_normal, axis=1)
+                        tangent = displacement - target_component[:, None] * target_normal
+                        valid &= (~target_valid) | (numpy.linalg.norm(tangent, axis=1) <= tangent_tolerance)
+                    if numpy.any(source_valid & target_valid):
+                        paired_target_normals = target_normals[nearest.clip(min=0)]
+                        alignment = numpy.abs(numpy.sum(
+                            source_normals * paired_target_normals, axis=1
+                        ))
+                        valid &= (~(source_valid & target_valid)) | (
+                            alignment >= float(normal_alignment)
+                        )
+            else:
+                valid &= distances <= contact_distance
+            # 最近邻不应被强制成双射：同一连续表面在两个部件上经常有完全
+            # 不同的三角网格密度，高密度侧的多个点合理投影到低密度侧同一点。
+            # 防止“整条槽边吸到一个孤立点”的方式改为要求至少多个不同目标
+            # 支持点；只有目标本来就只有一个点时，另用局部范围限制处理。
+            # 原始权重总量会让少量弱权重点几乎没有话语权（例如左/右两侧
+            # 各有一个很弱的点，强中心点却能把错误匹配“冲淡”）。使用相对
+            # 权重下限保留强度排序，同时让每个正权重样本都能影响判定。
+            finite_positive = source_weights[numpy.isfinite(source_weights) & (source_weights > 0)]
+            if len(finite_positive) == 0:
+                return 0.0, float("inf")
+            source_peak = float(numpy.max(finite_positive))
+            floor = max(source_peak * max(float(weak_weight_floor), 0.0), 0.05)
+            evaluation_weights = numpy.where(
+                numpy.isfinite(source_weights) & (source_weights > 0),
+                numpy.maximum(source_weights, floor),
+                0.0,
+            )
+            total = float(numpy.sum(evaluation_weights))
+            # 稀疏的凹槽底/装饰物可能只有 1~2 个正权重采样点，不能因为
+            # 全局默认值较高就被强制拆开。两边都很稀疏时按可用点数动态下调，
+            # 但仍至少保留一个真正的扩散配对作为证据。
+            required_support = min(
+                max(int(min_support_points), 1),
+                len(source_points),
+                len(target_points),
+            )
+            if total <= 1e-8 or int(numpy.count_nonzero(valid)) < required_support:
+                return 0.0, float("inf")
+            unique_target_support = len(numpy.unique(nearest[valid]))
+            if unique_target_support < required_support:
+                return 0.0, float("inf")
+            evaluation_w = evaluation_weights[valid]
+            # weak_weight_floor 只用于“每个采样点有多少评估影响”，不能
+            # 覆写拿来比较的原始权重值；旧实现把 0.01 抬成 0.25 后再与
+            # 另一侧真实 0.01 比，凭空制造了 0.24 的误差。
+            source_w = source_weights[valid]
+            target_w = target_weights[nearest[valid]]
+            coverage = float(numpy.sum(evaluation_w) / total)
+            error = float(numpy.sum(evaluation_w * numpy.abs(source_w - target_w)) /
+                          max(float(numpy.sum(evaluation_w)), 1e-8))
+            return coverage, error
+
+        cov_ab, err_ab = directional(
+            points_a, weights_a, points_b, weights_b, normals_a, normals_b
+        )
+        cov_ba, err_ba = directional(
+            points_b, weights_b, points_a, weights_a, normals_b, normals_a
+        )
+        if cov_ab >= cov_ba:
+            coverage, error = cov_ab, err_ab
+        else:
+            coverage, error = cov_ba, err_ba
+        # 极稀疏的一侧只有一个采样点时没有“多个目标支持点”可用。此时
+        # 要求另一侧本身局限在一个接触直径内，并且双向都有覆盖；这样保留
+        # 单点小附件，同时拒绝一个点吸附整条长槽边。
+        if min(len(points_a), len(points_b)) <= 1:
+            larger = points_a if len(points_a) > len(points_b) else points_b
+            extent = float(numpy.linalg.norm(
+                numpy.max(larger, axis=0) - numpy.min(larger, axis=0)
+            ))
+            if extent > contact_distance * 2.0:
+                return False
+            if min(cov_ab, cov_ba) < float(min_coverage):
+                return False
+        return coverage >= float(min_coverage) and error <= float(weight_tolerance)
 
     # ------------------------------------------------------------------
     # 骨骼矩阵读取
@@ -598,43 +927,77 @@ class EFMIBoneMapBuilder:
         submesh_skeletons: dict[str, tuple],
         match_tolerance: float = 1e-3,
         centroid_tolerance: float = 0.02,
+        diffusion_distance: float = 0.05,
+        diffusion_weight_tolerance: float = 0.20,
+        diffusion_min_coverage: float = 0.30,
+        diffusion_layer_distance: float = 0.15,
+        diffusion_tangent_tolerance: float = 0.05,
+        diffusion_normal_alignment: float = 0.70,
+        diffusion_weak_weight_floor: float = 0.25,
+        diffusion_min_support_points: int = 2,
+        protected_pairs: set[tuple[tuple[str, int], tuple[str, int]]] | None = None,
+        constraint_labels: dict[tuple[str, int], object] | None = None,
+        deduplicate: bool | None = None,
     ) -> tuple[dict[str, dict], dict[str, int]]:
-        """跨子网格"矩阵硬门控 + 质心确认"去重构建 vg_map（同部件不去重）。
+        """跨子网格按"矩阵硬门控 + 权重扩散确认"去重构建 vg_map（同部件不去重）。
 
-        总开关 _DEDUP_ENABLED（当前 False：临时整体关闭，等手动标注结果反推判据）；
+        总开关 _DEDUP_ENABLED（默认 True；关闭时仅用于诊断/回滚）；
         置 False 时退化为恒等映射（local → vg_offset + local），下方并查集逻辑不执行。
 
         参数:
             unique_str -> (skeleton_buffer, vg_count, weighted_vertex_counts[, signatures])
-            - signatures: {local: {centroid, bbox_min/max, vertex_count, spread, weight_total}}
-              （仅 centroid 参与判定，其余字段保留供调试/探针）
+            - signatures: {local: {centroid, bbox_min/max, vertex_count, spread,
+              weight_total, diffusion_points, diffusion_weights}}
+              （扩散字段参与近似矩阵判定，其余字段供回退/调试）
+            - protected_pairs: 已由跨 LOD 原始候选对应层确认“不可合并”的候选对。
+              这些对在本 LOD 内强制断边，用于防止一侧过度去重吞掉另一侧能区分的组。
+            - constraint_labels: 跨 LOD 迭代产生的临时语义标签。两个候选都已有
+              标签且标签不同时，其并查集组不可合并；无标签候选可附着到一侧，
+              但不能再作为桥把两个不同标签的组串起来。
         返回: (vg_maps, vg_offsets)
 
         去重判据（分层，矩阵是必要条件——几何接近无权推翻矩阵不一致）：
         1. **矩阵 diff >= match_tolerance：永不合并**。
            实测定案"误合并有害、漏合并无害"（容差误并手指两节导致功能丢失；
            漏并仅多占槽位，蒙皮仍正确）。
-        2. **矩阵 bitwise 完全相同（diff == 0）：直接合并**（无需签名）。
-        3. **0 < diff < match_tolerance：需加权质心距离 < centroid_tolerance 才合并**。
-           矩阵无法区分"同一骨骼的浮点误差"与"不同骨骼的恰好重合"
-           （539/493 差 1.8e-07 是同一骨骼；手指两节差 1.79e-07 是不同骨骼），
-           驱动质心是第二身份指纹：同骨骼跨部件驱动同区域（质心近），
-           不同骨骼驱动不同区域（质心远）。缺签名时近似矩阵保守不合并。
+        2. **矩阵 bitwise 完全相同（diff == 0）**：有扩散采样时仍需通过接触
+           权重一致性；缺少采样时兼容参考插件直接合并。
+        3. **0 < diff < match_tolerance：优先做权重扩散确认**。
+           将每个组的正权重点视为空间扩散场，在另一个组的正权重点上做最近邻
+           采样；普通点云要求接触半径内，能估计局部表面法向时允许沿法向
+           存在层间距，但切向误差和法向夹角必须通过；接触位置覆盖率达到 30%，
+           原始权重平均误差不超过 0.20 才合并。这能识别“大腿 + 丝袜”而不要求
+           共享顶点或整体质心相同。
+        4. 没有扩散采样时回退到加权质心距离 < centroid_tolerance；两者都缺失
+           则保守不合并（bitwise 完全相同仍保留直接合并的兼容语义）。
 
         废止记录：此前的"多维度投票"（矩阵/质心/包围盒/扩散球 vote>=2）把矩阵
-        降为可输的一票——质心/包围盒/扩散球三个维度都是"驱动点云接近度"的相关度量，
-        会同时通过并推翻矩阵反对票；实测"测试"工作空间 08-10 dump 上 195 个合并组中
-        42 组矩阵差异 > 1e-3（最高 0.27），即"明明不在一起的骨骼被并在一起"，已回退。
+        降为可输的一票——几何接近度会同时通过并推翻矩阵反对票；实测"测试"工作空间
+        08-10 dump 上 195 个合并组中 42 组矩阵差异 > 1e-3（最高 0.27）。当前扩散
+        判据只在矩阵硬门内使用“接触位置权重值”确认，不允许几何接近单独促成合并。
 
         **同部件冲突拒绝**（硬性规则）：并查集 union 时检查，组内同部件最多 1 个 local，
         防"同位置功能骨骼"（如手指两节）合并及链式绕过。
 
-        **完全图判定**：新成员必须与组内所有成员两两通过判据才能并入
-        （C 要与 A 且 B 都通过，才能连进 {A,B} 组），防关联判定/链式漂移。
+        **连续扩散图判定**：每个成员必须通过至少一条权重扩散边连接到组，
+        并在并入后对整组重新做连通性检查；不要求平面和每一个凹槽底直接
+        两两相交，允许“平面 → 槽壁/槽底”的连续桥接，同时禁止孤立断点。
 
         参数（可实测调整）:
             match_tolerance: 矩阵硬门控上限（默认 1e-3，达到即不合并）。
-            centroid_tolerance: 近似矩阵的质心确认阈值（默认 0.02）。
+            centroid_tolerance: 无扩散采样时的质心回退阈值（默认 0.02）。
+            diffusion_distance: 接触点基础距离阈值（默认 0.05）。
+            diffusion_weight_tolerance: 接触点原始权重平均误差（默认 0.20）。
+            diffusion_min_coverage: 一侧扩散场需被另一侧覆盖的最小比例（默认 0.30）。
+            diffusion_layer_distance: 平行/错位表面允许的法向扩散走廊（默认 0.15）。
+            diffusion_tangent_tolerance: 表面投影允许的切向误差（默认 0.05）。
+            diffusion_normal_alignment: 两层局部法向最小绝对点积（默认 0.70）。
+            diffusion_weak_weight_floor: 弱权重点的最小评估权重，占该方向最大
+                权重的比例（默认 0.25；同时有 0.05 的绝对下限）。
+            diffusion_min_support_points: 每个方向至少需要的唯一配对点数（默认 2，
+                对稀疏组按实际采样数动态下调到至少 1）。
+            deduplicate: 显式设为 False 时只建立恒等槽位映射，供目标 LOD 同步使用，
+                不运行权重扩散/并查集去重；省略时使用全局 _DEDUP_ENABLED。
         """
         # 收集所有骨骼候选
         candidates: list[dict] = []
@@ -681,13 +1044,15 @@ class EFMIBoneMapBuilder:
         if n == 0:
             return {}, {}
 
-        if not _DEDUP_ENABLED:
+        dedup_enabled = _DEDUP_ENABLED if deduplicate is None else bool(deduplicate)
+        if not dedup_enabled:
             # 恒等映射：每根骨骼独占全局槽位（候选收集阶段已按
             # global_vg_id = vg_offset + local_vg_id 分配），不做任何合并。
-            print(
-                f"[EFMI骨骼合并] 顶点组去重已全局关闭（_DEDUP_ENABLED=False），"
-                f"{n} 根骨骼全部独占槽位（恒等映射，无任何合并）。"
-            )
+            if deduplicate is None:
+                print(
+                    f"[EFMI骨骼合并] 顶点组去重已全局关闭（_DEDUP_ENABLED=False），"
+                    f"{n} 根骨骼全部独占槽位（恒等映射，无任何合并）。"
+                )
             identity_maps: dict[str, dict] = {}
             for cand in candidates:
                 identity_maps.setdefault(cand["unique_str"], {})[
@@ -697,7 +1062,7 @@ class EFMIBoneMapBuilder:
 
         parent = list(range(n))
         group_submeshes: list[set] = [{candidates[i]["unique_str"]} for i in range(n)]
-        # 每组的所有成员索引（用于"完全图判定"：新成员必须与组内所有成员两两通过）
+        # 每组的所有成员索引（用于合并后的权重扩散连通性校验）
         group_members: list[list[int]] = [[i] for i in range(n)]
 
         def find(x):
@@ -712,24 +1077,145 @@ class EFMIBoneMapBuilder:
             return candidates[idx].get("signature")
 
         def passes(i, j) -> bool:
-            """分层判据（两两独立）：矩阵硬门控 + 质心确认。
+            """分层判据（两两独立）：矩阵硬门控 + 权重扩散确认。
 
             - 矩阵 diff >= match_tolerance：永不合并（几何接近无权推翻）；
-            - 矩阵 bitwise 完全相同：直接通过；
-            - 近似：需加权质心距离 < centroid_tolerance（缺签名保守拒绝）。
+            - 矩阵 bitwise 完全相同：有扩散采样时仍验证权重场，无采样时兼容直接通过；
+            - 近似：优先验证权重扩散，无扩散时才用加权质心距离（缺签名保守拒绝）。
             """
             matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
             if matrix_diff >= match_tolerance:
                 return False
-            if matrix_diff == 0.0:
-                return True
             si, sj = _sig(i), _sig(j)
+            if matrix_diff == 0.0 and (si is None or sj is None):
+                # 没有 Position/Blend 扩散证据时保留参考插件的 bitwise
+                # 兼容语义；有证据则必须验证接触位置的权重场。
+                return True
             if si is None or sj is None:
                 return False
+
+            # 两边都有 Position/Blend 生成的扩散采样时，扩散场是主判据；
+            # 质心仅作为旧缓存/测试签名的兼容回退，不能覆盖已观测到的
+            # 接触位置权重冲突。
+            has_diffusion = (
+                len(si.get("diffusion_points", [])) > 0
+                and len(si.get("diffusion_weights", [])) > 0
+                and len(sj.get("diffusion_points", [])) > 0
+                and len(sj.get("diffusion_weights", [])) > 0
+            )
+            if has_diffusion:
+                # 包围盒完全分离且间隙超过扩散半径时不可能存在接触
+                # 证据，先在这里剪枝，避免对所有候选执行最近邻扫描。
+                try:
+                    a_min = numpy.asarray(si["bbox_min"], dtype=numpy.float64)
+                    a_max = numpy.asarray(si["bbox_max"], dtype=numpy.float64)
+                    b_min = numpy.asarray(sj["bbox_min"], dtype=numpy.float64)
+                    b_max = numpy.asarray(sj["bbox_max"], dtype=numpy.float64)
+                    gap_vec = numpy.maximum(numpy.maximum(a_min - b_max, b_min - a_max), 0.0)
+                    gap = float(numpy.linalg.norm(gap_vec))
+                    radius = max(
+                        float(diffusion_distance),
+                        float(diffusion_layer_distance),
+                        EFMIBoneMapBuilder._diffusion_radius(
+                            numpy.asarray(si["diffusion_points"], dtype=numpy.float32)
+                        ),
+                        EFMIBoneMapBuilder._diffusion_radius(
+                            numpy.asarray(sj["diffusion_points"], dtype=numpy.float32)
+                        ),
+                    )
+                    if gap > radius:
+                        return False
+                except (KeyError, TypeError, ValueError):
+                    # 外部调用者可只提供 diffusion_points/weights；字段不全
+                    # 时交给最近邻函数做保守判定。
+                    pass
+                return EFMIBoneMapBuilder.weight_diffusion_similarity(
+                    si,
+                    sj,
+                    distance_tolerance=diffusion_distance,
+                    weight_tolerance=diffusion_weight_tolerance,
+                    min_coverage=diffusion_min_coverage,
+                    layer_distance=diffusion_layer_distance,
+                    tangent_tolerance=diffusion_tangent_tolerance,
+                    normal_alignment=diffusion_normal_alignment,
+                    weak_weight_floor=diffusion_weak_weight_floor,
+                    min_support_points=diffusion_min_support_points,
+                )
+            if matrix_diff == 0.0:
+                return True
             dist = float(numpy.linalg.norm(
                 si["centroid"].astype(numpy.float64) - sj["centroid"].astype(numpy.float64)
             ))
             return dist < centroid_tolerance
+
+        pair_cache: dict[tuple[int, int], bool] = {}
+
+        normalized_protected_pairs: set[tuple[tuple[str, int], tuple[str, int]]] = set()
+        for pair in protected_pairs or ():
+            try:
+                left, right = pair
+                left_key = (str(left[0]), int(left[1]))
+                right_key = (str(right[0]), int(right[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            if left_key == right_key:
+                continue
+            normalized_protected_pairs.add(
+                tuple(sorted((left_key, right_key)))
+            )
+
+        normalized_constraint_labels = {}
+        for candidate_key, label in (constraint_labels or {}).items():
+            try:
+                key = (str(candidate_key[0]), int(candidate_key[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            normalized_constraint_labels[key] = label
+
+        def _candidate_label(idx: int):
+            candidate = candidates[idx]
+            return normalized_constraint_labels.get((
+                str(candidate["unique_str"]), int(candidate["local_vg_id"])
+            ))
+
+        group_labels: list[set] = []
+        for idx in range(n):
+            label = _candidate_label(idx)
+            group_labels.append(set() if label is None else {label})
+
+        def is_protected(i: int, j: int) -> bool:
+            left = (str(candidates[i]["unique_str"]), int(candidates[i]["local_vg_id"]))
+            right = (str(candidates[j]["unique_str"]), int(candidates[j]["local_vg_id"]))
+            return tuple(sorted((left, right))) in normalized_protected_pairs
+
+        def pair_passes(a, b) -> bool:
+            key = (a, b) if a < b else (b, a)
+            if key not in pair_cache:
+                pair_cache[key] = bool(not is_protected(a, b) and passes(a, b))
+            return pair_cache[key]
+
+        def _continuous_members(members: list[int]) -> bool:
+            """检查合并出来的 VG 是否存在权重扩散断点。
+
+            这是一个无向图：顶点是原始顶点组，边是通过矩阵硬门控和
+            权重扩散确认的配对。只有整组连通才允许写回同一个 global VG；
+            因而“平面 + 多个槽底”可以通过各自的局部桥接合并，但没有任何
+            扩散证据的孤立物体永远不会被带进来。
+            """
+            if len(members) <= 1:
+                return True
+            visited = {members[0]}
+            stack = [members[0]]
+            member_set = set(members)
+            while stack:
+                current = stack.pop()
+                for other in member_set - visited:
+                    if candidates[current]["unique_str"] == candidates[other]["unique_str"]:
+                        continue
+                    if pair_passes(current, other):
+                        visited.add(other)
+                        stack.append(other)
+            return len(visited) == len(member_set)
 
         def try_union(a, b):
             ra, rb = find(a), find(b)
@@ -738,15 +1224,25 @@ class EFMIBoneMapBuilder:
             # 冲突拒绝：合并后某子网格在同组会有 >1 个 local → 拒绝
             if group_submeshes[ra] & group_submeshes[rb]:
                 return
-            # 完全图判定（用户定义）：b 组每个成员必须与 a 组每个成员都两两判定通过，
-            # 才能并入（C 要与 A 且 B 都通过，才能连进 {A,B} 组）——防止关联判定/链式漂移
-            for mi in group_members[ra]:
-                for mj in group_members[rb]:
-                    if not passes(mi, mj):
-                        return
+            # 跨 LOD 语义冲突拒绝：不同标签的两组不能被无标签候选桥接。
+            if len(group_labels[ra] | group_labels[rb]) > 1:
+                return
+            # 只要两组之间存在一条真实扩散桥即可尝试合并；随后对合并结果
+            # 做整组连通性复核。这样不会把平面和每个凹槽底强行当作完全图，
+            # 也不会允许没有任何桥接的孤立成员混入。
+            if not any(
+                pair_passes(mi, mj)
+                for mi in group_members[ra]
+                for mj in group_members[rb]
+            ):
+                return
+            merged_members = group_members[ra] + group_members[rb]
+            if not _continuous_members(merged_members):
+                return
             parent[ra] = rb
             group_submeshes[rb] = group_submeshes[ra] | group_submeshes[rb]
-            group_members[rb] = group_members[ra] + group_members[rb]
+            group_members[rb] = merged_members
+            group_labels[rb] = group_labels[ra] | group_labels[rb]
 
         for i in range(n):
             for j in range(i + 1, n):
@@ -756,14 +1252,37 @@ class EFMIBoneMapBuilder:
                 if find(i) == find(j):
                     continue
 
-                # 分层判据：矩阵硬门控 + 质心确认
-                if passes(i, j):
+                # 分层判据：矩阵硬门控 + 权重扩散/质心确认
+                if pair_passes(i, j):
                     try_union(i, j)
 
-        # 分组
-        groups: dict[int, list[int]] = {}
+        # 分组。并查集合并过程中已经逐次检查过连通性；这里再做一次最终
+        # 权重扩散图校验，并把任何意外断开的组件拆回独立 global VG，避免
+        # “中途通过、最终写回却有孤岛”的缓存/调用方回归。
+        raw_groups: dict[int, list[int]] = {}
         for i in range(n):
-            groups.setdefault(find(i), []).append(i)
+            raw_groups.setdefault(find(i), []).append(i)
+
+        groups: dict[int, list[int]] = {}
+        next_group_id = 0
+        for members in raw_groups.values():
+            remaining = set(members)
+            while remaining:
+                seed = next(iter(remaining))
+                component = {seed}
+                stack = [seed]
+                remaining.remove(seed)
+                while stack:
+                    current = stack.pop()
+                    for other in tuple(remaining):
+                        if candidates[current]["unique_str"] == candidates[other]["unique_str"]:
+                            continue
+                        if pair_passes(current, other):
+                            remaining.remove(other)
+                            component.add(other)
+                            stack.append(other)
+                groups[next_group_id] = sorted(component)
+                next_group_id += 1
 
         # 每组 canonical = 权重顶点数最多的候选
         vg_maps: dict[str, dict] = {}
@@ -775,6 +1294,764 @@ class EFMIBoneMapBuilder:
                 vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
 
         return vg_maps, vg_offsets
+
+    @staticmethod
+    def build_lod_maps_from_reference(
+        reference_submesh_skeletons: dict[str, tuple],
+        reference_vg_maps: dict[str, dict],
+        target_submesh_skeletons: dict[str, tuple],
+        correspondence: dict,
+        reference_lod: str | None = None,
+        target_lod: str | None = None,
+    ) -> tuple[dict[str, dict], dict[str, int]]:
+        """按参考 LOD 的去重分区生成目标 LOD 映射。
+
+        目标侧只建立原始槽位的恒等映射，然后把已有的一对一原始候选对应
+        投影到参考侧 global group。这样 LOD1 不再独立运行权重扩散/并查集，
+        但仍使用自己的槽位编号和自己的骨骼矩阵池；未被对应覆盖的额外 LOD1
+        候选保留恒等槽位，不伪造参考侧缺失的顶点组。
+        """
+        target_maps, target_offsets = EFMIBoneMapBuilder.build_vg_maps(
+            target_submesh_skeletons,
+            deduplicate=False,
+        )
+        if not target_maps or not reference_vg_maps:
+            return target_maps, target_offsets
+
+        reference_lod = str(
+            reference_lod or correspondence.get("reference_lod", "") or ""
+        ).strip()
+        if target_lod is None:
+            lod_names = {
+                str(row.get("target_lod", "") or "").strip()
+                for row in correspondence.get("matches", []) or []
+            }
+            target_lod = next(iter(sorted(lod_names)), "")
+        target_lod = str(target_lod or "").strip()
+
+        # 先为每个参考 global group 选一个确定性的目标槽位。primary
+        # correspondence 已保证一个目标原始候选只对应一个参考候选；同一参考组
+        # 的多个目标候选表示 LOD1 额外细分，全部投到该组的第一个目标槽位。
+        target_slot_by_reference_group: dict[int, int] = {}
+        projected_rows = []
+        for row in correspondence.get("matches", []) or []:
+            if reference_lod and str(row.get("reference_lod", "") or "") != reference_lod:
+                continue
+            if target_lod and str(row.get("target_lod", "") or "") != target_lod:
+                continue
+            reference_unique = str(row.get("reference_unique_str", "") or "")
+            target_unique = str(row.get("target_unique_str", "") or "")
+            if reference_unique not in reference_submesh_skeletons:
+                continue
+            try:
+                reference_local = int(row.get("reference_local_vg_id", 0) or 0)
+                target_local = int(row.get("target_local_vg_id", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            reference_group = reference_vg_maps.get(reference_unique, {}).get(reference_local)
+            target_slot = target_maps.get(target_unique, {}).get(target_local)
+            if reference_group is None or target_slot is None:
+                continue
+            reference_group = int(reference_group)
+            target_slot = int(target_slot)
+            projected_rows.append((
+                reference_group,
+                target_slot,
+                target_unique,
+                target_local,
+            ))
+            previous = target_slot_by_reference_group.get(reference_group)
+            if previous is None or target_slot < previous:
+                target_slot_by_reference_group[reference_group] = target_slot
+
+        for reference_group, _target_slot, target_unique, target_local in projected_rows:
+            canonical_target = target_slot_by_reference_group.get(reference_group)
+            if canonical_target is None:
+                continue
+            if target_local in target_maps.get(target_unique, {}):
+                target_maps[target_unique][target_local] = canonical_target
+        return target_maps, target_offsets
+
+    @staticmethod
+    def build_cross_lod_correspondence(
+        lod_submesh_skeletons: dict[str, dict[str, tuple]],
+        reference_lod: str = "LOD0",
+        match_tolerance: float = 1.25,
+        centroid_tolerance: float = 0.10,
+    ) -> dict:
+        """用原始顶点组的矩阵 + 加权中心建立跨 LOD 对应，并生成去重保护边。
+
+        这里故意接收 *未去重* 的 ``submesh_skeletons``。如果先在每个 LOD
+        内部去重，某一侧已经吞掉的候选就无法再被另一侧矩阵区分出来。返回值中
+        ``protected_pairs`` 保留为诊断/兼容字段；联合导入路径不再把它交给两侧
+        独立去重，而是用 ``matches`` 将 LOD0 的分区同步到目标 LOD。
+
+        对应不是按文件夹名配对：LOD 提取时组件 hash、局部索引和顶点数量都可能
+        轻微变化。先为每个部件聚合其权重扩散点云，使用对称最近邻几何距离、包围盒
+        和整体中心做一对一部件匹配；再**只在匹配的部件对内部**按局部加权中心配对
+        原始顶点组，矩阵只作为第二排序键和异常过滤。LOD 之间的矩阵本身可能因为
+        简化网格/捕获帧不同而有明显差异，因此这里的 1.25 仅是跨 LOD 参考门槛，不会
+        改变各 LOD 内部 build_vg_maps 的 1e-3 硬门控。
+        不要求两个 LOD 的整片驱动区域完全重合（例如平面和贴合物体）。
+        同一参考候选在目标 LOD 可以有多个命中，表示目标 LOD 的额外细分；反向
+        保护只在两个候选分别对应不同参考候选时触发。
+
+        返回字段是纯 Python/JSON 友好的结构：
+        ``reference_lod``、``matches``、``protected_pairs``、``counts``、
+        ``unmatched_reference``、``unmatched_by_lod``。
+        """
+        if not lod_submesh_skeletons:
+            return {
+                "reference_lod": "",
+                "part_matches": [],
+                "unmatched_reference_parts": [],
+                "unmatched_target_parts": {},
+                "matches": [],
+                "protected_pairs": {},
+                "counts": {},
+                "unmatched_reference": [],
+                "unmatched_by_lod": {},
+            }
+
+        lod_names = sorted(str(name) for name in lod_submesh_skeletons.keys())
+        reference_lod = str(reference_lod or "").strip()
+        if reference_lod not in lod_names:
+            reference_lod = "LOD0" if "LOD0" in lod_names else lod_names[0]
+
+        def _flatten(lod_name: str) -> list[dict]:
+            result = []
+            parts = lod_submesh_skeletons.get(lod_name, {}) or {}
+            for unique_str in sorted(parts.keys()):
+                entry = parts[unique_str]
+                if not entry or len(entry) < 2:
+                    continue
+                skeleton = entry[0]
+                vg_count = int(entry[1] or 0)
+                weighted = entry[2] if len(entry) > 2 else None
+                signatures = entry[3] if len(entry) > 3 else {}
+                if skeleton is None or vg_count <= 0 or len(skeleton) < vg_count:
+                    continue
+                for local in range(vg_count):
+                    bone = numpy.asarray(skeleton[local], dtype=numpy.float64)
+                    if bone.size == 0 or numpy.all(bone == 0):
+                        continue
+                    count = 0
+                    if weighted is not None and local < len(weighted):
+                        try:
+                            count = int(weighted[local])
+                        except (TypeError, ValueError):
+                            count = 0
+                    signature = signatures.get(local) if isinstance(signatures, dict) else None
+                    centroid = None
+                    spread = 0.0
+                    diffusion_points = numpy.empty((0, 3), dtype=numpy.float64)
+                    diffusion_weights = numpy.empty((0,), dtype=numpy.float64)
+                    if isinstance(signature, dict):
+                        raw_centroid = signature.get("centroid")
+                        if raw_centroid is not None:
+                            try:
+                                value = numpy.asarray(raw_centroid, dtype=numpy.float64)
+                                if value.shape == (3,) and numpy.isfinite(value).all():
+                                    centroid = value
+                            except (TypeError, ValueError):
+                                centroid = None
+                        try:
+                            spread = max(float(signature.get("spread", 0.0) or 0.0), 0.0)
+                        except (TypeError, ValueError):
+                            spread = 0.0
+                        try:
+                            raw_points = numpy.asarray(
+                                signature.get("diffusion_points", []),
+                                dtype=numpy.float64,
+                            )
+                            raw_weights = numpy.asarray(
+                                signature.get("diffusion_weights", []),
+                                dtype=numpy.float64,
+                            )
+                            if (
+                                raw_points.ndim == 2
+                                and raw_points.shape[1] == 3
+                                and raw_weights.ndim == 1
+                                and len(raw_points) == len(raw_weights)
+                            ):
+                                valid = numpy.isfinite(raw_points).all(axis=1) & numpy.isfinite(raw_weights)
+                                valid &= raw_weights > 0
+                                diffusion_points = raw_points[valid]
+                                diffusion_weights = raw_weights[valid]
+                        except (TypeError, ValueError):
+                            diffusion_points = numpy.empty((0, 3), dtype=numpy.float64)
+                            diffusion_weights = numpy.empty((0,), dtype=numpy.float64)
+                    result.append({
+                        "lod": lod_name,
+                        "unique_str": str(unique_str),
+                        "local_vg_id": int(local),
+                        "bone": bone,
+                        "weighted_vertex_count": count,
+                        "centroid": centroid,
+                        "spread": spread,
+                        "diffusion_points": diffusion_points,
+                        "diffusion_weights": diffusion_weights,
+                    })
+            return result
+
+        flattened = {lod: _flatten(lod) for lod in lod_names}
+        counts = {lod: len(items) for lod, items in flattened.items()}
+        reference_candidates = flattened.get(reference_lod, [])
+
+        # 先建立子网格/节点级对应。跨 LOD 文件夹名是不同 hash，不能直接拼接；
+        # 部件整体中心通常比单个骨骼中心稳定，也能避免两个局部骨骼恰好共心时
+        # 被分到不同部件。
+        part_candidates = {}
+        for lod_name, candidates_for_lod in flattened.items():
+            by_part = {}
+            for candidate in candidates_for_lod:
+                by_part.setdefault(candidate["unique_str"], []).append(candidate)
+            part_candidates[lod_name] = by_part
+
+        def _part_descriptor(items):
+            """建立部件级点云描述，避免把不同部件的局部组放到同一候选池。"""
+            center_items = [item for item in items if item["centroid"] is not None]
+            center = None
+            total_weight = 0.0
+            if center_items:
+                center_weights = numpy.asarray([
+                    max(int(item["weighted_vertex_count"]), 1)
+                    for item in center_items
+                ], dtype=numpy.float64)
+                center_points = numpy.stack([
+                    item["centroid"] for item in center_items
+                ]).astype(numpy.float64)
+                center = numpy.average(center_points, axis=0, weights=center_weights)
+                total_weight = float(center_weights.sum())
+
+            point_chunks = []
+            weight_chunks = []
+            for item in items:
+                points = numpy.asarray(item.get("diffusion_points", []), dtype=numpy.float64)
+                weights = numpy.asarray(item.get("diffusion_weights", []), dtype=numpy.float64)
+                if (
+                    points.ndim == 2 and points.shape[1] == 3
+                    and weights.ndim == 1 and len(points) == len(weights)
+                    and len(points) > 0
+                ):
+                    # 每个局部组最多贡献 64 个点，部件级匹配只需要形状指纹，
+                    # 不把全部平面点云复制进 11×11 的比较矩阵。
+                    stride = max(int(numpy.ceil(len(points) / 64.0)), 1)
+                    points = points[::stride][:64]
+                    weights = weights[::stride][:64]
+                    valid = numpy.isfinite(points).all(axis=1) & numpy.isfinite(weights)
+                    valid &= weights > 0
+                    if numpy.any(valid):
+                        point_chunks.append(points[valid])
+                        weight_chunks.append(weights[valid])
+                elif item["centroid"] is not None:
+                    point_chunks.append(numpy.asarray(item["centroid"], dtype=numpy.float64)[None, :])
+                    weight_chunks.append(numpy.asarray([
+                        max(int(item["weighted_vertex_count"]), 1)
+                    ], dtype=numpy.float64))
+
+            if point_chunks:
+                points = numpy.concatenate(point_chunks, axis=0)
+                weights = numpy.concatenate(weight_chunks, axis=0)
+                if len(points) > 512:
+                    sample_idx = numpy.linspace(0, len(points) - 1, 512, dtype=numpy.int64)
+                    points = points[sample_idx]
+                    weights = weights[sample_idx]
+                if center is None:
+                    center = numpy.average(points, axis=0, weights=weights)
+                total_weight = max(total_weight, float(weights.sum()))
+                bbox_min = numpy.min(points, axis=0)
+                bbox_max = numpy.max(points, axis=0)
+            elif center is not None:
+                points = center[None, :].astype(numpy.float64)
+                weights = numpy.asarray([max(total_weight, 1.0)], dtype=numpy.float64)
+                bbox_min = center.copy()
+                bbox_max = center.copy()
+            else:
+                points = numpy.empty((0, 3), dtype=numpy.float64)
+                weights = numpy.empty((0,), dtype=numpy.float64)
+                bbox_min = None
+                bbox_max = None
+
+            return {
+                "center": center,
+                "count": len(items),
+                "weight": total_weight,
+                "points": points,
+                "weights": weights,
+                "bbox_min": bbox_min,
+                "bbox_max": bbox_max,
+            }
+
+        part_descriptors = {
+            lod_name: {
+                unique_str: _part_descriptor(items)
+                for unique_str, items in by_part.items()
+            }
+            for lod_name, by_part in part_candidates.items()
+        }
+
+        def _part_cloud_distance(source, target):
+            source_points = source["points"]
+            target_points = target["points"]
+            if len(source_points) == 0 or len(target_points) == 0:
+                return None
+
+            def nearest_median(points_a, points_b):
+                distances = []
+                for start in range(0, len(points_a), 64):
+                    chunk = points_a[start:start + 64]
+                    delta = chunk[:, None, :] - points_b[None, :, :]
+                    squared = numpy.sum(delta * delta, axis=2)
+                    distances.extend(numpy.sqrt(numpy.min(squared, axis=1)).tolist())
+                return float(numpy.median(numpy.asarray(distances, dtype=numpy.float64)))
+
+            return 0.5 * (
+                nearest_median(source_points, target_points)
+                + nearest_median(target_points, source_points)
+            )
+
+        def _part_pair_score(source_lod, source, target_lod, target):
+            source_desc = part_descriptors[source_lod][source]
+            target_desc = part_descriptors[target_lod][target]
+            center_distance = None
+            if source_desc["center"] is not None and target_desc["center"] is not None:
+                center_distance = float(numpy.linalg.norm(
+                    source_desc["center"] - target_desc["center"]
+                ))
+                if center_distance > max(float(centroid_tolerance) * 8.0, 0.75):
+                    return None
+
+            cloud_distance = _part_cloud_distance(source_desc, target_desc)
+            bbox_gap = 0.0
+            if (
+                source_desc["bbox_min"] is not None
+                and source_desc["bbox_max"] is not None
+                and target_desc["bbox_min"] is not None
+                and target_desc["bbox_max"] is not None
+            ):
+                gap_vec = numpy.maximum(
+                    numpy.maximum(source_desc["bbox_min"] - target_desc["bbox_max"],
+                                  target_desc["bbox_min"] - source_desc["bbox_max"]),
+                    0.0,
+                )
+                bbox_gap = float(numpy.linalg.norm(gap_vec))
+
+            source_extent = (
+                numpy.zeros(3, dtype=numpy.float64)
+                if source_desc["bbox_min"] is None
+                else source_desc["bbox_max"] - source_desc["bbox_min"]
+            )
+            target_extent = (
+                numpy.zeros(3, dtype=numpy.float64)
+                if target_desc["bbox_min"] is None
+                else target_desc["bbox_max"] - target_desc["bbox_min"]
+            )
+            extent_scale = max(float(numpy.linalg.norm(source_extent)),
+                               float(numpy.linalg.norm(target_extent)), 0.05)
+            extent_error = float(numpy.linalg.norm(source_extent - target_extent)) / extent_scale
+            count_ratio = max(
+                source_desc["count"] / max(target_desc["count"], 1),
+                target_desc["count"] / max(source_desc["count"], 1),
+            )
+            count_term = min(float(numpy.log(max(count_ratio, 1.0))), 4.0) * 0.05
+            # 点云形状是主判据；中心/bbox/部件数量只做稳定器，防止两个部件
+            # 恰好整体中心接近时被错误交换。
+            score = 0.0 if cloud_distance is None else cloud_distance
+            score += bbox_gap * 0.25
+            score += (0.0 if center_distance is None else center_distance * 0.10)
+            score += extent_error * 0.05 + count_term
+            return score
+
+        def _match_parts(source_lod, target_lod):
+            source_parts = sorted(part_descriptors.get(source_lod, {}).keys())
+            target_parts = sorted(part_descriptors.get(target_lod, {}).keys())
+            rows = []
+            for source in source_parts:
+                for target in target_parts:
+                    score = _part_pair_score(source_lod, source, target_lod, target)
+                    if score is not None:
+                        rows.append((score, source, target))
+            rows.sort(key=lambda row: (row[0], row[1], row[2]))
+
+            # 11×11 规模使用精确的一对一最小代价分配，避免贪心先占用
+            # 一个近似部件后把后续部件错配；部件数量不等时退化为贪心。
+            score_by_pair = {(source, target): score for score, source, target in rows}
+            if len(source_parts) == len(target_parts) and len(source_parts) <= 12:
+                states = {0: (0.0, [])}
+                for source_index, source in enumerate(source_parts):
+                    next_states = {}
+                    for mask, (total, selected) in states.items():
+                        for target_index, target in enumerate(target_parts):
+                            if mask & (1 << target_index):
+                                continue
+                            score = score_by_pair.get((source, target))
+                            if score is None:
+                                continue
+                            new_mask = mask | (1 << target_index)
+                            candidate = (total + score, selected + [(source, target, score)])
+                            previous = next_states.get(new_mask)
+                            if previous is None or candidate[0] < previous[0]:
+                                next_states[new_mask] = candidate
+                    states = next_states
+                full_mask = (1 << len(target_parts)) - 1
+                if full_mask in states:
+                    selected = states[full_mask][1]
+                    return (
+                        {source: target for source, target, _score in selected},
+                        {(source, target): float(score) for source, target, score in selected},
+                    )
+
+            used_source, used_target = set(), set()
+            mapping = {}
+            selected_scores = {}
+            for _score, source, target in rows:
+                if source in used_source or target in used_target:
+                    continue
+                used_source.add(source)
+                used_target.add(target)
+                mapping[source] = target
+                selected_scores[(source, target)] = float(_score)
+            return mapping, selected_scores
+
+        def _pair_score(left: dict, right: dict):
+            matrix_diff = float(numpy.max(numpy.abs(left["bone"] - right["bone"])))
+            if matrix_diff >= float(match_tolerance):
+                return None
+            # 没有任何权重中心时不能靠宽松的跨 LOD 矩阵门槛硬配；这类数据
+            # 只有逐位矩阵才足够安全，否则把“缺少几何证据”当成对应关系。
+            if left["centroid"] is None or right["centroid"] is None:
+                if matrix_diff >= 1e-3:
+                    return None
+            centroid_distance = None
+            if left["centroid"] is not None and right["centroid"] is not None:
+                centroid_distance = float(numpy.linalg.norm(
+                    left["centroid"] - right["centroid"]
+                ))
+            # 同一根骨骼在两个 LOD 的大平面/附件顶点数可能相差很大；权重数量
+            # 只用于同分候选的轻微排序，不作为硬门槛。
+            weight_ratio = 0.0
+            if left["weighted_vertex_count"] > 0 and right["weighted_vertex_count"] > 0:
+                ratio = max(
+                    left["weighted_vertex_count"] / right["weighted_vertex_count"],
+                    right["weighted_vertex_count"] / left["weighted_vertex_count"],
+                )
+                weight_ratio = min(float(numpy.log(max(ratio, 1.0))), 4.0)
+            center_term = 0.0
+            if centroid_distance is not None:
+                center_term = min(
+                    centroid_distance / max(float(centroid_tolerance), 1e-6),
+                    8.0,
+                )
+                # 这里已经限定在同一个“部件节点”内；部件可能是大平面，
+                # 同一根骨骼的散落附件中心相距很远，因此不能再用绝对中心距
+                # 做硬拒绝，只把它作为候选排序项。
+            # 跨 LOD 以加权中心为第一排序键，矩阵只做次级稳定器；不能把
+            # LOD0/LOD1 的捕获姿态差异误当成不同骨骼的硬拒绝。
+            score = center_term + matrix_diff / max(float(match_tolerance), 1e-8) * 0.05
+            score += weight_ratio * 0.03
+            return score, matrix_diff, centroid_distance
+
+        protected_by_lod: dict[str, set[tuple[tuple[str, int], tuple[str, int]]]] = {
+            lod: set() for lod in lod_names
+        }
+        all_matches = []
+        part_matches = []
+
+        for target_lod in lod_names:
+            if target_lod == reference_lod:
+                continue
+            target_candidates = flattened.get(target_lod, [])
+            reference_part_to_target, part_pair_scores = _match_parts(
+                reference_lod, target_lod
+            )
+            for (reference_part, target_part), score in sorted(part_pair_scores.items()):
+                part_matches.append({
+                    "reference_lod": reference_lod,
+                    "target_lod": target_lod,
+                    "reference_unique_str": reference_part,
+                    "target_unique_str": target_part,
+                    "score": float(score),
+                    "reference_group_count": len(part_candidates.get(reference_lod, {}).get(reference_part, [])),
+                    "target_group_count": len(part_candidates.get(target_lod, {}).get(target_part, [])),
+                })
+            pair_rows = []
+            for ref in reference_candidates:
+                for target in target_candidates:
+                    if reference_part_to_target.get(ref["unique_str"]) != target["unique_str"]:
+                        continue
+                    scored = _pair_score(ref, target)
+                    if scored is None:
+                        continue
+                    score, matrix_diff, centroid_distance = scored
+                    pair_rows.append((
+                        score,
+                        ref,
+                        target,
+                        matrix_diff,
+                        centroid_distance,
+                    ))
+
+            # 先做稳定的一对一主匹配：一个目标候选不能被两个参考候选抢走。
+            # 额外目标候选随后仍可通过各自最佳参考建立“LOD1 多于 LOD0”的关系，
+            # 但不会因此制造错误的保护边。
+            pair_rows.sort(key=lambda row: (
+                row[0],
+                -row[1]["weighted_vertex_count"],
+                -row[2]["weighted_vertex_count"],
+                row[1]["unique_str"],
+                row[1]["local_vg_id"],
+                row[2]["unique_str"],
+                row[2]["local_vg_id"],
+            ))
+            used_ref = set()
+            used_target = set()
+            primary = []
+            for row in pair_rows:
+                ref, target = row[1], row[2]
+                ref_key = (ref["unique_str"], ref["local_vg_id"])
+                target_key = (target["unique_str"], target["local_vg_id"])
+                if ref_key in used_ref or target_key in used_target:
+                    continue
+                used_ref.add(ref_key)
+                used_target.add(target_key)
+                primary.append(row)
+
+            # 每个目标候选都保留一个最佳参考（包括额外候选）。
+            best_ref_for_target = {}
+            for row in pair_rows:
+                target = row[2]
+                target_key = (target["unique_str"], target["local_vg_id"])
+                if target_key not in best_ref_for_target:
+                    best_ref_for_target[target_key] = row
+
+            target_rows_by_ref: dict[tuple[str, int], list[dict]] = {}
+            for row in pair_rows:
+                ref, target = row[1], row[2]
+                ref_key = (ref["unique_str"], ref["local_vg_id"])
+                target_rows_by_ref.setdefault(ref_key, []).append(target)
+            for ref_key in target_rows_by_ref:
+                target_rows_by_ref[ref_key].sort(
+                    key=lambda item: (item["unique_str"], item["local_vg_id"])
+                )
+
+            best_target_for_ref = {}
+            for row in pair_rows:
+                ref = row[1]
+                ref_key = (ref["unique_str"], ref["local_vg_id"])
+                if ref_key not in best_target_for_ref:
+                    best_target_for_ref[ref_key] = row
+
+            primary_target_for_ref = {
+                (row[1]["unique_str"], row[1]["local_vg_id"]): row[2]
+                for row in primary
+            }
+            primary_ref_for_target = {
+                (row[2]["unique_str"], row[2]["local_vg_id"]): row[1]
+                for row in primary
+            }
+
+            def _cross_side_is_distinct(left: dict, right: dict, threshold: float) -> bool:
+                """判断另一侧是否提供了足够强的“拆分证据”。
+
+                中心相距很远本身不能拆分：同一根骨骼可以同时驱动大平面和
+                散落附件。只有另一侧的矩阵也出现明显分离时才回传保护边；
+                这样跨 LOD 姿态的小幅矩阵变化不会把正常的重复骨骼全部拆散。
+                """
+                return float(numpy.max(numpy.abs(left["bone"] - right["bone"]))) >= float(threshold)
+
+            def _current_side_can_merge(left: dict, right: dict) -> bool:
+                # 保护边只约束本侧原本有机会通过矩阵硬门的候选；不同矩阵
+                # 已经由 build_vg_maps 拒绝，不应让跨 LOD 层扩大拆分范围。
+                return float(numpy.max(numpy.abs(left["bone"] - right["bone"]))) < 1e-3
+
+            # 参考侧有两个候选，而目标侧分别存在两个可区分候选时，禁止参考
+            # 侧把它们并成一组；反过来也一样。这正是“用另一侧矩阵补齐”
+            # 的约束来源。
+            for ref_a_index in range(len(reference_candidates)):
+                ref_a = reference_candidates[ref_a_index]
+                ref_a_key = (ref_a["unique_str"], ref_a["local_vg_id"])
+                target_a = primary_target_for_ref.get(ref_a_key)
+                if target_a is None:
+                    continue
+                target_a_key = (target_a["unique_str"], target_a["local_vg_id"])
+                for ref_b in reference_candidates[ref_a_index + 1:]:
+                    ref_b_key = (ref_b["unique_str"], ref_b["local_vg_id"])
+                    target_b = primary_target_for_ref.get(ref_b_key)
+                    if target_b is None:
+                        continue
+                    target_b_key = (target_b["unique_str"], target_b["local_vg_id"])
+                    if (
+                        target_a_key != target_b_key
+                        and _current_side_can_merge(ref_a, ref_b)
+                        # LOD0 是基准，只有 LOD1 矩阵出现明显分叉才拆它，
+                        # 避免跨帧姿态差异把基准侧拆得过碎。
+                        and _cross_side_is_distinct(target_a, target_b, 0.75)
+                    ):
+                        protected_by_lod[reference_lod].add(
+                            tuple(sorted((ref_a_key, ref_b_key)))
+                        )
+
+            target_to_refs: dict[tuple[str, int], list[dict]] = {}
+            for row in pair_rows:
+                target = row[2]
+                target_key = (target["unique_str"], target["local_vg_id"])
+                ref = row[1]
+                target_to_refs.setdefault(target_key, []).append(ref)
+            for target_key, refs in target_to_refs.items():
+                refs = sorted(refs, key=lambda item: (item["unique_str"], item["local_vg_id"]))
+                for ref_a_index in range(len(refs)):
+                    ref_a = refs[ref_a_index]
+                    ref_a_key = (ref_a["unique_str"], ref_a["local_vg_id"])
+                    for ref_b in refs[ref_a_index + 1:]:
+                        ref_b_key = (ref_b["unique_str"], ref_b["local_vg_id"])
+                        # 一个目标候选对应多个参考候选，不能在目标侧无中生有
+                        # 地拆分；只有目标侧本身存在不同候选时才添加保护边，
+                        # 该情况由下面的反向扫描覆盖。
+                        if ref_a_key == ref_b_key:
+                            continue
+
+            for target_a_index in range(len(target_candidates)):
+                target_a = target_candidates[target_a_index]
+                target_a_key = (target_a["unique_str"], target_a["local_vg_id"])
+                ref_a = primary_ref_for_target.get(target_a_key)
+                if ref_a is None:
+                    continue
+                ref_a_key = (ref_a["unique_str"], ref_a["local_vg_id"])
+                for target_b in target_candidates[target_a_index + 1:]:
+                    target_b_key = (target_b["unique_str"], target_b["local_vg_id"])
+                    ref_b = primary_ref_for_target.get(target_b_key)
+                    if ref_b is None:
+                        continue
+                    ref_b_key = (ref_b["unique_str"], ref_b["local_vg_id"])
+                    if (
+                        ref_a_key != ref_b_key
+                        and _current_side_can_merge(target_a, target_b)
+                        # LOD1 允许比 LOD0 更细；当参考侧能区分时优先保留
+                        # 目标侧的细分，确保目标组数不会因独立去重而变少。
+                        and _cross_side_is_distinct(ref_a, ref_b, 0.24)
+                    ):
+                        protected_by_lod[target_lod].add(
+                            tuple(sorted((target_a_key, target_b_key)))
+                        )
+
+            for row in primary:
+                ref, target = row[1], row[2]
+                all_matches.append({
+                    "reference_lod": reference_lod,
+                    "target_lod": target_lod,
+                    "reference_unique_str": ref["unique_str"],
+                    "reference_local_vg_id": int(ref["local_vg_id"]),
+                    "target_unique_str": target["unique_str"],
+                    "target_local_vg_id": int(target["local_vg_id"]),
+                    "reference_component": ref["unique_str"],
+                    "target_component": target["unique_str"],
+                    "component_score": float(part_pair_scores.get((
+                        ref["unique_str"], target["unique_str"]
+                    ), 0.0)),
+                    "score": float(row[0]),
+                    "matrix_diff": float(row[3]),
+                    "centroid_distance": (
+                        None if row[4] is None else float(row[4])
+                    ),
+                })
+
+        unmatched_reference = []
+        matched_ref_keys = {
+            (item["reference_unique_str"], item["reference_local_vg_id"])
+            for item in all_matches
+        }
+        for candidate in reference_candidates:
+            key = (candidate["unique_str"], candidate["local_vg_id"])
+            if key not in matched_ref_keys:
+                unmatched_reference.append({
+                    "unique_str": candidate["unique_str"],
+                    "local_vg_id": int(candidate["local_vg_id"]),
+                })
+
+        unmatched_by_lod = {}
+        for lod_name in lod_names:
+            if lod_name == reference_lod:
+                continue
+            matched_targets = {
+                (item["target_unique_str"], item["target_local_vg_id"])
+                for item in all_matches if item["target_lod"] == lod_name
+            }
+            unmatched_by_lod[lod_name] = [
+                {
+                    "unique_str": candidate["unique_str"],
+                    "local_vg_id": int(candidate["local_vg_id"]),
+                }
+                for candidate in flattened.get(lod_name, [])
+                if (candidate["unique_str"], candidate["local_vg_id"]) not in matched_targets
+            ]
+
+        serialized_protected = {}
+        for lod_name, pairs in protected_by_lod.items():
+            serialized_protected[lod_name] = [
+                [list(left), list(right)]
+                for left, right in sorted(pairs)
+            ]
+        matched_part_pairs = {
+            (row["reference_unique_str"], row["target_unique_str"])
+            for row in part_matches
+        }
+        matched_reference_parts = {row[0] for row in matched_part_pairs}
+        matched_target_parts = {row[1] for row in matched_part_pairs}
+        return {
+            "reference_lod": reference_lod,
+            "part_matches": part_matches,
+            "unmatched_reference_parts": [
+                part for part in sorted(part_candidates.get(reference_lod, {}))
+                if part not in matched_reference_parts
+            ],
+            "unmatched_target_parts": {
+                lod_name: [
+                    part for part in sorted(part_candidates.get(lod_name, {}))
+                    if part not in matched_target_parts
+                ]
+                for lod_name in lod_names if lod_name != reference_lod
+            },
+            "matches": all_matches,
+            "protected_pairs": protected_by_lod,
+            "protected_pairs_json": serialized_protected,
+            "counts": counts,
+            "unmatched_reference": unmatched_reference,
+            "unmatched_by_lod": unmatched_by_lod,
+        }
+
+    @staticmethod
+    def _build_cross_lod_constraint_labels(
+        correspondence: dict,
+        lod_name: str,
+        vg_maps: dict[str, dict],
+    ) -> dict[tuple[str, int], tuple]:
+        """从另一侧当前 global group 生成本侧下一轮的单调约束标签。"""
+        labels = {}
+        reference_lod = correspondence.get("reference_lod", "LOD0")
+        for row in correspondence.get("matches", []) or []:
+            if lod_name == reference_lod:
+                unique_str = row.get("reference_unique_str", "")
+                local_id = int(row.get("reference_local_vg_id", 0) or 0)
+                other_unique = row.get("target_unique_str", "")
+                other_local = int(row.get("target_local_vg_id", 0) or 0)
+                other_lod = row.get("target_lod", "")
+            else:
+                if row.get("target_lod") != lod_name:
+                    continue
+                unique_str = row.get("target_unique_str", "")
+                local_id = int(row.get("target_local_vg_id", 0) or 0)
+                other_unique = row.get("reference_unique_str", "")
+                other_local = int(row.get("reference_local_vg_id", 0) or 0)
+                other_lod = row.get("reference_lod", reference_lod)
+            other_map = vg_maps.get(other_unique, {})
+            if other_local not in other_map and str(other_local) not in other_map:
+                continue
+            other_group = other_map.get(other_local, other_map.get(str(other_local)))
+            labels[(str(unique_str), local_id)] = (str(other_lod), int(other_group))
+        return labels
+
+
 class EFMISkeletonMergeHelper:
     """EFMI 骨骼合并总流程：定位 FrameAnalysis -> 解析 log -> 构建映射 -> 写回工作空间。"""
 
@@ -1024,17 +2301,16 @@ class EFMISkeletonMergeHelper:
         workspace_root: str,
         unique_str_list: list[str],
         force: bool = False,
+        lod_group_projection: bool = True,
     ) -> tuple[bool, str]:
         """为 EFMI 工作空间的子网格生成并写回骨骼合并数据（幂等）。
 
-        多 LOD 语义（2026-08 实测定案）：LOD0 / LOD1 相互独立——各自对应独立的
-        FrameAnalysis dump 提取目录（Config/WorkPageTabs.json 的 tab 名即 LOD 名，
-        每个 tab 的 Config/Tabs/<tabid>.json 记录自己的 frameAnalysisFolderPath），
-        各自根据自己 dump 的数据生成统一顶点组。因此：
-        1. unique_str_list 按 LOD 前缀分组（无前缀归默认目录）；
-        2. 每组用**自己的 dump** 解析 log 并查找骨骼数据；
-        3. 每组**独立** build_vg_maps：vg_offsets 各自从 0 起，LOD 之间骨骼槽位
-           命名空间互不混用（导出端同样按 LOD 分组生成多套独立合并骨架配置）。
+        多 LOD 语义：unique_str_list 按 LOD 前缀分组，每组用**自己的 dump** 解析
+        原始骨骼候选；先按部件点云建立原始候选对应。lod_group_projection=True
+        时只对 LOD0 执行一次权重扩散去重，再将分区投影到 LOD1；为 False 时
+        两边各自独立执行去重。没有对应的额外 LOD1 候选保留恒等槽位。
+        运行时槽位仍按 LOD 独立从 0 起，避免把不同 dump 的骨骼池混写；对应事实
+        写入 EFMILODCorrespondence/EFMILOD* 字段，供导出和问题复核。
 
         返回 (是否成功, 描述)。
         """
@@ -1052,6 +2328,173 @@ class EFMISkeletonMergeHelper:
         groups: dict[str, list[str]] = {}
         for unique_str in unique_str_list:
             groups.setdefault(cls._parse_lod_name(unique_str), []).append(unique_str)
+        lod_group_projection = bool(lod_group_projection)
+
+        # 多 LOD 先收集原始候选，再建立跨 LOD 对应。分组投影模式下 LOD0 是唯一
+        # 执行权重扩散去重的基准侧；LOD1 只把该分区投影到自己的原始槽位，避免
+        # 两侧各自计算后出现“同一对应关系被拆成两套 global group”的回退。独立
+        # 模式仍使用同一份部件对应账本，但两侧分别调用 build_vg_maps。
+        # 已有完整联合缓存时保持幂等，不重复读取大型 Position/Blend 缓冲。
+        if len(groups) > 1:
+            joint_cache_ready = True
+            for group_list in groups.values():
+                for unique_str in group_list:
+                    json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+                    if not json_path:
+                        continue
+                    try:
+                        payload = JsonUtils.LoadFromFile(json_path)
+                    except Exception:
+                        joint_cache_ready = False
+                        break
+                    if not isinstance(payload, dict):
+                        joint_cache_ready = False
+                        break
+                    try:
+                        cache_version = int(payload.get("VGMapAlgorithmVersion", 0) or 0)
+                    except (TypeError, ValueError):
+                        cache_version = 0
+                    if not (
+                        payload.get("VGMap")
+                        and cache_version == _VG_MAP_ALGORITHM_VERSION
+                        and payload.get("VGMapDedupEnabled") == bool(_DEDUP_ENABLED)
+                        and int(payload.get("EFMILODLayoutVersion", 0) or 0)
+                        == _CROSS_LOD_LAYOUT_VERSION
+                        and bool(payload.get("EFMILODProjection", False))
+                        == lod_group_projection
+                    ):
+                        joint_cache_ready = False
+                        break
+                if not joint_cache_ready:
+                    break
+            if joint_cache_ready and not force:
+                return True, "全部子网格已有跨 LOD 骨骼合并缓存（VGMap），无需重新生成。"
+
+            collected_by_lod = {}
+            group_meta_by_lod = {}
+            group_skipped_by_lod = {}
+            for lod_name in sorted(groups.keys()):
+                group_list = groups[lod_name]
+                frame_analysis_dir = lod_map.get(lod_name) or default_dir
+                label = lod_name or "工作空间根目录"
+                if not frame_analysis_dir:
+                    print(
+                        f"[EFMI骨骼合并] {label}: 无 FrameAnalysis 目录，"
+                        f"跳过 {len(group_list)} 个子网格"
+                    )
+                    collected_by_lod[lod_name] = {}
+                    group_meta_by_lod[lod_name] = {}
+                    group_skipped_by_lod[lod_name] = 0
+                    continue
+                log_path = os.path.join(frame_analysis_dir, "log.txt")
+                if not os.path.isfile(log_path):
+                    print(
+                        f"[EFMI骨骼合并] {label}: FrameAnalysis 缺少 log.txt: {log_path}"
+                    )
+                    collected_by_lod[lod_name] = {}
+                    group_meta_by_lod[lod_name] = {}
+                    group_skipped_by_lod[lod_name] = 0
+                    continue
+                parser = EFMILogParser(log_path)
+                collected, metadata, skipped = cls._ensure_skeleton_data_for_group(
+                    workspace_root=workspace_root,
+                    unique_str_list=group_list,
+                    parser=parser,
+                    force=True,
+                    collect_only=True,
+                )
+                collected_by_lod[lod_name] = collected
+                group_meta_by_lod[lod_name] = metadata
+                group_skipped_by_lod[lod_name] = skipped
+
+            correspondence = EFMIBoneMapBuilder.build_cross_lod_correspondence(
+                collected_by_lod,
+                reference_lod="LOD0",
+            )
+            maps_by_lod = {}
+            offsets_by_lod = {}
+            reference_lod = correspondence.get("reference_lod", "")
+            reference_skeletons = collected_by_lod.get(reference_lod, {})
+            if lod_group_projection:
+                reference_maps, reference_offsets = EFMIBoneMapBuilder.build_vg_maps(
+                    reference_skeletons,
+                ) if reference_skeletons else ({}, {})
+                maps_by_lod[reference_lod] = reference_maps
+                offsets_by_lod[reference_lod] = reference_offsets
+                for lod_name, skeletons in collected_by_lod.items():
+                    if lod_name == reference_lod:
+                        continue
+                    if not skeletons:
+                        maps_by_lod[lod_name] = {}
+                        offsets_by_lod[lod_name] = {}
+                        continue
+                    maps_by_lod[lod_name], offsets_by_lod[lod_name] = (
+                        EFMIBoneMapBuilder.build_lod_maps_from_reference(
+                            reference_skeletons,
+                            reference_maps,
+                            skeletons,
+                            correspondence,
+                            reference_lod=reference_lod,
+                            target_lod=lod_name,
+                        )
+                    )
+            else:
+                # 诊断/兼容模式：保留跨部件点云对应账本，但两侧不共享分区，
+                # 各自使用原有权重扩散判定独立生成 VGMap。
+                for lod_name, skeletons in collected_by_lod.items():
+                    if not skeletons:
+                        maps_by_lod[lod_name] = {}
+                        offsets_by_lod[lod_name] = {}
+                        continue
+                    maps_by_lod[lod_name], offsets_by_lod[lod_name] = (
+                        EFMIBoneMapBuilder.build_vg_maps(skeletons)
+                    )
+
+            provisional_counts = {
+                lod_name: len({
+                    int(global_id)
+                    for local_map in maps.values()
+                    for global_id in local_map.values()
+                })
+                for lod_name, maps in maps_by_lod.items()
+            }
+            reference_lod = correspondence.get("reference_lod", "")
+            baseline_group_count = int(provisional_counts.get(reference_lod, 0) or 0)
+            correspondence["baseline_group_count"] = baseline_group_count
+            correspondence["group_count_by_lod"] = dict(provisional_counts)
+            correspondence["projection_enabled"] = lod_group_projection
+
+            group_results: list[str] = []
+            total_written = 0
+            total_skipped = 0
+            for lod_name in sorted(groups.keys()):
+                group_list = groups[lod_name]
+                frame_analysis_dir = lod_map.get(lod_name) or default_dir
+                label = lod_name or "工作空间根目录"
+                if not frame_analysis_dir or not os.path.isfile(
+                    os.path.join(frame_analysis_dir, "log.txt")
+                ):
+                    continue
+                parser = EFMILogParser(os.path.join(frame_analysis_dir, "log.txt"))
+                written, skipped, message = cls._ensure_skeleton_data_for_group(
+                    workspace_root=workspace_root,
+                    unique_str_list=group_list,
+                    parser=parser,
+                    force=True,
+                    vg_maps_override=maps_by_lod.get(lod_name),
+                    vg_offsets_override=offsets_by_lod.get(lod_name),
+                    cross_lod_info=correspondence,
+                )
+                total_written += written
+                total_skipped += skipped
+                group_results.append(f"{label}: {message}")
+
+            if total_written == 0 and total_skipped == 0:
+                return False, "没有子网格成功生成骨骼数据。"
+            return (
+                total_written > 0 or total_skipped > 0,
+                "；".join(group_results),
+            )
 
         group_results: list[str] = []
         total_written = 0
@@ -1095,11 +2538,18 @@ class EFMISkeletonMergeHelper:
         unique_str_list: list[str],
         parser: EFMILogParser,
         force: bool = False,
-    ) -> tuple[int, int, str]:
+        protected_pairs: set[tuple[tuple[str, int], tuple[str, int]]] | None = None,
+        constraint_labels: dict[tuple[str, int], object] | None = None,
+        vg_maps_override: dict[str, dict] | None = None,
+        vg_offsets_override: dict[str, int] | None = None,
+        collect_only: bool = False,
+        cross_lod_info: dict | None = None,
+    ) -> tuple[int, int, str] | tuple[dict[str, tuple], dict[str, dict], int]:
         """为单个 LOD 组的子网格生成并写回骨骼合并数据（幂等）。
 
         返回 (written, skipped, 描述消息)；vg_offsets 在该组内从 0 起分配，
-        与其它 LOD 组完全独立。
+        与其它 LOD 组完全独立。collect_only=True 时只返回原始候选和元数据，
+        不写文件，供跨 LOD 对应阶段使用。
         """
         if not unique_str_list:
             return 0, 0, "没有子网格需要处理。"
@@ -1119,11 +2569,26 @@ class EFMISkeletonMergeHelper:
             if not isinstance(submesh_json, dict):
                 continue
 
-            # 幂等：已有 VGMap 且非强制
+            # 幂等：只有当前算法版本的 VGMap 才能跳过。旧版缓存没有扩散
+            # 判据，自动失效并重算，避免用户必须先手动清缓存才能看到修复。
             existing_vg_map = submesh_json.get("VGMap")
             if existing_vg_map and not force:
-                skipped += 1
-                continue
+                try:
+                    cache_version = int(submesh_json.get("VGMapAlgorithmVersion", 0) or 0)
+                except (TypeError, ValueError):
+                    cache_version = 0
+                cache_dedup_enabled = submesh_json.get("VGMapDedupEnabled")
+                if (
+                    cache_version == _VG_MAP_ALGORITHM_VERSION
+                    and isinstance(cache_dedup_enabled, bool)
+                    and cache_dedup_enabled == bool(_DEDUP_ENABLED)
+                ):
+                    skipped += 1
+                    continue
+                print(
+                    f"[EFMI骨骼合并] {unique_str}: VGMap 缓存版本 {cache_version} 已失效，"
+                    f"按算法版本 {_VG_MAP_ALGORITHM_VERSION} 重算"
+                )
 
             element_info = cls.parse_blend_element_info(submesh_json)
             if element_info is None:
@@ -1198,7 +2663,8 @@ class EFMISkeletonMergeHelper:
                 )
                 continue
 
-            # 三维度去重的"驱动签名"（读 Position.buf + Blend.buf 计算每骨骼驱动点云特征）
+            # 权重扩散去重签名（读 Position.buf + Blend.buf 计算每骨骼的
+            # 正权重采样场；质心/包围盒仅作回退与剪枝）
             position_buf_path = os.path.join(os.path.dirname(json_path), bare_name + "-Position.buf")
             try:
                 centroids = EFMIBoneMapBuilder.compute_driven_signatures(
@@ -1216,13 +2682,27 @@ class EFMISkeletonMergeHelper:
                 "draw_index": drawcall_index_list[0],
             }
 
+        if collect_only:
+            # 联合 LOD 流程需要保留去重前的完整候选；这里不写任何缓存。
+            return submesh_skeletons, submesh_meta, skipped
+
         if not submesh_skeletons:
             if skipped > 0:
                 return 0, skipped, f"全部 {skipped} 个子网格已有骨骼合并缓存（VGMap），无需重新生成。"
             return 0, 0, "没有子网格成功生成骨骼数据。"
 
-        # 组内跨子网格去重构建 vg_map（组内从 0 起分配槽位，与其它 LOD 组互不影响）
-        vg_maps, vg_offsets = EFMIBoneMapBuilder.build_vg_maps(submesh_skeletons)
+        # 组内跨子网格去重构建 vg_map（组内从 0 起分配槽位，与其它 LOD 组互不影响）。
+        # 联合 LOD 写回阶段传入预计算映射：LOD0 使用唯一一次真实去重结果，
+        # LOD1 使用按对应关系投影后的映射，避免重新跑一套权重扩散并查集。
+        if vg_maps_override is not None and vg_offsets_override is not None:
+            vg_maps = vg_maps_override
+            vg_offsets = vg_offsets_override
+        else:
+            vg_maps, vg_offsets = EFMIBoneMapBuilder.build_vg_maps(
+                submesh_skeletons,
+                protected_pairs=protected_pairs,
+                constraint_labels=constraint_labels,
+            )
 
         # 写回工作空间 json + 复制骨骼池缓存
         written = 0
@@ -1245,6 +2725,69 @@ class EFMISkeletonMergeHelper:
             submesh_json["VGCount"] = vg_count
             submesh_json["VGOffset"] = vg_offset
             submesh_json["VGMap"] = {str(k): int(v) for k, v in sorted(vg_map.items())}
+            submesh_json["VGMapAlgorithmVersion"] = _VG_MAP_ALGORITHM_VERSION
+            submesh_json["VGMapDedupEnabled"] = bool(_DEDUP_ENABLED)
+
+            # 联合 LOD 对应只写诊断/后续处理元数据，不改变本 LOD 的运行时
+            # offset 布局。这样 LOD0/LOD1 仍可各自挂载自己的骨骼池，同时保留
+            # “哪一个原始组对应哪一个基准组、是否存在缺口”的事实账本。
+            if cross_lod_info:
+                reference_lod = str(cross_lod_info.get("reference_lod", "") or "")
+                current_lod = cls._parse_lod_name(unique_str)
+                baseline_count = int(cross_lod_info.get("baseline_group_count", 0) or 0)
+                count_by_lod = cross_lod_info.get("group_count_by_lod", {}) or {}
+                actual_count = int(count_by_lod.get(current_lod, 0) or 0)
+                # 账本口径遵守 LOD0 基准：LOD1 如果原始候选确实少，不能把
+                # 少出来的语义槽位悄悄当成“已对应”。Actual 保留真实去重数，
+                # GroupCount 是后续对应层使用的有效槽位下限。
+                current_count = max(actual_count, baseline_count) \
+                    if current_lod != reference_lod else actual_count
+                correspondence_rows = {}
+                for row in cross_lod_info.get("matches", []) or []:
+                    if row.get("reference_lod") == reference_lod and current_lod == reference_lod:
+                        if row.get("reference_unique_str") != unique_str:
+                            continue
+                        local_id = row.get("reference_local_vg_id")
+                        correspondence_rows[str(local_id)] = {
+                            "lod": row.get("target_lod", ""),
+                            "unique_str": row.get("target_unique_str", ""),
+                            "local_vg_id": int(row.get("target_local_vg_id", 0) or 0),
+                            "reference_component": row.get("reference_component", unique_str),
+                            "target_component": row.get(
+                                "target_component", row.get("target_unique_str", "")
+                            ),
+                            "component_score": float(row.get("component_score", 0.0) or 0.0),
+                            "matrix_diff": float(row.get("matrix_diff", 0.0) or 0.0),
+                            "centroid_distance": row.get("centroid_distance"),
+                        }
+                    elif row.get("target_lod") == current_lod:
+                        if row.get("target_unique_str") != unique_str:
+                            continue
+                        local_id = row.get("target_local_vg_id")
+                        correspondence_rows[str(local_id)] = {
+                            "lod": row.get("reference_lod", ""),
+                            "unique_str": row.get("reference_unique_str", ""),
+                            "local_vg_id": int(row.get("reference_local_vg_id", 0) or 0),
+                            "reference_component": row.get(
+                                "reference_component", row.get("reference_unique_str", "")
+                            ),
+                            "target_component": row.get("target_component", unique_str),
+                            "component_score": float(row.get("component_score", 0.0) or 0.0),
+                            "matrix_diff": float(row.get("matrix_diff", 0.0) or 0.0),
+                            "centroid_distance": row.get("centroid_distance"),
+                        }
+                submesh_json["EFMILODLayoutVersion"] = _CROSS_LOD_LAYOUT_VERSION
+                submesh_json["EFMILODReference"] = reference_lod
+                submesh_json["EFMILODProjection"] = bool(
+                    cross_lod_info.get("projection_enabled", True)
+                )
+                submesh_json["EFMILODBaselineGroupCount"] = baseline_count
+                submesh_json["EFMILODGroupCount"] = current_count
+                submesh_json["EFMILODActualGroupCount"] = actual_count
+                submesh_json["EFMILODMissingBaselineCount"] = max(
+                    baseline_count - actual_count, 0
+                ) if current_lod != reference_lod else 0
+                submesh_json["EFMILODCorrespondence"] = correspondence_rows
 
             # 复制骨骼池 buffer 到 ModImpRuntime 缓存（复用 NTEMI 缓存模式）
             try:
@@ -1275,9 +2818,9 @@ class EFMISkeletonMergeHelper:
     def clear_vgmap_cache(cls, workspace_root: str) -> tuple[int, int]:
         """删除工作空间内所有子网格 json 的 VGMap/VGOffset/VGCount/SkeletonGroup 缓存键。
 
-        用途：去重策略变更（或去重关闭）后，旧策略写回的 VGMap 会被
-        ensure_skeleton_data 的幂等检查跳过而一直残留；清掉后下次导入
-        即按当前策略重新生成。SkeletonGroup 是 ZZMI 分组版字段（EFMI json 没有，
+        用途：去重策略变更（或去重关闭）后，手动清掉缓存即可强制下次导入
+        按当前策略重新生成；正常导入也会通过 VGMapAlgorithmVersion 自动
+        使旧策略缓存失效。SkeletonGroup 是 ZZMI 分组版字段（EFMI json 没有，
         一并列出无副作用）。
         ModImpRuntime/*-BoneMatrix.buf 与 BoneMatrixFileName 不删：
         那是原始骨骼池拷贝，与去重策略无关，重新生成时会复用/覆写同名文件。
@@ -1303,7 +2846,13 @@ class EFMISkeletonMergeHelper:
                     continue
                 if not isinstance(payload, dict) or "VGMap" not in payload:
                     continue
-                for key in ("VGMap", "VGOffset", "VGCount", "SkeletonGroup"):
+                for key in (
+                    "VGMap", "VGOffset", "VGCount", "VGMapAlgorithmVersion",
+                    "VGMapDedupEnabled", "SkeletonGroup", "EFMILODLayoutVersion",
+                    "EFMILODReference", "EFMILODProjection", "EFMILODBaselineGroupCount", "EFMILODGroupCount",
+                    "EFMILODActualGroupCount", "EFMILODMissingBaselineCount",
+                    "EFMILODCorrespondence"
+                ):
                     payload.pop(key, None)
                 try:
                     JsonUtils.SaveToFile(filepath=path, json_dict=payload)

@@ -5,6 +5,8 @@ __pycache__
 .kunsdd/
 .dsh/
 .dsh-vision-router/
+# 所有层级中以点开头的目录均不参与 Git 追踪
+**/.*/
 # Codex benchmark output directory
 dist/
 DIST/

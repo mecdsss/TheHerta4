@@ -1,7 +1,7 @@
 """EFMI 骨骼合并 VGMap 缓存清理（EFMISkeletonMergeHelper.clear_vgmap_cache）单测。
 
-背景：去重策略变更后，旧策略写回子网格 json 的 VGMap 会被 ensure_skeleton_data
-的幂等检查跳过而残留；clear_vgmap_cache 删除这些键，强制下次导入重新生成。
+背景：去重策略变更后，旧策略写回子网格 json 的 VGMap 会由算法版本自动失效；
+clear_vgmap_cache 仍可删除这些键，强制下次导入重新生成。
 """
 
 import importlib.util
@@ -61,6 +61,8 @@ class ClearVgmapCacheTests(unittest.TestCase):
             "VGMap": {"0": 0, "1": 5},
             "VGOffset": 0,
             "VGCount": 2,
+            "VGMapAlgorithmVersion": 3,
+            "VGMapDedupEnabled": True,
             "SkeletonGroup": 1,
             "BoneMatrixFileName": "aaaabbbb-100-0-BoneMatrix.buf",
         })
@@ -97,6 +99,8 @@ class ClearVgmapCacheTests(unittest.TestCase):
         self.assertNotIn("VGMap", data_a)
         self.assertNotIn("VGOffset", data_a)
         self.assertNotIn("VGCount", data_a)
+        self.assertNotIn("VGMapAlgorithmVersion", data_a)
+        self.assertNotIn("VGMapDedupEnabled", data_a)
         # ZZMI 分组版的 SkeletonGroup 一并清除（EFMI json 无此键，幂等无副作用）
         self.assertNotIn("SkeletonGroup", data_a)
         # 无关键保留（BoneMatrixFileName 指向原始骨骼池拷贝，与去重策略无关，不删）

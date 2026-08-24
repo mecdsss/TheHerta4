@@ -407,6 +407,9 @@ class PanelBasicInformation(bpy.types.Panel):
         # 勾选 = 导入全局顶点组、导出走合并骨架；不勾选 = 完全维持原路线（见 ZZMI骨骼合并计划书.md §5.1）。
         if GlobalConfig.logic_name in (LogicName.WWMI, LogicName.ZZMI, LogicName.EFMI):
             layout.prop(global_properties, "import_merged_vgmap")
+        # EFMI 专用：多 LOD 使用 LOD0 分组投影，关闭则两侧独立去重。
+        if GlobalConfig.logic_name == LogicName.EFMI:
+            layout.prop(global_properties, "efmi_lod_group_projection")
 
         if GlobalConfig.logic_name == LogicName.WWMI or GlobalConfig.logic_name == LogicName.NTEMI:
             layout.prop(global_properties, "import_skip_empty_vertex_groups")

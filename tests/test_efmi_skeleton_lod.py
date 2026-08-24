@@ -1,14 +1,12 @@
-"""EFMI 骨骼合并多 LOD 适配（构建端 per-LOD 独立计算）单测。
+"""EFMI 骨骼合并多 LOD 适配（原始候选联合对应 + LOD0 基准同步）单测。
 
-实测定案（2026-08）：LOD0 / LOD1 相互独立——各自对应独立的 FrameAnalysis dump
-提取目录（Config/WorkPageTabs.json 的 tab 名即 LOD 名，每个 tab 在
-Config/Tabs/<tabid>.json 里记录自己的 frameAnalysisFolderPath）；构建统一骨骼时
-各自根据**自己 dump** 的数据生成统一顶点组，vg 槽位各自从 0 起，绝不跨 LOD 混算。
+LOD0 / LOD1 仍然使用各自的 FrameAnalysis dump 和运行时槽位，但在去重之前先用
+原始矩阵/权重中心建立对应；LOD0 执行一次去重，LOD1 按对应关系同步分区。
 
 覆盖：
 - _parse_lod_name / resolve_frame_analysis_dirs_by_lod（WorkPageTabs 映射 + 兜底）；
 - ensure_skeleton_data 按 LOD 分组：每个 LOD 从自己的 dump 读取骨骼数据、
-  各自 VGOffset 从 0 起、BoneMatrix 缓存来自各自 dump；
+  各自 VGOffset 从 0 起、BoneMatrix 缓存来自各自 dump，并写回跨 LOD 对应账本；
 - WorkPageTabs 缺失时退化为共用默认目录（此时查不到自己 drawcall 的 LOD 被跳过）。
 """
 
@@ -55,6 +53,8 @@ _load_module(f"{PKG}.utils.json_utils", REPO_ROOT / "utils" / "json_utils.py")
 _efmi = _load_module(f"{PKG}.common.efmi_skeleton", REPO_ROOT / "common" / "efmi_skeleton.py")
 
 EFMISkeletonMergeHelper = _efmi.EFMISkeletonMergeHelper
+EFMIBoneMapBuilder = _efmi.EFMIBoneMapBuilder
+VG_MAP_ALGORITHM_VERSION = _efmi._VG_MAP_ALGORITHM_VERSION
 
 
 def _write_json(path, payload):
@@ -193,7 +193,7 @@ class ResolveFrameAnalysisDirsByLodTests(unittest.TestCase):
 
 
 class MultiLodBuildTests(unittest.TestCase):
-    """构建端 e2e：两个 LOD 各自用自己的 dump 生成统一顶点组，互不混算。"""
+    """构建端 e2e：两个 LOD 各自用自己的 dump，LOD1 复用 LOD0 分区。"""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="efmi_lod_ws_")
@@ -235,6 +235,24 @@ class MultiLodBuildTests(unittest.TestCase):
         self.assertEqual(json1.get("VGOffset"), 0)
         self.assertEqual(json0.get("VGCount"), 1)
         self.assertEqual(json1.get("VGCount"), 1)
+        self.assertEqual(json0.get("VGMapAlgorithmVersion"), VG_MAP_ALGORITHM_VERSION)
+        self.assertEqual(json1.get("VGMapAlgorithmVersion"), VG_MAP_ALGORITHM_VERSION)
+        self.assertEqual(json0.get("EFMILODReference"), "LOD0")
+        self.assertEqual(json1.get("EFMILODReference"), "LOD0")
+        self.assertTrue(json0.get("EFMILODProjection"))
+        self.assertTrue(json1.get("EFMILODProjection"))
+        self.assertEqual(json0.get("EFMILODBaselineGroupCount"), 1)
+        self.assertEqual(json1.get("EFMILODBaselineGroupCount"), 1)
+        self.assertEqual(json0.get("EFMILODGroupCount"), 1)
+        self.assertEqual(json1.get("EFMILODGroupCount"), 1)
+        self.assertEqual(json0.get("EFMILODMissingBaselineCount"), 0)
+        self.assertEqual(json1.get("EFMILODMissingBaselineCount"), 0)
+        self.assertEqual(json0.get("EFMILODActualGroupCount"), 1)
+        self.assertEqual(json1.get("EFMILODActualGroupCount"), 1)
+        # 两个最小 dump 故意使用不同平移矩阵，超过硬门控时应保留“无对应”事实，
+        # 不能为了凑数量伪造一条跨 LOD 匹配。
+        self.assertEqual(json0.get("EFMILODCorrespondence"), {})
+        self.assertEqual(json1.get("EFMILODCorrespondence"), {})
 
         # BoneMatrix 缓存来自各自 dump（整池拷贝 800x4，骨骼 0 位于 偏移 7 起；tx 不同：A=1.5，B=2.5）
         pool0 = numpy.fromfile(
@@ -265,6 +283,32 @@ class MultiLodBuildTests(unittest.TestCase):
         self.assertEqual(json1.get("VGMap"), {"0": 0})
         self.assertEqual(json1.get("VGOffset"), 0)
 
+    def test_independent_lod_mode_runs_dedup_on_both_sides(self):
+        """关闭分组投影时，两侧分别调用原有去重，不复用 LOD0 映射。"""
+        original = EFMIBoneMapBuilder.build_vg_maps
+        calls = []
+
+        def wrapped(submesh_skeletons, *args, **kwargs):
+            calls.append(kwargs.get("deduplicate"))
+            return original(submesh_skeletons, *args, **kwargs)
+
+        EFMIBoneMapBuilder.build_vg_maps = staticmethod(wrapped)
+        try:
+            ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=str(self.ws),
+                unique_str_list=[self.u_lod0, self.u_lod1],
+                force=True,
+                lod_group_projection=False,
+            )
+        finally:
+            EFMIBoneMapBuilder.build_vg_maps = staticmethod(original)
+        self.assertTrue(ok, message)
+        self.assertEqual(calls, [None, None])
+        json0 = self._read_submesh_json("LOD0", "aaaabbbb-100-0")
+        json1 = self._read_submesh_json("LOD1", "ccccdddd-200-0")
+        self.assertFalse(json0.get("EFMILODProjection"))
+        self.assertFalse(json1.get("EFMILODProjection"))
+
     def test_idempotent_second_run_skips(self):
         ok1, message1 = EFMISkeletonMergeHelper.ensure_skeleton_data(
             workspace_root=str(self.ws),
@@ -277,6 +321,25 @@ class MultiLodBuildTests(unittest.TestCase):
         )
         self.assertTrue(ok2, message2)
         self.assertIn("无需重新生成", message2)
+
+    def test_stale_vgmap_version_is_rebuilt(self):
+        ok1, message1 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0],
+        )
+        self.assertTrue(ok1, message1)
+        json_path = next((self.ws / "LOD0" / "aaaabbbb-100-0").glob("TYPE_*/*.json"))
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        payload["VGMapAlgorithmVersion"] = VG_MAP_ALGORITHM_VERSION - 1
+        json_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        ok2, message2 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0],
+        )
+        self.assertTrue(ok2, message2)
+        rebuilt = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(rebuilt.get("VGMapAlgorithmVersion"), VG_MAP_ALGORITHM_VERSION)
 
 
 if __name__ == "__main__":
