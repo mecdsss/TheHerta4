@@ -109,11 +109,22 @@ class SubMeshModel:
             and GlobalConfig.logic_name == LogicName.EFMI
             and GlobalProterties.import_merged_vgmap()
         ):
-            try:
-                self.blendindices_widened = self.d3d11_game_type.widen_blendindices()
-            except Exception as e:
-                print(f"[SubMeshModel] BLENDINDICES 升宽失败（忽略，按原格式导出）: {e}")
-                self.blendindices_widened = False
+            self.blendindices_widened = self.d3d11_game_type.widen_blendindices()
+            blend_layouts = self.d3d11_game_type.get_blendindices_layouts()
+            if not blend_layouts:
+                raise RuntimeError(
+                    f"[EFMI骨骼合并] {self.unique_str} 的 GameType 不含 BLENDINDICES"
+                )
+            narrow_layouts = [
+                (semantic_index, fmt)
+                for semantic_index, fmt, _extract_slot in blend_layouts
+                if str(fmt).upper().startswith("R8")
+            ]
+            if narrow_layouts:
+                raise RuntimeError(
+                    f"[EFMI骨骼合并] {self.unique_str} 的 BLENDINDICES 升宽未完成: "
+                    f"{narrow_layouts}"
+                )
 
         TimerUtils.start_stage("数据哈希预计算")
         object_hashes, source_obj_list = self._precompute_object_hashes()
@@ -314,13 +325,10 @@ class SubMeshModel:
             elif GlobalConfig.logic_name == LogicName.ZZMI and self.vg_count > 0:
                 run_merged_skeleton_preprocess = True
         if run_merged_skeleton_preprocess:
-            try:
-                if GlobalConfig.logic_name == LogicName.ZZMI:
-                    self._prepare_zzmi_merged_skeleton_vertex_groups(submesh_merged_obj)
-                else:
-                    self._prepare_merged_skeleton_vertex_groups(submesh_merged_obj)
-            except Exception as e:
-                print(f"[骨骼合并] 顶点组预处理失败（忽略，按原样导出）: {e}")
+            if GlobalConfig.logic_name == LogicName.ZZMI:
+                self._prepare_zzmi_merged_skeleton_vertex_groups(submesh_merged_obj)
+            else:
+                self._prepare_merged_skeleton_vertex_groups(submesh_merged_obj)
 
         obj_buffer_result = ExportUtils.build_unity_obj_buffer_result(
             obj=submesh_merged_obj,
@@ -378,50 +386,52 @@ class SubMeshModel:
     def _prepare_merged_skeleton_vertex_groups(self, obj):
         """骨骼合并导出前顶点组预处理（对齐参考插件 ObjectMerger.finalize_temp_objects_data）。
 
-        EFMI/ZZMI 合并骨架模式共用：组名 = 全局骨骼 id。
-        步骤：
-        1.（可选）按数字名补缺顶点组（受 export_add_missing_vertex_groups 开关控制）；
-        2. 按名字排序，使 index 顺序与数字名一致；
-        3. 剔除名字含 'ignore' 的组（不做数字越界删除：组名为全局骨骼 id，
-           可能小于本组件 vg_offset 或大于 vg_offset+vg_count，局部上限会误删共享骨骼）；
-        4. 全部组重命名为 str(vg.index)（紧凑化），使导出 blend 索引 = 全局骨骼 id。
+        EFMI/ZZMI 合并骨架模式共用：组名 = 全局骨骼 id。非数字组不属于骨骼命名
+        空间，在临时导出对象上先移除；数字组无条件补缺、排序并验证
+        ``vertex_group.index == int(vertex_group.name)``。任一步失败都中止导出，
+        禁止退回原样导出后静默重编号全局骨骼。
         """
         if obj is None or obj.type != 'MESH':
             return
         if not obj.vertex_groups:
-            return
+            raise RuntimeError(f"[骨骼合并] {obj.name} 没有可导出的数字骨骼顶点组")
 
-        # 1. 补缺（按数字名补缺到最大数字，对齐参考插件 fill_gaps_in_vertex_groups）
-        try:
-            if GlobalProterties.export_add_missing_vertex_groups():
-                self._fill_vertex_group_gaps(obj)
-        except Exception as e:
-            print(f"[EFMI骨骼合并] 补缺顶点组失败（跳过补缺）: {e}")
+        non_numeric_groups = [
+            vg for vg in obj.vertex_groups
+            if re.fullmatch(r"[0-9]+", str(vg.name)) is None
+        ]
+        for vg in non_numeric_groups:
+            obj.vertex_groups.remove(vg)
+        if non_numeric_groups:
+            print(
+                f"[骨骼合并] {obj.name}: 已从临时导出对象移除 "
+                f"{len(non_numeric_groups)} 个非数字顶点组"
+            )
+        if not obj.vertex_groups:
+            raise RuntimeError(f"[骨骼合并] {obj.name} 移除非数字组后没有骨骼顶点组")
 
-        # 2. 按名字排序，使 index 顺序与数字名一致（补缺后 index 与数字名错位，需先排序）
+        numeric_ids = [int(vg.name) for vg in obj.vertex_groups]
+        if len(numeric_ids) != len(set(numeric_ids)):
+            raise RuntimeError(
+                f"[骨骼合并] {obj.name} 存在等价的重复数字顶点组名: {numeric_ids}"
+            )
+
+        # 连续全局 id 是合并骨架正确性前提，不受普通导出补组开关控制。
+        self._fill_vertex_group_gaps(obj)
+
+        prev_active = bpy.context.view_layer.objects.active
         try:
-            prev_active = bpy.context.view_layer.objects.active
             bpy.context.view_layer.objects.active = obj
             bpy.ops.object.vertex_group_sort()
-            if prev_active is not None:
-                bpy.context.view_layer.objects.active = prev_active
-        except Exception as e:
-            print(f"[EFMI骨骼合并] 顶点组排序失败（继续）: {e}")
+        finally:
+            bpy.context.view_layer.objects.active = prev_active
 
-        # 3. 剔除 ignore 组
-        # 说明：不做数字越界删除——组名为全局骨骼 id（去重 canonical 后可能小于本组件 vg_offset，
-        # 或大于本组件 vg_offset+vg_count），用局部 vg_count 做上限会误删共享骨骼。
-        # 参考插件的越界删除针对"组件整模内全局 id >= Σvg_count"的场景，
-        # 当前架构每子网格独立导出，保守起见不删数字名组。
-        remove_list = [
-            vg for vg in obj.vertex_groups
-            if 'ignore' in str(vg.name).lower()
-        ]
-        for vg in remove_list:
-            obj.vertex_groups.remove(vg)
-
-        # 4. 紧凑化重命名（导出 blend 索引 = 紧凑索引）
         for vg in obj.vertex_groups:
+            if int(vg.name) != int(vg.index):
+                raise RuntimeError(
+                    f"[骨骼合并] {obj.name} 顶点组排序不变量失败: "
+                    f"name={vg.name}, index={vg.index}"
+                )
             vg.name = str(vg.index)
 
     def _prepare_zzmi_merged_skeleton_vertex_groups(self, obj):
@@ -435,38 +445,7 @@ class SubMeshModel:
         3. 按名排序 + 重命名 str(index)（补缺+排序后此为安全恒等操作）；
         4. 自检：非数字组名只警告；空组正常（无顶点引用的骨骼，无害）。
         """
-        if obj is None or obj.type != 'MESH':
-            return
-        if not obj.vertex_groups:
-            return
-
-        # 1. 无条件补缺（先补缺，保证数字名 0..max 连续）
-        try:
-            self._fill_vertex_group_gaps(obj)
-        except Exception as e:
-            print(f"[ZZMI骨骼合并] 补缺顶点组失败（继续）: {e}")
-
-        # 2. 按名排序（Blender 自然排序，数字名按数值排），使 index == 数字名
-        try:
-            prev_active = bpy.context.view_layer.objects.active
-            bpy.context.view_layer.objects.active = obj
-            bpy.ops.object.vertex_group_sort()
-            if prev_active is not None:
-                bpy.context.view_layer.objects.active = prev_active
-        except Exception as e:
-            print(f"[ZZMI骨骼合并] 顶点组排序失败（继续）: {e}")
-
-        # 3. 恒等重命名（补缺 + 排序后 index == 数字名，此行仅为兜底保险）
-        for vg in obj.vertex_groups:
-            vg.name = str(vg.index)
-
-        # 4. 自检与告警
-        non_numeric = [str(vg.name) for vg in obj.vertex_groups if not str(vg.name).isdigit()]
-        if non_numeric:
-            print(
-                f"[ZZMI骨骼合并] 警告: {obj.name} 存在非数字顶点组 {non_numeric[:8]}"
-                f"（共 {len(non_numeric)} 个），它们不会被当作骨骼导出"
-            )
+        self._prepare_merged_skeleton_vertex_groups(obj)
 
     def _ensure_target_shape_key_union(self, target_obj: bpy.types.Object, source_objs: list[bpy.types.Object]):
         objects = [

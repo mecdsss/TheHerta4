@@ -4,10 +4,12 @@ import importlib.util
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -352,6 +354,16 @@ class ZZSIMergedSkeletonCollectTests(unittest.TestCase):
         components, _ = exporter._collect_merged_skeleton_components()
         self.assertEqual(components, [])
 
+    def test_collect_rejects_vgmap_slot_outside_component_range(self):
+        models = [_FakeDrawIBModel(
+            "b20f90ea",
+            [_FakeSubmesh("LOD0.b20f90ea-19182-0", 0, 1, vg_map={0: 999})],
+        )]
+        exporter = _make_exporter(models, merged_vgmap=True)
+        components, id_dict = exporter._collect_merged_skeleton_components()
+        self.assertEqual(components, [])
+        self.assertEqual(id_dict, {})
+
 
 class ZZSIMergedSkeletonIniTests(unittest.TestCase):
     def _build_vb_section(self, with_merged=True):
@@ -428,7 +440,7 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("filename = Meshes/zz_vgmap_a23aa8a3.buf", text)
         self.assertIn("[ResourceZZVgMap_b20f90ea]", text)
         self.assertIn("filename = Meshes/zz_vgmap_b20f90ea.buf", text)
-        # 逐部件 attach 段（参数写死：x1=0 / y1=vg_count；cs-t1 = vg_map）
+        # 逐部件 attach 段（x1=0 / y1=vg_count；cs-t1 = vg_map；Dispatch 动态取整）
         self.assertIn("[CustomShaderZZMIMergedSkeletonAttach_C0]", lines)
         self.assertIn("[CustomShaderZZMIMergedSkeletonAttach_C1]", lines)
         self.assertNotIn("CustomShaderZZMIMergedSkeletonAttach_C0_G0", text)
@@ -439,7 +451,7 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("cs-t1 = ref ResourceZZVgMap_a23aa8a3", text)
         self.assertIn("cs-t0 = ref ResourceZZPalette_b20f90ea", text)
         self.assertIn("cs-u0 = ref ResourceZZMergedSkeleton_G0", text)
-        self.assertIn("Dispatch = 8, 1, 1", text)
+        self.assertIn("Dispatch = 2, 1, 1", text)  # ceil(105 / 64)
         # [Present] 兜底 run：每部件一次（无变量参数）
         self.assertIn("[Present]", text)
         present_text = text.split("[Present]")[1]
@@ -552,6 +564,110 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         text = "\n".join(builder.sections[0].SectionLineList)
 
         self.assertIn("array = 51", text)  # max(0+11, 31+20) = 51，而非 sum=31
+
+    def test_g4_slots_use_runtime_merged_skeleton_bounds(self):
+        """G4 的 249..265 槽必须由实际 UAV 长度放行，不能被角色专用常量截断。"""
+        shader = (REPO_ROOT / "Toolset" / "zzmi_merged_skeleton_attach.hlsl").read_text(
+            encoding="utf-8"
+        )
+
+        threads = _zzmi_module.ExportZZMI.MERGED_SKELETON_ATTACH_THREADS
+        self.assertIn(f"[numthreads({threads}, 1, 1)]", shader)
+        self.assertIn(
+            "src_palette.GetDimensions(palette_count, palette_stride)", shader
+        )
+        self.assertIn("vg_map.GetDimensions(vg_map_count)", shader)
+        self.assertIn(
+            "merged_skeleton.GetDimensions(merged_count, merged_stride)", shader
+        )
+        self.assertIn("slot < merged_count", shader)
+        self.assertNotIn("slot < 249", shader)
+
+        submesh_add = _FakeSubmesh(
+            "LOD0.add6ff13-624-0",
+            249,
+            1,
+            4,
+            vg_map={0: 249},
+        )
+        submesh_d892 = _FakeSubmesh(
+            "LOD0.d892c658-2256-0",
+            250,
+            16,
+            4,
+            vg_map={local: 250 + local for local in range(16)},
+        )
+        exporter = _make_exporter(
+            [
+                _FakeDrawIBModel("add6ff13", [submesh_add]),
+                _FakeDrawIBModel("d892c658", [submesh_d892]),
+            ],
+            merged_vgmap=True,
+        )
+        exporter.merged_skeleton_components, exporter.merged_skeleton_component_id_dict = (
+            exporter._collect_merged_skeleton_components()
+        )
+        builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(builder)
+        text = "\n".join(builder.sections[0].SectionLineList)
+
+        self.assertIn("[ResourceZZMergedSkeleton_G4]", text)
+        self.assertEqual(text.count("[ResourceZZMergedSkeleton_G4]"), 1)
+        self.assertIn("array = 266", text)
+        meshes_path = Path(_FAKE_MOD_FOLDER) / "Meshes"
+        add_slots = [
+            value[0]
+            for value in struct.iter_unpack(
+                "<4I", (meshes_path / "zz_vgmap_add6ff13.buf").read_bytes()
+            )
+        ]
+        d892_slots = [
+            value[0]
+            for value in struct.iter_unpack(
+                "<4I", (meshes_path / "zz_vgmap_d892c658.buf").read_bytes()
+            )
+        ]
+        self.assertEqual(add_slots + d892_slots, list(range(249, 266)))
+
+    def test_attach_dispatch_scales_past_512_bones(self):
+        """numthreads=64 时，513 根 palette 必须生成 9 个 dispatch group。"""
+        count = 513
+        submesh = _FakeSubmesh("LOD0.aaaaaaaa-100-0", 0, count)
+        exporter = _make_exporter(
+            [_FakeDrawIBModel("aaaaaaaa", [submesh])], merged_vgmap=True
+        )
+        exporter.merged_skeleton_components, exporter.merged_skeleton_component_id_dict = (
+            exporter._collect_merged_skeleton_components()
+        )
+        builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(builder)
+        text = "\n".join(builder.sections[0].SectionLineList)
+
+        self.assertIn("y1 = 513", text)
+        self.assertIn("Dispatch = 9, 1, 1", text)
+
+    def test_vgmap_publish_failure_aborts_and_preserves_previous_file(self):
+        submesh = _FakeSubmesh("LOD0.aaaaaaaa-100-0", 0, 1)
+        exporter = _make_exporter(
+            [_FakeDrawIBModel("aaaaaaaa", [submesh])], merged_vgmap=True
+        )
+        exporter.merged_skeleton_components, exporter.merged_skeleton_component_id_dict = (
+            exporter._collect_merged_skeleton_components()
+        )
+        target = Path(_FAKE_MOD_FOLDER) / "Meshes" / "zz_vgmap_aaaaaaaa.buf"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"previous")
+
+        with mock.patch.object(_zzmi_module.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(RuntimeError):
+                exporter.add_merged_skeleton_sections(_FakeIniBuilder())
+        self.assertEqual(target.read_bytes(), b"previous")
+
+    def test_missing_attach_shader_aborts_export(self):
+        exporter = _make_exporter([], merged_vgmap=True)
+        with mock.patch.object(_zzmi_module.os.path, "isfile", return_value=False):
+            with self.assertRaises(FileNotFoundError):
+                exporter._copy_merged_skeleton_shader_to_mod()
 
 
 class ZZMICrossGroupGuardTests(unittest.TestCase):

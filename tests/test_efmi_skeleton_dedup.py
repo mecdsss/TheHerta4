@@ -458,6 +458,127 @@ class DedupGateTests(unittest.TestCase):
         vg_maps, _ = EFMIBoneMapBuilder.build_vg_maps(submesh)
         self.assertEqual(vg_maps["thigh"][0], vg_maps["tights"][0])
 
+    def test_weight_diffusion_searches_past_a_closer_wrong_layer(self):
+        """多层裙摆：最近层法向错误时，仍应找到稍远但同层级的扩散对应。"""
+        base = [[x, y, 0.0] for x in (0.0, 0.2, 0.4) for y in (0.0, 0.2, 0.4)]
+        weights = [1.0, 0.8, 0.6, 0.8, 0.6, 0.4, 0.6, 0.4, 0.2]
+        # 每个源点附近放四个更近、但法向垂直的错误层采样；正确的平行层
+        # 在 z=0.08。旧实现先取三维最近点再验法向，因而永远看不到正确层。
+        wrong_layer = [
+            [x + dx, y, 0.01]
+            for x, y, _ in base
+            for dx in (-0.015, -0.005, 0.005, 0.015)
+        ]
+        correct_layer = [[x, y, 0.08] for x, y, _ in base]
+        sig_a = _diff_sig(base, weights)
+        sig_b = _diff_sig(
+            wrong_layer + correct_layer,
+            [1.0] * len(wrong_layer) + weights,
+        )
+        sig_a["diffusion_normals"] = numpy.tile(
+            numpy.asarray([0.0, 0.0, 1.0], dtype=numpy.float32), (len(base), 1)
+        )
+        sig_b["diffusion_normals"] = numpy.concatenate((
+            numpy.tile(
+                numpy.asarray([1.0, 0.0, 0.0], dtype=numpy.float32),
+                (len(wrong_layer), 1),
+            ),
+            numpy.tile(
+                numpy.asarray([0.0, 0.0, 1.0], dtype=numpy.float32),
+                (len(correct_layer), 1),
+            ),
+        ))
+
+        self.assertTrue(EFMIBoneMapBuilder.weight_diffusion_similarity(sig_a, sig_b))
+
+    def test_ambiguous_component_candidates_keep_only_best_diffusion_match(self):
+        """A:1 同时命中 B:8/B:9 时，只合并扩散相似度更高的那个。"""
+        base = [[x, y, 0.0] for x in (0.0, 0.2, 0.4) for y in (0.0, 0.2, 0.4)]
+        weights = [1.0, 0.8, 0.6, 0.8, 0.6, 0.4, 0.6, 0.4, 0.2]
+        farther = [[x, y, 0.12] for x, y, _ in base]
+        closer = [[x, y, 0.04] for x, y, _ in base]
+        normal = numpy.tile(
+            numpy.asarray([0.0, 0.0, 1.0], dtype=numpy.float32), (len(base), 1)
+        )
+        sig_a = _diff_sig(base, weights)
+        sig_farther = _diff_sig(farther, weights)
+        sig_closer = _diff_sig(closer, weights)
+        for signature in (sig_a, sig_farther, sig_closer):
+            signature["diffusion_normals"] = normal.copy()
+
+        submesh = {
+            "A_part": _entry([_bone(0.1)], {0: sig_a}),
+            # local 0 先被遍历，但 local 1 的扩散距离明显更相似。
+            "B_part": _entry(
+                [_bone(0.1), _bone(0.1)],
+                {0: sig_farther, 1: sig_closer},
+            ),
+        }
+        vg_maps, _ = EFMIBoneMapBuilder.build_vg_maps(submesh)
+
+        self.assertNotEqual(vg_maps["B_part"][0], vg_maps["B_part"][1])
+        self.assertNotEqual(vg_maps["A_part"][0], vg_maps["B_part"][0])
+        self.assertEqual(vg_maps["A_part"][0], vg_maps["B_part"][1])
+
+    def test_ambiguous_candidates_prioritize_matrix_before_diffusion(self):
+        """矩阵更接近的候选即使扩散更远，也不能被覆盖层抢走。"""
+        base = [[x, y, 0.0] for x in (0.0, 0.2, 0.4) for y in (0.0, 0.2, 0.4)]
+        weights = [1.0, 0.8, 0.6, 0.8, 0.6, 0.4, 0.6, 0.4, 0.2]
+        exact_matrix_layer = [[x, y, 0.14] for x, y, _ in base]
+        near_matrix_layer = [[x, y, 0.04] for x, y, _ in base]
+        normal = numpy.tile(
+            numpy.asarray([0.0, 0.0, 1.0], dtype=numpy.float32), (len(base), 1)
+        )
+        sig_a = _diff_sig(base, weights)
+        sig_exact = _diff_sig(exact_matrix_layer, weights)
+        sig_near = _diff_sig(near_matrix_layer, weights)
+        for signature in (sig_a, sig_exact, sig_near):
+            signature["diffusion_normals"] = normal.copy()
+
+        near_matrix_bone = _bone(0.1)
+        near_matrix_bone[0] += 2.5e-5
+        submesh = {
+            "A_part": _entry([_bone(0.1)], {0: sig_a}),
+            "B_part": _entry(
+                [_bone(0.1), near_matrix_bone],
+                {0: sig_exact, 1: sig_near},
+            ),
+        }
+        vg_maps, _ = EFMIBoneMapBuilder.build_vg_maps(submesh)
+
+        self.assertEqual(vg_maps["A_part"][0], vg_maps["B_part"][0])
+        self.assertNotEqual(vg_maps["A_part"][0], vg_maps["B_part"][1])
+
+    def test_global_edge_order_keeps_matrix_best_bridge(self):
+        """全局并入时也先处理矩阵更好的桥，避免链式浮层占用目标槽位。"""
+        base = [[x, y, 0.0] for x in (0.0, 0.2, 0.4) for y in (0.0, 0.2, 0.4)]
+        near = [[x, y, 0.02] for x, y, _ in base]
+        far = [[x, y, 0.14] for x, y, _ in base]
+        weights = [1.0, 0.8, 0.6, 0.8, 0.6, 0.4, 0.6, 0.4, 0.2]
+        normal = numpy.tile(
+            numpy.asarray([0.0, 0.0, 1.0], dtype=numpy.float32), (len(base), 1)
+        )
+        sig_base = _diff_sig(base, weights)
+        sig_near = _diff_sig(near, weights)
+        sig_far = _diff_sig(far, weights)
+        for signature in (sig_base, sig_near, sig_far):
+            signature["diffusion_normals"] = normal.copy()
+
+        exact = _bone(0.1)
+        offset = _bone(0.1)
+        offset[0] += 1e-4
+        submesh = {
+            # A:0→B:0 是真实矩阵相同的边，但扩散距离比链式桥更远；
+            # A:1→C:0→B:0 是扩散更近、矩阵略差的覆盖层链。
+            "A_part": _entry([exact, offset], {0: sig_base, 1: sig_near}),
+            "B_part": _entry([exact], {0: sig_far}),
+            "C_part": _entry([offset], {0: sig_near}),
+        }
+        vg_maps, _ = EFMIBoneMapBuilder.build_vg_maps(submesh)
+
+        self.assertEqual(vg_maps["A_part"][0], vg_maps["B_part"][0])
+        self.assertNotEqual(vg_maps["A_part"][1], vg_maps["B_part"][0])
+
     def test_weight_diffusion_uses_strict_contact_when_one_surface_normal_is_missing(self):
         """单侧 PCA 失败时不能把体积间隔当作跨层表面投影。"""
         base = [[x, y, 0.0] for x in (0.0, 0.2, 0.4) for y in (0.0, 0.2, 0.4)]

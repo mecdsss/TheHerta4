@@ -34,7 +34,9 @@ class SSMTImportHelper:
 		mesh_name = os.path.splitext(submesh_json.FileName)[0]
 		logic_name = submesh_json.GamePreset
 		gametypename = submesh_json.WorkGameType
-		wwmi_vg_map = submesh_json.VGMap if (submesh_json.VGMap and GlobalProterties.import_merged_vgmap()) else None
+		wwmi_vg_map = submesh_json.VGMap if (
+			GlobalProterties.import_merged_vgmap() and int(submesh_json.VGCount or 0) > 0
+		) else None
 
 		obj = MeshCreateHelper.create_mesh_object(
 			mesh_name=mesh_name,
@@ -56,6 +58,7 @@ class SSMTImportHelper:
 			wwmi_vertex_count=submesh_json.VertexCount,
 			wwmi_vg_map=wwmi_vg_map,
 			wwmi_vg_offset=submesh_json.VGOffset,
+			wwmi_vg_count=submesh_json.VGCount,
 		)
 		if obj is not None:
 			obj["3DMigoto:WorkspaceUniqueStr"] = SSMTImportHelper._build_workspace_unique_str_from_json_path(json_file_path)

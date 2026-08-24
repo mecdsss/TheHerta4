@@ -241,6 +241,33 @@ class NTEMIImporterMaterialTests(unittest.TestCase):
             )
             self.assertEqual(tex_node.image.alpha_mode, "NONE")
 
+    def test_workspace_texture_marks_strip_color_prefix_when_toggled(self):
+        """开启去掉颜色贴图前缀后，材质名不再带 DiffuseMap 前缀。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diffuse = os.path.join(temp_dir, "diffuse.dds")
+            with open(diffuse, "wb") as file_obj:
+                file_obj.write(b"texture")
+
+            props = sys.modules[f"{PKG}.common.global_properties"].GlobalProterties
+            props.import_texture_material_strip_color_prefix = lambda: True
+            try:
+                obj = _FakeObject("d892c658-2256-0")
+                ntemi_importer._apply_material_from_texture_slots(
+                    obj,
+                    {
+                        "ps-t0": {
+                            "source_path": diffuse,
+                            "mark_name": "DiffuseMap",
+                        },
+                    },
+                )
+            finally:
+                props.import_texture_material_strip_color_prefix = lambda: False
+
+            material_names = [slot.material.name for slot in obj.material_slots]
+            self.assertIn("d892c658-2256-0_ps-t0", material_names)
+            self.assertNotIn("DiffuseMap_d892c658-2256-0_ps-t0", material_names)
+
     def test_collect_modimp_props_only_returns_non_empty_modimp_custom_props(self):
         obj = types.SimpleNamespace(
             keys=lambda: ["modimp_profile_id", "modimp_vb0_buf_path", "not_modimp", "modimp_empty"],

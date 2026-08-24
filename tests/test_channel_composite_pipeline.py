@@ -351,6 +351,75 @@ class GeneratedMapDependencyTests(unittest.TestCase):
         self.assertLess(float(ao[16, 16]), float(ao[2, 2]))
         self.assertLess(float(ao[16, 16]), 1.0)
 
+    def test_shift_with_edge_offset_larger_than_image(self):
+        """回归：偏移 >= 图像尺寸时旧实现会从空切片复制边缘值而崩溃。"""
+        processor = tt_normal_map.ChannelProcessor()
+
+        data = np.arange(16, dtype=np.float32).reshape(4, 4)
+        shifted = processor._shift_with_edge(data, 8, 8)
+
+        self.assertEqual(shifted.shape, (4, 4))
+        self.assertTrue(np.allclose(shifted, data[0, 0]))
+
+    def test_shift_with_edge_offsets_beyond_both_dims(self):
+        processor = tt_normal_map.ChannelProcessor()
+
+        data = np.arange(16, dtype=np.float32).reshape(4, 4)
+        shifted = processor._shift_with_edge(data, -8, 3)
+
+        self.assertEqual(shifted.shape, (4, 4))
+        # 行方向整体钳制到最底行、列方向整体钳制到最左列
+        self.assertTrue(np.allclose(shifted, np.full((4, 4), data[3, 0], dtype=np.float32)))
+
+    def test_shift_with_edge_matches_clamped_reference(self):
+        """在图像范围内的偏移与逐像素边缘钳制语义一致。"""
+        processor = tt_normal_map.ChannelProcessor()
+
+        rng = np.random.default_rng(7)
+        data = rng.random((5, 6), dtype=np.float32)
+        for offset_y, offset_x in ((2, 3), (-2, -3), (0, 0), (1, -1), (-4, 4)):
+            shifted = processor._shift_with_edge(data, offset_y, offset_x)
+            expected = np.empty_like(data)
+            for y in range(5):
+                for x in range(6):
+                    src_y = min(max(y - offset_y, 0), 4)
+                    src_x = min(max(x - offset_x, 0), 5)
+                    expected[y, x] = data[src_y, src_x]
+            self.assertTrue(np.array_equal(shifted, expected), (offset_y, offset_x))
+
+    def test_ao_from_geometry_small_image_large_radius_no_crash(self):
+        """回归：4×4 图像 + 半径 8（原崩溃用例）应稳定返回有限值。"""
+        processor = tt_normal_map.ChannelProcessor()
+
+        height = np.random.default_rng(3).random((4, 4), dtype=np.float32)
+        normal = (
+            np.full((4, 4), 0.5, dtype=np.float32),
+            np.full((4, 4), 0.5, dtype=np.float32),
+            np.ones((4, 4), dtype=np.float32),
+        )
+
+        ao = processor.generate_ao_from_geometry(height, normal, radius=8, height_scale=16.0, power=1.0)
+
+        self.assertEqual(ao.shape, (4, 4))
+        self.assertTrue(np.all(np.isfinite(ao)))
+        self.assertTrue(np.all((ao >= 0.0) & (ao <= 1.0)))
+
+    def test_ao_from_geometry_radius_equal_to_image_size(self):
+        """半径 == 图像尺寸（边界值）也必须稳定。"""
+        processor = tt_normal_map.ChannelProcessor()
+
+        height = np.random.default_rng(5).random((4, 4), dtype=np.float32)
+        normal = (
+            np.full((4, 4), 0.5, dtype=np.float32),
+            np.full((4, 4), 0.5, dtype=np.float32),
+            np.ones((4, 4), dtype=np.float32),
+        )
+
+        ao = processor.generate_ao_from_geometry(height, normal, radius=4, height_scale=16.0, power=1.0)
+
+        self.assertEqual(ao.shape, (4, 4))
+        self.assertTrue(np.all(np.isfinite(ao)))
+
     def test_compose_normal_xy_plus_ao_example(self):
         """端到端：R=法线X、G=法线Y、B=AO —— 法线与 AO 沿依赖链各算一次再取通道"""
         operator = tt_normal_map.TT_OT_execute_channel_composite()

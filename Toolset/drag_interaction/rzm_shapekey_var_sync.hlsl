@@ -16,21 +16,17 @@
 //   - The variable changed this frame (hotkey / animation driver) -> the
 //     variable owns the buffer and is written immediately, even while a
 //     drag is active (variable always wins).
-//   - The only exception is the CPU readback echo: the generated
-//     CommandListDragShapeKeyVarReadback mirrors the buffer into the
-//     variable on pull frames and marks those frames via the pull flag
-//     (IniParams[83 + i/4][i%4]); such frames must NOT push the variable
-//     back into the buffer, or the store-latency-stale value would fight
-//     the drag CS every frame.
+//   - CPU/GPU arbitration uses a mode handshake in IniParams[90..98]:
+//     mode 1 suppresses a CPU readback echo; mode 2 force-pushes a changed
+//     variable until the delayed store readback confirms the same value.
 //   - ZoneActive is still recomputed here every frame (same hit test as
 //     rzm_shapekey_drive) and consumed by the CPU readback to decide which
 //     side owns the variable.
 // GPU->CPU synchronization is emitted by the generated
 // CommandListDragShapeKeyVarReadback section. It reads ZoneActive and the
 // drive slot with the loader's direct-resource store syntax (without ref).
-// A short settle window after each variable change absorbs the store
-// latency before pulls resume, so a fresh hotkey value is never clobbered
-// by a stale buffer read (the "hotkey toggle snapped back next frame" bug).
+// The pending/ack settle handshake absorbs store latency before pulls resume,
+// so a fresh hotkey value is never clobbered by a stale buffer read.
 //
 // Bindings:
 //   t67  = ResourceDragPinnedDetectInfo (hover hit + zone id; same SRV the
@@ -68,7 +64,7 @@ StructuredBuffer<float4> PinnedDetectInfo : register(t67);
 Texture1D<float4> IniParams         : register(t120);
 
 #define VAR_SYNC_INIPARAM_BASE 81
-#define VAR_SYNC_PULL_BASE 83
+#define VAR_SYNC_MODE_BASE 90
 #define VAR_SYNC_GATE_PARAMS 75
 
 uint ClampZoneID(float zoneValue, uint zoneCount)
@@ -110,13 +106,17 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     for (uint i = 0u; i < count; ++i)
     {
         float raw = IniParams[VAR_SYNC_INIPARAM_BASE + (i >> 2)][i & 3];
-        if (abs(raw - VarSyncPrev[i]) <= 1e-6)
-            continue;
-        // 变量为主：变量一旦变化立即回写缓冲（即使区域拖拽激活中）。
-        // 唯一例外是 CPU 回读回声帧（pull flag）——拉取值本就来自缓冲，
-        // 且带 store 延迟，推回会与拖拽 CS 每帧打架。
+        float syncMode = IniParams[VAR_SYNC_MODE_BASE + (i >> 2)][i & 3];
+        bool forcePush = syncMode > 1.5;
+        if (!forcePush)
+        {
+            if (abs(raw - VarSyncPrev[i]) <= 1e-6)
+                continue;
+        }
         VarSyncPrev[i] = raw;
-        if (IniParams[VAR_SYNC_PULL_BASE + (i >> 2)][i & 3] > 0.5)
+        // mode=1 表示 CPU 刚从缓冲拉取，跳过回声；mode=2 表示变量值仍
+        // 等待 store 确认，必须绕过 prev 去重持续推送，直到 CPU 观察到追平。
+        if (syncMode > 0.5 && syncMode < 1.5)
             continue;
         uint4 mapping = VarSyncMap[i];
         uint slot = mapping.x;

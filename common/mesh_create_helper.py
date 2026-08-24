@@ -67,6 +67,7 @@ class MeshCreateHelper:
         wwmi_vertex_count:int = -1,
         wwmi_vg_map:dict | None = None,
         wwmi_vg_offset:int = 0,
+        wwmi_vg_count:int = 0,
     ):
         TimerUtils.Start("Import 3Dmigoto Raw")
         print("导入模型: " + mesh_name)
@@ -94,6 +95,7 @@ class MeshCreateHelper:
         )
 
         blend_indices = {}
+        blend_index_formats = {}
         blend_weights = {}
         texcoords = {}
         shapekeys = {}
@@ -138,6 +140,7 @@ class MeshCreateHelper:
                     mesh.vertex_colors.new(name=element.ElementName)
                     mesh.vertex_colors[element.ElementName].data.foreach_set('color', colors_flat.ravel())
             elif element.SemanticName == "BLENDINDICES":
+                blend_index_formats[element.SemanticIndex] = element.Format
                 if data.ndim == 1:
                     blend_indices[element.SemanticIndex] = numpy.array([(x,) for x in data])
                 else:
@@ -190,24 +193,29 @@ class MeshCreateHelper:
                 raise Fatal("Unknown ElementName: " + element.ElementName)
 
         if len(blend_weights) == 0 and len(blend_indices) != 0:
-            print("检测到BLENDWEIGHTS为空，但是含有BLENDINDICES数据，特殊情况，默认补充1,0,0,0的BLENDWEIGHTS")
+            print("检测到 BLENDWEIGHTS 为空但含 BLENDINDICES，按实际通道数补充首通道权重 1")
             for semantic_index, blendindices_tuple in blend_indices.items():
+                index_array = numpy.asarray(blendindices_tuple)
+                channel_count = index_array.shape[1] if index_array.ndim > 1 else 1
+                default_weights = (1.0,) + (0.0,) * max(channel_count - 1, 0)
                 new_list = []
                 for _indices in blendindices_tuple:
-                    new_list.append((1.0, 0, 0, 0))
+                    new_list.append(default_weights)
                 blend_weights[semantic_index] = new_list
 
         MeshCreateHelper.import_uv_layers(mesh, obj, texcoords)
 
         component = None
-        if wwmi_vg_map:
-            normalized_vg_map = {}
-            for vg_key, vg_value in wwmi_vg_map.items():
-                try:
-                    normalized_vg_map[vg_key] = int(vg_value)
-                except (TypeError, ValueError):
-                    continue
-            component = SimpleNamespace(vg_map=normalized_vg_map, vg_offset=int(wwmi_vg_offset or 0))
+        if wwmi_vg_map is not None:
+            normalized_vg_map = MeshCreateHelper._normalize_and_validate_vg_map(
+                wwmi_vg_map,
+                vg_count=int(wwmi_vg_count or 0),
+            )
+            component = SimpleNamespace(
+                vg_map=normalized_vg_map,
+                vg_offset=int(wwmi_vg_offset or 0),
+                vg_count=int(wwmi_vg_count or 0),
+            )
         elif GlobalProterties.import_merged_vgmap() and logic_name == LogicName.WWMI:
             metadatajsonpath = os.path.join(os.path.dirname(source_path), 'Metadata.json')
             if os.path.exists(metadatajsonpath):
@@ -223,7 +231,14 @@ class MeshCreateHelper:
                     pass
 
         print("导入顶点组")
-        MeshCreateHelper.import_vertex_groups(mesh, obj, blend_indices, blend_weights, component)
+        MeshCreateHelper.import_vertex_groups(
+            mesh,
+            obj,
+            blend_indices,
+            blend_weights,
+            component,
+            blend_index_formats=blend_index_formats,
+        )
         print("导入顶点组完毕")
 
         MeshCreateHelper.import_shapekeys(mesh, obj, shapekeys)
@@ -268,7 +283,10 @@ class MeshCreateHelper:
             if GlobalProterties.import_skip_empty_vertex_groups():
                 VertexGroupUtils.remove_unused_vertex_groups(obj)
         elif GlobalConfig.logic_name == LogicName.EFMI:
-            if GlobalProterties.import_skip_empty_vertex_groups():
+            if (
+                GlobalProterties.import_skip_empty_vertex_groups()
+                and not GlobalProterties.import_merged_vgmap()
+            ):
                 # 删除空顶点组会重排组 index，而导出按组 index 取骨骼 id。
                 # EFMI 骨骼合并模式下组名=全局骨骼 id，删空组后必须按名称排序，
                 # 使 index == 全局骨骼 id（与参考插件 Merged Skeleton 的排序纪律一致）。
@@ -365,32 +383,112 @@ class MeshCreateHelper:
                 blender_uvs.data.foreach_set('uv', uv_array)
 
     @staticmethod
-    def import_vertex_groups(mesh, obj, blend_indices, blend_weights, component):
-        def get_mapped_group_id(vg_map:dict, local_index:int):
-            if local_index in vg_map:
-                return vg_map[local_index]
-            local_index_str = str(local_index)
-            if local_index_str in vg_map:
-                return vg_map[local_index_str]
-            return None
+    def _normalize_blend_index_array(values, dxgi_format:str | None = None):
+        """把 BLENDINDICES 转成 int64，并按实际 DXGI 位宽消除 UINT 哨兵。"""
+        source = numpy.asarray(values)
+        if source.dtype.kind == 'f':
+            normalized = numpy.rint(source).astype(numpy.int64)
+        else:
+            normalized = source.astype(numpy.int64, copy=True)
+
+        format_name = str(dxgi_format or "").upper()
+        sentinel = None
+        if "_UINT" in format_name:
+            if format_name.startswith("R8"):
+                sentinel = 0xFF
+            elif format_name.startswith("R16"):
+                sentinel = 0xFFFF
+            elif format_name.startswith("R32"):
+                sentinel = 0xFFFFFFFF
+        elif not format_name and source.dtype.kind == 'u':
+            sentinel = (1 << (source.dtype.itemsize * 8)) - 1
+
+        if sentinel is not None:
+            normalized[normalized == sentinel] = -1
+        return normalized
+
+    @staticmethod
+    def _valid_blend_channel_mask(indices, weights):
+        """只把“索引有效且权重大于零”的通道计入顶点组。"""
+        index_array = numpy.asarray(indices)
+        weight_array = numpy.asarray(weights)
+        if index_array.shape != weight_array.shape:
+            raise Fatal(
+                f"BLENDINDICES/BLENDWEIGHT shape mismatch: "
+                f"{index_array.shape} != {weight_array.shape}"
+            )
+        return (
+            (index_array >= 0)
+            & numpy.isfinite(weight_array)
+            & (weight_array > 0.0)
+        )
+
+    @staticmethod
+    def _normalize_and_validate_vg_map(vg_map:dict, vg_count:int):
+        """规范化合并骨架 VGMap；缺键/重复键/负槽位一律大声失败。"""
+        if not isinstance(vg_map, dict):
+            raise Fatal("合并骨架 VGMap 必须是字典")
+        try:
+            expected_count = int(vg_count)
+        except (TypeError, ValueError) as exc:
+            raise Fatal(f"合并骨架 VGCount 无效: {vg_count}") from exc
+        if expected_count < 0:
+            raise Fatal(f"合并骨架 VGCount 不能为负数: {expected_count}")
+
+        normalized = {}
+        for raw_key, raw_value in vg_map.items():
+            try:
+                key = int(raw_key)
+                value = int(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise Fatal(f"合并骨架 VGMap 含非整数项: {raw_key!r} -> {raw_value!r}") from exc
+            if key in normalized:
+                raise Fatal(f"合并骨架 VGMap 规范化后键重复: {key}")
+            if value < 0:
+                raise Fatal(f"合并骨架 VGMap 槽位不能为负数: {key} -> {value}")
+            normalized[key] = value
+
+        expected_keys = set(range(expected_count))
+        actual_keys = set(normalized)
+        if actual_keys != expected_keys:
+            missing = sorted(expected_keys - actual_keys)
+            extra = sorted(actual_keys - expected_keys)
+            raise Fatal(
+                f"合并骨架 VGMap 键不完整（VGCount={expected_count}，"
+                f"缺少={missing}，多余={extra}）"
+            )
+        return normalized
+
+    @staticmethod
+    def import_vertex_groups(
+        mesh,
+        obj,
+        blend_indices,
+        blend_weights,
+        component,
+        blend_index_formats=None,
+    ):
+        blend_index_formats = blend_index_formats or {}
 
         for semantic_index, bone_indices_list in blend_indices.items():
-            arr = numpy.asarray(bone_indices_list)
-            if arr.dtype.kind == 'f':
-                arr = numpy.rint(arr).astype(numpy.int64)
-            else:
-                arr = arr.astype(numpy.int64, copy=False)
-            arr[arr == 65535] = -1
-            blend_indices[semantic_index] = arr
+            blend_indices[semantic_index] = MeshCreateHelper._normalize_blend_index_array(
+                bone_indices_list,
+                blend_index_formats.get(semantic_index),
+            )
 
         assert len(blend_indices) == len(blend_weights)
         if blend_indices:
             max_valid_group_id = -1
-            for bone_indices_array in blend_indices.values():
-                flattened_indices = numpy.asarray(bone_indices_array, dtype=numpy.int64).ravel()
-                non_negative_indices = flattened_indices[flattened_indices >= 0]
-                if non_negative_indices.size > 0:
-                    max_valid_group_id = max(max_valid_group_id, int(non_negative_indices.max()))
+            valid_masks = {}
+            for semantic_index, bone_indices_array in blend_indices.items():
+                valid_mask = MeshCreateHelper._valid_blend_channel_mask(
+                    bone_indices_array,
+                    blend_weights[semantic_index],
+                )
+                valid_masks[semantic_index] = valid_mask
+                valid_indices = bone_indices_array[valid_mask]
+                if valid_indices.size > 0:
+                    max_valid_group_id = max(max_valid_group_id, int(valid_indices.max()))
 
             if max_valid_group_id < 0:
                 return
@@ -398,16 +496,13 @@ class MeshCreateHelper:
             if component is None:
                 num_vertex_groups = max_valid_group_id + 1
             else:
-                mapped_group_ids = set()
-                for mapped_group_id in getattr(component, "vg_map", {}).values():
-                    try:
-                        mapped_group_ids.add(int(mapped_group_id))
-                    except (TypeError, ValueError):
-                        continue
-
-                vg_offset = int(getattr(component, "vg_offset", 0) or 0)
+                vg_count = int(getattr(component, "vg_count", len(component.vg_map)) or 0)
+                component.vg_map = MeshCreateHelper._normalize_and_validate_vg_map(
+                    component.vg_map,
+                    vg_count,
+                )
+                mapped_group_ids = set(component.vg_map.values())
                 max_global_group_id = max(mapped_group_ids) if mapped_group_ids else -1
-                max_global_group_id = max(max_global_group_id, vg_offset + max_valid_group_id)
                 if max_global_group_id < 0:
                     return
                 num_vertex_groups = max_global_group_id + 1
@@ -423,16 +518,17 @@ class MeshCreateHelper:
             for vertex in mesh.vertices:
                 for semantic_index in sorted(blend_indices.keys()):
                     for i, w in zip(blend_indices[semantic_index][vertex.index], blend_weights[semantic_index][vertex.index]):
-                        if i < 0 or w == 0.0:
+                        if i < 0 or not numpy.isfinite(w) or w <= 0.0:
                             continue
                         if component is None:
                             target_group_id = int(i)
                         else:
-                            mapped_group_id = get_mapped_group_id(component.vg_map, int(i))
-                            if mapped_group_id is None:
-                                target_group_id = int(getattr(component, "vg_offset", 0) or 0) + int(i)
-                            else:
-                                target_group_id = int(mapped_group_id)
+                            try:
+                                target_group_id = int(component.vg_map[int(i)])
+                            except KeyError as exc:
+                                raise Fatal(
+                                    f"BLENDINDICES 引用了 VGMap 未覆盖的局部骨骼 {int(i)}"
+                                ) from exc
 
                         if target_group_id < 0:
                             continue
@@ -806,6 +902,12 @@ class MeshCreateHelper:
             return
 
         material_name = f"DiffuseMap_{mesh_name}"
+        try:
+            if GlobalProterties.import_texture_material_strip_color_prefix():
+                # 开启后去掉颜色贴图（DiffuseMap）前缀，只保留网格名。
+                material_name = mesh_name
+        except Exception:
+            pass
         material = bpy.data.materials.new(name=material_name)
         material.use_nodes = True
         if logic_name == LogicName.IdentityV:

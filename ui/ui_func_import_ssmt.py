@@ -239,10 +239,14 @@ def ImprotFromWorkSpaceFull(self, context):
                 self.report({'INFO'}, message)
             else:
                 print(f"[EFMI骨骼合并] 未生成骨骼数据：{message}")
+                # 部分/全部子网格未生成合并骨架数据时会走普通导入路线，
+                # 必须显式警告，避免用户误以为骨骼合并已完整生效。
+                self.report({'WARNING'}, f"骨骼合并未完整生成：{message}")
         except Exception as e:
             import traceback
             print(f"[EFMI骨骼合并] 预生成失败（不阻断导入）: {e}")
             traceback.print_exc()
+            self.report({'WARNING'}, f"EFMI 骨骼合并预生成异常，已回退普通导入：{e}")
 
     # ZZMI 骨骼合并数据预生成（与 EFMI 同构的分支选项）：
     # 复选框（import_merged_vgmap，「使用融合统一顶点组」）关闭时完全不执行，保持旧逻辑；
@@ -265,10 +269,14 @@ def ImprotFromWorkSpaceFull(self, context):
                 self.report({'INFO'}, message)
             else:
                 print(f"[ZZMI骨骼合并] 未生成骨骼数据：{message}")
+                # 部分/全部子网格未生成合并骨架数据时会走普通导入路线，
+                # 必须显式警告，避免用户误以为骨骼合并已完整生效。
+                self.report({'WARNING'}, f"骨骼合并未完整生成：{message}")
         except Exception as e:
             import traceback
             print(f"[ZZMI骨骼合并] 预生成失败（不阻断导入）: {e}")
             traceback.print_exc()
+            self.report({'WARNING'}, f"ZZMI 骨骼合并预生成异常，已回退普通导入：{e}")
 
     foldername_gametypename_dict = {}
     imported_objects = []

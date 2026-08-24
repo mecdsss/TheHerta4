@@ -270,6 +270,18 @@ def _material_name_for_texture_slot(obj_name: str, mark_name: str, slot_name: st
     safe_mark = _safe_material_name_token(mark_name)
     safe_obj = _safe_material_name_token(obj_name)
     safe_slot = _safe_material_name_token(slot_name)
+
+    try:
+        strip_color_prefix = bool(GlobalProterties.import_texture_material_strip_color_prefix())
+    except Exception:
+        strip_color_prefix = False
+
+    if strip_color_prefix:
+        # 开启后去掉颜色贴图（如 DiffuseMap）前缀，只保留物体名（及槽位后缀）。
+        if safe_slot:
+            return f"{safe_obj}_{safe_slot}"
+        return safe_obj
+
     if safe_slot:
         return f"{safe_mark}_{safe_obj}_{safe_slot}"
     return f"{safe_mark}_{safe_obj}"

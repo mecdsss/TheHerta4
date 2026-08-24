@@ -1,4 +1,5 @@
 import os
+import tempfile
 
 import bpy
 
@@ -23,6 +24,8 @@ class ZZMITextureMarkName:
 
 
 class ExportZZMI(ExportUnity):
+    MERGED_SKELETON_ATTACH_THREADS = 64
+
     CROSS_IB_METHOD_VB_COPY = "VB_COPY"
     CROSS_IB_METHOD_VB_COPY_CB1 = "VB_COPY_CB1"
     CROSS_IB_METHOD_VB_REF_SO0 = "VB_REF_SO0"
@@ -32,6 +35,31 @@ class ExportZZMI(ExportUnity):
         CROSS_IB_METHOD_VB_COPY_CB1,
         CROSS_IB_METHOD_VB_REF_SO0,
     }
+
+    @staticmethod
+    def _atomic_write_binary(path: str, payload: bytes) -> None:
+        """同目录临时文件完整落盘后原子替换，失败时保留旧产物。"""
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp",
+            dir=directory,
+        )
+        try:
+            with os.fdopen(fd, "wb") as temp_file:
+                temp_file.write(payload)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_path, path)
+        except Exception as exc:
+            raise RuntimeError(f"原子发布二进制文件失败 {path}: {exc}") from exc
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
     SLOT_FIX_RESOURCE_NAME_DICT = {
         ZZMITextureMarkName.DiffuseMap: r"Resource\ZZMI\Diffuse",
@@ -271,27 +299,79 @@ class ExportZZMI(ExportUnity):
         for drawib_model in self.drawib_model_list:
             for submesh_model in drawib_model.submesh_model_list:
                 vg_count = int(getattr(submesh_model, "vg_count", 0) or 0)
-                if vg_count > 0:
-                    components.append({
-                        "draw_ib": drawib_model.draw_ib,
-                        "unique_str": str(getattr(submesh_model, "unique_str", "") or ""),
-                        "vg_offset": int(getattr(submesh_model, "vg_offset", 0) or 0),
-                        "vg_count": vg_count,
-                        "skeleton_group": int(getattr(submesh_model, "skeleton_group", 0) or 0),
-                        # 局部骨骼 id -> 全局槽位（attach CS 按此写合并骨架，
-                        # 本部件引用的共享 canonical 槽位当帧覆盖）
-                        "vg_map": {
-                            int(k): int(v)
-                            for k, v in (getattr(submesh_model, "vg_map", {}) or {}).items()
-                        },
-                        # 导出侧守卫元数据（反查写回）：deform pass draw 序号 +
-                        # 原部件顶点数；缺省 0（旧缓存未刷新）
-                        "deform_draw": int(getattr(submesh_model, "deform_draw_index", 0) or 0),
-                        "original_vertex_count": int(
-                            getattr(submesh_model, "original_vertex_count", 0) or 0
-                        ),
-                    })
-                    break
+                if vg_count <= 0:
+                    continue
+                # 导出侧防线：VGMap 必须完整覆盖 0..vg_count-1 且槽位非负。
+                # 缓存正常时由 ensure_skeleton_data 保证；此处兜底拦截陈旧/被
+                # 手工改坏的 json——缺键会让 attach CS 的 vg_map.get(local, 0)
+                # 静默塌缩到槽位 0，整块蒙皮炸裂，宁可整部件退出合并骨架。
+                try:
+                    vg_map = {}
+                    for raw_key, raw_value in (
+                        getattr(submesh_model, "vg_map", {}) or {}
+                    ).items():
+                        key = int(raw_key)
+                        if key in vg_map:
+                            raise ValueError(f"规范化后键重复: {key}")
+                        vg_map[key] = int(raw_value)
+                except (TypeError, ValueError):
+                    vg_map = {}
+                expected_keys = set(range(vg_count))
+                missing_keys = sorted(expected_keys - set(vg_map.keys()))
+                extra_keys = sorted(set(vg_map.keys()) - expected_keys)
+                negative_slots = [slot for slot in vg_map.values() if slot < 0]
+                oversized_slots = [slot for slot in vg_map.values() if slot > 0xFFFFFFFF]
+                vg_offset = int(getattr(submesh_model, "vg_offset", 0) or 0)
+                skeleton_group = int(getattr(submesh_model, "skeleton_group", 0) or 0)
+                if (
+                    missing_keys
+                    or extra_keys
+                    or negative_slots
+                    or oversized_slots
+                    or vg_offset < 0
+                    or skeleton_group < 0
+                ):
+                    print(
+                        f"[ZZMI骨骼合并] 警告 {drawib_model.draw_ib}: VGMap 未完整覆盖 "
+                        f"0..{vg_count - 1}（缺失 {missing_keys[:5]}，多余 {extra_keys[:5]}）"
+                        "、槽位/偏移/分组越界，"
+                        "该部件不进入合并骨架；请重新一键导入刷新骨骼合并缓存"
+                    )
+                    continue
+                components.append({
+                    "draw_ib": drawib_model.draw_ib,
+                    "unique_str": str(getattr(submesh_model, "unique_str", "") or ""),
+                    "vg_offset": vg_offset,
+                    "vg_count": vg_count,
+                    "skeleton_group": skeleton_group,
+                    # 局部骨骼 id -> 全局槽位（attach CS 按此写合并骨架，
+                    # 本部件引用的共享 canonical 槽位当帧覆盖）
+                    "vg_map": vg_map,
+                    # 导出侧守卫元数据（反查写回）：deform pass draw 序号 +
+                    # 原部件顶点数；缺省 0（旧缓存未刷新）
+                    "deform_draw": int(getattr(submesh_model, "deform_draw_index", 0) or 0),
+                    "original_vertex_count": int(
+                        getattr(submesh_model, "original_vertex_count", 0) or 0
+                    ),
+                })
+                break
+        if components:
+            buffer_slots = max(c["vg_offset"] + c["vg_count"] for c in components)
+            valid_components = []
+            for component in components:
+                invalid_slots = sorted({
+                    slot for slot in component["vg_map"].values()
+                    if slot >= buffer_slots
+                })
+                if invalid_slots:
+                    print(
+                        f"[ZZMI骨骼合并] 警告 {component['draw_ib']}: VGMap 槽位 "
+                        f"{invalid_slots[:5]} 超出合并骨架范围 0..{buffer_slots - 1}，"
+                        "该部件不进入合并骨架；请重新一键导入刷新骨骼合并缓存"
+                    )
+                    continue
+                valid_components.append(component)
+            components = valid_components
         components.sort(key=lambda c: (c["skeleton_group"], c["vg_offset"], c["draw_ib"]))
         component_id_dict = {c["draw_ib"]: i for i, c in enumerate(components)}
         return components, component_id_dict
@@ -1076,14 +1156,14 @@ class ExportZZMI(ExportUnity):
             vgmap_filename = f"zz_vgmap_{component['draw_ib']}.buf"
             section.append("filename = Meshes/" + vgmap_filename)
             section.new_line()
-            try:
-                os.makedirs(mod_meshes_dir, exist_ok=True)
-                with open(os.path.join(mod_meshes_dir, vgmap_filename), "wb") as vgmap_file:
-                    for local in range(component["vg_count"]):
-                        slot = int(vg_map.get(local, 0))
-                        vgmap_file.write(_struct.pack("<4I", slot, 0, 0, 0))
-            except Exception as e:
-                print(f"[ZZMI骨骼合并] 写 vg_map 文件失败 {component['draw_ib']}: {e}")
+            payload = b"".join(
+                _struct.pack("<4I", int(vg_map[local]), 0, 0, 0)
+                for local in range(component["vg_count"])
+            )
+            self._atomic_write_binary(
+                os.path.join(mod_meshes_dir, vgmap_filename),
+                payload,
+            )
 
         # 每组一套合并骨架（组内统一：只直拷本组骨骼，跨组别禁止合并）
         for skeleton_group in groups:
@@ -1093,19 +1173,27 @@ class ExportZZMI(ExportUnity):
             section.append("array = " + str(bones_count))
             section.new_line()
 
-        # 逐部件 attach 段（参数写死：y1 = vg_count；deform VB 段与 [Present] 共用）
+        # 逐部件 attach 段（y1 = vg_count；deform VB 段与 [Present] 共用）。
+        # Dispatch 按 HLSL numthreads(64,1,1) 动态取整，避免 palette > 512 时
+        # 固定 8 组漏掉尾部骨骼。
         for component_id, component in enumerate(self.merged_skeleton_components):
+            vg_count = int(component["vg_count"])
+            dispatch_count = max(
+                1,
+                (vg_count + self.MERGED_SKELETON_ATTACH_THREADS - 1)
+                // self.MERGED_SKELETON_ATTACH_THREADS,
+            )
             section.append(f"[CustomShaderZZMIMergedSkeletonAttach_C{component_id}]")
             section.append("flags = optimization_level3 all_resources_bound skip_validation")
             section.append("cs = ./res/zzmi_merged_skeleton_attach.hlsl")
             section.append("x1 = 0")
-            section.append(f"y1 = {component['vg_count']}")
+            section.append(f"y1 = {vg_count}")
             section.append(f"cs-t0 = ref ResourceZZPalette_{component['draw_ib']}")
             section.append(f"cs-t1 = ref ResourceZZVgMap_{component['draw_ib']}")
             section.append(
                 f"cs-u0 = ref ResourceZZMergedSkeleton_G{component['skeleton_group']}"
             )
-            section.append("Dispatch = 8, 1, 1")
+            section.append(f"Dispatch = {dispatch_count}, 1, 1")
             section.append("cs-u0 = null")
             section.new_line()
 
@@ -1119,16 +1207,17 @@ class ExportZZMI(ExportUnity):
 
     def _copy_merged_skeleton_shader_to_mod(self):
         """把 attach CS 着色器（组内直拷版）复制到生成 Mod 的 res/ 目录。"""
-        import shutil
-
         addon_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         shader_src = os.path.join(addon_root, "Toolset", "zzmi_merged_skeleton_attach.hlsl")
         if not os.path.isfile(shader_src):
-            print(f"[ZZMI骨骼合并] 警告: 未找到 attach CS 着色器 {shader_src}")
-            return
+            raise FileNotFoundError(f"未找到 ZZMI 合并骨架 attach CS 着色器: {shader_src}")
         res_dir = os.path.join(GlobalConfig.path_generate_mod_folder(), "res")
-        os.makedirs(res_dir, exist_ok=True)
-        shutil.copy2(shader_src, os.path.join(res_dir, "zzmi_merged_skeleton_attach.hlsl"))
+        with open(shader_src, "rb") as shader_file:
+            shader_payload = shader_file.read()
+        self._atomic_write_binary(
+            os.path.join(res_dir, "zzmi_merged_skeleton_attach.hlsl"),
+            shader_payload,
+        )
 
     def add_unity_vs_resource_vb_sections(self, ini_builder: M_IniBuilder, drawib_model):
         super().add_unity_vs_resource_vb_sections(ini_builder=ini_builder, drawib_model=drawib_model)

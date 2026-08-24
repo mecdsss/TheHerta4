@@ -223,6 +223,12 @@ class GlobalProterties(bpy.types.PropertyGroup):
         default=True,
     ) # type: ignore
 
+    import_texture_material_strip_color_prefix: bpy.props.BoolProperty(
+        name="导入贴图材质去掉颜色贴图前缀",
+        description="开启后，从工作空间导入时创建的贴图材质名称不再携带颜色贴图（DiffuseMap）前缀，例如由 DiffuseMap_d892c658-2256-0 变为 d892c658-2256-0",
+        default=False,
+    ) # type: ignore
+
     enable_preprocess_cache: bpy.props.BoolProperty(
         name="启用前处理缓存",
         description="启用后，前处理结果会被缓存到本地文件。当物体数据未变化时，下次导出将直接使用缓存，减少重复计算",
@@ -480,6 +486,19 @@ class GlobalProterties(bpy.types.PropertyGroup):
     @classmethod
     def enable_non_mirror_workflow(cls):
         return cls._instance().enable_non_mirror_workflow
+
+    @classmethod
+    def import_texture_material_strip_color_prefix(cls) -> bool:
+        return cls._bool_attr("import_texture_material_strip_color_prefix", False)
+
+    @classmethod
+    def toggle_import_texture_material_strip_color_prefix(cls) -> bool:
+        """翻转 import_texture_material_strip_color_prefix，返回翻转后的新值。"""
+        instance = cls._instance()
+        instance.import_texture_material_strip_color_prefix = not bool(
+            getattr(instance, "import_texture_material_strip_color_prefix", False)
+        )
+        return bool(instance.import_texture_material_strip_color_prefix)
 
     @classmethod
     def enable_preprocess_cache(cls):

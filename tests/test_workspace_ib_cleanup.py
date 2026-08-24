@@ -11,7 +11,9 @@
 - 分区目录（含 Config.json）及分区内 LOD 子目录的枚举；
 - 别名后缀文件夹（xxx-1-0.Face）按完整名字精确匹配；
 - 根目录下 "LOD0.xxx-1-0" 式文件夹名解析；
-- 非子网格目录（Config、无横杠目录）永不作清理候选。
+- 非子网格目录（Config、无横杠目录）永不作清理候选；
+- **安全护栏**：空保留集合（场景为空/身份解析失败）拒绝返回任何目录，
+  清空整个工作空间必须走 get_all_submesh_folder_list 的显式全量枚举。
 """
 
 import importlib.util
@@ -208,13 +210,71 @@ class WorkspaceIBCleanupTests(unittest.TestCase):
         _GlobalConfig.workspace_folder = str(self.root / "not-exist") + os.sep
         self.assertEqual(self._unwanted({("", "aaaabbbb-100-0")}), [])
 
-    def test_empty_kept_set_deletes_everything(self):
+    def test_empty_kept_set_refuses_deletion(self):
+        """空保留集合（场景为空/身份解析失败）必须拒绝执行，绝不返回全部目录。"""
         keep_folder = self._make_submesh("aaaabbbb-100-0")
         del_folder = self._make_submesh("ccccdddd-200-0")
 
         unwanted = self._unwanted(set())
+        unwanted_none = self._unwanted(None)
 
-        self.assertEqual(unwanted, [str(keep_folder), str(del_folder)])
+        self.assertEqual(unwanted, [])
+        self.assertEqual(unwanted_none, [])
+        # 目录原封未动：拒绝路径不允许任何目录被列为待删
+        self.assertTrue(keep_folder.is_dir())
+        self.assertTrue(del_folder.is_dir())
+
+    def test_get_all_submesh_folder_list_returns_everything(self):
+        """清空操作专用枚举：不经保留过滤，返回全部子网格文件夹（含 LOD 目录）。"""
+        root_folder = self._make_submesh("aaaabbbb-100-0")
+        lod_folder = self._make_submesh("LOD1/ccccdddd-200-0.Tail")
+
+        all_folders = WorkSpaceHelper.get_all_submesh_folder_list()
+
+        self.assertEqual(
+            all_folders,
+            [str(root_folder), str(lod_folder)],
+        )
+        # 不受保留集合影响：传入任何保留键都返回同一份全量列表
+        self.assertEqual(self._unwanted({("", "aaaabbbb-100-0")}), [str(lod_folder)])
+
+    def test_delete_folder_list_records_only_actual_success(self):
+        """删除失败的目标绝不能记入成功列表（日志与磁盘状态一致）。"""
+        ok_folder = self._make_submesh("aaaabbbb-100-0")
+        # 用普通文件冒充目标：shutil.rmtree 会抛异常 -> 进入失败列表
+        bad_target = self.root / "ccccdddd-200-0"
+        bad_target.write_text("not-a-directory", encoding="utf-8")
+
+        deleted, failed = WorkSpaceHelper.delete_folder_list(
+            [str(ok_folder), str(bad_target)]
+        )
+
+        self.assertEqual(deleted, [str(ok_folder)])
+        self.assertEqual(failed, [str(bad_target)])
+        self.assertFalse(ok_folder.exists())
+        self.assertTrue(bad_target.exists())
+
+    def test_count_kept_submesh_folders(self):
+        self._make_submesh("aaaabbbb-100-0")
+        self._make_submesh("LOD0/aaaabbbb-100-0")
+
+        self.assertEqual(WorkSpaceHelper.count_kept_submesh_folders(set()), 0)
+        self.assertEqual(WorkSpaceHelper.count_kept_submesh_folders(None), 0)
+        self.assertEqual(
+            WorkSpaceHelper.count_kept_submesh_folders({("", "aaaabbbb-100-0")}),
+            1,
+        )
+        self.assertEqual(
+            WorkSpaceHelper.count_kept_submesh_folders(
+                {("", "aaaabbbb-100-0"), ("LOD0", "aaaabbbb-100-0")}
+            ),
+            2,
+        )
+        # 保留键非空但与工作空间零匹配（选错工作空间/命名不一致）
+        self.assertEqual(
+            WorkSpaceHelper.count_kept_submesh_folders({("", "ffffffff-999-9")}),
+            0,
+        )
 
     def test_records_cover_root_lod_and_alias(self):
         self._make_submesh("aaaabbbb-100-0")

@@ -363,6 +363,7 @@ _install_module(
 _install_module(
     f"{PKG}.utils.vertex_color_utils",
     build_vertex_color_payload=lambda *args, **kwargs: None,
+    convert_color_srgb_to_linear=lambda color: color,
     ensure_color_attribute=lambda *args, **kwargs: None,
 )
 

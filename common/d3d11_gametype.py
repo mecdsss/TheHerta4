@@ -129,46 +129,51 @@ class D3D11GameType:
             new_dict[categoryname] = category_stride
         return new_dict
 
-    def widen_blendindices(self, new_format: str = "R16G16B16A16_UINT") -> bool:
+    def widen_blendindices(self) -> bool:
         """将 BLENDINDICES 元素升宽（用于 EFMI 骨骼合并场景）。
 
         修改运行时副本的元素 Format/ByteWidth，并联动重算 AlignedByteOffset 与
         CategoryStrideDict（get_total_structured_dtype 为动态计算，自动生效）。
-        已是 R32 系或目标格式时无需处理。
+        已是 R16/R32 系时保持原通道数与格式；R8 系按相同通道数升至 R16。
 
         Returns:
             是否发生了升宽修改。
         """
-        element_name = None
-        for name in self.OrderedFullElementList:
-            if name.startswith("BLENDINDICES"):
-                element_name = name
-                break
-        if element_name is None:
-            return False
+        widen_map = {
+            "R8_UINT": ("R16_UINT", 2),
+            "R8G8_UINT": ("R16G16_UINT", 4),
+            "R8G8B8A8_UINT": ("R16G16B16A16_UINT", 8),
+            "R8_SINT": ("R16_SINT", 2),
+            "R8G8_SINT": ("R16G16_SINT", 4),
+            "R8G8B8A8_SINT": ("R16G16B16A16_SINT", 8),
+        }
 
-        element = self.ElementNameD3D11ElementDict.get(element_name)
-        if element is None:
-            return False
+        changed = False
+        for element in self.D3D11ElementList:
+            if str(getattr(element, "SemanticName", "") or "").upper() != "BLENDINDICES":
+                continue
+            current_format = str(getattr(element, "Format", "") or "").upper()
+            # R16/R32 系已经能无损承载全局骨骼编号；必须保留通道数和真实布局，导出端
+            # 会按最终格式生成 ElementFormat，不能把 16 字节数据伪装成 R16。
+            if current_format.startswith("R16") or current_format.startswith("R32"):
+                continue
+            widened = widen_map.get(current_format)
+            if widened is None:
+                raise ValueError(f"不支持升宽的 BLENDINDICES 格式: {current_format}")
+            new_format, new_width = widened
+            old_width = int(getattr(element, "ByteWidth", 0) or 0)
+            if old_width <= 0:
+                continue
+            element.Format = new_format
+            element.ByteWidth = new_width
+            changed = True
+            print(
+                f"[D3D11GameType] BLENDINDICES{element.SemanticIndex} 升宽: "
+                f"{current_format} -> {new_format} (ByteWidth {old_width} -> {new_width})"
+            )
 
-        current_format = str(getattr(element, "Format", "") or "").upper()
-        new_format = str(new_format or "").upper()
-        if current_format == new_format:
+        if not changed:
             return False
-        # R32 系已足够宽，无需升宽
-        if current_format in ("R32G32B32A32_UINT", "R32G32B32A32_SINT", "R32G32B32A32_FLOAT"):
-            return False
-
-        old_width = int(getattr(element, "ByteWidth", 0) or 0)
-        new_width = {
-            "R16G16B16A16_UINT": 8,
-            "R16_UINT": 2,
-        }.get(new_format)
-        if new_width is None or old_width <= 0:
-            return False
-
-        element.Format = new_format
-        element.ByteWidth = new_width
 
         # 重算 AlignedByteOffset（按元素顺序累加）
         aligned_byte_offset = 0
@@ -184,11 +189,21 @@ class D3D11GameType:
                 + int(d3d11_element.ByteWidth)
             )
 
-        print(
-            f"[D3D11GameType] BLENDINDICES 升宽: {current_format} -> {new_format} "
-            f"(ByteWidth {old_width} -> {new_width})"
-        )
         return True
+
+    def get_blendindices_layouts(self) -> list[tuple[int, str, str]]:
+        """返回最终 BLENDINDICES 布局：(SemanticIndex, Format, ExtractSlot)。"""
+        layouts = []
+        for element in self.D3D11ElementList:
+            if str(getattr(element, "SemanticName", "") or "").upper() != "BLENDINDICES":
+                continue
+            layouts.append((
+                int(getattr(element, "SemanticIndex", 0) or 0),
+                str(getattr(element, "Format", "") or "").upper(),
+                str(getattr(element, "ExtractSlot", "") or ""),
+            ))
+        layouts.sort(key=lambda item: item[0])
+        return layouts
 
     def get_blendindices_count_wwmi(self) -> int:
         """获取 WWMI 游戏的混合索引数量（给 WWMI 准备，其它逻辑不兼容）

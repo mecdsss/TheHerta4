@@ -3,7 +3,6 @@
 '''
 import bpy
 import os
-import shutil
 
 from ..common.global_config import GlobalConfig
 from ..common.global_properties import GlobalProterties
@@ -73,6 +72,18 @@ class SSMT_OT_ToggleIgnoreTextureAlpha(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SSMT_OT_ToggleStripTextureColorPrefix(bpy.types.Operator):
+    bl_idname = "ssmt.toggle_strip_texture_color_prefix"
+    bl_label = "导入贴图材质去掉颜色贴图前缀"
+    bl_description = "开启后，从工作空间导入时创建的贴图材质名称不再携带颜色贴图（DiffuseMap）前缀，例如由 DiffuseMap_d892c658-2256-0 变为 d892c658-2256-0"
+
+    def execute(self, context):
+        new_value = GlobalProterties.toggle_import_texture_material_strip_color_prefix()
+        state_text = "已开启" if new_value else "已关闭"
+        self.report({'INFO'}, f"导入贴图材质去掉颜色贴图前缀: {state_text}")
+        return {'FINISHED'}
+
+
 class SSMT_OT_ClearMergedSkeletonCache(bpy.types.Operator):
     bl_idname = "ssmt.clear_merged_skeleton_cache"
     bl_label = "清除骨骼合并VGMap缓存"
@@ -118,6 +129,10 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
     再次全部导入。本算子以当前场景对象（3DMigoto:WorkspaceUniqueStr）为准，
     找出工作空间里未被场景引用的 IB 文件夹并直接删除，删除后一键导入即不再
     导入这些 IB。支持多 LOD：按 LOD 前缀精确匹配（LOD0/xxx 只被 LOD0.xxx 保留）。
+
+    安全护栏：场景为空或没有任何对象能解析出 IB 身份时（保留集合为空），
+    拒绝执行——此时“全部未保留”等于“清空整个工作空间”，必须走
+    SSMT_OT_ClearAllWorkspaceIB 的独立强确认操作。
     """
     bl_idname = "ssmt.cleanup_unused_ib"
     bl_label = "清理未使用IB文件夹"
@@ -150,14 +165,33 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
     def _compute_targets(self, context):
         workspace_root = GlobalConfig.path_workspace_folder()
         if not workspace_root or not os.path.isdir(workspace_root):
-            return [], 0
+            return [], 0, 0
         kept_pairs = self._collect_kept_lod_bare_pairs(context)
+        if not kept_pairs:
+            # 场景为空 / 身份解析失败：空集合会把"全部目录"当成待删目标，
+            # 直接拒绝，绝不允许进入确认流程。
+            return [], 0, 0
         targets = WorkSpaceHelper.get_unwanted_submesh_folder_list(kept_pairs)
-        return targets, len(kept_pairs)
+        kept_folder_count = WorkSpaceHelper.count_kept_submesh_folders(kept_pairs)
+        return targets, len(kept_pairs), kept_folder_count
 
     def invoke(self, context, event):
-        targets, _kept_count = self._compute_targets(context)
+        targets, kept_count, kept_folder_count = self._compute_targets(context)
         self._targets = targets
+        if kept_count == 0:
+            self.report(
+                {'ERROR'},
+                "场景为空或没有可解析 IB 身份的对象，已拒绝清理；"
+                "如需清空整个工作空间的 IB 文件夹，请使用「清空全部」",
+            )
+            return {'CANCELLED'}
+        if targets and kept_folder_count == 0:
+            self.report(
+                {'ERROR'},
+                "场景中的 IB 身份与当前工作空间没有任何匹配（疑似工作空间选错），"
+                "已拒绝清理；确认要删除工作空间全部 IB 文件夹请使用「清空全部」",
+            )
+            return {'CANCELLED'}
         if not targets:
             self.report({'INFO'}, "当前场景已包含工作空间中的全部 IB，无需清理")
             return {'FINISHED'}
@@ -176,20 +210,99 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
     def execute(self, context):
         targets = getattr(self, "_targets", None)
         if not targets:
-            targets, _kept_count = self._compute_targets(context)
+            targets, kept_count, kept_folder_count = self._compute_targets(context)
             self._targets = targets
-        deleted_count = 0
-        for folder_path in targets:
-            try:
-                shutil.rmtree(folder_path)
-                deleted_count += 1
-            except Exception as e:
-                print(f"[IB清理] 删除失败: {folder_path}，错误: {e}")
-                self.report({'WARNING'}, f"删除失败 {os.path.basename(folder_path)}")
-        print(f"[IB清理] 已按当前场景清理 {deleted_count}/{len(targets)} 个未使用 IB 文件夹")
-        for folder_path in targets:
+            if kept_count == 0:
+                self.report(
+                    {'ERROR'},
+                    "场景为空或没有可解析 IB 身份的对象，已拒绝清理；"
+                    "如需清空整个工作空间的 IB 文件夹，请使用「清空全部」",
+                )
+                return {'CANCELLED'}
+            if kept_folder_count == 0:
+                self.report(
+                    {'ERROR'},
+                    "场景中的 IB 身份与当前工作空间没有任何匹配（疑似工作空间选错），"
+                    "已拒绝清理；确认要删除工作空间全部 IB 文件夹请使用「清空全部」",
+                )
+                return {'CANCELLED'}
+        deleted_paths, failed_paths = WorkSpaceHelper.delete_folder_list(targets)
+        for folder_path in failed_paths:
+            self.report({'WARNING'}, f"删除失败 {os.path.basename(folder_path)}")
+        print(f"[IB清理] 已按当前场景清理 {len(deleted_paths)}/{len(targets)} 个未使用 IB 文件夹")
+        for folder_path in deleted_paths:
             print(f"[IB清理] 已删除: {folder_path}")
-        self.report({'INFO'}, f"已删除 {deleted_count} 个未使用的 IB 文件夹")
+        for folder_path in failed_paths:
+            print(f"[IB清理] 删除失败: {folder_path}")
+        self.report({'INFO'}, f"已删除 {len(deleted_paths)} 个未使用的 IB 文件夹")
+        return {'FINISHED'}
+
+
+class SSMT_OT_ClearAllWorkspaceIB(bpy.types.Operator):
+    """清空整个工作空间的全部 IB 子网格文件夹（独立强确认操作）。
+
+    与 SSMT_OT_CleanupUnusedIB（按场景保留集合清理）完全分离：本算子不依赖
+    场景身份解析，默认删除工作空间中每一个子网格文件夹。为避免误触，
+    需要额外的「我确认」勾选框才会真正执行。
+    """
+    bl_idname = "ssmt.clear_all_workspace_ib"
+    bl_label = "清空全部IB文件夹"
+    bl_description = (
+        "删除当前工作空间中全部 IB 子网格文件夹（清空整个工作空间的 IB 内容，"
+        "不可恢复；删除后一键导入将不再导入任何 IB）"
+    )
+    bl_options = {'REGISTER'}
+
+    confirm_wipe: bpy.props.BoolProperty(
+        name="我确认清空工作空间全部IB文件夹",
+        description="勾选后才会真正删除；此操作不可恢复",
+        default=False,
+    )
+
+    def _compute_all_targets(self, context):
+        workspace_root = GlobalConfig.path_workspace_folder()
+        if not workspace_root or not os.path.isdir(workspace_root):
+            return []
+        return WorkSpaceHelper.get_all_submesh_folder_list()
+
+    def invoke(self, context, event):
+        self.confirm_wipe = False  # 每次弹窗都从“未确认”开始，防止属性残留直接放行
+        self._targets = self._compute_all_targets(context)
+        if not self._targets:
+            self.report({'INFO'}, "工作空间中没有可删除的 IB 子网格文件夹")
+            return {'FINISHED'}
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.alert = True
+        layout.label(
+            text=f"将清空工作空间中全部 {len(self._targets)} 个 IB 文件夹，此操作不可恢复！",
+            icon='ERROR',
+        )
+        box = layout.box()
+        for folder_path in self._targets[:10]:
+            box.label(text="· " + os.path.basename(folder_path))
+        if len(self._targets) > 10:
+            box.label(text=f"… 等共 {len(self._targets)} 个")
+        layout.prop(self, "confirm_wipe")
+
+    def execute(self, context):
+        if not getattr(self, "confirm_wipe", False):
+            self.report({'ERROR'}, "未勾选确认项，已取消清空操作")
+            return {'CANCELLED'}
+        targets = getattr(self, "_targets", None)
+        if not targets:
+            targets = self._compute_all_targets(context)
+        deleted_paths, failed_paths = WorkSpaceHelper.delete_folder_list(targets)
+        for folder_path in failed_paths:
+            self.report({'WARNING'}, f"删除失败 {os.path.basename(folder_path)}")
+        print(f"[IB清理] 清空工作空间: 已删除 {len(deleted_paths)}/{len(targets)} 个 IB 文件夹")
+        for folder_path in deleted_paths:
+            print(f"[IB清理] 已删除: {folder_path}")
+        for folder_path in failed_paths:
+            print(f"[IB清理] 删除失败: {folder_path}")
+        self.report({'INFO'}, f"已清空 {len(deleted_paths)} 个 IB 文件夹")
         return {'FINISHED'}
 
 
@@ -222,7 +335,7 @@ class PanelBasicInformation(bpy.types.Panel):
             or BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
         )
 
-        layout.label(text="TheHerta4 v4.4.30", icon='INFO')
+        layout.label(text="TheHerta4 v4.4.31", icon='INFO')
         layout.label(text=TR.translate("SSMT缓存文件夹路径: ") + GlobalConfig.ssmtlocation)
         layout.label(text=TR.translate("当前配置名称: ") + GlobalConfig.gamename)
         layout.label(text=TR.translate("当前游戏预设: ") + GlobalConfig.logic_name)
@@ -245,6 +358,14 @@ class PanelBasicInformation(bpy.types.Panel):
 
         layout.prop(global_properties, "enable_non_mirror_workflow", text="非镜像工作流", toggle=True)
 
+        # 导入贴图材质去掉颜色贴图前缀 — 以按钮呈现，按下时表示已开启
+        layout.operator(
+            SSMT_OT_ToggleStripTextureColorPrefix.bl_idname,
+            text="导入贴图材质去掉颜色贴图前缀",
+            icon='COLOR',
+            depress=GlobalProterties.import_texture_material_strip_color_prefix(),
+        )
+
         # 自动上贴图时使用法线贴图 — 以按钮呈现，按下时表示已开启
         layout.operator(
             SSMT_OT_ToggleUseNormalMap.bl_idname,
@@ -262,7 +383,10 @@ class PanelBasicInformation(bpy.types.Panel):
         )
 
         # 基于当前场景剩余的 IB，删除工作空间中未使用 IB 的文件夹
-        layout.operator(SSMT_OT_CleanupUnusedIB.bl_idname, text="清理未使用IB文件夹", icon='TRASH')
+        ib_cleanup_row = layout.row(align=True)
+        ib_cleanup_row.operator(SSMT_OT_CleanupUnusedIB.bl_idname, text="清理未使用IB文件夹", icon='TRASH')
+        # 独立强确认操作：清空整个工作空间全部 IB（不依赖场景身份解析）
+        ib_cleanup_row.operator(SSMT_OT_ClearAllWorkspaceIB.bl_idname, text="清空全部", icon='ERROR')
 
         workspace_box = layout.box()
         workspace_box.label(text="工作空间来源", icon='FILE_FOLDER')
@@ -424,15 +548,19 @@ def register():
     bpy.utils.register_class(SSMT4RefreshWorkspaceList)
     bpy.utils.register_class(SSMT_OT_ToggleUseNormalMap)
     bpy.utils.register_class(SSMT_OT_ToggleIgnoreTextureAlpha)
+    bpy.utils.register_class(SSMT_OT_ToggleStripTextureColorPrefix)
     bpy.utils.register_class(SSMT_OT_ClearMergedSkeletonCache)
     bpy.utils.register_class(SSMT_OT_CleanupUnusedIB)
+    bpy.utils.register_class(SSMT_OT_ClearAllWorkspaceIB)
     bpy.utils.register_class(PanelBasicInformation)
 
 
 def unregister():
     bpy.utils.unregister_class(PanelBasicInformation)
+    bpy.utils.unregister_class(SSMT_OT_ClearAllWorkspaceIB)
     bpy.utils.unregister_class(SSMT_OT_CleanupUnusedIB)
     bpy.utils.unregister_class(SSMT_OT_ClearMergedSkeletonCache)
+    bpy.utils.unregister_class(SSMT_OT_ToggleStripTextureColorPrefix)
     bpy.utils.unregister_class(SSMT_OT_ToggleIgnoreTextureAlpha)
     bpy.utils.unregister_class(SSMT_OT_ToggleUseNormalMap)
     bpy.utils.unregister_class(SSMT4RefreshWorkspaceList)

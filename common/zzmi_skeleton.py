@@ -38,7 +38,6 @@ ZZMI（绝区零）骨骼合并支持模块
 
 import os
 import re
-import shutil
 
 import numpy
 
@@ -47,6 +46,10 @@ from .efmi_skeleton import EFMIBoneMapBuilder, EFMISkeletonMergeHelper
 
 # 每骨骼矩阵的 float 数（4x3 = 48 字节，已实测确认）
 _BONE_MATRIX_FLOATS = 12
+
+# ZZMI 骨骼合并缓存算法版本：快路径幂等判定必须与本版本一致；
+# 策略变更时递增，旧缓存会自动整批重建（同 EFMI 的 VGMapAlgorithmVersion 机制）。
+_ZZMI_VG_MAP_ALGORITHM_VERSION = 1
 
 
 class ZZMILogParser:
@@ -78,12 +81,15 @@ class ZZMILogParser:
 
     def __init__(self, log_path: str):
         self.log_path = log_path
+        self.base_dir = os.path.dirname(os.path.abspath(log_path))
         # draw_index -> {"vb": {slot: hash}, "ib": hash, "so": {slot: hash},
         #                "vs_t0": hash, "vs_shader": hash,
         #                "vertex_count": int|None, "draw_indexed": dict|None}
         self.draws: dict[str, dict] = {}
-        # 渲染 draw_index -> vs-cb1 dump 实际路径（deduped/*.buf，来自 dump 行）
-        self.render_cb1_dumps: dict[str, str] = {}
+        # 渲染 draw_index -> vs-cb1 dump 的 (逻辑文件名, 记录路径)。
+        # 记录路径在 dump 被搬走后会失效，因此始终保存逻辑名并延迟解析
+        # （get_render_cb1_path 按候选路径逐一回退）。
+        self.render_cb1_dumps: dict[str, tuple[str, str]] = {}
         # 逻辑文件名（根目录 dump 文件名）-> deduped 实际路径
         self.dump_map: dict[str, str] = {}
         self._parse()
@@ -196,12 +202,14 @@ class ZZMILogParser:
                     dst_path = dump_match.group(2)
                     if src_name not in self.dump_map:
                         self.dump_map[src_name] = dst_path
-                    # vs-cb1 dump（渲染 draw 的对象变换 CB）：按 draw 索引直接记录路径
+                    # vs-cb1 dump（渲染 draw 的对象变换 CB）：按 draw 索引记录
+                    # (逻辑文件名, 记录路径)。不校验记录路径是否存在——dump 被
+                    # 搬走后原绝对路径失效，get_render_cb1_path 按候选路径延迟解析。
                     cb1_match = self._CB1_DUMP_RE.match(src_name)
-                    if cb1_match and os.path.isfile(dst_path):
+                    if cb1_match:
                         draw_key = cb1_match.group(1)
                         if draw_key not in self.render_cb1_dumps:
-                            self.render_cb1_dumps[draw_key] = dst_path
+                            self.render_cb1_dumps[draw_key] = (src_name, dst_path)
                     continue
 
     # ------------------------------------------------------------------
@@ -212,9 +220,31 @@ class ZZMILogParser:
         info = self.draws.get(draw_index)
         return info["vb"].get(slot, "") if info else ""
 
+    def _deduped_candidates(self, dst_path: str | None) -> list[str]:
+        """生成 deduped 候选路径：log 记录的原路径 + dump 目录 deduped/ 下的同名文件。"""
+        candidates = []
+        if dst_path:
+            candidates.append(dst_path)
+            basename = os.path.basename(dst_path)
+            if basename:
+                candidates.append(os.path.join(self.base_dir, "deduped", basename))
+        return candidates
+
     def get_render_cb1_path(self, draw_index: str) -> str | None:
-        """渲染 draw 的 vs-cb1 dump 实际路径（对象变换 CB；未 dump 返回 None）。"""
-        return self.render_cb1_dumps.get(draw_index)
+        """渲染 draw 的 vs-cb1 dump 实际路径（对象变换 CB；延迟解析）。
+
+        log 记录的绝对路径在 FrameAnalysis 被搬走后失效：按候选路径
+        （记录路径 -> 当前 dump 目录 deduped/<同名文件>）逐一回退。
+        未 dump 或全部候选失效返回 None。
+        """
+        record = self.render_cb1_dumps.get(draw_index)
+        if record is None:
+            return None
+        _logical_name, dst_path = record
+        for candidate in self._deduped_candidates(dst_path):
+            if os.path.isfile(candidate):
+                return candidate
+        return None
 
     def get_deform_passes(self) -> dict[str, dict]:
         """识别全部 deform pass（pointlist Draw + SO 输出 + vs-t0 palette + vb0）。
@@ -239,15 +269,23 @@ class ZZMILogParser:
         return result
 
     def get_deduped_path(self, logical_filename: str) -> str | None:
-        """按根目录逻辑文件名（如 000002-vs-t0=...buf）查 deduped 实际路径。"""
-        path = self.dump_map.get(logical_filename)
-        if path and os.path.isfile(path):
-            return path
+        """按根目录逻辑文件名（如 000002-vs-t0=...buf）查 deduped 实际路径。
+
+        log.txt 里记录的 deduped 绝对路径可能是提取时的路径，FrameAnalysis 被
+        搬走后失效：先按 log 记录的路径，失效时用文件名在**当前** dump 目录的
+        deduped/ 子目录兜底定位（deduped 文件名是内容 hash，唯一）。
+        """
+        dst = self.dump_map.get(logical_filename)
+        for candidate in self._deduped_candidates(dst):
+            if os.path.isfile(candidate):
+                return candidate
         # 兜底：按 draw+槽位前缀匹配（逻辑名可能缺 -vs= 尾段）
         prefix = logical_filename.split("=", 1)[0] + "="
-        for src, dst in self.dump_map.items():
-            if src.startswith(prefix) and os.path.isfile(dst):
-                return dst
+        for src, dst2 in self.dump_map.items():
+            if src.startswith(prefix):
+                for candidate in self._deduped_candidates(dst2):
+                    if os.path.isfile(candidate):
+                        return candidate
         return None
 
 
@@ -476,6 +514,165 @@ class ZZMISkeletonMergeHelper:
         EFMISkeletonMergeHelper.parse_blend_element_info
     )
 
+    @staticmethod
+    def _merge_driven_signatures(target: dict, incoming: dict) -> dict:
+        """合并同 DrawIB 拆分子网格的局部骨骼驱动签名。"""
+        merged = dict(target or {})
+        for local_id, new_sig in (incoming or {}).items():
+            local_id = int(local_id)
+            old_sig = merged.get(local_id)
+            if old_sig is None:
+                merged[local_id] = dict(new_sig)
+                continue
+
+            old_points = numpy.asarray(
+                old_sig.get("diffusion_points", []), dtype=numpy.float32
+            ).reshape(-1, 3)
+            new_points = numpy.asarray(
+                new_sig.get("diffusion_points", []), dtype=numpy.float32
+            ).reshape(-1, 3)
+            points = numpy.concatenate((old_points, new_points), axis=0)
+            old_weights = numpy.asarray(
+                old_sig.get("diffusion_weights", []), dtype=numpy.float32
+            ).reshape(-1)
+            new_weights = numpy.asarray(
+                new_sig.get("diffusion_weights", []), dtype=numpy.float32
+            ).reshape(-1)
+            weights = numpy.concatenate((old_weights, new_weights), axis=0)
+            if len(points) > 256:
+                sample_index = numpy.linspace(0, len(points) - 1, 256, dtype=numpy.int64)
+                points = points[sample_index]
+                weights = weights[sample_index]
+
+            old_total = float(old_sig.get("weight_total", 0.0) or 0.0)
+            new_total = float(new_sig.get("weight_total", 0.0) or 0.0)
+            weight_total = old_total + new_total
+            if weight_total > 0:
+                centroid = (
+                    numpy.asarray(old_sig.get("centroid", (0, 0, 0)), dtype=numpy.float64)
+                    * old_total
+                    + numpy.asarray(new_sig.get("centroid", (0, 0, 0)), dtype=numpy.float64)
+                    * new_total
+                ) / weight_total
+            elif len(points):
+                centroid = numpy.mean(points, axis=0, dtype=numpy.float64)
+            else:
+                centroid = numpy.zeros(3, dtype=numpy.float64)
+
+            vertex_count = int(old_sig.get("vertex_count", 0) or 0) + int(
+                new_sig.get("vertex_count", 0) or 0
+            )
+            if len(points) and len(weights) == len(points) and float(weights.sum()) > 0:
+                sampled_total = float(weights.sum())
+                sampled_mean_sq = float(
+                    (weights * ((points - centroid) ** 2).sum(axis=1)).sum()
+                    / sampled_total
+                )
+                spread = float(numpy.sqrt(max(sampled_mean_sq, 0.0)))
+            else:
+                spread = max(
+                    float(old_sig.get("spread", 0.0) or 0.0),
+                    float(new_sig.get("spread", 0.0) or 0.0),
+                )
+            merged[local_id] = {
+                "centroid": numpy.asarray(centroid, dtype=numpy.float32),
+                "bbox_min": numpy.minimum(
+                    numpy.asarray(old_sig.get("bbox_min", centroid), dtype=numpy.float32),
+                    numpy.asarray(new_sig.get("bbox_min", centroid), dtype=numpy.float32),
+                ),
+                "bbox_max": numpy.maximum(
+                    numpy.asarray(old_sig.get("bbox_max", centroid), dtype=numpy.float32),
+                    numpy.asarray(new_sig.get("bbox_max", centroid), dtype=numpy.float32),
+                ),
+                "vertex_count": vertex_count,
+                "spread": spread,
+                "weight_total": weight_total,
+                "mean_weight": weight_total / max(vertex_count, 1),
+                "diffusion_points": points,
+                "diffusion_weights": weights,
+                "diffusion_radius": EFMIBoneMapBuilder._diffusion_radius(points),
+                "diffusion_normals": EFMIBoneMapBuilder._estimate_diffusion_normals(points),
+            }
+        return merged
+
+    @staticmethod
+    def _runtime_cache_path(
+        submesh_json: dict,
+        json_path: str,
+        unique_str: str,
+        cb1_file_name: str | None = None,
+    ) -> str:
+        """解析子网格 json 运行时缓存文件的路径（ModImpRuntime 下）。
+
+        默认解析 BoneMatrixFileName 指向的骨骼缓存路径；cb1_file_name="ObjectCB1"
+        时解析对象变换 CB 缓存（<bare>-ObjectCB1.buf，优先 json 的 ObjectCB1FileName）。
+        只接受纯文件名（拒绝路径穿越）；文件可能不存在，由调用方 isfile 校验。
+        """
+        if cb1_file_name:
+            file_name = str(submesh_json.get("ObjectCB1FileName", "") or "").strip()
+            if not file_name or os.path.basename(file_name) != file_name:
+                bare_name = unique_str.split(".", 1)[-1]
+                file_name = f"{bare_name}-{cb1_file_name}.buf"
+        else:
+            file_name = str(submesh_json.get("BoneMatrixFileName", "") or "").strip()
+            if not file_name or os.path.basename(file_name) != file_name:
+                bare_name = unique_str.split(".", 1)[-1]
+                file_name = f"{bare_name}-BoneMatrix.buf"
+        submesh_dir = os.path.dirname(os.path.dirname(json_path))
+        return os.path.join(submesh_dir, "ModImpRuntime", file_name)
+
+    @classmethod
+    def _zzmi_cache_intact(cls, submesh_json: dict, json_path: str, unique_str: str) -> bool:
+        """ZZMI 缓存快路径完整性校验（schema + 算法版本 + 映射覆盖 + 缓存文件）。
+
+        任何一项缺失都判定缓存不完整，走整批重建——复制骨骼缓存失败或工作空间
+        搬迁漏掉 ModImpRuntime 时，绝不允许带着半成品 VGMap 永久幂等跳过。校验项：
+        - SkeletonGroup / DeformDrawIndex / OriginalVertexCount 存在；
+        - VGMapAlgorithmVersion == 当前算法版本；
+        - VGCount / VGOffset 存在且非负；
+        - VGMap 键完整覆盖 0..VGCount-1、len(VGMap) == VGCount、全局槽位非负
+          （缺键会让导出侧 vg_map.get(local, 0) 静默映射到槽位 0，蒙皮塌缩）；
+        - BoneMatrixFileName 指向的 ModImpRuntime 文件存在且大小
+          >= VGCount * 48 字节（每骨骼 4x3 float32）。
+        """
+        try:
+            cache_version = int(submesh_json.get("VGMapAlgorithmVersion", 0) or 0)
+        except (TypeError, ValueError):
+            cache_version = 0
+        if cache_version != _ZZMI_VG_MAP_ALGORITHM_VERSION:
+            return False
+        if "SkeletonGroup" not in submesh_json:
+            return False
+        if "DeformDrawIndex" not in submesh_json:
+            return False
+        if "OriginalVertexCount" not in submesh_json:
+            return False
+
+        vg_map = submesh_json.get("VGMap")
+        if not isinstance(vg_map, dict) or not vg_map:
+            return False
+        try:
+            vg_count = int(submesh_json.get("VGCount"))
+            vg_offset = int(submesh_json.get("VGOffset"))
+            mapped = {int(key): int(value) for key, value in vg_map.items()}
+        except (TypeError, ValueError):
+            return False
+        if vg_count <= 0 or vg_offset < 0:
+            return False
+        if len(mapped) != vg_count:
+            return False
+        if set(mapped.keys()) != set(range(vg_count)):
+            return False
+        if any(slot < 0 for slot in mapped.values()):
+            return False
+
+        bone_matrix_path = cls._runtime_cache_path(submesh_json, json_path, unique_str)
+        if not os.path.isfile(bone_matrix_path):
+            return False
+        if not EFMIBoneMapBuilder.cache_file_size_ok(bone_matrix_path, vg_count):
+            return False
+        return True
+
     @classmethod
     def ensure_skeleton_data(
         cls,
@@ -491,20 +688,32 @@ class ZZMISkeletonMergeHelper:
             return False, "没有子网格需要处理。"
 
         frame_analysis_dir = cls.resolve_frame_analysis_dir(workspace_root)
-        if not frame_analysis_dir:
-            return False, (
-                "未找到 FrameAnalysis 目录：请检查工作空间 "
-                f"{os.path.join(workspace_root, 'Config', 'FrameAnalysisPath.json')}"
+        log_path = os.path.join(frame_analysis_dir, "log.txt") if frame_analysis_dir else ""
+        parser = None
+        resolver = None
+        if frame_analysis_dir:
+            if not os.path.isfile(log_path):
+                print(
+                    f"[ZZMI骨骼合并] 提示: FrameAnalysis 缺少 log.txt（{log_path}），"
+                    "将仅用工作空间缓存重建"
+                )
+            else:
+                parser = ZZMILogParser(log_path)
+                resolver = ZZMIDeformResolver(parser)
+                if not resolver.passes:
+                    print(
+                        "[ZZMI骨骼合并] 提示: FrameAnalysis log 中未识别到 deform pass，"
+                        "将仅用工作空间缓存重建"
+                    )
+                    parser = None
+                    resolver = None
+        else:
+            # dump 目录已被删除：上次导入已把 palette / 对象变换 CB 复制进工作空间
+            # ModImpRuntime，缓存完整的子网格可以脱离 dump 重建。
+            print(
+                "[ZZMI骨骼合并] 提示: 未找到 FrameAnalysis 目录（可能已被删除），"
+                "将仅用工作空间缓存重建"
             )
-
-        log_path = os.path.join(frame_analysis_dir, "log.txt")
-        if not os.path.isfile(log_path):
-            return False, f"FrameAnalysis 缺少 log.txt: {log_path}"
-
-        parser = ZZMILogParser(log_path)
-        resolver = ZZMIDeformResolver(parser)
-        if not resolver.passes:
-            return False, "FrameAnalysis log 中未识别到 deform pass（pointlist 蒙皮变形）。"
 
         # 第一遍：收集每个子网格信息并按 DrawIB 分组（同 DrawIB 的拆分子网格共享
         # 同一 deform pass / palette / VGMap，只参与一次去重）。
@@ -520,23 +729,37 @@ class ZZMISkeletonMergeHelper:
         # DeformDrawIndex/OriginalVertexCount 属于导出侧守卫所需 schema（合并网格
         # 的 deform 时序校验 + 渲染 vb1 换绑），同样纳入门控：旧缓存缺字段时
         # 整批重建刷新。
+        # 快路径还校验**缓存产物完整性**：算法版本必须与当前一致；BoneMatrixFileName
+        # 引用的骨骼缓存文件必须真实存在。否则（复制失败 / 工作空间搬迁漏掉
+        # ModImpRuntime / 旧算法缓存）整批重建，绝不允许带着半成品永久幂等跳过。
         groups: dict[str, dict] = {}
         stale = 0
+        # 无法定位/无法解析 json 的目标（最后按“未处理目标”计入失败报告，
+        # 不能让部分完成被报告成完整成功）
+        unresolved_targets: list[str] = []
+        seen_members: set[str] = set()
 
         for unique_str in unique_str_list:
+            if unique_str in seen_members:
+                continue  # 重复目标只处理一次（计数口径与写回均不重复）
+            seen_members.add(unique_str)
             json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
             if not json_path:
                 print(f"[ZZMI骨骼合并] 跳过 {unique_str}: 未找到子网格 json")
+                unresolved_targets.append(unique_str)
                 continue
 
             submesh_json = JsonUtils.LoadFromFile(json_path)
             if not isinstance(submesh_json, dict):
+                print(f"[ZZMI骨骼合并] 跳过 {unique_str}: 子网格 json 读取失败")
+                unresolved_targets.append(unique_str)
                 continue
 
             bare_name = unique_str.split(".", 1)[-1]
             draw_ib = bare_name.split("-")[0] if "-" in bare_name else bare_name
             if not draw_ib:
                 print(f"[ZZMI骨骼合并] 跳过 {unique_str}: 无法解析 DrawIB")
+                unresolved_targets.append(unique_str)
                 continue
 
             group = groups.get(draw_ib)
@@ -544,31 +767,38 @@ class ZZMISkeletonMergeHelper:
                 group = {
                     "palette": None,
                     "vg_count": 0,
-                    "original_vertex_count": 0,
+                    "original_vertex_counts": {},
                     "members": [],
                     "json_paths": {},
                     "palette_path": "",
                     "draw_index": "",
                     "signatures": {},
                     "transform": None,
+                    "cb1_path": "",
+                    "skip_reason": "",
                     "representative": unique_str,
                 }
                 groups[draw_ib] = group
             group["members"].append(unique_str)
             group["json_paths"][unique_str] = json_path
 
-            if not force and (
-                submesh_json.get("VGMap")
-                and "SkeletonGroup" in submesh_json
-                and "DeformDrawIndex" in submesh_json
-                and "OriginalVertexCount" in submesh_json
-            ):
-                continue  # 该子网格缓存为当前 schema（临时计数，见下）
+            if not force and cls._zzmi_cache_intact(submesh_json, json_path, unique_str):
+                continue  # 该子网格缓存完整（临时计数，见下）
             stale += 1
 
         up_to_date = len(groups) and stale == 0
         if up_to_date and not force:
             total = sum(len(g["members"]) for g in groups.values())
+            if unresolved_targets:
+                # 目标目录被删/无法解析时绝不能报“全部已缓存”：这些目标
+                # 没有进入任何组，必须显式失败，否则会被幂等快路径静默遗漏。
+                shown = unresolved_targets[:5]
+                suffix = "…" if len(unresolved_targets) > 5 else ""
+                return False, (
+                    f"{total} 个子网格已有骨骼合并数据（幂等），但 "
+                    f"{len(unresolved_targets)} 个目标无法解析: "
+                    f"{'、'.join(shown)}{suffix}"
+                )
             return True, f"所有 {total} 个子网格均已有骨骼合并数据（幂等跳过）。"
 
         # 第二遍：逐组反查 deform pass -> palette，读取 Blend.buf 得 vg_count
@@ -577,6 +807,7 @@ class ZZMISkeletonMergeHelper:
             json_path = group["json_paths"][representative]
             submesh_json = JsonUtils.LoadFromFile(json_path)
             if not isinstance(submesh_json, dict):
+                group["skip_reason"] = "子网格 json 读取失败"
                 continue
 
             category_hash = submesh_json.get("CategoryHash", {}) or {}
@@ -590,60 +821,167 @@ class ZZMISkeletonMergeHelper:
                 os.path.basename(os.path.dirname(os.path.dirname(json_path))), []
             )
 
-            draw_index, deform_pass, via = resolver.resolve(
-                position_hash=position_hash,
-                vertex_limit_hash=vertex_limit_hash,
-                render_draw_indices=render_draws,
-            )
-            if deform_pass is None:
-                print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: 无法挂载到 deform pass（A/B/C 均未命中）")
+            draw_index, deform_pass, via = "", None, ""
+            if resolver is not None:
+                draw_index, deform_pass, via = resolver.resolve(
+                    position_hash=position_hash,
+                    vertex_limit_hash=vertex_limit_hash,
+                    render_draw_indices=render_draws,
+                )
+
+            palette_logical = ""
+            if deform_pass is not None:
+                palette_logical = f"{draw_index}-vs-t0={deform_pass['palette_hash']}"
+            palette_path = parser.get_deduped_path(palette_logical) if parser is not None else None
+            if not palette_path:
+                # dump 被删除/搬走后的兜底：上次导入已把 palette 复制到工作空间
+                # ModImpRuntime/<bare>-BoneMatrix.buf（导出侧同款缓存）。同 DrawIB
+                # 的拆分子网格共享同一 palette，因此**遍历组内全部成员**找缓存——
+                # 代表子网格的缓存丢失时，兄弟子网格的缓存同样有效。
+                for member in group["members"]:
+                    member_json_path = group["json_paths"].get(member, "")
+                    if not member_json_path:
+                        continue
+                    try:
+                        member_json = JsonUtils.LoadFromFile(member_json_path)
+                    except Exception:
+                        member_json = None
+                    if not isinstance(member_json, dict):
+                        member_json = {}
+                    cached_path = cls._runtime_cache_path(
+                        member_json, member_json_path, member
+                    )
+                    if os.path.isfile(cached_path):
+                        palette_path = cached_path
+                        print(
+                            f"[ZZMI骨骼合并] {draw_ib}: dump 中 palette 缺失，"
+                            f"已回退工作空间缓存（{member}）"
+                        )
+                        break
+            if not palette_path:
+                print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: palette 缺失 {palette_logical or '(工作空间缓存也不存在)'}")
+                group["skip_reason"] = "palette 缺失（dump 与全部成员缓存均无）"
                 continue
 
-            palette_logical = f"{draw_index}-vs-t0={deform_pass['palette_hash']}"
-            palette_path = parser.get_deduped_path(palette_logical)
-            if not palette_path:
-                print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: palette dump 缺失 {palette_logical}")
+            # draw_index：dump 可用时来自 deform pass 反查；否则回退上次写回的
+            # DeformDrawIndex 元数据（导出侧守卫时序校验依赖它）。同 DrawIB 成员
+            # 共享同一序号，代表子网格缺字段时遍历兄弟子网格。
+            if not draw_index:
+                cached_deform_index = None
+                for member in group["members"]:
+                    member_json_path = group["json_paths"].get(member, "")
+                    if not member_json_path:
+                        continue
+                    try:
+                        member_json = JsonUtils.LoadFromFile(member_json_path)
+                    except Exception:
+                        member_json = None
+                    if not isinstance(member_json, dict):
+                        continue
+                    cached_deform_index = member_json.get("DeformDrawIndex")
+                    if cached_deform_index is not None:
+                        break
+                try:
+                    draw_index = str(int(cached_deform_index)).zfill(6) if cached_deform_index is not None else ""
+                except (TypeError, ValueError):
+                    draw_index = ""
+            if not draw_index:
+                print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: 无 deform draw 序号（dump 与缓存均缺失）")
+                group["skip_reason"] = "无 deform draw 序号"
                 continue
 
             try:
                 palette = ZZMIBoneMapBuilder.load_palette(palette_path)
             except Exception as e:
                 print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: 读取 palette 失败: {e}")
+                group["skip_reason"] = f"palette 读取失败: {e}"
                 continue
 
-            # vg_count：工作空间 Blend.buf 的 BLENDINDICES 最大非负索引 + 1
-            element_info = cls._parse_blend_element_info(submesh_json)
-            if element_info is None:
-                print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: Blend 类别缺少 BLENDINDICES 元素")
-                continue
-            blend_buf_path = os.path.join(
-                os.path.dirname(json_path),
-                os.path.splitext(os.path.basename(json_path))[0] + "-Blend.buf",
-            )
-            try:
-                blend_indices = EFMIBoneMapBuilder.parse_blendindices_from_buf(
-                    blend_buf_path, element_info
+            # vg_count：同 DrawIB 的全部拆分子网格共同决定。每个成员可能使用
+            # 不同的局部骨骼；只解析代表成员会截短 palette 并生成不完整 VGMap。
+            # 每个 Blend.buf 的 BLENDINDICES 有效通道最大索引 + 1。
+            # 有效通道 = 索引非哨兵（按数据格式：u1->0xFF / u2->0xFFFF /
+            # u4|i4->0xFFFFFFFF）且对应 BLENDWEIGHTS > 0；无权重元素时按
+            # “每顶点第一索引权重=1”兜底（与导入侧默认权重语义一致）。
+            # 否则 R16_UINT 等格式的空通道哨兵 0xFFFF 会被算成真实骨骼，
+            # vg_count 膨胀到 65,536 后因 palette 不足整部件被跳过。
+            vg_count = 0
+            combined_signatures = {}
+            member_parse_failed = False
+            for member in group["members"]:
+                member_json_path = group["json_paths"][member]
+                try:
+                    member_json = JsonUtils.LoadFromFile(member_json_path)
+                except Exception as e:
+                    group["skip_reason"] = f"{member}: 子网格 json 读取失败: {e}"
+                    member_parse_failed = True
+                    break
+                if not isinstance(member_json, dict):
+                    group["skip_reason"] = f"{member}: 子网格 json 读取失败"
+                    member_parse_failed = True
+                    break
+
+                element_info = cls._parse_blend_element_info(member_json)
+                if element_info is None:
+                    group["skip_reason"] = f"{member}: Blend 类别缺少 BLENDINDICES 元素"
+                    member_parse_failed = True
+                    break
+                blend_buf_path = os.path.join(
+                    os.path.dirname(member_json_path),
+                    os.path.splitext(os.path.basename(member_json_path))[0] + "-Blend.buf",
                 )
-            except Exception as e:
-                print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: 读取 Blend.buf 失败: {e}")
-                continue
+                try:
+                    blend_indices = EFMIBoneMapBuilder.parse_blendindices_from_buf(
+                        blend_buf_path, element_info
+                    )
+                    blend_layout = EFMIBoneMapBuilder.parse_blend_layout(member_json)
+                    blend_weights = EFMIBoneMapBuilder.parse_blendweights_from_buf(
+                        blend_buf_path, blend_layout
+                    )
+                except Exception as e:
+                    group["skip_reason"] = f"{member}: 读取 Blend.buf 失败: {e}"
+                    member_parse_failed = True
+                    break
 
-            local_indices = blend_indices.astype(numpy.int64, copy=False).ravel()
-            valid_indices = local_indices[local_indices >= 0]
-            if len(valid_indices) == 0:
-                print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: BLENDINDICES 全为空")
+                valid_mask = EFMIBoneMapBuilder.valid_blend_channels(
+                    blend_indices, element_info, blend_weights
+                )
+                valid_indices = blend_indices[valid_mask].astype(numpy.int64)
+                if len(valid_indices) == 0:
+                    group["skip_reason"] = f"{member}: BLENDINDICES 无有效通道"
+                    member_parse_failed = True
+                    break
+                vg_count = max(vg_count, int(valid_indices.max()) + 1)
+                # 导出侧按成员自己的几何行数做 vb1 换绑判定。
+                group["original_vertex_counts"][member] = int(len(blend_indices))
+
+                position_buf_path = os.path.join(
+                    os.path.dirname(member_json_path),
+                    os.path.splitext(os.path.basename(member_json_path))[0] + "-Position.buf",
+                )
+                try:
+                    member_signatures = EFMIBoneMapBuilder.compute_driven_signatures(
+                        position_buf_path, blend_buf_path, member_json
+                    )
+                    combined_signatures = cls._merge_driven_signatures(
+                        combined_signatures, member_signatures
+                    )
+                except Exception as e:
+                    print(
+                        f"[ZZMI骨骼合并] 提示 {member}: 驱动签名计算失败"
+                        f"（刚性命中对将拆开）: {e}"
+                    )
+
+            if member_parse_failed:
+                print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: {group['skip_reason']}")
                 continue
-            vg_count = int(valid_indices.max()) + 1
-            # 原部件顶点数（工作空间 Blend.buf 行数）：导出侧守卫用——合并网格
-            # （一个对象含多个部件几何）的渲染 draw 需要换绑本 mod 的 Texcoord，
-            # 否则索引越界读游戏原 vb1（OOB 返回 0，UV 糊到 (0,0)）。
-            group["original_vertex_count"] = int(len(blend_indices))
 
             if len(palette) < vg_count:
                 print(
                     f"[ZZMI骨骼合并] 跳过 {draw_ib}: palette {len(palette)} 根骨骼 < "
                     f"顶点组 {vg_count}（数据不一致）"
                 )
+                group["skip_reason"] = f"palette 骨骼数 {len(palette)} < 顶点组 {vg_count}"
                 continue
             if len(palette) != vg_count:
                 # 实测应恒等；不等时裁到实际用量并提示
@@ -658,39 +996,84 @@ class ZZMISkeletonMergeHelper:
             group["palette_path"] = palette_path
             group["draw_index"] = draw_index
             group["via"] = via
-
-            # 刚性部件质心门控用的驱动签名（读 Position.buf + Blend.buf 计算每骨骼
-            # 驱动点云质心；失败则空签名 -> 该部件的刚性命中对保守拆开，安全方向）
-            position_buf_path = os.path.join(
-                os.path.dirname(json_path),
-                os.path.splitext(os.path.basename(json_path))[0] + "-Position.buf",
-            )
-            try:
-                group["signatures"] = EFMIBoneMapBuilder.compute_driven_signatures(
-                    position_buf_path, blend_buf_path, submesh_json
-                )
-            except Exception as e:
-                print(f"[ZZMI骨骼合并] 提示 {draw_ib}: 驱动签名计算失败（刚性命中对将拆开）: {e}")
-                group["signatures"] = {}
+            group["signatures"] = combined_signatures
 
             # 骨架分组键：渲染 draw 的 vs-cb1 对象→世界矩阵（palette 蒙皮到对象空间，
             # 渲染 VS 用 cb1 摆到世界，两者逐物体 1:1 配对）。取该部件渲染 draw 列表中
             # 第一个可解析的逐部件 cb1 块；全部失败则 None -> 独立成组（不共享，安全）。
-            for render_draw in sorted(render_draws):
-                cb1_path = parser.get_render_cb1_path(render_draw)
-                if not cb1_path:
+            # 解析顺序：当前 dump（按候选路径延迟解析）-> 上次导入复制到工作空间的
+            # ObjectCB1 缓存（dump 已删除时仍能重建出相同的骨架分组）。同 DrawIB
+            # 成员共享同一对象变换，代表子网格缓存缺失时遍历兄弟子网格。
+            cb1_cache_paths = []
+            for member in group["members"]:
+                member_json_path = group["json_paths"].get(member, "")
+                if not member_json_path:
                     continue
-                transform = ZZMIBoneMapBuilder.parse_object_transform(cb1_path)
-                if transform is not None:
-                    group["transform"] = transform
-                    break
+                try:
+                    member_json = JsonUtils.LoadFromFile(member_json_path)
+                except Exception:
+                    member_json = None
+                if not isinstance(member_json, dict):
+                    member_json = {}
+                member_cb1 = cls._runtime_cache_path(
+                    member_json, member_json_path, member, cb1_file_name="ObjectCB1"
+                )
+                if os.path.isfile(member_cb1):
+                    cb1_cache_paths.append(member_cb1)
+            cb1_path = ""
+            dump_cb1_seen = False
+            for render_draw in sorted(render_draws):
+                candidate = parser.get_render_cb1_path(render_draw) if parser is not None else None
+                if candidate:
+                    dump_cb1_seen = True
+                    # 缓存发布必须跟随当前 dump，即使这帧矩阵因数值异常不适合
+                    # 用作分组键，也不能退回旧缓存并把陈旧字节继续发布。
+                    if not cb1_path:
+                        cb1_path = candidate
+                    transform = ZZMIBoneMapBuilder.parse_object_transform(candidate)
+                    if transform is not None:
+                        group["transform"] = transform
+                        break
+            if group["transform"] is None and not dump_cb1_seen:
+                for member_cb1 in cb1_cache_paths:
+                    transform = ZZMIBoneMapBuilder.parse_object_transform(member_cb1)
+                    if transform is not None:
+                        group["transform"] = transform
+                        if not cb1_path:
+                            cb1_path = member_cb1
+                        print(
+                            f"[ZZMI骨骼合并] {draw_ib}: dump 中 cb1 缺失，"
+                            f"已回退工作空间 ObjectCB1 缓存（{os.path.basename(os.path.dirname(os.path.dirname(member_cb1)))}）"
+                        )
+                        break
+            group["cb1_path"] = cb1_path
             if group["transform"] is None:
                 print(f"[ZZMI骨骼合并] 提示 {draw_ib}: 未能解析对象变换（渲染 cb1），独立成组")
 
         ready_groups = {
             draw_ib: group for draw_ib, group in groups.items() if group["palette"] is not None
         }
+        unprocessed_groups = {
+            draw_ib: (group.get("skip_reason") or "未知原因")
+            for draw_ib, group in groups.items()
+            if group["palette"] is None
+        }
         if not ready_groups:
+            failure_parts: list[str] = []
+            if unprocessed_groups:
+                detail = "、".join(
+                    f"{draw_ib}({reason})"
+                    for draw_ib, reason in sorted(unprocessed_groups.items())
+                )
+                failure_parts.append(f"{len(unprocessed_groups)} 个部件未生成: {detail}")
+            if unresolved_targets:
+                shown = unresolved_targets[:5]
+                suffix = "…" if len(unresolved_targets) > 5 else ""
+                failure_parts.append(
+                    f"{len(unresolved_targets)} 个目标无法解析: {'、'.join(shown)}{suffix}"
+                )
+            if failure_parts:
+                return False, "没有子网格成功生成骨骼数据（" + "；".join(failure_parts) + "）"
             return False, "没有子网格成功生成骨骼数据。"
 
         # 第三遍：按对象变换分组（跨组绝不共享骨架），组内 bitwise + 刚性门控去重得
@@ -754,6 +1137,8 @@ class ZZMISkeletonMergeHelper:
                 submesh_json["VGCount"] = vg_count
                 submesh_json["VGOffset"] = vg_offset
                 submesh_json["VGMap"] = {str(k): int(v) for k, v in sorted(vg_map.items())}
+                # 算法版本：快路径幂等判定依据；策略变更时递增版本使旧缓存自动失效
+                submesh_json["VGMapAlgorithmVersion"] = _ZZMI_VG_MAP_ALGORITHM_VERSION
                 # 骨架分组（渲染 cb1 对象变换配对）：导出侧把 deform pass 换绑到本组
                 # ResourceZZMergedSkeleton_G<N>；VGMap/VGOffset 为全局骨骼编号（组基址拼接）
                 submesh_json["SkeletonGroup"] = skeleton_group
@@ -762,22 +1147,37 @@ class ZZMISkeletonMergeHelper:
                 # 还是上一帧内容）+ 原部件顶点数（渲染 vb1 换绑判定）
                 submesh_json["DeformDrawIndex"] = int(group["draw_index"])
                 submesh_json["OriginalVertexCount"] = int(
-                    group.get("original_vertex_count", 0) or 0
+                    group.get("original_vertex_counts", {}).get(unique_str, 0) or 0
                 )
 
-                # 复制 palette buf 到 ModImpRuntime 缓存（NTEMI/EFMI 同款模式）
+                # palette / CB1 缓存发布与 JSON 写回属于同一事务。重建时始终刷新
+                # 当前源；任何发布失败都不得提交半成品 JSON 或计入 written。
                 try:
                     bare_name = unique_str.split(".", 1)[-1]
                     submesh_dir = os.path.dirname(os.path.dirname(json_path))
                     runtime_dir = os.path.join(submesh_dir, "ModImpRuntime")
-                    os.makedirs(runtime_dir, exist_ok=True)
                     dest_name = f"{bare_name}-BoneMatrix.buf"
                     dest_path = os.path.join(runtime_dir, dest_name)
-                    if not os.path.isfile(dest_path) or force:
-                        shutil.copy2(group["palette_path"], dest_path)
+                    EFMISkeletonMergeHelper._atomic_publish_cache(
+                        group["palette_path"],
+                        dest_path,
+                        vg_count=vg_count,
+                    )
                     submesh_json["BoneMatrixFileName"] = dest_name
+
+                    # 对象变换 CB 是分组稳定性的缓存来源；存在源时同样原子刷新。
+                    if group.get("cb1_path"):
+                        cb1_dest_name = f"{bare_name}-ObjectCB1.buf"
+                        cb1_dest_path = os.path.join(runtime_dir, cb1_dest_name)
+                        EFMISkeletonMergeHelper._atomic_publish_cache(
+                            group["cb1_path"],
+                            cb1_dest_path,
+                            min_size=4,
+                        )
+                        submesh_json["ObjectCB1FileName"] = cb1_dest_name
                 except Exception as e:
-                    print(f"[ZZMI骨骼合并] 复制骨骼缓存失败 {unique_str}: {e}")
+                    print(f"[ZZMI骨骼合并] 发布运行时缓存失败 {unique_str}: {e}")
+                    continue
 
                 try:
                     JsonUtils.SaveToFile(json_dict=submesh_json, filepath=json_path)
@@ -785,8 +1185,33 @@ class ZZMISkeletonMergeHelper:
                 except Exception as e:
                     print(f"[ZZMI骨骼合并] 写回 json 失败 {unique_str}: {e}")
 
-        return written > 0, (
+        success_message = (
             f"已为 {written} 个子网格生成骨骼合并数据"
             f"（{len(ready_groups)} 个部件 / {len(group_members)} 个骨架组，"
             f"全局共 {sum(group_slots.values())} 槽）"
         )
+        # 完整性报告：只要还有目标未处理（部件未生成 / 目标无法解析 / json 写回
+        # 失败），就不能报告完整成功——部分完成必须大声暴露，否则调用方会把
+        # 缺失 BoneMatrix 的部件当成已生成。
+        failure_parts: list[str] = []
+        if unprocessed_groups:
+            detail = "、".join(
+                f"{draw_ib}({reason})"
+                for draw_ib, reason in sorted(unprocessed_groups.items())
+            )
+            failure_parts.append(f"{len(unprocessed_groups)} 个部件未生成: {detail}")
+        if unresolved_targets:
+            shown = unresolved_targets[:5]
+            suffix = "…" if len(unresolved_targets) > 5 else ""
+            failure_parts.append(
+                f"{len(unresolved_targets)} 个目标无法解析: {'、'.join(shown)}{suffix}"
+            )
+        ready_member_total = sum(len(group["members"]) for group in ready_groups.values())
+        if written < ready_member_total:
+            failure_parts.append(
+                f"{ready_member_total - written} 个子网格未生成"
+                "（缓存发布或 json 写回失败）"
+            )
+        if failure_parts:
+            return False, success_message + "；" + "；".join(failure_parts)
+        return written > 0, success_message

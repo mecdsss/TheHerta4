@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import tempfile
 import numpy
 
 from ..utils.json_utils import JsonUtils
@@ -50,7 +51,11 @@ _BONE_SEGMENT_FLOAT4 = 256 * 3
 _INSTANCE_CONFIG_BONE_OFFSET_ROW = 5
 # 写回 json 的算法版本。旧版只保存 VGMap，没有扩散采样判据，不能继续
 # 作为当前策略的幂等缓存使用；版本不匹配时 ensure_skeleton_data 自动重算。
-_VG_MAP_ALGORITHM_VERSION = 11
+# v14：在 v13 的层级兼容最近点和 Component 对内一对一动态收紧基础上，
+# 全局并入顺序也按矩阵差优先；矩阵歧义只按 1e-3 → 1e-4 → 1e-5 → 1e-6
+# 有限级联，不进入 1e-7。
+_VG_MAP_ALGORITHM_VERSION = 14
+_MATRIX_AMBIGUITY_FLOOR = 1e-6
 
 # 跨 LOD 原始候选对应层版本。它和 VGMap 算法版本分开记录，便于以后只调整
 # 对应评分而不误把旧的运行时槽位当成新布局。
@@ -352,6 +357,201 @@ class EFMIBoneMapBuilder:
         return indices.astype(numpy.uint32, copy=False)
 
     @staticmethod
+    def blend_index_sentinel(np_type: str) -> int:
+        """BLENDINDICES 数据格式对应的无效通道哨兵值（uint32 空间）。
+
+        解析器把索引统一 astype(uint32)：SINT 的 -1 经无符号转换后同样变成全 1
+        位（0xFFFFFFFF），因此 i4 与 u4 共用同一哨兵。
+        """
+        np_type = str(np_type or "").strip().lower()
+        if np_type == "u1":
+            return 0xFF
+        if np_type == "u2":
+            return 0xFFFF
+        return 0xFFFFFFFF  # u4 / i4
+
+    @staticmethod
+    def parse_blend_layout(submesh_json_dict: dict) -> dict | None:
+        """解析 Blend 类别的 BLENDINDICES + BLENDWEIGHTS 布局。
+
+        返回 {
+            "stride": 顶点行总字节数,
+            "bi_offset": BLENDINDICES 字节偏移,
+            "bi_np": numpy dtype 字符串（'u1'/'u2'/'u4'/'i4'）,
+            "bi_channels": 索引通道数,
+            "bw_offset": BLENDWEIGHTS 字节偏移（无权重元素时为 None）,
+            "bw_np": 权重 dtype（无权重元素时为 None）,
+            "bw_channels": 权重通道数,
+            "bw_div": 权重归一化除数,
+        }；无法解析返回 None。
+        """
+        blend_stride = 0
+        bi_offset = None
+        bi_layout = None
+        bw_offset = None
+        bw_layout = None
+        bw_div = 1.0
+        for category_buffer in submesh_json_dict.get("CategoryBufferList", []):
+            elements = category_buffer.get("D3D11ElementList", [])
+            is_blend = any(
+                str(e.get("Category", "") or "").strip().lower() == "blend"
+                for e in elements
+            )
+            if not is_blend:
+                continue
+            off = 0
+            for element in elements:
+                width = int(element.get("ByteWidth", 0) or 0)
+                blend_stride += width
+                semantic = str(element.get("SemanticName", "") or "").upper()
+                fmt = str(element.get("Format", "") or "").upper()
+                if semantic == "BLENDINDICES":
+                    bi_offset = off
+                    bi_layout = EFMIBoneMapBuilder._blend_index_layout_entry(fmt)
+                elif semantic.startswith("BLENDWEIGHT"):
+                    bw_offset = off
+                    if fmt == "R16G16B16A16_UNORM":
+                        bw_layout, bw_div = ("u2", 4), 65535.0
+                    elif fmt == "R32G32B32A32_FLOAT":
+                        bw_layout, bw_div = ("f4", 4), 1.0
+                    elif fmt == "R32G32_FLOAT":
+                        bw_layout, bw_div = ("f4", 2), 1.0
+                    elif fmt == "R8G8B8A8_UNORM":
+                        bw_layout, bw_div = ("u1", 4), 255.0
+                off += width
+            break
+
+        if blend_stride <= 0 or bi_offset is None or not bi_layout:
+            return None
+        return {
+            "stride": blend_stride,
+            "bi_offset": bi_offset,
+            "bi_np": bi_layout[0],
+            "bi_channels": bi_layout[1],
+            "bw_offset": bw_offset,
+            "bw_np": bw_layout[0] if bw_layout else None,
+            "bw_channels": bw_layout[1] if bw_layout else 0,
+            "bw_div": bw_div,
+        }
+
+    @staticmethod
+    def _blend_index_layout_entry(fmt: str) -> tuple[str, int] | None:
+        layout = {
+            "R8G8B8A8_UINT": ("u1", 4),
+            "R8_UINT": ("u1", 1),
+            "R16G16B16A16_UINT": ("u2", 4),
+            "R16G16_UINT": ("u2", 2),
+            "R16_UINT": ("u2", 1),
+            "R32G32B32A32_UINT": ("u4", 4),
+            "R32G32_UINT": ("u4", 2),
+            "R32_UINT": ("u4", 1),
+            "R32G32B32A32_SINT": ("i4", 4),
+            "R32G32_SINT": ("i4", 2),
+            "R32_SINT": ("i4", 1),
+        }
+        return layout.get(fmt)
+
+    @staticmethod
+    def layout_element_info(blend_layout: dict) -> dict:
+        """把 parse_blend_layout 的布局转成 parse_blendindices_from_buf 的元素信息。"""
+        return {
+            "byte_offset": int(blend_layout["bi_offset"]),
+            "byte_width": int(blend_layout["bi_channels"])
+            * numpy.dtype(blend_layout["bi_np"]).itemsize,
+            "stride": int(blend_layout["stride"]),
+            "np_type": blend_layout["bi_np"],
+            "component_count": int(blend_layout["bi_channels"]),
+        }
+
+    @staticmethod
+    def parse_blendweights_from_buf(
+        blend_buf_path: str, blend_layout: dict | None
+    ) -> numpy.ndarray | None:
+        """从 Blend.buf 读取 BLENDWEIGHTS 数组（(vertex_count, bw_channels) float32）。
+
+        blend_layout 由 parse_blend_layout 产出；布局缺失或没有 BLENDWEIGHTS
+        元素时返回 None（调用方按“每顶点第一索引权重=1”兜底）。
+        """
+        if not blend_layout or blend_layout.get("bw_offset") is None or not blend_layout.get("bw_np"):
+            return None
+        if not os.path.isfile(blend_buf_path):
+            raise FileNotFoundError(f"Blend buffer 不存在: {blend_buf_path}")
+
+        stride = int(blend_layout["stride"])
+        raw = numpy.fromfile(blend_buf_path, dtype=numpy.uint8)
+        if len(raw) % stride != 0:
+            raise ValueError(
+                f"Blend buffer 大小与 stride 不对齐: {blend_buf_path} "
+                f"({len(raw)} % {stride})"
+            )
+        vertex_count = len(raw) // stride
+        rows = raw.reshape(vertex_count, stride)
+        bw_np, bw_channels = blend_layout["bw_np"], int(blend_layout["bw_channels"])
+        bw_byte_width = bw_channels * numpy.dtype(bw_np).itemsize
+        weights = numpy.frombuffer(
+            rows[:, blend_layout["bw_offset"]:blend_layout["bw_offset"] + bw_byte_width].tobytes(),
+            dtype=numpy.dtype(bw_np),
+        ).reshape(vertex_count, bw_channels).astype(numpy.float32) / float(blend_layout["bw_div"])
+        return weights
+
+    @staticmethod
+    def cache_file_size_ok(cache_path: str, vg_count: int) -> bool:
+        """骨骼缓存文件大小合理性：float32 流（4 字节对齐）且 >= vg_count * 48。
+
+        48 字节 = 每骨骼 4x3 float32。EFMI 缓存是整池拷贝（远大于下限），
+        ZZMI 缓存是 palette 拷贝（通常等于下限）；被截断/损坏的文件都会
+        在这里被判不通过，由写回阶段重新复制。
+        """
+        try:
+            size = os.path.getsize(cache_path)
+        except OSError:
+            return False
+        return size % 4 == 0 and size >= int(vg_count) * _BONE_MATRIX_FLOATS * 4
+
+    @staticmethod
+    def valid_blend_channels(
+        blend_indices: numpy.ndarray,
+        element_info: dict,
+        blend_weights: numpy.ndarray | None = None,
+    ) -> numpy.ndarray:
+        """返回 BLENDINDICES 数组的有效通道布尔掩码（与索引同形状）。
+
+        有效通道 = 索引不是该数据格式的哨兵值（0xFF/0xFFFF/0xFFFFFFFF）且
+        对应权重 > 0。没有 BLENDWEIGHTS 元素时按“每顶点第一索引权重=1、其余
+        通道权重=0”兜底（与导入侧 mesh_create_helper 的默认权重语义一致）。
+        """
+        indices = numpy.asarray(blend_indices)
+        if indices.ndim == 1:
+            indices = indices.reshape(-1, 1)
+        np_type = str(element_info.get("np_type", "u4") or "u4").strip().lower()
+        sentinel = EFMIBoneMapBuilder.blend_index_sentinel(np_type)
+        if blend_weights is not None:
+            weights = numpy.asarray(blend_weights, dtype=numpy.float32)
+            if weights.ndim == 1:
+                weights = weights.reshape(-1, 1)
+        else:
+            # 无 BLENDWEIGHTS 元素：按“每顶点第一索引权重=1、其余通道=0”兜底
+            weights = numpy.zeros((indices.shape[0], indices.shape[1]), dtype=numpy.float32)
+            weights[:, 0] = 1.0
+
+        mask = numpy.zeros(indices.shape, dtype=bool)
+        for channel in range(indices.shape[1]):
+            weight_col = weights[:, channel] if channel < weights.shape[1] else weights[:, 0]
+            column = indices[:, channel]
+            if np_type == "i4":
+                # SINT 经 uint32 转换后，任何负值都落在高位；-1 只是其中一种
+                # 无效标记，这里把全部负数回绕值一并过滤。
+                index_valid = column < 0x80000000
+            else:
+                index_valid = column != sentinel
+            mask[:, channel] = (
+                index_valid
+                & (weight_col > 0)
+                & numpy.isfinite(weight_col)
+            )
+        return mask
+
+    @staticmethod
     def compute_driven_centroids(
         position_buf_path: str,
         blend_buf_path: str,
@@ -417,70 +617,34 @@ class EFMIBoneMapBuilder:
         )
 
         # ---- Blend 布局（BLENDINDICES + BLENDWEIGHTS offset/格式）----
-        blend_stride = 0
-        bi_offset = None
-        bi_np = None
-        bw_offset = None
-        bw_np = None
-        bw_div = 1.0
-        for category_buffer in submesh_json_dict.get("CategoryBufferList", []):
-            elements = category_buffer.get("D3D11ElementList", [])
-            is_blend = any(
-                str(e.get("Category", "") or "").strip().lower() == "blend"
-                for e in elements
+        # 统一走 parse_blend_layout / parse_blendindices_from_buf /
+        # parse_blendweights_from_buf：中央格式表覆盖 R16G16_UINT、R32G32_UINT
+        # 等全部解析器支持格式，哨兵按数据格式判定（不再硬编码 0xFFFF）。
+        blend_layout = EFMIBoneMapBuilder.parse_blend_layout(submesh_json_dict)
+        if not blend_layout:
+            return empty
+        element_info = EFMIBoneMapBuilder.layout_element_info(blend_layout)
+        try:
+            blend_indices = EFMIBoneMapBuilder.parse_blendindices_from_buf(
+                blend_buf_path, element_info
             )
-            if not is_blend:
-                continue
-            off = 0
-            for element in elements:
-                width = int(element.get("ByteWidth", 0) or 0)
-                blend_stride += width
-                semantic = str(element.get("SemanticName", "") or "").upper()
-                fmt = str(element.get("Format", "") or "").upper()
-                if semantic == "BLENDINDICES":
-                    bi_offset = off
-                    bi_np = {
-                        "R8G8B8A8_UINT": ("u1", 4), "R8_UINT": ("u1", 1),
-                        "R16G16B16A16_UINT": ("u2", 4), "R16_UINT": ("u2", 1),
-                        "R32G32B32A32_UINT": ("u4", 4), "R32_UINT": ("u4", 1),
-                        "R32G32B32A32_SINT": ("i4", 4),
-                    }.get(fmt)
-                elif semantic.startswith("BLENDWEIGHT"):
-                    bw_offset = off
-                    if fmt == "R16G16B16A16_UNORM":
-                        bw_np, bw_div = ("u2", 4), 65535.0
-                    elif fmt == "R32G32B32A32_FLOAT":
-                        bw_np, bw_div = ("f4", 4), 1.0
-                    elif fmt == "R32G32_FLOAT":
-                        bw_np, bw_div = ("f4", 2), 1.0
-                    elif fmt == "R8G8B8A8_UNORM":
-                        bw_np, bw_div = ("u1", 4), 255.0
-                off += width
-            break
-
-        if blend_stride <= 0 or bi_offset is None or not bi_np:
+            blend_weights = EFMIBoneMapBuilder.parse_blendweights_from_buf(
+                blend_buf_path, blend_layout
+            )
+        except Exception:
+            return empty
+        if len(blend_indices) != vertex_count:
             return empty
 
-        blend_raw = numpy.fromfile(blend_buf_path, dtype=numpy.uint8)
-        n = len(blend_raw) // blend_stride
-        if n != vertex_count:
-            return empty
-        rows = blend_raw.reshape(n, blend_stride)
-
-        bi_np_type, bi_channels = bi_np
-        indices = numpy.frombuffer(
-            rows[:, bi_offset:bi_offset + (bi_channels * numpy.dtype(bi_np_type).itemsize)].tobytes(),
-            dtype=numpy.dtype(bi_np_type),
-        ).reshape(n, bi_channels).astype(numpy.int64)
-
-        if bw_offset is not None and bw_np:
-            bw_np_type, bw_channels = bw_np
-            weights = numpy.frombuffer(
-                rows[:, bw_offset:bw_offset + (bw_channels * numpy.dtype(bw_np_type).itemsize)].tobytes(),
-                dtype=numpy.dtype(bw_np_type),
-            ).reshape(n, bw_channels).astype(numpy.float32) / bw_div
+        bi_channels = blend_layout["bi_channels"]
+        valid_mask = EFMIBoneMapBuilder.valid_blend_channels(
+            blend_indices, element_info, blend_weights
+        )
+        indices = blend_indices.astype(numpy.int64)
+        if blend_weights is not None:
+            weights = numpy.asarray(blend_weights, dtype=numpy.float32)
         else:
-            weights = numpy.zeros((n, bi_channels), dtype=numpy.float32)
+            weights = numpy.zeros((len(blend_indices), bi_channels), dtype=numpy.float32)
             weights[:, 0] = 1.0
 
         # ---- 每 local 的驱动顶点集合（质心 + 包围盒 + 权重扩散采样）----
@@ -493,10 +657,7 @@ class EFMIBoneMapBuilder:
             idx_col = indices[:, c]
             w_col = weights[:, c] if c < weights.shape[1] else weights[:, 0]
             valid = (
-                (w_col > 0)
-                & numpy.isfinite(w_col)
-                & (idx_col >= 0)
-                & (idx_col != 0xFFFF)
+                valid_mask[:, c]
                 & numpy.isfinite(positions).all(axis=1)
             )
             if not numpy.any(valid):
@@ -658,6 +819,117 @@ class EFMIBoneMapBuilder:
             )
         return distances, indices
 
+    @staticmethod
+    def _nearest_compatible_diffusion_points(
+        source: numpy.ndarray,
+        target: numpy.ndarray,
+        source_normals: numpy.ndarray,
+        target_normals: numpy.ndarray,
+        contact_distance: float,
+        layer_distance: float,
+        tangent_tolerance: float,
+        normal_alignment: float,
+    ) -> tuple[numpy.ndarray, numpy.ndarray]:
+        """在层间几何约束内查找最近点，而不是先取最近点再做拒绝。
+
+        多层裙摆等点云里，欧氏最近点可能来自相邻的错误层。旧流程选中该点后
+        才检查法向/切向约束，失败时不会继续搜索稍远但层级正确的点。这里先对
+        每个点对应用距离、切向和法向约束，再从仍兼容的点里取最近者。
+        """
+        source = numpy.asarray(source, dtype=numpy.float32)
+        target = numpy.asarray(target, dtype=numpy.float32)
+        if len(source) == 0 or len(target) == 0:
+            return (
+                numpy.full(len(source), numpy.inf, dtype=numpy.float32),
+                numpy.full(len(source), -1, dtype=numpy.int64),
+            )
+
+        source_normals = numpy.asarray(source_normals, dtype=numpy.float32)
+        target_normals = numpy.asarray(target_normals, dtype=numpy.float32)
+        source_shape_ok = source_normals.shape == (len(source), 3)
+        target_shape_ok = target_normals.shape == (len(target), 3)
+        source_valid_all = (
+            numpy.isfinite(source_normals).all(axis=1)
+            if source_shape_ok else numpy.zeros(len(source), dtype=bool)
+        )
+        target_valid_all = (
+            numpy.isfinite(target_normals).all(axis=1)
+            if target_shape_ok else numpy.zeros(len(target), dtype=bool)
+        )
+        safe_source_normals = (
+            numpy.where(numpy.isfinite(source_normals), source_normals, 0.0)
+            if source_shape_ok else numpy.zeros((len(source), 3), dtype=numpy.float32)
+        )
+        safe_target_normals = (
+            numpy.where(numpy.isfinite(target_normals), target_normals, 0.0)
+            if target_shape_ok else numpy.zeros((len(target), 3), dtype=numpy.float32)
+        )
+
+        distances = numpy.full(len(source), numpy.inf, dtype=numpy.float32)
+        indices = numpy.full(len(source), -1, dtype=numpy.int64)
+        for start in range(0, len(source), 64):
+            chunk = source[start:start + 64]
+            chunk_len = len(chunk)
+            displacement = target[None, :, :] - chunk[:, None, :]
+            squared = numpy.sum(displacement * displacement, axis=2)
+            euclidean = numpy.sqrt(squared)
+
+            source_valid = source_valid_all[start:start + chunk_len]
+            paired_surface = source_valid[:, None] & target_valid_all[None, :]
+            allowed_distance = numpy.where(
+                paired_surface,
+                float(layer_distance),
+                float(contact_distance),
+            )
+            compatible = euclidean <= allowed_distance
+
+            if numpy.any(source_valid):
+                source_normal = safe_source_normals[start:start + chunk_len]
+                normal_component = numpy.sum(
+                    displacement * source_normal[:, None, :], axis=2
+                )
+                tangent = (
+                    displacement
+                    - normal_component[:, :, None] * source_normal[:, None, :]
+                )
+                tangent_distance = numpy.linalg.norm(tangent, axis=2)
+                compatible &= (~source_valid[:, None]) | (
+                    tangent_distance <= float(tangent_tolerance)
+                )
+
+            if numpy.any(target_valid_all):
+                target_component = numpy.sum(
+                    displacement * safe_target_normals[None, :, :], axis=2
+                )
+                tangent = (
+                    displacement
+                    - target_component[:, :, None] * safe_target_normals[None, :, :]
+                )
+                tangent_distance = numpy.linalg.norm(tangent, axis=2)
+                compatible &= (~target_valid_all[None, :]) | (
+                    tangent_distance <= float(tangent_tolerance)
+                )
+
+            if numpy.any(paired_surface):
+                alignment = numpy.abs(
+                    safe_source_normals[start:start + chunk_len]
+                    @ safe_target_normals.T
+                )
+                compatible &= (~paired_surface) | (
+                    alignment >= float(normal_alignment)
+                )
+
+            compatible_squared = numpy.where(compatible, squared, numpy.inf)
+            nearest = numpy.argmin(compatible_squared, axis=1)
+            nearest_squared = compatible_squared[numpy.arange(chunk_len), nearest]
+            found = numpy.isfinite(nearest_squared)
+            if numpy.any(found):
+                found_indices = numpy.flatnonzero(found)
+                output_indices = start + found_indices
+                indices[output_indices] = nearest[found]
+                distances[output_indices] = numpy.sqrt(nearest_squared[found])
+        return distances, indices
+
     @classmethod
     def weight_diffusion_similarity(
         cls,
@@ -671,7 +943,8 @@ class EFMIBoneMapBuilder:
         normal_alignment: float = 0.70,
         weak_weight_floor: float = 0.25,
         min_support_points: int = 2,
-    ) -> bool:
+        return_metrics: bool = False,
+    ) -> bool | dict:
         """检测两个顶点组在空间接触处是否扩散出一致的权重场。
 
         每个方向都把本组的正权重点投影到另一组最近的正权重点。普通点云
@@ -681,10 +954,29 @@ class EFMIBoneMapBuilder:
         最终取覆盖率较高的方向。为避免“强权重点淹没弱权重点”，每个正权重
         点的评估权重至少达到该方向最大权重的 ``weak_weight_floor``；同时要求
         至少 ``min_support_points`` 个不同源点与不同目标点匹配。这只是评估用的
-        最低影响，不会修改写回的原始蒙皮权重。
+        最低影响，不会修改写回的原始蒙皮权重。``return_metrics`` 仅供候选歧义
+        消解复用同一次扫描得到的覆盖率、权重误差和空间误差；默认仍返回 bool。
         """
+        def finish(
+            passes: bool,
+            coverage: float = 0.0,
+            weight_error: float = float("inf"),
+            spatial_error: float = float("inf"),
+            coverage_ab: float = 0.0,
+            coverage_ba: float = 0.0,
+        ):
+            metrics = {
+                "passes": bool(passes),
+                "coverage": float(coverage),
+                "weight_error": float(weight_error),
+                "spatial_error": float(spatial_error),
+                "coverage_ab": float(coverage_ab),
+                "coverage_ba": float(coverage_ba),
+            }
+            return metrics if return_metrics else bool(passes)
+
         if not signature_a or not signature_b:
-            return False
+            return finish(False)
         points_a = numpy.asarray(signature_a.get("diffusion_points", []), dtype=numpy.float32)
         weights_a = numpy.asarray(signature_a.get("diffusion_weights", []), dtype=numpy.float32)
         points_b = numpy.asarray(signature_b.get("diffusion_points", []), dtype=numpy.float32)
@@ -696,7 +988,7 @@ class EFMIBoneMapBuilder:
             or points_a.shape[1] != 3 or points_b.shape[1] != 3
             or weights_a.ndim != 1 or weights_b.ndim != 1
         ):
-            return False
+            return finish(False)
 
         radius_a = float(signature_a.get("diffusion_radius", cls._diffusion_radius(points_a)))
         radius_b = float(signature_b.get("diffusion_radius", cls._diffusion_radius(points_b)))
@@ -735,55 +1027,25 @@ class EFMIBoneMapBuilder:
             source_normals,
             target_normals,
         ):
-            distances, nearest = cls._nearest_diffusion_points(source_points, target_points)
             # 没有可靠表面法向时保持原来的“真实接触”距离；
             # 两层表面都有法向时，允许沿法向存在一小段层间距。
-            valid = nearest >= 0
             if has_surface_normals:
-                source_valid = (
-                    source_normals.ndim == 2
-                    and source_normals.shape == (len(source_points), 3)
-                    and numpy.isfinite(source_normals).all(axis=1)
-                )
-                target_valid_all = (
-                    target_normals.ndim == 2
-                    and target_normals.shape == (len(target_points), 3)
-                    and numpy.isfinite(target_normals).all(axis=1)
-                )
-                target_valid = target_valid_all[nearest.clip(min=0)]
-                paired_surface = source_valid & target_valid
-                allowed_distance = numpy.where(
-                    paired_surface,
-                    layer_distance,
+                distances, nearest = cls._nearest_compatible_diffusion_points(
+                    source_points,
+                    target_points,
+                    source_normals,
+                    target_normals,
                     contact_distance,
+                    layer_distance,
+                    tangent_tolerance,
+                    normal_alignment,
                 )
-                valid &= distances <= allowed_distance
-                if numpy.any(source_valid | target_valid):
-                    displacement = target_points[nearest.clip(min=0)] - source_points
-                    if numpy.any(source_valid):
-                        source_normal = numpy.where(
-                            numpy.isfinite(source_normals), source_normals, 0.0
-                        )
-                        normal_component = numpy.sum(displacement * source_normal, axis=1)
-                        tangent = displacement - normal_component[:, None] * source_normal
-                        valid &= (~source_valid) | (numpy.linalg.norm(tangent, axis=1) <= tangent_tolerance)
-                    if numpy.any(target_valid):
-                        paired_target_normals = target_normals[nearest.clip(min=0)]
-                        target_normal = numpy.where(
-                            numpy.isfinite(paired_target_normals), paired_target_normals, 0.0
-                        )
-                        target_component = numpy.sum(displacement * target_normal, axis=1)
-                        tangent = displacement - target_component[:, None] * target_normal
-                        valid &= (~target_valid) | (numpy.linalg.norm(tangent, axis=1) <= tangent_tolerance)
-                    if numpy.any(source_valid & target_valid):
-                        paired_target_normals = target_normals[nearest.clip(min=0)]
-                        alignment = numpy.abs(numpy.sum(
-                            source_normals * paired_target_normals, axis=1
-                        ))
-                        valid &= (~(source_valid & target_valid)) | (
-                            alignment >= float(normal_alignment)
-                        )
             else:
+                distances, nearest = cls._nearest_diffusion_points(
+                    source_points, target_points
+                )
+            valid = nearest >= 0
+            if not has_surface_normals:
                 valid &= distances <= contact_distance
             # 最近邻不应被强制成双射：同一连续表面在两个部件上经常有完全
             # 不同的三角网格密度，高密度侧的多个点合理投影到低密度侧同一点。
@@ -794,7 +1056,7 @@ class EFMIBoneMapBuilder:
             # 权重下限保留强度排序，同时让每个正权重样本都能影响判定。
             finite_positive = source_weights[numpy.isfinite(source_weights) & (source_weights > 0)]
             if len(finite_positive) == 0:
-                return 0.0, float("inf")
+                return 0.0, float("inf"), float("inf")
             source_peak = float(numpy.max(finite_positive))
             floor = max(source_peak * max(float(weak_weight_floor), 0.0), 0.05)
             evaluation_weights = numpy.where(
@@ -812,10 +1074,10 @@ class EFMIBoneMapBuilder:
                 len(target_points),
             )
             if total <= 1e-8 or int(numpy.count_nonzero(valid)) < required_support:
-                return 0.0, float("inf")
+                return 0.0, float("inf"), float("inf")
             unique_target_support = len(numpy.unique(nearest[valid]))
             if unique_target_support < required_support:
-                return 0.0, float("inf")
+                return 0.0, float("inf"), float("inf")
             evaluation_w = evaluation_weights[valid]
             # weak_weight_floor 只用于“每个采样点有多少评估影响”，不能
             # 覆写拿来比较的原始权重值；旧实现把 0.01 抬成 0.25 后再与
@@ -825,18 +1087,22 @@ class EFMIBoneMapBuilder:
             coverage = float(numpy.sum(evaluation_w) / total)
             error = float(numpy.sum(evaluation_w * numpy.abs(source_w - target_w)) /
                           max(float(numpy.sum(evaluation_w)), 1e-8))
-            return coverage, error
+            spatial_error = float(
+                numpy.sum(evaluation_w * distances[valid])
+                / max(float(numpy.sum(evaluation_w)), 1e-8)
+            )
+            return coverage, error, spatial_error
 
-        cov_ab, err_ab = directional(
+        cov_ab, err_ab, spatial_ab = directional(
             points_a, weights_a, points_b, weights_b, normals_a, normals_b
         )
-        cov_ba, err_ba = directional(
+        cov_ba, err_ba, spatial_ba = directional(
             points_b, weights_b, points_a, weights_a, normals_b, normals_a
         )
-        if cov_ab >= cov_ba:
-            coverage, error = cov_ab, err_ab
+        if (cov_ab, -err_ab, -spatial_ab) >= (cov_ba, -err_ba, -spatial_ba):
+            coverage, error, spatial_error = cov_ab, err_ab, spatial_ab
         else:
-            coverage, error = cov_ba, err_ba
+            coverage, error, spatial_error = cov_ba, err_ba, spatial_ba
         # 极稀疏的一侧只有一个采样点时没有“多个目标支持点”可用。此时
         # 要求另一侧本身局限在一个接触直径内，并且双向都有覆盖；这样保留
         # 单点小附件，同时拒绝一个点吸附整条长槽边。
@@ -846,10 +1112,17 @@ class EFMIBoneMapBuilder:
                 numpy.max(larger, axis=0) - numpy.min(larger, axis=0)
             ))
             if extent > contact_distance * 2.0:
-                return False
+                return finish(
+                    False, coverage, error, spatial_error, cov_ab, cov_ba
+                )
             if min(cov_ab, cov_ba) < float(min_coverage):
-                return False
-        return coverage >= float(min_coverage) and error <= float(weight_tolerance)
+                return finish(
+                    False, coverage, error, spatial_error, cov_ab, cov_ba
+                )
+        passes = coverage >= float(min_coverage) and error <= float(weight_tolerance)
+        return finish(
+            passes, coverage, error, spatial_error, cov_ab, cov_ba
+        )
 
     # ------------------------------------------------------------------
     # 骨骼矩阵读取
@@ -979,6 +1252,10 @@ class EFMIBoneMapBuilder:
         **同部件冲突拒绝**（硬性规则）：并查集 union 时检查，组内同部件最多 1 个 local，
         防"同位置功能骨骼"（如手指两节）合并及链式绕过。
 
+        **歧义候选一对一消解**：每对 Component 内先收集所有通过硬门控的边，再同步
+        收紧证据等级、矩阵差、权重误差、覆盖缺口和空间误差。A:1 同时命中 B:8/B:9
+        时只保留扩散相似度更高的一条；完全相同才用稳定 id 决胜，结果不依赖遍历先后。
+
         **连续扩散图判定**：每个成员必须通过至少一条权重扩散边连接到组，
         并在并入后对整组重新做连通性检查；不要求平面和每一个凹槽底直接
         两两相交，允许“平面 → 槽壁/槽底”的连续桥接，同时禁止孤立断点。
@@ -1076,23 +1353,37 @@ class EFMIBoneMapBuilder:
         def _sig(idx):
             return candidates[idx].get("signature")
 
-        def passes(i, j) -> bool:
-            """分层判据（两两独立）：矩阵硬门控 + 权重扩散确认。
+        def evaluate(i, j) -> dict:
+            """分层判据（两两独立）及后续歧义消解所需的连续指标。
 
             - 矩阵 diff >= match_tolerance：永不合并（几何接近无权推翻）；
             - 矩阵 bitwise 完全相同：有扩散采样时仍验证权重场，无采样时兼容直接通过；
             - 近似：优先验证权重扩散，无扩散时才用加权质心距离（缺签名保守拒绝）。
             """
             matrix_diff = float(numpy.abs(mats[i] - mats[j]).max())
+            result = {
+                "passes": False,
+                "evidence_rank": 3,
+                "matrix_diff": matrix_diff,
+                "coverage": 0.0,
+                "weight_error": float("inf"),
+                "spatial_error": float("inf"),
+            }
             if matrix_diff >= match_tolerance:
-                return False
+                return result
             si, sj = _sig(i), _sig(j)
             if matrix_diff == 0.0 and (si is None or sj is None):
                 # 没有 Position/Blend 扩散证据时保留参考插件的 bitwise
                 # 兼容语义；有证据则必须验证接触位置的权重场。
-                return True
+                result.update({
+                    "passes": True,
+                    "evidence_rank": 1,
+                    "weight_error": 0.0,
+                    "spatial_error": 0.0,
+                })
+                return result
             if si is None or sj is None:
-                return False
+                return result
 
             # 两边都有 Position/Blend 生成的扩散采样时，扩散场是主判据；
             # 质心仅作为旧缓存/测试签名的兼容回退，不能覆盖已观测到的
@@ -1124,12 +1415,12 @@ class EFMIBoneMapBuilder:
                         ),
                     )
                     if gap > radius:
-                        return False
+                        return result
                 except (KeyError, TypeError, ValueError):
                     # 外部调用者可只提供 diffusion_points/weights；字段不全
                     # 时交给最近邻函数做保守判定。
                     pass
-                return EFMIBoneMapBuilder.weight_diffusion_similarity(
+                metrics = EFMIBoneMapBuilder.weight_diffusion_similarity(
                     si,
                     sj,
                     distance_tolerance=diffusion_distance,
@@ -1140,15 +1431,36 @@ class EFMIBoneMapBuilder:
                     normal_alignment=diffusion_normal_alignment,
                     weak_weight_floor=diffusion_weak_weight_floor,
                     min_support_points=diffusion_min_support_points,
+                    return_metrics=True,
                 )
+                result.update({
+                    "passes": bool(metrics["passes"]),
+                    "evidence_rank": 0,
+                    "coverage": float(metrics["coverage"]),
+                    "weight_error": float(metrics["weight_error"]),
+                    "spatial_error": float(metrics["spatial_error"]),
+                })
+                return result
             if matrix_diff == 0.0:
-                return True
+                result.update({
+                    "passes": True,
+                    "evidence_rank": 1,
+                    "weight_error": 0.0,
+                    "spatial_error": 0.0,
+                })
+                return result
             dist = float(numpy.linalg.norm(
                 si["centroid"].astype(numpy.float64) - sj["centroid"].astype(numpy.float64)
             ))
-            return dist < centroid_tolerance
+            result.update({
+                "passes": dist < centroid_tolerance,
+                "evidence_rank": 2,
+                "weight_error": 0.0,
+                "spatial_error": dist,
+            })
+            return result
 
-        pair_cache: dict[tuple[int, int], bool] = {}
+        pair_evaluation_cache: dict[tuple[int, int], dict] = {}
 
         normalized_protected_pairs: set[tuple[tuple[str, int], tuple[str, int]]] = set()
         for pair in protected_pairs or ():
@@ -1188,11 +1500,24 @@ class EFMIBoneMapBuilder:
             right = (str(candidates[j]["unique_str"]), int(candidates[j]["local_vg_id"]))
             return tuple(sorted((left, right))) in normalized_protected_pairs
 
-        def pair_passes(a, b) -> bool:
+        def pair_evaluation(a, b) -> dict:
             key = (a, b) if a < b else (b, a)
-            if key not in pair_cache:
-                pair_cache[key] = bool(not is_protected(a, b) and passes(a, b))
-            return pair_cache[key]
+            if key not in pair_evaluation_cache:
+                if is_protected(a, b):
+                    pair_evaluation_cache[key] = {
+                        "passes": False,
+                        "evidence_rank": 3,
+                        "matrix_diff": float("inf"),
+                        "coverage": 0.0,
+                        "weight_error": float("inf"),
+                        "spatial_error": float("inf"),
+                    }
+                else:
+                    pair_evaluation_cache[key] = evaluate(a, b)
+            return pair_evaluation_cache[key]
+
+        def pair_passes(a, b) -> bool:
+            return bool(pair_evaluation(a, b)["passes"])
 
         def _continuous_members(members: list[int]) -> bool:
             """检查合并出来的 VG 是否存在权重扩散断点。
@@ -1244,17 +1569,164 @@ class EFMIBoneMapBuilder:
             group_members[rb] = merged_members
             group_labels[rb] = group_labels[ra] | group_labels[rb]
 
+        def edge_dimensions(edge) -> tuple[float, ...]:
+            """把通过边投影到可共同收紧的无量纲“不相似度”维度。
+
+            矩阵差放在第一维；候选冲突时先按有限矩阵级联消解，只有
+            矩阵仍无法区分时才读取后续扩散维度。
+            """
+            _i, _j, evaluation = edge
+            matrix_error = float(evaluation["matrix_diff"]) / max(
+                float(match_tolerance), 1e-8
+            )
+            evidence_rank = float(evaluation["evidence_rank"])
+            if int(evaluation["evidence_rank"]) == 0:
+                weight_error = float(evaluation["weight_error"]) / max(
+                    float(diffusion_weight_tolerance), 1e-8
+                )
+                coverage_error = max(0.0, 1.0 - float(evaluation["coverage"]))
+                spatial_error = float(evaluation["spatial_error"]) / max(
+                    float(diffusion_distance),
+                    float(diffusion_layer_distance),
+                    1e-8,
+                )
+            elif int(evaluation["evidence_rank"]) == 2:
+                # 无扩散采样的质心回退仍可参与确定性一对一选择，但其证据
+                # 等级低于真实扩散场，空间误差按自己的通过阈值归一化。
+                weight_error = 0.0
+                coverage_error = 1.0
+                spatial_error = float(evaluation["spatial_error"]) / max(
+                    float(centroid_tolerance), 1e-8
+                )
+            else:
+                # bitwise 相同但无采样时没有扩散维度可比较；最后由矩阵及
+                # 稳定的候选 id 决胜，保留旧数据的兼容合并语义。
+                weight_error = 0.0
+                coverage_error = 1.0
+                spatial_error = 0.0
+            return (
+                matrix_error,
+                evidence_rank,
+                weight_error,
+                coverage_error,
+                spatial_error,
+            )
+
+        def choose_ambiguous_edge(edges: list[tuple[int, int, dict]]):
+            """先有限收紧矩阵，再逐维收紧扩散指标，直到只剩唯一候选。
+
+            初始集合已经通过 ``match_tolerance`` 硬门控。矩阵歧义阶段最多
+            从 1e-3 逐级收紧到 1e-6；只要某一级只剩一个候选就立即返回，
+            后续扩散维度不能把它抢走。到 1e-6 仍有多个候选时，才同步
+            收紧证据等级、权重误差、覆盖缺口和空间误差；最后用稳定 id
+            处理完全相同或维度互有胜负的候选。
+            """
+            contenders = list(edges)
+            dimensions = {id(edge): edge_dimensions(edge) for edge in contenders}
+
+            matrix_thresholds = [float(match_tolerance)]
+            matrix_threshold = float(match_tolerance)
+            while matrix_threshold > _MATRIX_AMBIGUITY_FLOOR:
+                next_threshold = max(
+                    _MATRIX_AMBIGUITY_FLOOR,
+                    matrix_threshold / 10.0,
+                )
+                if next_threshold >= matrix_threshold:
+                    break
+                matrix_thresholds.append(next_threshold)
+                matrix_threshold = next_threshold
+                if matrix_threshold <= _MATRIX_AMBIGUITY_FLOOR:
+                    break
+
+            for matrix_threshold in matrix_thresholds:
+                narrowed = [
+                    edge for edge in contenders
+                    if float(edge[2]["matrix_diff"]) < matrix_threshold
+                ]
+                if narrowed:
+                    contenders = narrowed
+                    if len(contenders) == 1:
+                        return contenders[0]
+
+            # 到矩阵下限仍无法区分，矩阵维度冻结，只处理后续维度。
+            for factor in (0.75, 0.50, 0.25, 0.10, 0.05, 0.01, 0.0):
+                mins = tuple(
+                    min(dimensions[id(edge)][dimension] for edge in contenders)
+                    for dimension in range(1, 5)
+                )
+                maxs = tuple(
+                    max(dimensions[id(edge)][dimension] for edge in contenders)
+                    for dimension in range(1, 5)
+                )
+                limits = tuple(
+                    mins[dimension - 1]
+                    + (maxs[dimension - 1] - mins[dimension - 1]) * float(factor)
+                    for dimension in range(1, 5)
+                )
+                narrowed = [
+                    edge for edge in contenders
+                    if all(
+                        dimensions[id(edge)][dimension] <= limits[dimension - 1] + 1e-9
+                        for dimension in range(1, 5)
+                    )
+                ]
+                if narrowed:
+                    contenders = narrowed
+                    if len(contenders) == 1:
+                        return contenders[0]
+
+            def stable_quality(edge):
+                vector = dimensions[id(edge)]
+                return (max(vector), sum(vector), vector, edge[0], edge[1])
+
+            return min(contenders, key=stable_quality)
+
+        # 每对 Component 先形成一个一对一候选集。同一个 A local 即使同时
+        # 命中 B:8/B:9，也只能保留动态收紧后的最佳边；反向同理。之后仍由
+        # 并查集的 group_submeshes 约束保证跨多个 Component 的组内唯一性。
+        edges_by_component_pair: dict[
+            tuple[str, str], list[tuple[int, int, dict]]
+        ] = {}
         for i in range(n):
             for j in range(i + 1, n):
-                # 同部件（同子网格）内的 local 绝不合并
-                if candidates[i]["unique_str"] == candidates[j]["unique_str"]:
+                component_i = str(candidates[i]["unique_str"])
+                component_j = str(candidates[j]["unique_str"])
+                if component_i == component_j:
                     continue
-                if find(i) == find(j):
+                evaluation = pair_evaluation(i, j)
+                if not evaluation["passes"]:
                     continue
+                labels = group_labels[i] | group_labels[j]
+                if len(labels) > 1:
+                    continue
+                component_pair = tuple(sorted((component_i, component_j)))
+                edges_by_component_pair.setdefault(component_pair, []).append(
+                    (i, j, evaluation)
+                )
 
-                # 分层判据：矩阵硬门控 + 权重扩散/质心确认
-                if pair_passes(i, j):
-                    try_union(i, j)
+        selected_edges: list[tuple[int, int, dict]] = []
+        for component_pair in sorted(edges_by_component_pair):
+            remaining = list(edges_by_component_pair[component_pair])
+            while remaining:
+                chosen = choose_ambiguous_edge(remaining)
+                selected_edges.append(chosen)
+                chosen_members = {chosen[0], chosen[1]}
+                remaining = [
+                    edge for edge in remaining
+                    if not chosen_members.intersection((edge[0], edge[1]))
+                ]
+
+        # 全局并入顺序也必须保持“矩阵优先”。之前这里先比较所有维度的
+        # 最大值，可能让扩散误差较小但矩阵差明显更大的浮层边先占用槽位，
+        # 使真正的同骨骼边在 try_union 的子网格冲突检查中被拒绝。
+        selected_edges.sort(key=lambda edge: (
+            edge_dimensions(edge),
+            edge[0],
+            edge[1],
+        ))
+        for i, j, _evaluation in selected_edges:
+            if find(i) != find(j):
+                try_union(i, j)
 
         # 分组。并查集合并过程中已经逐次检查过连通性；这里再做一次最终
         # 权重扩散图校验，并把任何意外断开的组件拆回独立 global VG，避免
@@ -2056,6 +2528,56 @@ class EFMISkeletonMergeHelper:
     """EFMI 骨骼合并总流程：定位 FrameAnalysis -> 解析 log -> 构建映射 -> 写回工作空间。"""
 
     @staticmethod
+    def _atomic_publish_cache(
+        source_path: str,
+        dest_path: str,
+        *,
+        vg_count: int = 0,
+        min_size: int = 4,
+    ) -> None:
+        """原子刷新运行时缓存，并在提交前校验完整性。
+
+        重建事务不能复用“同尺寸即最新”的旧缓存；源、目标不同时始终复制到同目录
+        临时文件，校验通过后再 ``os.replace``。源就是目标（dump 已删除后的缓存回退）
+        时只做完整性校验，避免自拷贝破坏唯一副本。
+        """
+        source_path = os.path.abspath(str(source_path or ""))
+        dest_path = os.path.abspath(str(dest_path or ""))
+        if not source_path or not os.path.isfile(source_path):
+            raise FileNotFoundError(f"骨骼缓存源文件不存在: {source_path}")
+
+        def _validate(path: str) -> None:
+            size = os.path.getsize(path)
+            if size < int(min_size) or size % 4 != 0:
+                raise OSError(f"缓存文件大小无效: {path} ({size} bytes)")
+            if not EFMIBoneMapBuilder.cache_file_size_ok(path, int(vg_count)):
+                raise OSError(
+                    f"缓存文件不足以容纳 {int(vg_count)} 根骨骼: {path} ({size} bytes)"
+                )
+
+        if source_path == dest_path:
+            _validate(source_path)
+            return
+
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(dest_path)}.",
+            suffix=".tmp",
+            dir=os.path.dirname(dest_path),
+        )
+        os.close(fd)
+        try:
+            shutil.copy2(source_path, temp_path)
+            _validate(temp_path)
+            os.replace(temp_path, dest_path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+    @staticmethod
     def resolve_frame_analysis_dir(workspace_root: str) -> str:
         """定位 FrameAnalysis 目录（多候选回退）。
 
@@ -2341,7 +2863,11 @@ class EFMISkeletonMergeHelper:
                 for unique_str in group_list:
                     json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
                     if not json_path:
-                        continue
+                        # 任一输入子网格 json 缺失都必须使联合缓存失效：
+                        # 缺失者会被跳过重建，其余子网格若仍幂等跳过，
+                        # 两侧槽位口径将不一致。
+                        joint_cache_ready = False
+                        break
                     try:
                         payload = JsonUtils.LoadFromFile(json_path)
                     except Exception:
@@ -2350,19 +2876,19 @@ class EFMISkeletonMergeHelper:
                     if not isinstance(payload, dict):
                         joint_cache_ready = False
                         break
+                    if not cls._efmi_cache_intact(payload, json_path, unique_str):
+                        joint_cache_ready = False
+                        break
                     try:
-                        cache_version = int(payload.get("VGMapAlgorithmVersion", 0) or 0)
+                        lod_layout_version = int(
+                            payload.get("EFMILODLayoutVersion", 0) or 0
+                        )
                     except (TypeError, ValueError):
-                        cache_version = 0
-                    if not (
-                        payload.get("VGMap")
-                        and cache_version == _VG_MAP_ALGORITHM_VERSION
-                        and payload.get("VGMapDedupEnabled") == bool(_DEDUP_ENABLED)
-                        and int(payload.get("EFMILODLayoutVersion", 0) or 0)
-                        == _CROSS_LOD_LAYOUT_VERSION
-                        and bool(payload.get("EFMILODProjection", False))
-                        == lod_group_projection
-                    ):
+                        lod_layout_version = 0
+                    if lod_layout_version != _CROSS_LOD_LAYOUT_VERSION:
+                        joint_cache_ready = False
+                        break
+                    if bool(payload.get("EFMILODProjection", False)) != lod_group_projection:
                         joint_cache_ready = False
                         break
                 if not joint_cache_ready:
@@ -2372,7 +2898,6 @@ class EFMISkeletonMergeHelper:
 
             collected_by_lod = {}
             group_meta_by_lod = {}
-            group_skipped_by_lod = {}
             for lod_name in sorted(groups.keys()):
                 group_list = groups[lod_name]
                 frame_analysis_dir = lod_map.get(lod_name) or default_dir
@@ -2384,7 +2909,6 @@ class EFMISkeletonMergeHelper:
                     )
                     collected_by_lod[lod_name] = {}
                     group_meta_by_lod[lod_name] = {}
-                    group_skipped_by_lod[lod_name] = 0
                     continue
                 log_path = os.path.join(frame_analysis_dir, "log.txt")
                 if not os.path.isfile(log_path):
@@ -2393,10 +2917,9 @@ class EFMISkeletonMergeHelper:
                     )
                     collected_by_lod[lod_name] = {}
                     group_meta_by_lod[lod_name] = {}
-                    group_skipped_by_lod[lod_name] = 0
                     continue
                 parser = EFMILogParser(log_path)
-                collected, metadata, skipped = cls._ensure_skeleton_data_for_group(
+                collected, metadata, _skipped = cls._ensure_skeleton_data_for_group(
                     workspace_root=workspace_root,
                     unique_str_list=group_list,
                     parser=parser,
@@ -2405,7 +2928,6 @@ class EFMISkeletonMergeHelper:
                 )
                 collected_by_lod[lod_name] = collected
                 group_meta_by_lod[lod_name] = metadata
-                group_skipped_by_lod[lod_name] = skipped
 
             correspondence = EFMIBoneMapBuilder.build_cross_lod_correspondence(
                 collected_by_lod,
@@ -2474,6 +2996,11 @@ class EFMISkeletonMergeHelper:
                 if not frame_analysis_dir or not os.path.isfile(
                     os.path.join(frame_analysis_dir, "log.txt")
                 ):
+                    # 不可用的 LOD 必须显式进入结果，不能静默 continue——
+                    # 否则外层会把部分完成误判为全部完成。
+                    group_results.append(
+                        f"{label}: FrameAnalysis 不可用，{len(group_list)} 个目标未生成骨骼数据"
+                    )
                     continue
                 parser = EFMILogParser(os.path.join(frame_analysis_dir, "log.txt"))
                 written, skipped, message = cls._ensure_skeleton_data_for_group(
@@ -2489,12 +3016,16 @@ class EFMISkeletonMergeHelper:
                 total_skipped += skipped
                 group_results.append(f"{label}: {message}")
 
-            if total_written == 0 and total_skipped == 0:
+            expected_targets = len(set(unique_str_list))
+            processed = total_written + total_skipped
+            if processed == 0:
+                if group_results:
+                    return False, "没有子网格成功生成骨骼数据（" + "；".join(group_results) + "）"
                 return False, "没有子网格成功生成骨骼数据。"
-            return (
-                total_written > 0 or total_skipped > 0,
-                "；".join(group_results),
-            )
+            message = "；".join(group_results)
+            if processed < expected_targets:
+                message += f"；共 {expected_targets - processed} 个目标未生成骨骼数据"
+            return processed == expected_targets, message
 
         group_results: list[str] = []
         total_written = 0
@@ -2508,11 +3039,17 @@ class EFMISkeletonMergeHelper:
                     f"[EFMI骨骼合并] {label}: 无 FrameAnalysis 目录，"
                     f"跳过 {len(group_list)} 个子网格"
                 )
+                group_results.append(
+                    f"{label}: FrameAnalysis 不可用，{len(group_list)} 个目标未生成骨骼数据"
+                )
                 continue
             log_path = os.path.join(frame_analysis_dir, "log.txt")
             if not os.path.isfile(log_path):
                 print(
                     f"[EFMI骨骼合并] {label}: FrameAnalysis 缺少 log.txt: {log_path}"
+                )
+                group_results.append(
+                    f"{label}: FrameAnalysis 缺少 log.txt，{len(group_list)} 个目标未生成骨骼数据"
                 )
                 continue
             parser = EFMILogParser(log_path)
@@ -2526,10 +3063,17 @@ class EFMISkeletonMergeHelper:
             total_skipped += skipped
             group_results.append(f"{label}: {message}")
 
-        if total_written == 0 and total_skipped == 0:
+        expected_targets = len(set(unique_str_list))
+        processed = total_written + total_skipped
+        if processed == 0:
+            if group_results:
+                return False, "没有子网格成功生成骨骼数据（" + "；".join(group_results) + "）"
             return False, "没有子网格成功生成骨骼数据。"
-        # 全部命中缓存（无新写入）也视为成功，与旧版单组语义一致
-        return (total_written > 0 or total_skipped > 0), "；".join(group_results)
+        message = "；".join(group_results)
+        if processed < expected_targets:
+            message += f"；共 {expected_targets - processed} 个目标未生成骨骼数据"
+        # 全部命中缓存（无新写入）也视为成功；但只要存在未处理目标就必须失败
+        return processed == expected_targets, message
 
     @classmethod
     def _ensure_skeleton_data_for_group(
@@ -2559,7 +3103,46 @@ class EFMISkeletonMergeHelper:
         submesh_meta: dict[str, dict] = {}
         skipped = 0
 
+        # 幂等门控（整组原子语义）：单 LOD 组内所有子网格共享同一次 build_vg_maps
+        # 分配的全局槽位，绝不允许“部分子网格用缓存、部分子网格重算”——重算的
+        # 子网格会从槽位 0 重新编号，与缓存子网格的 VGOffset 碰撞（实测复现：
+        # A VGOffset=0、B VGOffset=1，仅 B 失效后 B 被单独重算成 VGOffset=0）。
+        # 因此：全部缓存完整才整批跳过；任一子网格缓存失效则整组全部重算。
+        resolved_cache: dict[str, bool] = {}
         for unique_str in unique_str_list:
+            json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+            if not json_path:
+                # 目标无法定位必须记为缓存失效：否则"全部已缓存"的批跳过
+                # 会把该目标静默遗漏、误报整组缓存完整。
+                resolved_cache[unique_str] = False
+                continue
+            try:
+                cached_json = JsonUtils.LoadFromFile(json_path)
+            except Exception:
+                resolved_cache[unique_str] = False
+                continue
+            if not isinstance(cached_json, dict):
+                resolved_cache[unique_str] = False
+                continue
+            resolved_cache[unique_str] = cls._efmi_cache_intact(
+                cached_json, json_path, unique_str
+            )
+        if (
+            not force
+            and not collect_only
+            and resolved_cache
+            and all(resolved_cache.values())
+        ):
+            skipped = len(resolved_cache)
+            return 0, skipped, (
+                f"全部 {skipped} 个子网格已有骨骼合并缓存（VGMap），无需重新生成。"
+            )
+
+        seen_targets: set[str] = set()
+        for unique_str in unique_str_list:
+            if unique_str in seen_targets:
+                continue
+            seen_targets.add(unique_str)
             json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
             if not json_path:
                 print(f"[EFMI骨骼合并] 跳过 {unique_str}: 未找到子网格 json")
@@ -2569,25 +3152,13 @@ class EFMISkeletonMergeHelper:
             if not isinstance(submesh_json, dict):
                 continue
 
-            # 幂等：只有当前算法版本的 VGMap 才能跳过。旧版缓存没有扩散
-            # 判据，自动失效并重算，避免用户必须先手动清缓存才能看到修复。
-            existing_vg_map = submesh_json.get("VGMap")
-            if existing_vg_map and not force:
-                try:
-                    cache_version = int(submesh_json.get("VGMapAlgorithmVersion", 0) or 0)
-                except (TypeError, ValueError):
-                    cache_version = 0
-                cache_dedup_enabled = submesh_json.get("VGMapDedupEnabled")
-                if (
-                    cache_version == _VG_MAP_ALGORITHM_VERSION
-                    and isinstance(cache_dedup_enabled, bool)
-                    and cache_dedup_enabled == bool(_DEDUP_ENABLED)
-                ):
-                    skipped += 1
-                    continue
+            # 整组原子语义下这里不再单独跳过：组内任一子网格缓存失效时
+            # 全组重算（见上方门控注释）。存在旧缓存但失效的子网格打印原因，
+            # 方便排查（版本过期 / schema 缺字段 / BoneMatrix 文件缺失等）。
+            if submesh_json.get("VGMap"):
                 print(
-                    f"[EFMI骨骼合并] {unique_str}: VGMap 缓存版本 {cache_version} 已失效，"
-                    f"按算法版本 {_VG_MAP_ALGORITHM_VERSION} 重算"
+                    f"[EFMI骨骼合并] {unique_str}: VGMap 缓存不完整或版本失效，"
+                    f"按算法版本 {_VG_MAP_ALGORITHM_VERSION} 整组重算"
                 )
 
             element_info = cls.parse_blend_element_info(submesh_json)
@@ -2632,36 +3203,53 @@ class EFMISkeletonMergeHelper:
                 print(f"[EFMI骨骼合并] 跳过 {unique_str}: 未找到 drawcall 映射")
                 continue
 
-            # 取第一个有有效骨骼数据的 drawcall
+            # 取第一个有有效骨骼数据的 drawcall，并记录实际成功的 draw_index。
+            # 后备 drawcall 成功后元数据仍必须指向它——骨骼池复制（vs-t0）按
+            # draw_index 反查，指向第一个失败的候选会拿到错误骨骼池或根本没有。
             skeleton_buffer = None
+            skeleton_draw_index = None
             for draw_index in drawcall_index_list:
-                skeleton_buffer = EFMIBoneMapBuilder(parser).get_skeleton_buffer(draw_index)
-                if skeleton_buffer is not None:
+                candidate_buffer = EFMIBoneMapBuilder(parser).get_skeleton_buffer(draw_index)
+                if candidate_buffer is not None:
+                    skeleton_buffer = candidate_buffer
+                    skeleton_draw_index = draw_index
                     break
 
-            if skeleton_buffer is None:
+            if skeleton_buffer is None or skeleton_draw_index is None:
                 print(f"[EFMI骨骼合并] 跳过 {unique_str}: 无法从 FrameAnalysis 读取骨骼数据")
                 continue
 
             try:
                 blend_indices = EFMIBoneMapBuilder.parse_blendindices_from_buf(blend_buf_path, element_info)
+                blend_layout = EFMIBoneMapBuilder.parse_blend_layout(submesh_json)
+                blend_weights = EFMIBoneMapBuilder.parse_blendweights_from_buf(
+                    blend_buf_path, blend_layout
+                )
             except Exception as e:
                 print(f"[EFMI骨骼合并] 跳过 {unique_str}: 读取 Blend.buf 失败: {e}")
                 continue
 
-            local_indices = blend_indices.ravel()
-            valid_indices = local_indices[local_indices != 0xFFFF]
+            # vg_count 复用与 ZZMI 相同的有效通道判定（按数据格式排除哨兵 +
+            # 正权重过滤）：u1 的 0xFF / u2 的 0xFFFF / u4|i4 的 0xFFFFFFFF
+            # 都不再被算成真实骨骼。
+            valid_mask = EFMIBoneMapBuilder.valid_blend_channels(
+                blend_indices, element_info, blend_weights
+            )
+            valid_indices = blend_indices[valid_mask].astype(numpy.int64)
             if len(valid_indices) == 0:
-                print(f"[EFMI骨骼合并] 跳过 {unique_str}: BLENDINDICES 全为空")
+                print(f"[EFMI骨骼合并] 跳过 {unique_str}: BLENDINDICES 无有效通道")
                 continue
             vg_count = int(valid_indices.max()) + 1
-            weighted_vertex_counts = numpy.bincount(valid_indices, minlength=vg_count)
 
+            # 先与骨骼段长度比对，再 bincount——bincount 的 minlength=vg_count
+            # 会按 vg_count 分配内存，损坏数据（如未被哨兵覆盖的巨值索引）
+            # 必须在这里被骨骼段上限拦截，否则可能尝试分配数十 GB。
             if len(skeleton_buffer) < vg_count:
                 print(
                     f"[EFMI骨骼合并] 跳过 {unique_str}: 骨骼段 {len(skeleton_buffer)} < 顶点组 {vg_count}"
                 )
                 continue
+            weighted_vertex_counts = numpy.bincount(valid_indices, minlength=vg_count)
 
             # 权重扩散去重签名（读 Position.buf + Blend.buf 计算每骨骼的
             # 正权重采样场；质心/包围盒仅作回退与剪枝）
@@ -2679,7 +3267,9 @@ class EFMISkeletonMergeHelper:
                 "json_path": json_path,
                 "submesh_dir": submesh_dir,
                 "bare_name": bare_name,
-                "draw_index": drawcall_index_list[0],
+                # 实际成功读到骨骼数据的 draw_index（后备 drawcall 成功时
+                # 绝不能回落到 drawcall_index_list[0] 的失败候选）
+                "draw_index": skeleton_draw_index,
             }
 
         if collect_only:
@@ -2687,8 +3277,6 @@ class EFMISkeletonMergeHelper:
             return submesh_skeletons, submesh_meta, skipped
 
         if not submesh_skeletons:
-            if skipped > 0:
-                return 0, skipped, f"全部 {skipped} 个子网格已有骨骼合并缓存（VGMap），无需重新生成。"
             return 0, 0, "没有子网格成功生成骨骼数据。"
 
         # 组内跨子网格去重构建 vg_map（组内从 0 起分配槽位，与其它 LOD 组互不影响）。
@@ -2706,6 +3294,7 @@ class EFMISkeletonMergeHelper:
 
         # 写回工作空间 json + 复制骨骼池缓存
         written = 0
+        written_targets: set[str] = set()
         for unique_str, entry in submesh_skeletons.items():
             skeleton_buffer = entry[0]
             vg_count = entry[1]
@@ -2789,30 +3378,114 @@ class EFMISkeletonMergeHelper:
                 ) if current_lod != reference_lod else 0
                 submesh_json["EFMILODCorrespondence"] = correspondence_rows
 
-            # 复制骨骼池 buffer 到 ModImpRuntime 缓存（复用 NTEMI 缓存模式）
+            # 缓存发布与 JSON 写回属于同一事务；发布失败的目标不得计入 written。
             try:
                 pool_path = cls._resolve_skeleton_pool_path(parser, meta["draw_index"])
-                if pool_path:
-                    runtime_dir = os.path.join(meta["submesh_dir"], "ModImpRuntime")
-                    os.makedirs(runtime_dir, exist_ok=True)
-                    dest_name = f"{meta['bare_name']}-BoneMatrix.buf"
-                    dest_path = os.path.join(runtime_dir, dest_name)
-                    if not os.path.isfile(dest_path) or force:
-                        shutil.copy2(pool_path, dest_path)
-                    submesh_json["BoneMatrixFileName"] = dest_name
+                if not pool_path:
+                    raise FileNotFoundError(
+                        f"draw {meta['draw_index']} 未解析到骨骼池 buffer"
+                    )
+                runtime_dir = os.path.join(meta["submesh_dir"], "ModImpRuntime")
+                dest_name = f"{meta['bare_name']}-BoneMatrix.buf"
+                dest_path = os.path.join(runtime_dir, dest_name)
+                cls._atomic_publish_cache(
+                    pool_path,
+                    dest_path,
+                    vg_count=vg_count,
+                )
+                submesh_json["BoneMatrixFileName"] = dest_name
             except Exception as e:
                 print(f"[EFMI骨骼合并] 复制骨骼池缓存失败 {unique_str}: {e}")
+                continue
 
             try:
                 JsonUtils.SaveToFile(json_dict=submesh_json, filepath=json_path)
                 written += 1
+                written_targets.add(unique_str)
             except Exception as e:
                 print(f"[EFMI骨骼合并] 写回 json 失败 {unique_str}: {e}")
 
-        return written, skipped, (
-            f"已为 {written} 个子网格生成骨骼合并数据"
-            + (f"（跳过已缓存 {skipped} 个）" if skipped else "")
-        )
+        # 完整性：written + skipped 必须覆盖全部请求目标；重建过程中任何
+        # 读取失败/生成失败的目标都会让 unprocessed > 0，由外层据此判定失败。
+        unprocessed_targets = sorted(set(unique_str_list) - written_targets)
+        unprocessed_count = len(unprocessed_targets)
+        message = f"已为 {written} 个子网格生成骨骼合并数据"
+        if skipped:
+            message += f"（跳过已缓存 {skipped} 个）"
+        if unprocessed_count > 0:
+            shown = unprocessed_targets[:5]
+            suffix = "…" if len(unprocessed_targets) > 5 else ""
+            message += (
+                f"；{unprocessed_count} 个目标未生成骨骼数据: "
+                f"{'、'.join(shown)}{suffix}"
+            )
+        return written, skipped, message
+
+    @staticmethod
+    def _runtime_cache_path(submesh_json: dict, json_path: str, unique_str: str) -> str:
+        """解析子网格 json 的 BoneMatrixFileName 指向的实际缓存路径。
+
+        只接受纯文件名（拒绝路径穿越）；指向 ModImpRuntime 下的文件。
+        返回路径字符串（文件可能不存在，由调用方 isfile 校验）。
+        """
+        file_name = str(submesh_json.get("BoneMatrixFileName", "") or "").strip()
+        if not file_name or os.path.basename(file_name) != file_name:
+            bare_name = unique_str.split(".", 1)[-1]
+            file_name = f"{bare_name}-BoneMatrix.buf"
+        submesh_dir = os.path.dirname(os.path.dirname(json_path))
+        return os.path.join(submesh_dir, "ModImpRuntime", file_name)
+
+    @classmethod
+    def _efmi_cache_intact(cls, submesh_json: dict, json_path: str, unique_str: str) -> bool:
+        """EFMI 缓存快路径完整性校验（版本 + schema + 映射覆盖 + 骨骼缓存文件）。
+
+        与 ZZMI 的 _zzmi_cache_intact 同构：任何一项缺失都判定缓存不完整，
+        整批重建——骨骼池复制失败 / 工作空间搬迁漏掉 ModImpRuntime / 旧算法
+        缓存都不允许带着半成品 VGMap 永久幂等跳过。校验项：
+        - VGMapAlgorithmVersion == 当前算法版本、VGMapDedupEnabled == 全局开关；
+        - VGCount/VGOffset 存在且非负；
+        - VGMap 非空、键为 0..VGCount-1 的子集且槽位非负（EFMI 会跳过全零
+          矩阵骨骼，因此键可以合法地不满集，但不能越界）；
+        - BoneMatrixFileName 指向的 ModImpRuntime 文件存在且大小
+          >= VGCount * 48 字节（每骨骼 4x3 float32）。
+        """
+        try:
+            cache_version = int(submesh_json.get("VGMapAlgorithmVersion", 0) or 0)
+        except (TypeError, ValueError):
+            cache_version = 0
+        if cache_version != _VG_MAP_ALGORITHM_VERSION:
+            return False
+        cache_dedup_enabled = submesh_json.get("VGMapDedupEnabled")
+        if not isinstance(cache_dedup_enabled, bool) or cache_dedup_enabled != bool(_DEDUP_ENABLED):
+            return False
+
+        vg_map = submesh_json.get("VGMap")
+        if not isinstance(vg_map, dict) or not vg_map:
+            return False
+        try:
+            vg_count = int(submesh_json.get("VGCount"))
+            vg_offset = int(submesh_json.get("VGOffset"))
+            mapped = {int(key): int(value) for key, value in vg_map.items()}
+        except (TypeError, ValueError):
+            return False
+        if vg_count <= 0 or vg_offset < 0:
+            return False
+        # EFMI 的 build_vg_maps 会跳过全零矩阵骨骼（零矩阵不参与候选），
+        # 因此合法缓存的 VGMap 键可以是 0..VGCount-1 的子集，但不能越界、
+        # 不能为空、槽位必须非负。
+        if not mapped or len(mapped) > vg_count:
+            return False
+        if not set(mapped.keys()) <= set(range(vg_count)):
+            return False
+        if any(slot < 0 for slot in mapped.values()):
+            return False
+
+        cache_path = cls._runtime_cache_path(submesh_json, json_path, unique_str)
+        if not os.path.isfile(cache_path):
+            return False
+        if not EFMIBoneMapBuilder.cache_file_size_ok(cache_path, vg_count):
+            return False
+        return True
 
     @classmethod
     def clear_vgmap_cache(cls, workspace_root: str) -> tuple[int, int]:

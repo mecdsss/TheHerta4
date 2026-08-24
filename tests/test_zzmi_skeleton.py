@@ -14,6 +14,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy
@@ -301,6 +302,7 @@ class TestZZMISkeletonMergeHelper(unittest.TestCase):
                 changed = False
                 for field in (
                     "VGMap", "VGOffset", "VGCount", "BoneMatrixFileName",
+                    "VGMapAlgorithmVersion", "ObjectCB1FileName",
                     "SkeletonGroupCb1SourceIb", "DeformDrawIndex", "OriginalVertexCount",
                 ):
                     if field in payload:
@@ -428,6 +430,663 @@ class TestZZMISkeletonMergeHelper(unittest.TestCase):
         )
         self.assertTrue(ok, message)
         self.assertIn("15 个子网格", message)
+
+
+class TestBlendChannelValidation(unittest.TestCase):
+    """P2 回归：BLENDINDICES 无效通道（哨兵/零权重）不能算成真实骨骼。"""
+
+    @staticmethod
+    def _info(np_type):
+        return {"np_type": np_type}
+
+    def test_u2_sentinel_excluded_even_with_positive_weight(self):
+        indices = numpy.array([[0, 1, 0xFFFF, 2]], dtype=numpy.uint32)
+        weights = numpy.array([[1.0, 1.0, 1.0, 1.0]], dtype=numpy.float32)
+        mask = EFMIBoneMapBuilder.valid_blend_channels(indices, self._info("u2"), weights)
+        self.assertEqual(mask.tolist(), [[True, True, False, True]])
+
+    def test_i4_sentinel_wraps_to_ffffffff(self):
+        raw = numpy.array([-1], dtype=numpy.int32)
+        indices = raw.astype(numpy.uint32).reshape(1, 1)
+        weights = numpy.array([[1.0]], dtype=numpy.float32)
+        mask = EFMIBoneMapBuilder.valid_blend_channels(indices, self._info("i4"), weights)
+        self.assertFalse(bool(mask[0, 0]))
+
+    def test_u4_sentinel_excluded(self):
+        indices = numpy.array([[7, 0xFFFFFFFF]], dtype=numpy.uint32)
+        weights = numpy.array([[1.0, 1.0]], dtype=numpy.float32)
+        mask = EFMIBoneMapBuilder.valid_blend_channels(indices, self._info("u4"), weights)
+        self.assertEqual(mask.tolist(), [[True, False]])
+
+    def test_zero_weight_channel_excluded(self):
+        indices = numpy.array([[0, 9, 3, 1]], dtype=numpy.uint32)
+        weights = numpy.array([[0.5, 0.0, 0.3, 0.2]], dtype=numpy.float32)
+        mask = EFMIBoneMapBuilder.valid_blend_channels(indices, self._info("u1"), weights)
+        self.assertEqual(mask.tolist(), [[True, False, True, True]])
+
+    def test_missing_weights_defaults_to_first_channel_only(self):
+        indices = numpy.array([[0, 9, 3, 1]], dtype=numpy.uint32)
+        mask = EFMIBoneMapBuilder.valid_blend_channels(indices, self._info("u1"), None)
+        self.assertEqual(mask.tolist(), [[True, False, False, False]])
+
+    def test_parse_blend_layout_and_weights_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = Path(tmp) / "sub.json"
+            buf_path = Path(tmp) / "sub-Blend.buf"
+            json_path.write_text(json.dumps({
+                "CategoryBufferList": [{"D3D11ElementList": [
+                    {"Category": "Blend", "SemanticName": "BLENDINDICES",
+                     "Format": "R16G16_UINT", "ByteWidth": 4},
+                    {"Category": "Blend", "SemanticName": "BLENDWEIGHTS",
+                     "Format": "R32G32B32A32_FLOAT", "ByteWidth": 16},
+                ]}],
+            }), encoding="utf-8")
+            layout = EFMIBoneMapBuilder.parse_blend_layout(
+                json.loads(json_path.read_text(encoding="utf-8"))
+            )
+            self.assertEqual(layout["bi_np"], "u2")
+            self.assertEqual(layout["bi_channels"], 2)
+            self.assertEqual(layout["bw_np"], "f4")
+            self.assertEqual(layout["stride"], 20)
+            rows = numpy.zeros((3, 5), dtype=numpy.float32)  # 20 字节/行
+            # 索引占前 4 字节（float0），权重从 float1 开始
+            rows[:, 1] = [0.25, 0.5, 1.0]
+            buf_path.write_bytes(rows.astype(numpy.float32).tobytes())
+            weights = EFMIBoneMapBuilder.parse_blendweights_from_buf(str(buf_path), layout)
+            self.assertEqual(weights.shape, (3, 4))
+            self.assertAlmostEqual(float(weights[1, 0]), 0.5, places=6)
+
+
+class SyntheticZZMIR16SentinelTests(unittest.TestCase):
+    """P2 回归：R16_UINT 的 0xFFFF 哨兵通道不膨胀 vg_count、不整部件跳过。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zzmi_r16_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        root = Path(self.tmp)
+        dump = root / "dump"
+        (dump / "deduped").mkdir(parents=True, exist_ok=True)
+        deduped_abs = (dump / "deduped").resolve()
+
+        palette = numpy.zeros((3, 12), dtype=numpy.float32)
+        palette[:, 0] = [1.0, 2.0, 3.0]
+        palette_name = "000001-vs-t0=cccccccc.buf"
+        (dump / "deduped" / palette_name).write_bytes(palette.tobytes())
+        log_lines = [
+            "000001 IASetVertexBuffers(StartSlot:0, NumBuffers:3,",
+            "0: resource=0x00000000 hash=aaaaaaaa",
+            "000001 SOSetTargets(NumBuffers:1,",
+            "0: resource=0x00000000 hash=bbbbbbbb",
+            "000001 VSSetShaderResources(StartSlot:0, NumViews:1,",
+            "0: view=0x00000000 resource=0x00000000 hash=cccccccc",
+            "000001 Draw(VertexCount:4, StartVertexLocation:0)",
+            f"000001 3DMigoto Dumping Buffer {palette_name} -> {deduped_abs / palette_name}",
+        ]
+        (dump / "log.txt").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+
+        self.ws = root / "ws"
+        (self.ws / "Config").mkdir(parents=True, exist_ok=True)
+        (self.ws / "Config" / "FrameAnalysisPath.json").write_text(
+            json.dumps({"frameAnalysisFolderPath": str(dump)}), encoding="utf-8"
+        )
+        bare = "eeeeffff-100-0"
+        gametype = "GPU_P12_"
+        type_dir = self.ws / "LOD0" / bare / ("TYPE_" + gametype)
+        type_dir.mkdir(parents=True, exist_ok=True)
+        (type_dir / f"{bare}.json").write_text(json.dumps({
+            "CategoryHash": {"Position": "aaaaaaaa"},
+            "CategoryBufferList": [{"D3D11ElementList": [
+                {"Category": "Blend", "SemanticName": "BLENDINDICES",
+                 "Format": "R16_UINT", "ByteWidth": 2},
+            ]}],
+        }), encoding="utf-8")
+        # R16_UINT 单通道：第 3 个顶点是 0xFFFF 哨兵（无权重通道的标准填充值）
+        indices = numpy.array([0, 1, 0xFFFF, 2], dtype=numpy.uint16)
+        (type_dir / f"{bare}-Blend.buf").write_bytes(indices.tobytes())
+        (self.ws / "Import.json").write_text(
+            json.dumps({f"LOD0.{bare}": gametype}), encoding="utf-8"
+        )
+        self.unique = f"LOD0.{bare}"
+
+    def test_ensure_skeleton_data_ignores_r16_sentinel(self):
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=[self.unique]
+        )
+        self.assertTrue(ok, message)
+
+        json_path = (
+            self.ws / "LOD0" / "eeeeffff-100-0" / "TYPE_GPU_P12_" / "eeeeffff-100-0.json"
+        )
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload.get("VGCount"), 3, "0xFFFF 哨兵不能算成真实骨骼")
+        self.assertEqual(len(payload.get("VGMap", {})), 3)
+        # 缓存与 VGCount 一致（3 根骨骼）
+        cache_path = (
+            self.ws / "LOD0" / "eeeeffff-100-0" / "ModImpRuntime"
+            / "eeeeffff-100-0-BoneMatrix.buf"
+        )
+        self.assertTrue(cache_path.is_file())
+        cached_palette = ZZMIBoneMapBuilder.load_palette(str(cache_path))
+        self.assertEqual(len(cached_palette), 3)
+
+
+class MovedDumpDedupedFallbackTests(unittest.TestCase):
+    """P2 回归：FrameAnalysis 搬走后 deduped 文件按候选路径恢复。"""
+
+    def test_get_deduped_path_falls_back_to_current_dump_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dump = root / "dump"
+            (dump / "deduped").mkdir(parents=True)
+            stale = root / "old-dump" / "deduped" / "e018278f.buf"  # 记录路径已失效
+            real = dump / "deduped" / "e018278f.buf"
+            real.write_bytes(b"palette")
+            log = dump / "log.txt"
+            log.write_text(
+                f"000002 3DMigoto Dumping Buffer 000002-vs-t0=c2f5419a.buf -> {stale}\n",
+                encoding="utf-8",
+            )
+
+            parser = ZZMILogParser(str(log))
+
+            self.assertEqual(parser.get_deduped_path("000002-vs-t0=c2f5419a"), str(real))
+
+    def test_get_render_cb1_path_resolves_moved_dump(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dump = root / "dump"
+            (dump / "deduped").mkdir(parents=True)
+            stale = root / "old-dump" / "deduped" / "shared_cb1.buf"
+            real = dump / "deduped" / "shared_cb1.buf"
+            real.write_bytes(b"cb1")
+            log = dump / "log.txt"
+            log.write_text(
+                "000010 3DMigoto Dumping Buffer "
+                f"000010-vs-cb1=77777777-vs=aaaaaaaaaaaaaaaa.buf -> {stale}\n",
+                encoding="utf-8",
+            )
+
+            parser = ZZMILogParser(str(log))
+
+            self.assertEqual(parser.get_render_cb1_path("000010"), str(real))
+
+
+def _make_zzmi_dump_and_workspace(root: Path):
+    """构造最小 ZZMI dump + 工作空间：两个部件共享同一对象变换 CB。
+
+    返回 (dump_dir, workspace_dir, unique_strs)。
+    """
+    dump = root / "dump"
+    (dump / "deduped").mkdir(parents=True, exist_ok=True)
+    deduped_abs = (dump / "deduped").resolve()
+
+    # 两个部件各自的 deform pass（palette 各 1 根骨骼）
+    parts = [
+        ("000001", "11111111", "22222222", "33333333", "pal1.buf"),
+        ("000002", "44444444", "55555555", "66666666", "pal2.buf"),
+    ]
+    for draw_index, vb0, so, t0, pal_file in parts:
+        palette = numpy.zeros((1, 12), dtype=numpy.float32)
+        palette[0, 0] = 1.0
+        (dump / "deduped" / pal_file).write_bytes(palette.tobytes())
+
+    # 共享对象变换 CB（identity，64 字节 <= 512 逐部件块上限）
+    cb = numpy.zeros((16,), dtype=numpy.float32)
+    cb[[0, 5, 10, 15]] = 1.0
+    (dump / "deduped" / "shared_cb1.buf").write_bytes(cb.tobytes())
+
+    lines = []
+    for draw_index, vb0, so, t0, pal_file in parts:
+        lines += [
+            f"{draw_index} IASetVertexBuffers(StartSlot:0, NumBuffers:3,",
+            f"0: resource=0x00000000 hash={vb0}",
+            f"{draw_index} SOSetTargets(NumBuffers:1,",
+            f"0: resource=0x00000000 hash={so}",
+            f"{draw_index} VSSetShaderResources(StartSlot:0, NumViews:1,",
+            f"0: view=0x00000000 resource=0x00000000 hash={t0}",
+            f"{draw_index} Draw(VertexCount:1, StartVertexLocation:0)",
+            f"{draw_index} 3DMigoto Dumping Buffer {draw_index}-vs-t0={t0}.buf "
+            f"-> {deduped_abs / pal_file}",
+        ]
+    for render_draw in ("000010", "000020"):
+        lines += [
+            f"{render_draw} DrawIndexedInstanced(IndexCountPerInstance:3, InstanceCount:1, "
+            "StartIndexLocation:0, BaseVertexLocation:0, StartInstanceLocation:0)",
+            f"{render_draw} 3DMigoto Dumping Buffer "
+            f"{render_draw}-vs-cb1=77777777-vs=aaaaaaaaaaaaaaaa.buf "
+            f"-> {deduped_abs / 'shared_cb1.buf'}",
+        ]
+    (dump / "log.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    ws = root / "ws"
+    (ws / "Config").mkdir(parents=True, exist_ok=True)
+    (ws / "Config" / "FrameAnalysisPath.json").write_text(
+        json.dumps({"frameAnalysisFolderPath": str(dump)}), encoding="utf-8"
+    )
+    gametype = "GPU_P12_"
+    unique_strs = []
+    component_map = {}
+    import_map = {}
+    for bare, position_hash, render_draw in (
+        ("aaaa1111-100-0", "11111111", "000010"),
+        ("bbbb2222-200-0", "44444444", "000020"),
+    ):
+        type_dir = ws / "LOD0" / bare / ("TYPE_" + gametype)
+        type_dir.mkdir(parents=True, exist_ok=True)
+        (type_dir / f"{bare}.json").write_text(json.dumps({
+            "CategoryHash": {"Position": position_hash},
+            "CategoryBufferList": [{"D3D11ElementList": [
+                {"Category": "Blend", "SemanticName": "BLENDINDICES",
+                 "Format": "R32_UINT", "ByteWidth": 4},
+            ]}],
+        }), encoding="utf-8")
+        indices = numpy.array([0], dtype=numpy.uint32)
+        (type_dir / f"{bare}-Blend.buf").write_bytes(indices.tobytes())
+        component_map[bare] = [render_draw]
+        unique_str = f"LOD0.{bare}"
+        unique_strs.append(unique_str)
+        import_map[unique_str] = gametype
+    (ws / "Import.json").write_text(json.dumps(import_map), encoding="utf-8")
+    (ws / "LOD0" / "ComponentName_DrawCallIndexList.json").write_text(
+        json.dumps(component_map), encoding="utf-8"
+    )
+    return dump, ws, unique_strs
+
+
+def _read_zzmi_json(ws: Path, bare: str) -> dict:
+    for type_dir in (ws / "LOD0" / bare).iterdir():
+        if type_dir.is_dir() and type_dir.name.startswith("TYPE_"):
+            return json.loads((type_dir / f"{bare}.json").read_text(encoding="utf-8"))
+    raise AssertionError(f"未找到 {bare} 的子网格 json")
+
+
+def _write_zzmi_json(ws: Path, bare: str, payload: dict):
+    for type_dir in (ws / "LOD0" / bare).iterdir():
+        if type_dir.is_dir() and type_dir.name.startswith("TYPE_"):
+            (type_dir / f"{bare}.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            return
+    raise AssertionError(f"未找到 {bare} 的子网格 json")
+
+
+class ZZMIWorkspaceCacheOnlyTests(unittest.TestCase):
+    """P2 回归：FrameAnalysis 被搬走/删除后，仍能靠工作空间缓存正常重建。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zzmi_cache_only_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        root = Path(self.tmp)
+        self.dump, self.ws, self.unique_strs = _make_zzmi_dump_and_workspace(root)
+
+    def test_dump_moved_rebuilds_via_deduped_fallback(self):
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        before = {
+            bare: _read_zzmi_json(self.ws, bare)
+            for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+        }
+        self.assertEqual(before["aaaa1111-100-0"]["SkeletonGroup"],
+                         before["bbbb2222-200-0"]["SkeletonGroup"])
+
+        # 把 dump 整个搬到新位置：log 里记录的绝对路径全部失效，
+        # 必须靠「当前 dump 目录 deduped/<basename>」候选路径恢复。
+        moved = Path(self.tmp) / "moved-dump"
+        shutil.move(str(self.dump), str(moved))
+        (self.ws / "Config" / "FrameAnalysisPath.json").write_text(
+            json.dumps({"frameAnalysisFolderPath": str(moved)}), encoding="utf-8"
+        )
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs, force=True
+        )
+        self.assertTrue(ok2, message2)
+        after = {
+            bare: _read_zzmi_json(self.ws, bare)
+            for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+        }
+        self.assertEqual(after["aaaa1111-100-0"]["VGMap"], before["aaaa1111-100-0"]["VGMap"])
+        self.assertEqual(after["aaaa1111-100-0"]["SkeletonGroup"],
+                         after["bbbb2222-200-0"]["SkeletonGroup"])
+
+    def test_dump_deleted_rebuilds_from_workspace_cache_only(self):
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        before = {
+            bare: _read_zzmi_json(self.ws, bare)
+            for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+        }
+        self.assertEqual(before["aaaa1111-100-0"]["SkeletonGroup"],
+                         before["bbbb2222-200-0"]["SkeletonGroup"])
+        # 导入完成后所需的 palette / 对象变换 CB 必须已经复制进工作空间
+        for bare in ("aaaa1111-100-0", "bbbb2222-200-0"):
+            runtime = self.ws / "LOD0" / bare / "ModImpRuntime"
+            self.assertTrue((runtime / f"{bare}-BoneMatrix.buf").is_file())
+            self.assertTrue((runtime / f"{bare}-ObjectCB1.buf").is_file())
+
+        # 删除整个 FrameAnalysis dump（用户清理大体积提取文件）
+        shutil.rmtree(self.dump)
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs, force=True
+        )
+        self.assertTrue(ok2, message2)
+        after = {
+            bare: _read_zzmi_json(self.ws, bare)
+            for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+        }
+        # 骨骼数据、分组、时序元数据与 dump 删除前完全一致
+        self.assertEqual(after["aaaa1111-100-0"]["VGMap"], before["aaaa1111-100-0"]["VGMap"])
+        self.assertEqual(after["bbbb2222-200-0"]["VGMap"], before["bbbb2222-200-0"]["VGMap"])
+        self.assertEqual(after["aaaa1111-100-0"]["SkeletonGroup"],
+                         before["aaaa1111-100-0"]["SkeletonGroup"])
+        self.assertEqual(after["aaaa1111-100-0"]["SkeletonGroup"],
+                         after["bbbb2222-200-0"]["SkeletonGroup"])
+        self.assertEqual(after["aaaa1111-100-0"]["DeformDrawIndex"],
+                         before["aaaa1111-100-0"]["DeformDrawIndex"])
+
+        # 缓存完整时（不 force）：dump 已被删除也必须能幂等跳过，绝不触碰 dump
+        ok3, message3 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok3, message3)
+        self.assertIn("幂等跳过", message3)
+
+    def test_cache_incomplete_submesh_not_skipped(self):
+        """P2#6 回归：复制骨骼缓存失败/漏掉 ModImpRuntime 时不得幂等跳过。"""
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+
+        # 模拟工作空间搬迁漏掉 ModImpRuntime（骨骼缓存文件丢失）
+        shutil.rmtree(self.ws / "LOD0" / "aaaa1111-100-0" / "ModImpRuntime")
+
+        # 快路径必须发现缓存产物不完整并整批重建（而不是“幂等跳过”）
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        self.assertIn("个子网格生成", message2)
+        runtime = self.ws / "LOD0" / "aaaa1111-100-0" / "ModImpRuntime"
+        self.assertTrue((runtime / "aaaa1111-100-0-BoneMatrix.buf").is_file())
+
+    def test_missing_vgcount_vgoffset_rebuilds(self):
+        """快路径必须校验 VGCount/VGOffset：缺失时整批重建，不能幂等跳过。"""
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+
+        bare = "aaaa1111-100-0"
+        payload = _read_zzmi_json(self.ws, bare)
+        payload.pop("VGCount", None)
+        payload.pop("VGOffset", None)
+        _write_zzmi_json(self.ws, bare, payload)
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        self.assertIn("个子网格生成", message2)
+        rebuilt = _read_zzmi_json(self.ws, bare)
+        self.assertEqual(rebuilt.get("VGCount"), 1)
+        self.assertGreaterEqual(rebuilt.get("VGOffset", -1), 0)
+
+    def test_vgmap_missing_key_rebuilds(self):
+        """VGMap 键必须完整覆盖 0..VGCount-1：缺键时整批重建。"""
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+
+        bare = "aaaa1111-100-0"
+        payload = _read_zzmi_json(self.ws, bare)
+        del payload["VGMap"]["0"]
+        _write_zzmi_json(self.ws, bare, payload)
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        self.assertIn("个子网格生成", message2)
+        rebuilt = _read_zzmi_json(self.ws, bare)
+        self.assertEqual(set(rebuilt["VGMap"].keys()), {"0"})
+
+    def test_truncated_bone_matrix_file_rebuilt(self):
+        """BoneMatrix 文件存在但被截断（损坏）：快路径判失效并重建恢复。"""
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+
+        bare = "aaaa1111-100-0"
+        cache_path = self.ws / "LOD0" / bare / "ModImpRuntime" / f"{bare}-BoneMatrix.buf"
+        cache_path.write_bytes(b"\x00" * 10)  # 存在但小于 VGCount*48
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        self.assertIn("个子网格生成", message2)
+        self.assertGreaterEqual(cache_path.stat().st_size, 48)
+
+
+class ZZMISiblingCacheTests(unittest.TestCase):
+    """P2 回归：dump 删除后同 DrawIB 代表子网格缓存缺失时，回退兄弟子网格缓存；
+    存在未处理目标时不得报告完整成功。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zzmi_sibling_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        root = Path(self.tmp)
+        self.dump = root / "dump"
+        (self.dump / "deduped").mkdir(parents=True, exist_ok=True)
+        deduped_abs = (self.dump / "deduped").resolve()
+
+        parts = [
+            ("000001", "11111111", "22222222", "33333333", "pal1.buf"),
+            ("000002", "44444444", "55555555", "66666666", "pal2.buf"),
+        ]
+        for draw_index, vb0, so, t0, pal_file in parts:
+            palette = numpy.zeros((1, 12), dtype=numpy.float32)
+            palette[0, 0] = 1.0
+            (self.dump / "deduped" / pal_file).write_bytes(palette.tobytes())
+        cb = numpy.zeros((16,), dtype=numpy.float32)
+        cb[[0, 5, 10, 15]] = 1.0
+        (self.dump / "deduped" / "shared_cb1.buf").write_bytes(cb.tobytes())
+
+        lines = []
+        for draw_index, vb0, so, t0, pal_file in parts:
+            lines += [
+                f"{draw_index} IASetVertexBuffers(StartSlot:0, NumBuffers:3,",
+                f"0: resource=0x00000000 hash={vb0}",
+                f"{draw_index} SOSetTargets(NumBuffers:1,",
+                f"0: resource=0x00000000 hash={so}",
+                f"{draw_index} VSSetShaderResources(StartSlot:0, NumViews:1,",
+                f"0: view=0x00000000 resource=0x00000000 hash={t0}",
+                f"{draw_index} Draw(VertexCount:1, StartVertexLocation:0)",
+                f"{draw_index} 3DMigoto Dumping Buffer {draw_index}-vs-t0={t0}.buf "
+                f"-> {deduped_abs / pal_file}",
+            ]
+        for render_draw in ("000010", "000020"):
+            lines += [
+                f"{render_draw} DrawIndexedInstanced(IndexCountPerInstance:3, InstanceCount:1, "
+                "StartIndexLocation:0, BaseVertexLocation:0, StartInstanceLocation:0)",
+                f"{render_draw} 3DMigoto Dumping Buffer "
+                f"{render_draw}-vs-cb1=77777777-vs=aaaaaaaaaaaaaaaa.buf "
+                f"-> {deduped_abs / 'shared_cb1.buf'}",
+            ]
+        (self.dump / "log.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        self.ws = root / "ws"
+        (self.ws / "Config").mkdir(parents=True, exist_ok=True)
+        (self.ws / "Config" / "FrameAnalysisPath.json").write_text(
+            json.dumps({"frameAnalysisFolderPath": str(self.dump)}), encoding="utf-8"
+        )
+        gametype = "GPU_P12_"
+        component_map = {}
+        import_map = {}
+        # aaaa1111 的两个拆分子网格共享同一 deform pass（同 DrawIB）；
+        # bbbb2222 是另一个独立部件。
+        self.bares = ("aaaa1111-100-0", "aaaa1111-200-0", "bbbb2222-200-0")
+        for bare in self.bares:
+            type_dir = self.ws / "LOD0" / bare / ("TYPE_" + gametype)
+            type_dir.mkdir(parents=True, exist_ok=True)
+            position_hash = "11111111" if bare.startswith("aaaa1111") else "44444444"
+            (type_dir / f"{bare}.json").write_text(json.dumps({
+                "CategoryHash": {"Position": position_hash},
+                "CategoryBufferList": [{"D3D11ElementList": [
+                    {"Category": "Blend", "SemanticName": "BLENDINDICES",
+                     "Format": "R32_UINT", "ByteWidth": 4},
+                ]}],
+            }), encoding="utf-8")
+            (type_dir / f"{bare}-Blend.buf").write_bytes(
+                numpy.array([0], dtype=numpy.uint32).tobytes()
+            )
+            render_draw = "000010" if bare.startswith("aaaa1111") else "000020"
+            component_map[bare] = [render_draw]
+            import_map[f"LOD0.{bare}"] = gametype
+        (self.ws / "Import.json").write_text(json.dumps(import_map), encoding="utf-8")
+        (self.ws / "LOD0" / "ComponentName_DrawCallIndexList.json").write_text(
+            json.dumps(component_map), encoding="utf-8"
+        )
+        # 代表子网格 = 组内第一个成员（aaaa1111-100-0）
+        self.unique_strs = [f"LOD0.{bare}" for bare in self.bares]
+
+    def _runtime_dir(self, bare):
+        return self.ws / "LOD0" / bare / "ModImpRuntime"
+
+    def test_representative_cache_missing_recovers_from_sibling(self):
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+
+        # 删除 dump + 只删除代表子网格（aaaa1111-100-0）的 ModImpRuntime
+        shutil.rmtree(self.dump)
+        shutil.rmtree(self._runtime_dir("aaaa1111-100-0"))
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs, force=True
+        )
+        self.assertTrue(ok2, message2)
+
+        # 代表子网格的缓存已从兄弟子网格（aaaa1111-200-0）恢复
+        restored = self._runtime_dir("aaaa1111-100-0") / "aaaa1111-100-0-BoneMatrix.buf"
+        self.assertTrue(restored.is_file(), "代表缓存缺失时应回退兄弟子网格缓存")
+        # 同 DrawIB 拆分子网格的 VGMap / 分组一致
+        json_rep = _read_zzmi_json(self.ws, "aaaa1111-100-0")
+        json_sib = _read_zzmi_json(self.ws, "aaaa1111-200-0")
+        self.assertEqual(json_rep["VGMap"], json_sib["VGMap"])
+        self.assertEqual(json_rep["SkeletonGroup"], json_sib["SkeletonGroup"])
+        self.assertEqual(json_rep["VGCount"], 1)
+
+    def test_partial_completion_reports_incomplete(self):
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+
+        # 删除 dump + 删除 aaaa1111 全部成员的缓存（bbbb2222 缓存仍在）
+        shutil.rmtree(self.dump)
+        shutil.rmtree(self._runtime_dir("aaaa1111-100-0"))
+        shutil.rmtree(self._runtime_dir("aaaa1111-200-0"))
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs, force=True
+        )
+        # 只要存在未处理目标，就不能报告完整成功
+        self.assertFalse(ok2)
+        self.assertIn("未生成", message2)
+        self.assertIn("aaaa1111", message2)
+        # 独立部件 bbbb2222 已生成、代表子网格的缓存依然缺失（诚实暴露）
+        self.assertEqual(_read_zzmi_json(self.ws, "bbbb2222-200-0").get("VGCount"), 1)
+        missing = self._runtime_dir("aaaa1111-100-0") / "aaaa1111-100-0-BoneMatrix.buf"
+        self.assertFalse(missing.is_file())
+
+    def test_fast_path_does_not_ignore_unresolved_targets(self):
+        """P2 回归：幂等快路径必须把无法解析的目标计入失败，不能提前返回成功。"""
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+
+        # 删除一个目标目录（其余两个缓存完整），仍用原目标列表调用（不 force）
+        shutil.rmtree(self.ws / "LOD0" / "aaaa1111-200-0")
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertFalse(ok2, "快路径不得忽略无法解析的目标")
+        self.assertIn("无法解析", message2)
+        self.assertIn("LOD0.aaaa1111-200-0", message2)
+        # 未受影响的目标缓存完好
+        self.assertEqual(_read_zzmi_json(self.ws, "bbbb2222-200-0").get("VGCount"), 1)
+        self.assertEqual(_read_zzmi_json(self.ws, "aaaa1111-100-0").get("VGCount"), 1)
+
+    def test_sibling_blend_buffers_are_aggregated(self):
+        """同 DrawIB 拆分 Component 可以使用不同局部骨骼，不能只看代表成员。"""
+        palette = numpy.zeros((3, 12), dtype=numpy.float32)
+        palette[:, 0] = 1.0
+        (self.dump / "deduped" / "pal1.buf").write_bytes(palette.tobytes())
+        sibling_blend = (
+            self.ws / "LOD0" / "aaaa1111-200-0" / "TYPE_GPU_P12_"
+            / "aaaa1111-200-0-Blend.buf"
+        )
+        sibling_blend.write_bytes(numpy.array([2], dtype=numpy.uint32).tobytes())
+
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        sibling = _read_zzmi_json(self.ws, "aaaa1111-200-0")
+        self.assertEqual(sibling["VGCount"], 3)
+        self.assertEqual(set(sibling["VGMap"]), {"0", "1", "2"})
+        self.assertEqual(sibling["OriginalVertexCount"], 1)
+
+    def test_cache_copy_failure_is_not_reported_as_success(self):
+        with mock.patch.object(_efmi.shutil, "copy2", side_effect=OSError("disk full")):
+            ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=str(self.ws), unique_str_list=self.unique_strs
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("未生成", message)
+        for bare in self.bares:
+            self.assertFalse(
+                (self._runtime_dir(bare) / f"{bare}-BoneMatrix.buf").exists()
+            )
+
+    def test_rebuild_refreshes_same_size_palette_and_cb1_cache(self):
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+
+        source_palette = self.dump / "deduped" / "pal1.buf"
+        changed_palette = bytearray(source_palette.read_bytes())
+        changed_palette[0:4] = numpy.float32(123.0).tobytes()
+        source_palette.write_bytes(changed_palette)
+        source_cb1 = self.dump / "deduped" / "shared_cb1.buf"
+        changed_cb1 = bytearray(source_cb1.read_bytes())
+        changed_cb1[0:4] = numpy.float32(456.0).tobytes()
+        source_cb1.write_bytes(changed_cb1)
+
+        cache_a = self._runtime_dir("aaaa1111-100-0") / "aaaa1111-100-0-BoneMatrix.buf"
+        cb1_a = self._runtime_dir("aaaa1111-100-0") / "aaaa1111-100-0-ObjectCB1.buf"
+        (self._runtime_dir("bbbb2222-200-0") / "bbbb2222-200-0-BoneMatrix.buf").unlink()
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        self.assertEqual(cache_a.read_bytes(), source_palette.read_bytes())
+        self.assertEqual(cb1_a.read_bytes(), source_cb1.read_bytes())
 
 
 if __name__ == "__main__":

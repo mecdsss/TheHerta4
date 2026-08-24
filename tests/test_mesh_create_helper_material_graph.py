@@ -6,6 +6,8 @@ import types
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 
 def _install_module(name, **attrs):
     """安装 Fake 模块到 sys.modules"""
@@ -246,6 +248,54 @@ class MeshCreateHelperMaterialGraphTests(unittest.TestCase):
                         self.assertFalse(material.use_transparency_overlap)
                         self.assertIn("ShaderNodeMixShader", node_types)
                         self.assertIn("ShaderNodeBsdfTransparent", node_types)
+
+    def test_diffuse_material_name_strips_color_prefix_when_toggled(self):
+        """开启去掉颜色贴图前缀后，材质名 DiffuseMap_{mesh} 变为仅 {mesh}。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diffuse_path = os.path.join(temp_dir, "abc12345-12-DiffuseMap.dds")
+            with open(diffuse_path, "wb") as file_obj:
+                file_obj.write(b"diffuse")
+
+            props = sys.modules[f"{PKG}.common.global_properties"].GlobalProterties
+            props.import_texture_material_strip_color_prefix = lambda: True
+            try:
+                obj = _FakeObject("LOD0.Body")
+                mesh_create_helper.MeshCreateHelper.create_bsdf_with_diffuse_linked(
+                    obj=obj,
+                    mesh_name="d892c658-2256-0",
+                    directory=temp_dir,
+                    logic_name="GIMI",
+                )
+            finally:
+                props.import_texture_material_strip_color_prefix = lambda: False
+
+            self.assertEqual(obj.data.materials[0].name, "d892c658-2256-0")
+
+    def test_blend_index_sentinels_follow_dxgi_width(self):
+        helper = mesh_create_helper.MeshCreateHelper
+        cases = (
+            ("R8G8B8A8_UINT", np.array([[0, 0xFF]], dtype=np.uint8)),
+            ("R16G16_UINT", np.array([[0, 0xFFFF]], dtype=np.uint16)),
+            ("R32G32_UINT", np.array([[0, 0xFFFFFFFF]], dtype=np.uint32)),
+        )
+        for fmt, values in cases:
+            with self.subTest(fmt=fmt):
+                normalized = helper._normalize_blend_index_array(values, fmt)
+                self.assertEqual(normalized.tolist(), [[0, -1]])
+
+    def test_zero_weight_huge_index_is_excluded_from_group_scan(self):
+        helper = mesh_create_helper.MeshCreateHelper
+        indices = np.array([[0, 0xFFFFFFFF]], dtype=np.uint32)
+        normalized = helper._normalize_blend_index_array(indices, "R32G32_UINT")
+        valid = helper._valid_blend_channel_mask(
+            normalized, np.array([[1.0, 0.0]], dtype=np.float32)
+        )
+        self.assertEqual(normalized[valid].tolist(), [0])
+
+    def test_incomplete_merged_vgmap_is_rejected(self):
+        helper = mesh_create_helper.MeshCreateHelper
+        with self.assertRaises(RuntimeError):
+            helper._normalize_and_validate_vg_map({"0": 3}, vg_count=2)
 
 
 if __name__ == "__main__":

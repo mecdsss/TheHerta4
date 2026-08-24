@@ -1,4 +1,5 @@
 import os
+import shutil
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -263,6 +264,13 @@ class WorkSpaceHelper:
         return records
 
     @staticmethod
+    def _normalize_kept_keys(kept_lod_bare_pairs) -> set[tuple[str, str]]:
+        return {
+            (str(lod_name or "").upper().strip(), str(bare_name or "").strip())
+            for lod_name, bare_name in (kept_lod_bare_pairs or set())
+        }
+
+    @staticmethod
     def get_unwanted_submesh_folder_list(kept_lod_bare_pairs: set[tuple[str, str]]) -> List[str]:
         """返回工作空间中不在 kept 保留集合内的子网格文件夹路径列表（按文件夹名排序）。
 
@@ -273,16 +281,66 @@ class WorkSpaceHelper:
         保留，不会被裸 ("", "aaaabbbb-100-0") 或 ("LOD1", "aaaabbbb-100-0") 保留，
         避免跨 LOD 误留/误删。调用方可用这些路径直接删除文件夹（shutil.rmtree）。
         """
-        kept_keys = {
-            (str(lod_name or "").upper().strip(), str(bare_name or "").strip())
-            for lod_name, bare_name in (kept_lod_bare_pairs or set())
-        }
+        kept_keys = WorkSpaceHelper._normalize_kept_keys(kept_lod_bare_pairs)
+        if not kept_keys:
+            # 空保留集合意味着场景为空或对象身份解析失败——此时返回"全部目录"
+            # 会让调用方一次删光整个工作空间。这里是最后一道防线：宁可一个都不删，
+            # 由调用方显式报错；清空整个工作空间必须走 get_all_submesh_folder_list
+            # 的独立强确认路径。
+            return []
         unwanted_list = []
         for record in WorkSpaceHelper.get_submesh_folder_records():
             if (record["lod_name"], record["bare_name"]) not in kept_keys:
                 unwanted_list.append(record["folder_path"])
         unwanted_list.sort(key=lambda path: (os.path.basename(path).casefold(), path.casefold()))
         return unwanted_list
+
+    @staticmethod
+    def count_kept_submesh_folders(kept_lod_bare_pairs: set[tuple[str, str]]) -> int:
+        """统计保留键在工作空间中实际命中的子网格文件夹数。
+
+        保留键非空但命中数为 0 说明场景身份与当前工作空间完全对不上
+        （选错工作空间/命名不一致），此时 get_unwanted_submesh_folder_list
+        会把全部目录列为待删——调用方应据此拒绝执行。
+        """
+        kept_keys = WorkSpaceHelper._normalize_kept_keys(kept_lod_bare_pairs)
+        if not kept_keys:
+            return 0
+        return sum(
+            1
+            for record in WorkSpaceHelper.get_submesh_folder_records()
+            if (record["lod_name"], record["bare_name"]) in kept_keys
+        )
+
+    @staticmethod
+    def get_all_submesh_folder_list() -> List[str]:
+        """返回工作空间中全部子网格文件夹路径（按名排序），不做任何保留过滤。
+
+        仅供「清空整个工作空间 IB」这类显式强确认操作使用；常规清理必须走
+        get_unwanted_submesh_folder_list（空保留集合会拒绝返回全部目录）。
+        """
+        records = WorkSpaceHelper.get_submesh_folder_records()
+        folder_list = [record["folder_path"] for record in records]
+        folder_list.sort(key=lambda path: (os.path.basename(path).casefold(), path.casefold()))
+        return folder_list
+
+    @staticmethod
+    def delete_folder_list(folder_path_list: List[str]) -> tuple[List[str], List[str]]:
+        """删除文件夹列表，返回 (实际删除成功列表, 删除失败列表)。
+
+        只把 shutil.rmtree 真正成功的路径记入成功列表——日志与磁盘状态必须一致；
+        失败目录单独列出，由调用方以 WARNING 上报，绝不被误报成“已删除”。
+        """
+        deleted_paths: List[str] = []
+        failed_paths: List[str] = []
+        for folder_path in folder_path_list:
+            try:
+                shutil.rmtree(folder_path)
+                deleted_paths.append(folder_path)
+            except Exception as e:
+                print(f"[IB清理] 删除失败: {folder_path}，错误: {e}")
+                failed_paths.append(folder_path)
+        return deleted_paths, failed_paths
 
     @staticmethod
     def get_drawib_tabname_dict() -> Dict[str, str]:

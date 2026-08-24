@@ -48,12 +48,28 @@ void main(uint3 dispatch_id : SV_DispatchThreadID)
     {
         return;
     }
+
+    // y1、palette 与 vg_map 必须描述同一批局部骨骼。运行时按真实资源长度
+    // 再做一次保护，避免损坏/陈旧的 mod 资源造成 SRV 越界读取。
+    uint palette_count = 0;
+    uint palette_stride = 0;
+    uint vg_map_count = 0;
+    src_palette.GetDimensions(palette_count, palette_stride);
+    vg_map.GetDimensions(vg_map_count);
+    if (bone_index >= palette_count || bone_index >= vg_map_count)
+    {
+        return;
+    }
+
     // 按 vg_map 写入全局槽位：本部件引用的骨骼（含共享 canonical）当帧覆盖。
     // vg_map 是 3DMigoto 的 format=R32G32B32A32_UINT 格式化缓冲，用 Buffer<uint4>
     // 声明（与视图精确匹配；StructuredBuffer 声明曾导致只读到第 0 个元素、
     // 其余骨骼全部塌进 slot 0——2026-08-23 新 dump 实证 G3 仅 3 槽非零）。
     uint slot = vg_map[bone_index].x;
-    if (slot < 249)
+    uint merged_count = 0;
+    uint merged_stride = 0;
+    merged_skeleton.GetDimensions(merged_count, merged_stride);
+    if (slot < merged_count)
     {
         merged_skeleton[slot] = src_palette[bone_index];
     }

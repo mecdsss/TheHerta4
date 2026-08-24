@@ -208,30 +208,20 @@ class ChannelProcessor:
 
     @staticmethod
     def _shift_with_edge(data, offset_y, offset_x):
-        """把数组平移 (offset_y, offset_x) 像素，空出区域用边缘值填充"""
+        """把数组平移 (offset_y, offset_x) 像素，空出区域用边缘值填充。
+
+        用 numpy.pad(mode="edge") + 切片实现：偏移量可以大于图像尺寸
+        （此时结果整体等于对应方向最边缘的行/列），不会再像旧的手工
+        切片那样在 |offset| >= size 时拿到空切片而广播崩溃。
+        """
         height, width = data.shape
-        result = np.empty_like(data)
-
-        src_y0 = max(0, -offset_y)
-        src_y1 = min(height, height - offset_y)
-        dst_y0 = max(0, offset_y)
-        dst_y1 = min(height, height + offset_y)
-        src_x0 = max(0, -offset_x)
-        src_x1 = min(width, width - offset_x)
-        dst_x0 = max(0, offset_x)
-        dst_x1 = min(width, width + offset_x)
-
-        result[dst_y0:dst_y1, dst_x0:dst_x1] = data[src_y0:src_y1, src_x0:src_x1]
-
-        if dst_y0 > 0:
-            result[:dst_y0, :] = result[dst_y0:dst_y0 + 1, :]
-        if dst_y1 < height:
-            result[dst_y1:, :] = result[dst_y1 - 1:dst_y1, :]
-        if dst_x0 > 0:
-            result[:, :dst_x0] = result[:, dst_x0:dst_x0 + 1]
-        if dst_x1 < width:
-            result[:, dst_x1:] = result[:, dst_x1 - 1:dst_x1]
-        return result
+        pad_y = abs(int(offset_y))
+        pad_x = abs(int(offset_x))
+        padded = np.pad(data, ((pad_y, pad_y), (pad_x, pad_x)), mode="edge")
+        return padded[
+            pad_y - int(offset_y): pad_y - int(offset_y) + height,
+            pad_x - int(offset_x): pad_x - int(offset_x) + width,
+        ]
 
     @staticmethod
     def generate_ao_from_geometry(height_data, normal_map, radius=16, height_scale=16.0, power=1.0, directions=8):

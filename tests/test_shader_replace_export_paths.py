@@ -62,6 +62,10 @@ class _FakeSectionType:
     ShaderReplace = "ShaderReplace"
     CrossIBPresent = "CrossIBPresent"
     ResourceID = "ResourceID"
+    # 本轮 ZZMI/EFMI 骨骼合并新依赖的段类型
+    CommandList = "CommandList"
+    MergedSkeleton = "MergedSkeleton"
+    TextureOverrideVertexLimitRaise = "TextureOverrideVertexLimitRaise"
 
 
 class _FakeExportUnity:
@@ -183,6 +187,8 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
                 forbid_auto_texture_ini=lambda: True,
                 generate_branch_mod_gui=lambda: False,
                 use_rabbitfx_slot=lambda: False,
+                import_merged_vgmap=lambda: False,
+                zzz_use_slot_fix=lambda: False,
             ),
         )
         _install_module(
@@ -195,6 +201,8 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
             M_IniSection=_FakeIniSection,
             M_SectionType=_FakeSectionType,
         )
+        # zzmi.py / efmi.py 新增依赖：utils.json_utils（真实模块，仅 JSON 读写）
+        _load_module(f"{self.pkg}.utils.json_utils", "utils/json_utils.py")
 
         self.shader_replace_section_calls = []
 

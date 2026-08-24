@@ -39,6 +39,10 @@ DEFAULT_MOD_NAMESPACE = "A"
 SPARSE_ZONE_SLOTS = 4
 INVALID_ZONE_ID = 0xFFFFFFFF
 ZONES_PER_PAGE = 1
+VAR_SYNC_VALUE_BASE = 81
+VAR_SYNC_MODE_BASE = 90
+VAR_SYNC_FLOAT4_CAPACITY = 9
+VAR_SYNC_MAX_BINDINGS = VAR_SYNC_FLOAT4_CAPACITY * 4
 
 
 def _node_identity_key(node):
@@ -2905,6 +2909,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 if not var_name:
                     continue
                 bindings.append((var_name, slot_id, zone, nd_stage))
+        if len(bindings) > VAR_SYNC_MAX_BINDINGS:
+            raise ValueError(
+                f"形态键变量同步最多支持 {VAR_SYNC_MAX_BINDINGS} 个绑定，"
+                f"当前为 {len(bindings)} 个"
+            )
         return bindings
 
     # =======================================================================
@@ -3528,8 +3537,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if sec in sections:
             return
         drag_mode_var = self._runtime_variable_names(ns)[0]
-        # IniParams 打包：驱动 CS 用 76-80、形态键动画 CS 用 100+，同步段从 81 起，
-        # 每 float4 装 4 个变量，着色器按 [81 + i/4][i%4] 读取；
+        # 值区固定 81..89、握手模式区固定 90..98，各容纳 36 个绑定且不重叠。
         # 门控输入固定 IniParams[75]（低于驱动 CS 段，不与其他段冲突）
         lines = [
             f"cs = {RES_SHADER_DIR}/rzm_shapekey_var_sync.hlsl",
@@ -3539,12 +3547,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "w75 = $inputMode",
         ]
         for i, (var_name, _slot, _zone, _nd_stage) in enumerate(bindings):
-            lines.append(f"{'xyzw'[i % 4]}{81 + i // 4} = {var_name}")
-        # 回读回声标志（每绑定 1 位，从 83 起打包）：回读把缓冲值拉进变量时
-        # 置 1，同步 CS 据此跳过本帧的变量→缓冲回推（防 store 延迟的旧值
-        # 与拖拽 CS 打架）；变量变化帧置 0，保证变量优先回写。
+            lines.append(
+                f"{'xyzw'[i % 4]}{VAR_SYNC_VALUE_BASE + i // 4} = {var_name}"
+            )
+        # mode: 0=空闲，1=CPU 从缓冲拉取（抑制回声），2=变量待确认（强制推送）。
         for i, (_var_name, _slot, _zone, _nd_stage) in enumerate(bindings):
-            lines.append(f"{'xyzw'[i % 4]}{83 + i // 4} = $ssmtdrag_skpull_{ns}_{i}")
+            lines.append(
+                f"{'xyzw'[i % 4]}{VAR_SYNC_MODE_BASE + i // 4} = "
+                f"$ssmtdrag_skmode_{ns}_{i}"
+            )
         lines.extend([
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
             f"cs-t69 = ResourceDragShapeKeyVarSyncMap_{ns}",
@@ -3578,27 +3589,36 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 分词器把 ref 当独立 token 交给 GetTarget，ParseTarget 无此分支 →
         # Unknown target: ref，整条 store 行在加载期被静默丢弃（GIMI 实证有效
         # 写法为 store = $health, ps-cb0, 33，裸目标）。
-        # 变量↔缓冲双向联动（与点击计数导出同一套「变量为主」仲裁）：
-        #   - 变量变化（热键/动画驱动步进）→ 本帧不回读，pull=0；
-        #     同步 CS 随后把变量写回缓冲，实现「变量 → 缓冲」。
-        #   - 变量未变 → 每帧把缓冲值拉回变量，pull=1；同步 CS 据此跳过
-        #     回声，避免把带 store 延迟的旧值再写回缓冲与拖拽 CS 打架。
-        # 不再使用 ZoneActive 的「拖拽激活即缓冲独占」分支，也不再使用沉淀
-        # 窗口：这两处会把动画驱动刚减下去的值在后续帧重新顶回 1，破坏联动。
+        # 变量优先 + 确认握手：变量变化后 pending=1/mode=2，GPU 每帧强制推送，
+        # 直到 store 回读追平 prev 才结束；仅区域实际激活且无 pending 时允许缓冲
+        # 回拉变量。这样 store 的延迟旧值不会覆盖刚写入的新变量。
         lines = []
         for i, (var_name, slot, zone, _nd_stage) in enumerate(bindings):
+            active = f"$ssmtdrag_skact_{ns}_{i}"
             rb = f"$ssmtdrag_skrb_{ns}_{i}"
             prev = f"$ssmtdrag_skprev_{ns}_{i}"
-            pull = f"$ssmtdrag_skpull_{ns}_{i}"
+            pending = f"$ssmtdrag_skpending_{ns}_{i}"
+            mode = f"$ssmtdrag_skmode_{ns}_{i}"
             lines.extend([
+                f"store = {active}, ResourceDragShapeKeyZoneActive_{ns}, {zone}",
                 f"store = {rb}, ResourceDragShapeKeyDrive_{ns}, {slot}",
                 f"if {var_name} != {prev}",
                 f"\t{prev} = {var_name}",
-                f"\t{pull} = 0",
-                "else",
+                f"\t{pending} = 1",
+                f"\t{mode} = 2",
+                f"elif {pending} == 1",
+                f"\tif {rb} == {prev}",
+                f"\t\t{pending} = 0",
+                f"\t\t{mode} = 0",
+                "\telse",
+                f"\t\t{mode} = 2",
+                "\tendif",
+                f"elif {active} >= 1",
                 f"\t{var_name} = {rb}",
                 f"\t{prev} = {rb}",
-                f"\t{pull} = 1",
+                f"\t{mode} = 1",
+                "else",
+                f"\t{mode} = 0",
                 "endif",
             ])
         sections[sec] = lines
@@ -3637,6 +3657,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     # prev 值缓冲/激活标志随 boot 一并清零：persist 变量非 0 时首帧即触发同步写入
                     lines.append(f"\tclear = ResourceDragShapeKeyVarPrev_{ns} 0.0")
                     lines.append(f"\tclear = ResourceDragShapeKeyZoneActive_{ns} 0.0")
+                    for i in range(len(self._drag_drive_var_sync_bindings())):
+                        lines.append(f"\t$ssmtdrag_skpending_{ns}_{i} = 0")
+                        lines.append(f"\t$ssmtdrag_skmode_{ns}_{i} = 0")
             if self.enable_hand_cursor:
                 lines.append(f"\tclear = ResourceDragJiggleCursorPreview_{ns} 0.0")
             for comp in components:
@@ -4234,7 +4257,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"global $ssmtdrag_rmb_hold_fraction_{ns} = 0",
                 f"global $ssmtdrag_rmb_lone_hold_{ns} = 0",
             ])
-        # 变量↔缓冲双向同步辅助变量：回读值/变量上一帧/回读回声标志（每绑定一组）
+        # 变量↔缓冲双向同步辅助变量：激活/回读/上一值/待确认/同步模式。
         if getattr(self, "enable_shapekey_drive", False):
             _sync_n = len(self._drag_drive_var_sync_bindings())
             if _sync_n:
@@ -4243,9 +4266,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             globals_to_add.append(f"global $ssmtdrag_seed_pending_{ns} = 0")
             for i in range(_sync_n):
                 globals_to_add.extend([
+                    f"global $ssmtdrag_skact_{ns}_{i} = 0",
                     f"global $ssmtdrag_skrb_{ns}_{i} = 0",
                     f"global $ssmtdrag_skprev_{ns}_{i} = 0",
-                    f"global $ssmtdrag_skpull_{ns}_{i} = 0",
+                    f"global $ssmtdrag_skpending_{ns}_{i} = 0",
+                    f"global $ssmtdrag_skmode_{ns}_{i} = 0",
                 ])
         for comp in components:
             globals_to_add.append(f"global $ssmtdrag_last_dispatch_{comp['comp_name']}_{ns} = -1")

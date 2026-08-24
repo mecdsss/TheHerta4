@@ -922,6 +922,32 @@ class ExportEFMI:
                 return potential
         return ""
 
+    @staticmethod
+    def _validated_blendindices_layouts(submesh_models, context: str):
+        """返回实际 BLENDINDICES 布局；同一运行时命令列表内必须完全一致。"""
+        submesh_models = list(submesh_models)
+        if not submesh_models:
+            raise RuntimeError(f"{context}: 未找到对应子网格，无法确定 BLENDINDICES 布局")
+        expected = None
+        for submesh_model in submesh_models:
+            game_type = getattr(submesh_model, "d3d11_game_type", None)
+            if game_type is None:
+                raise RuntimeError(f"{context}: 子网格缺少 GameType")
+            layouts = tuple(game_type.get_blendindices_layouts())
+            if not layouts:
+                raise RuntimeError(
+                    f"{context}: {getattr(submesh_model, 'unique_str', '?')} "
+                    "不含 BLENDINDICES 布局"
+                )
+            if expected is None:
+                expected = layouts
+            elif layouts != expected:
+                raise RuntimeError(
+                    f"{context}: 同一 LOD 的 BLENDINDICES 布局不一致: "
+                    f"{expected} != {layouts}"
+                )
+        return expected or ()
+
     def _get_merged_skeleton_component_info(self):
         """收集 EFMI 骨骼合并（Merged Skeleton）组件信息。
 
@@ -1061,13 +1087,21 @@ class ExportEFMI:
             section.append(f"Pool\\EFMIv1\\Input_MergedSkeleton_Instance_LodLevel = ref Pool_MergedSkeleton_Instance_LodLevel{suffix}")
             section.append(f"Resource\\EFMIv1\\Output_MergedSkeleton = ref ResourceMergedSkeletonDataRW{suffix}")
             section.append("run = CommandList\\EFMIv1\\MergedSkeleton_AttachComponent")
-            section.append("; Force 16-bit VG IDs (Merged Skeleton may have more than 256 bones)")
-            blend_slot = "vb2"
-            for submesh_model in self.submesh_model_list:
-                if submesh_model.d3d11_game_type is not None:
-                    blend_slot = submesh_model.d3d11_game_type.CategoryExtractSlotDict.get("Blend", "vb2")
-                    break
-            section.append(f"{blend_slot}->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_UINT")
+            section.append("; BLENDINDICES layouts after merged-skeleton widening")
+            lod_unique_strs = {comp["unique_str"] for comp in lod_components}
+            lod_submesh_models = [
+                model for model in self.submesh_model_list
+                if model.unique_str in lod_unique_strs
+            ]
+            blend_layouts = self._validated_blendindices_layouts(
+                lod_submesh_models,
+                f"[EFMI骨骼合并] {lod or '单 LOD'}",
+            )
+            for semantic_index, element_format, extract_slot in blend_layouts:
+                section.append(
+                    f"{extract_slot}->ElementFormat(BLENDINDICES, {semantic_index}) = "
+                    f"{element_format}"
+                )
             section.new_line()
 
             section.append(f"[CommandListInitializeMergedSkeleton{suffix}]")
@@ -1307,10 +1341,16 @@ class ExportEFMI:
             # EFMI 骨骼合并升宽配套（非组件兜底）：合并组件已在上方走 EntryPoint 分支，
             # 这里只服务"升宽但无反查数据"的子网格——仅输出 ElementFormat 行（数据侧升宽，无运行时挂载）。
             if getattr(submesh_model, "blendindices_widened", False):
-                blend_slot = submesh_model.d3d11_game_type.CategoryExtractSlotDict.get("Blend", "vb2")
-                texture_override_ib_section.append(
-                    f"{blend_slot}->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_UINT"
-                )
+                for semantic_index, element_format, extract_slot in (
+                    self._validated_blendindices_layouts(
+                        [submesh_model],
+                        f"[EFMI骨骼合并] {submesh_model.unique_str}",
+                    )
+                ):
+                    texture_override_ib_section.append(
+                        f"{extract_slot}->ElementFormat(BLENDINDICES, {semantic_index}) = "
+                        f"{element_format}"
+                    )
 
             if is_target_ib:
                 texture_override_ib_section.append("analyse_options = deferred_ctx_immediate dump_rt dump_cb dump_vb dump_ib buf txt dds dump_tex dds symlink")

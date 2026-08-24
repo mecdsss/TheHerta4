@@ -1309,7 +1309,8 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("\tclear = ResourceDragShapeKeyVarPrev_testns 0.0", pin)
         self.assertIn("\tclear = ResourceDragShapeKeyZoneActive_testns 0.0", pin)
         self.assertNotIn("ResourceDragShapeKeyVarReadback_testns", "\n".join(pin))
-        self.assertNotIn("$ssmtdrag_skcd_testns", "\n".join(pin))
+        self.assertIn("$ssmtdrag_skpending_testns_0 = 0", "\n".join(pin))
+        self.assertIn("$ssmtdrag_skmode_testns_0 = 0", "\n".join(pin))
 
         present = "\n".join(sections["[Present]"])
         self.assertIn("run = CustomShaderDragShapeKeyVarSync_testns", present)
@@ -1324,34 +1325,57 @@ class DragNodeEmitTests(unittest.TestCase):
         rb = "\n".join(sections["[CommandListDragShapeKeyVarReadback_testns]"])
         # store 直接读源缓冲（无镜像/克隆）
         self.assertNotIn(" = copy ", rb)
-        # 变量↔缓冲双向联动（变量为主，与点击计数导出同套仲裁）：
-        # 变量变化 → 本帧不回读，pull=0（同步 CS 随后把变量推回缓冲）；
-        # 变量未变 → 每帧拉回缓冲，pull=1（同步 CS 跳过回声）。
+        # 变量优先握手：变化后 pending=1/mode=2，持续回推直到回读追平；
+        # 只有追平后才允许拖拽/缓冲变化以 mode=1 拉回变量。
+        self.assertIn("store = $ssmtdrag_skact_testns_0, ResourceDragShapeKeyZoneActive_testns, 0", rb)
         self.assertIn("store = $ssmtdrag_skrb_testns_0, ResourceDragShapeKeyDrive_testns, 5", rb)
         self.assertIn("if $Freq_A != $ssmtdrag_skprev_testns_0", rb)
         self.assertIn("$ssmtdrag_skprev_testns_0 = $Freq_A", rb)
-        self.assertIn("$ssmtdrag_skpull_testns_0 = 0", rb)
-        self.assertIn("else", rb)
+        self.assertIn("$ssmtdrag_skpending_testns_0 = 1", rb)
+        self.assertIn("$ssmtdrag_skmode_testns_0 = 2", rb)
+        self.assertIn("elif $ssmtdrag_skpending_testns_0 == 1", rb)
+        self.assertIn("if $ssmtdrag_skrb_testns_0 == $ssmtdrag_skprev_testns_0", rb)
+        self.assertIn("elif $ssmtdrag_skact_testns_0 >= 1", rb)
         self.assertIn("$Freq_A = $ssmtdrag_skrb_testns_0", rb)
-        self.assertIn("$ssmtdrag_skpull_testns_0 = 1", rb)
+        self.assertIn("$ssmtdrag_skmode_testns_0 = 1", rb)
         self.assertIn("store = $ssmtdrag_skrb_testns_1, ResourceDragShapeKeyDrive_testns, 0", rb)
         self.assertIn("$Freq_B = $ssmtdrag_skrb_testns_1", rb)
-        self.assertNotIn("skact", rb)
-        self.assertNotIn("skcd", rb)
 
         constants = "\n".join(sections["[Constants]"])
         self.assertIn("global $ssmtdrag_skheld_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_skact_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skrb_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skprev_testns_0 = 0", constants)
-        self.assertIn("global $ssmtdrag_skpull_testns_0 = 0", constants)
+        self.assertIn("global $ssmtdrag_skpending_testns_0 = 0", constants)
+        self.assertIn("global $ssmtdrag_skmode_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skrb_testns_1 = 0", constants)
-        self.assertNotIn("skact", constants)
-        self.assertNotIn("skcd", constants)
 
-        # 同步段把 pull 标志打包进 IniParams[83+] 供着色器回声抑制
+        # 同步模式区从 90 开始，与最多 36 个变量使用的 81..89 完全分离。
         cs = "\n".join(sections["[CustomShaderDragShapeKeyVarSync_testns]"])
-        self.assertIn("x83 = $ssmtdrag_skpull_testns_0", cs)
-        self.assertIn("y83 = $ssmtdrag_skpull_testns_1", cs)
+        self.assertIn("x90 = $ssmtdrag_skmode_testns_0", cs)
+        self.assertIn("y90 = $ssmtdrag_skmode_testns_1", cs)
+
+    def test_shapekey_var_sync_nine_bindings_do_not_overlap_iniparams(self):
+        zone = self._zone_item(0)
+        node = _make_node(
+            self.mod,
+            enable_shapekey_drive=True,
+            zone_objects=[zone],
+        )
+        node.id_data = types.SimpleNamespace(nodes=[
+            self._fake_sk_node([(f"SK{i}", 0, "0", 1) for i in range(9)]),
+        ])
+        sections = {}
+        node._emit_shapekey_var_sync_section(sections, "testns")
+        lines = sections["[CustomShaderDragShapeKeyVarSync_testns]"]
+        self.assertIn("x83 = $Freq_SK8", lines)
+        self.assertIn("x90 = $ssmtdrag_skmode_testns_0", lines)
+        param_targets = [
+            line.split("=", 1)[0].strip()
+            for line in lines
+            if line and line[0] in "xyzw" and "=" in line
+        ]
+        self.assertEqual(len(param_targets), len(set(param_targets)))
 
     def test_shapekey_var_sync_skipped_without_bindings(self):
         zone = self._zone_item(0)
@@ -1432,7 +1456,7 @@ class DragNodeEmitTests(unittest.TestCase):
         # 变量 4 个一组打包：从 IniParams[81] 起（76-80 为驱动 CS 占用）
         self.assertIn("#define VAR_SYNC_INIPARAM_BASE 81", content)
         self.assertIn("#define VAR_SYNC_GATE_PARAMS 75", content)
-        self.assertIn("#define VAR_SYNC_PULL_BASE 83", content)
+        self.assertIn("#define VAR_SYNC_MODE_BASE 90", content)
         self.assertIn("IniParams[VAR_SYNC_INIPARAM_BASE + (i >> 2)][i & 3]", content)
         # 与驱动 CS 同一命中判定，每帧重算每区域激活标志
         self.assertIn("ZoneActive[z] = (hasHit && z == hoverZone) ? 1.0 : 0.0;", content)
@@ -1441,7 +1465,8 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("VarSyncPrev[i] = raw;", content)
         # 变量为主：变化即回写（不再挂起拖拽激活帧）；仅 CPU 回读回声帧跳过
         self.assertNotIn("if (zone < clickSlots && ZoneActive[zone] > 0.5)", content)
-        self.assertIn("IniParams[VAR_SYNC_PULL_BASE + (i >> 2)][i & 3] > 0.5", content)
+        self.assertIn("IniParams[VAR_SYNC_MODE_BASE + (i >> 2)][i & 3]", content)
+        self.assertIn("syncMode > 1.5", content)
         self.assertIn("ShapeKeyDrive[slot] = v;", content)
         self.assertIn("ClickCountF[zone] = (float)ClickCount[zone];", content)
         # 无方向档位：变量非 0 打开对应档位，归 0 时仅清空本档位
