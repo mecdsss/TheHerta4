@@ -1,9 +1,11 @@
 # ZZMI 骨骼合并（Merged Skeleton）计划书
 
-> 状态：**已实现（单缓冲 + 骨架分组 + 校准版 attach），Blender headless 端到端 [PASS]** · 最后更新：2026-08-24
-> 2026-08-24 去重/分组/校准确认（均待游戏内复验证）：
+> 状态：**已实现（单缓冲 + 骨架分组 + 组内统一骨架直拷 attach），Blender headless 端到端 [PASS]** · 最后更新：2026-08-25
+> 2026-08-24 去重/分组确认（已实现）；**2026-08-25 用户拍板：放弃 CB1 校准**：
 > ① **单骨骼刚性部件（单权重物体）抓帧重合误并**——不同锚点骨（头顶/前额/后脑发饰/面部）在抓帧姿态下矩阵逐位相同被并成一根；修复：刚性部件命中对追加加权质心门控（<0.05 米才合并），仅拆不并、误拆零代价。
-> ② **palette 与渲染 cb1 逐物体 1:1 配对**（用户拍板）——palette 把顶点蒙皮到对象空间、渲染 VS 用 cb1 对象矩阵摆到世界；跨空间引用会被 cb1 摆错位置（身体组与头部组变换差 ≈0.5m，与"头发下沉/身体上移"症状吻合）。修复：**按渲染 cb1 对象变换分组 + 校准 attach**——每组一套全宽骨架，本组骨骼直拷、外来骨骼经 `inv(cb1_组)×cb1_源×M` 校准乘写入，跨组权重合法且各自对象→世界变换正常（数学与真实数据不变性经单测验证）。
+> ② **palette 与渲染 cb1 逐物体 1:1 配对**（用户拍板）——palette 把顶点蒙皮到对象空间、渲染 VS 用 cb1 对象矩阵摆到世界；跨空间引用会被 cb1 摆错位置（身体组与头部组变换差 ≈0.5m，与"头发下沉/身体上移"症状吻合）。修复：**按渲染 cb1 对象变换分组，组内统一骨架**——每组一套全宽骨架，只直拷本组骨骼；**禁止跨组别骨骼合并**（跨组引用导出时大声报警，无校准的运行时槽位永不被写入 = 原点塌陷）。
+> ③ **CB1 校准整体废弃（2026-08-25 用户拍板）**：校准版（捕获各组 cb1 + 外来骨骼经 `inv(cb1_组)×cb1_源×M` 校准乘写入）经多轮实测无法稳定（捕获段匹配脆弱、未捕获残留垃圾 CB、校准偏移越调越离谱），全部移除——不再有 cb1 捕获段/捕获源字段/校准 CS，attach 退化为纯直拷（`Toolset/zzmi_merged_skeleton_attach.hlsl`）。
+> ④ **未生成组件帧延迟对齐（2026-08-25 用户拍板）**：未生成的组件走游戏原渲染（当帧 palette），与导出组件（上一帧骨架）有一帧姿态差——为它们生成「当帧副本 → [Present] 推进 → 延迟副本」双缓冲（`ResourceZZPalette_<DrawIB>` / `ResourceZZDelayedPalette_<DrawIB>`），deform 段只换绑 vs-t0 不重发 draw，全角色统一慢一帧。
 > 这两个修正疑似此前"dump 数据层全对但游戏内持续偏移"悬案的根因——dump 总在相似姿态抓取，重合骨/跨空间引用在 dump 里恒"正确"。
 > 目标：参照 EFMI 骨骼合并（`common/efmi_skeleton.py`，已端到端验证）的「工作空间反查 FrameAnalysis dump → 数据复制回工作空间缓存」模式，为 ZZMI（绝区零）工作空间提供骨骼合并数据（VGMap/VGOffset/VGCount + 骨骼 palette 缓存）。
 > 与 EFMI 的关系：**只复用数据层模式**（log 解析、反查、矩阵去重、写回缓存、复选框门控）；**运行时的 CS 着色器与 INI 段落全部按 ZZZ 的数据存储位置/格式从零编写**（deform pass 挂载、vs-t0 SRV stride 48、per-pass Map + ring buffer 时序、SO 管线），不移植 EFMI 的任何着色器/段落——不同游戏数据布局完全不同。分支选项：复用复选框 `import_merged_vgmap`（「使用融合统一顶点组」），勾选则用骨骼合并，不勾选维持现状，零副作用。
@@ -151,7 +153,7 @@
   2. **仅跨部件之间去重合并，且只用 bitwise（字节级）判等，禁用浮点容差**——同一骨骼在同一帧被 CPU 上传到各 palette 时是同一份数据的逐位拷贝（实测共享骨骼跨部件 maxdiff = 0.00e+00）；不同骨骼或同骨骼不同帧位必然不同。
   3. **不同物体的不同编号顶点组，只要被同一骨骼矩阵驱动（bitwise 相同 = 同一骨骼），就去重为同一个全局顶点组**。例：物体 A 的 36 号顶点组与物体 B 的 7 号顶点组若由同一骨骼矩阵驱动，两者都映射到同一个全局 id，导入后在 Blender 里就是**同一个顶点组名称**（实测案例：b20f90ea 有 13 个组与其它部件共享）。
   4. **单骨骼刚性部件（单权重物体）追加加权质心门控**（2026-08-24 用户拍板）：命中对任一方 palette 仅 1 根骨骼时，bitwise 相同还须加权质心距离 < `rigid_centroid_tolerance`（默认 0.05 米）才合并，否则各占各槽。刚性部件的唯一骨骼 = 整个物体的锚点，质心即物体位置指纹——抓帧瞬间重合的不同锚点骨（头部挂件密集区高发）靠此分离。刚性部件误拆零代价（各自 attach 写同一矩阵，运行时内容恒等），误并则动画分叉时错位联动；只拆不并是安全方向。双方均为多骨骼部件时不加门控（多根同时位等不可能是巧合；真共享骨骼驱动区域质心实测可相距 0.25，加门控会误拆真共享）。缺签名时刚性命中对保守拆开。
-  5. **骨架分组 + 校准：palette 与渲染 cb1 逐物体 1:1 配对**（2026-08-24 用户拍板，校准版定案）：palette 矩阵把顶点蒙皮到**对象空间**（列向量约定 `object = Rm·bind + tm`，12 floats 平移在 [3,7,11]），渲染 VS 用该对象的 cb1 矩阵（rows 0-3 = 对象→世界，行向量约定 `world = object·R + t`）摆到世界。**合并骨架按渲染 cb1 对象变换分组**：变换逐位相同的部件进同组（同空间），组内去重（bitwise + 刚性门控），**骨骼 id 为全局编号（组基址拼接组内槽位）**——Blender 侧 join 无歧义、跨组权重可表达。运行时**每组一套全宽合并骨架**（array = 全局 max(vg_offset+vg_count)）：本组骨骼 attach 直拷，**外来骨骼经校准乘写入**——`M' = C×M`，`C = U_目标组⁻¹ × U_源组`（`C_rot = Rd·Rsᵀ`、`C_t = Rd·(t_src − t_dst)`，刚体逆 R⁻¹=Rᵀ），保证跨组引用时各自对象→世界变换正常（世界不变性 `U_dst·(M'·p) ≡ U_src·(M·p)` 经真实数据单测验证）。各组 cb1 在其代表部件（json `SkeletonGroupCb1SourceIb` + `SkeletonGroupCb1SourceSO`，其帧内最后一个渲染 draw 的 vs-cb1 是可解析逐部件块者）的渲染 draw 处捕获：**捕获段按源部件 SO 输出 hash 匹配**（TextureOverrideVB，渲染 draw 的 vb0 恒为游戏 SO 资源、不受我方 mod 换 ib 影响；按原 IB hash 匹配在全量合并后永不触发、未捕获资源残留游戏垃圾 CB 导致校准剪切失真，dump 124705 实证）+ `copy vs-cb1 unless_null`（last-wins 逐帧更新）。无捕获源的组 attach 自动退化直拷（CB 形态校验 row3.w=1 不过即直拷）。时序见 §5.4-4（Present 帧尾统一 attach，palette 副本与 cb1 捕获同属当帧）。json 写回 `SkeletonGroup`/`SkeletonGroupCb1SourceIb`/`SkeletonGroupCb1SourceSO` + 全局口径 VGMap/VGOffset。无 cb1 可解析的部件独立成组（不共享，安全方向）。实测分组见本文末尾。
+  5. **骨架分组 + 组内统一（2026-08-24 分组拍板；2026-08-25 移除校准拍板）**：palette 矩阵把顶点蒙皮到**对象空间**（列向量约定 `object = Rm·bind + tm`，12 floats 平移在 [3,7,11]），渲染 VS 用该对象的 cb1 矩阵（rows 0-3 = 对象→世界，行向量约定 `world = object·R + t`）摆到世界。**合并骨架按渲染 cb1 对象变换分组**：变换逐位相同的部件进同组（同空间），组内去重（bitwise + 刚性门控），**骨骼 id 为全局编号（组基址拼接组内槽位）**——Blender 侧组内 join 无歧义。运行时**每组一套全宽合并骨架**（array = 全局 max(vg_offset+vg_count)）：**只直拷本组骨骼**（Present 帧尾统一 attach，`Toolset/zzmi_merged_skeleton_attach.hlsl` 纯拷贝，无任何校准乘）。**禁止跨组别骨骼合并**：外来骨骼不再经校准乘写入其它组的骨架（曾经校准版 `M' = C×M`、`C = U_目标组⁻¹ × U_源组`，世界不变性虽经单测验证，但 cb1 捕获段在多轮实测中无法稳定——捕获匹配脆弱/未捕获垃圾 CB/校准偏移，2026-08-25 整体废弃）；跨组别引用由导出侧 `_warn_cross_group_bone_references` 大声报警（无校准的运行时这些槽位永不被写入 = 原点塌陷）。json 写回 `SkeletonGroup` + 全局口径 VGMap/VGOffset。无 cb1 可解析的部件独立成组（不共享，安全方向）。实测分组见本文末尾。
 - **为什么禁用容差（实测踩坑记录，`.dbg/zzmi_match_accuracy.py`）**：
   - 48625d6d 的 `#1/#8/#9` 与四部件共享骨骼 maxdiff = 3.5e-07/2.5e-06（近似非相等）——是**同一骨骼的不同动画帧姿态**（48625d6d 是脸部 morph 部件，deform pass 18 晚于 pass 1/29/30，动画已推进），容差匹配会把它们误并；
   - a23aa8a3 内部存在 maxdiff = 0.000000 的**不同骨骼**（对称/镜像骨骼浮点同值但位不同），84618ee0 内部不同骨骼最小差异仅 8.7e-04——容差稍大就误并。
@@ -218,19 +220,19 @@ if (
 1. **全局索引化导出**：顶点组名 = 全局 id 数字串；导出前预处理——补缺组（fill_gaps）、剔 ignore/全局骨架外组、按名排序/改名保证 `g.group == 全局 id`（对照 NTEMI `_sort_export_vertex_groups_by_name` 与 EFMI ObjectMerger 的 `str(index)` 改名）。挂钩点：`common/submesh_model.py` BLENDINDICES 生成处（EFMI 升宽分支 :89-101 同位置加 ZZMI 分支）。
 2. **升宽——实测后取消**：ZZMI 各 gametype 的 BLENDINDICES **本来就是 32 位通道**（BI16=`R32G32B32A32_SINT`、BI8=`R32G32_UINT`、BI4=`R32_UINT`——后缀数字是**字节数**不是位数），全局骨骼 id 直接装下，**无需升宽、无需 ElementFormat 行**（EFMI 的升宽是因为它的 BI4 是 R8 四通道 255 上限，与 ZZZ 无关）。实现已按此落地，导出 buffer 实测通过（见 §8）。
 3. **INI Merged Skeleton 段与 CS 着色器——按 ZZZ 数据布局从零编写（不移植 EFMI 实现）**：EFMI 的段落/着色器面向终末地的渲染 draw + instance config 体系，**只借鉴「逐组件 attach + 换绑合并骨架」的概念**，以下要素全部按 ZZZ 实测重新定义：
-   - **CS（新写）**：`Toolset/zzmi_merged_skeleton_attach_calibrated.hlsl`——输入 = 当前 deform pass 的 vs-t0（cs-t0 保存的当帧 palette，`StructuredBuffer<ZZBone3x4>`，stride 48）+ 源组/目标组 cb1 捕获（cs-cb1/cs-cb2）；输出 = 目标组 `RWStructuredBuffer` 合并骨架（全宽，槽位 = 全局骨骼编号）；逻辑 = 本组直拷 / 外来骨骼按 `M' = C×M`（`C = U_目标组⁻¹ × U_源组`）校准乘写入；cb1 形态校验不过（未捕获/首帧）自动直拷兜底。逐（部件 × 组）各调一次。
+   - **CS（零延迟版）**：`Toolset/zzmi_merged_skeleton_attach.hlsl`——输入 = 当前 deform pass 的 vs-t0（cs-t0 保存的当帧 palette，`StructuredBuffer<ZZBone3x4>`，stride 48）+ **vg_map 表**（cs-t1，`StructuredBuffer<uint4>`，槽位在 .x——3DMigoto data 行按 float4 元素流解析，每槽位值后跟 3 个 0；若按 stride=4 裸 uint 会错乱，dump 154125 实证所有骨骼写入同一槽位）；输出 = 本组 `RWStructuredBuffer` 合并骨架（全宽，槽位 = 全局骨骼编号）；逻辑 = **按 vg_map 写槽位** `merged[vg_map[id].x] = palette[id]`（本部件引用的骨骼——含跨部件共享 canonical——当帧覆盖）。无 cb1 输入、无校准乘（校准版 CS 2026-08-25 废弃删除）。deform VB 段与 [Present] 各 run 一次。
    - **INI 匹配键**：挂点段用 `checktextureoverride` 匹配 deform pass 的 **vb0/vb2 hash**——这两个键**工作空间子网格 json 里就有**（`CategoryHash.Position` / `CategoryHash.Blend`），生成器直接取用；NPC 的 deform pass hash 不在列表天然排除。
    - **换绑**：attach 后把该 pass 的 `vs-t0` 换绑到合并骨架 Resource（SRV 视图按 stride 48 声明）。
    - **与 ZZMIv1 的组合**：ZZMIv1 的 skin commandlist 在同一批 deform draw 上做 vb0-3/ib 的 mod 替换（全局索引 vb2 即经此路径生效）与 ps-tXX 清理，**不触碰 vs-t0**；我方段落只做 palette attach + vs-t0 换绑，职责不重叠。commandlist 先后次序与守卫需游戏内验证（任务 7）。
    - **渲染 draw 不动**：渲染 pass 的 vs-t0（共享 `7dfb0292`）与 vb2 维持 ZZMIv1 现状；渲染 VS 是否消费 vb2 需游戏内观察（风险 R3）。
-4. **ZZZ 运行时挂载点与帧对齐设计（用户拍板：全部数据同帧，整体延迟一帧，杜绝混帧抖动）**：11 份 palette 由 CPU 逐 pass `Map`（WRITE_DISCARD）上传且 ring buffer 复用，**任何时刻全帧不存在完整并存的全套当帧 palette**；cb1（对象→世界变换）只在渲染 draw 才绑得到，而渲染块（000037+）在 deform 块（000001-036）之后。因此：
-    - **"全部当前帧"（零延迟）物理不可行**：deform 时刻当帧全套 palette 不并存（ring 复用）、当帧 cb1 未绑定；跨组校准需全部组 cb1，最后一组的渲染 draw 之前它们从不齐集，而那时前面的部件早已画完。
-    - **定案 = "全部上一帧" + Present 时序 attach**：每个 deform pass：`pre` = 把该 pass 当帧 palette **copy 成持久资源** `ResourceZZPalette_<DrawIB>`（ring buffer 别名撑不到帧尾）→ `vs-t0` 换绑为本组骨架（此时骨架内容是上一帧帧尾完整 attach 的版本，全部同属上一帧）→ draw 蒙皮。渲染 draw 处按组 `copy vs-cb1`（last-wins）。**帧尾 [Present]：逐（部件 × 组）统一 attach**——当帧 palette 副本 × 当帧 cb1 捕获同时在手，一次写出的骨架全部同属当帧，供下一帧使用。
-    - 效果：任意时刻合并骨架都是**完整且同帧**的；无"先跑 pass 覆盖、后跑 pass 读混帧"的帧内渐进覆盖（逐 pass attach 旧设计的每帧抖动源，用户实测）；无"palette 当帧 × cb1 上一帧"的校准混帧（校准差与 palette 同帧）。
-    - 代价与边界：角色骨骼动画整体比游戏世界慢一帧（16ms@60fps，无感）；morph/blendshape 顶点数据是当帧而骨骼慢一帧（48625d6d 脸部 blendshape 与骨骼一帧错开，可接受）；首帧合并骨架全零（一帧异常后自愈）。
-    - 备注：`[Present]` 有双缓冲爆炸前科（R8）——那次是 Present 帧翻转 + 条件换绑的写法问题；本次只在 Present 跑 attach CS（无翻转无换绑），仍需游戏内验证。
-    - 这是 ZZZ per-pass Map + ring buffer 布局下能达到的最优语义（EFMI 共享骨骼池天然当帧一致，不需要此设计）。
-5. **跨部件/跨组权重**：合法——同组直接引用；跨组由校准 attach 把外来骨骼换算进本组空间（各自对象→世界变换正常），帧对齐见上——这是与降级 B 模式的本质区别。
+4. **ZZZ 运行时挂载点与帧对齐设计（2026-08-25 定案：零延迟逐 pass attach）**：11 份 palette 由 CPU 逐 pass `Map`（WRITE_DISCARD）上传且 ring buffer 复用。**渲染侧存在当帧角色级绑定矩阵（dump 143256 实证：渲染 vs-cb2 = 身体正向 + 头部逆向绑定表，每帧 Map 更新；渲染 VS/PS 消费当帧绑定；渲染 vs-t0 = 7dfb0292 部件参数表 128 矩阵对）**——"慢一帧"的 SO × 当帧绑定 = 运动时逐帧错位（静止时帧差≈0，故 dump 数据层正常；这正是"只要采用骨骼合并就错位、不合并（SO 当帧）不错位"的根因，用户实测）。因此：
+    - **"全部上一帧"（Present 时序 attach）已废弃**：慢一帧与渲染当帧绑定不兼容。
+    - **定案 = 零延迟逐 pass attach**：每个 deform pass：`pre` = 把该 pass 当帧 palette **copy 成持久资源** `ResourceZZPalette_<DrawIB>` → **立即 run attach CS**（cs-t1 = vg_map 表，按「局部骨骼 id → 全局槽位」写入本组骨架；本部件引用的全部骨骼——含跨部件共享的 canonical 槽位——此刻即为当帧内容）→ `vs-t0` 换绑为本组骨架 → draw 蒙皮。**deform 读到的 = 当帧姿态**，与渲染当帧绑定一致。逐 pass attach 只需本部件当帧 palette（copy 时刻有效），不依赖"当帧全套并存"（旧设计否决的只是帧尾拿全套）。
+    - **帧尾 [Present] 兜底**：再次 run 各部件 attach（同帧内容，写全部槽位作为下一帧基线/异常兜底）。
+    - 效果：所有部件当帧姿态；首帧即正确（无自愈期）；**未生成组件走游戏原渲染（当帧 palette），与合并部件天然同帧一致，无需任何延迟机制**。
+    - 备注：共享骨骼 canonical 槽位被后 deform 部件 attach 覆盖（同帧 bitwise 相同，覆盖无害）；先 deform 部件的 SO 已在 deform 时固定，不受后续覆盖影响。
+5. **跨部件/跨组权重**：同组（相同对象空间）直接引用合法——组内统一骨架；**跨组别骨骼合并已禁止**（2026-08-25 用户拍板，无校准）——导出时 `_warn_cross_group_bone_references` 对引用非本组骨骼 id 的部件大声报警（这些槽位永不被写入 = 原点塌陷）。用户只应把同组部件 join 到同一对象。
+6. **未生成组件（2026-08-25 定案：零延迟后无需任何机制）**：合并部件 deform 输出当帧姿态，未生成部件走游戏原渲染（当帧 palette）——两者天然同帧一致，**延迟双缓冲机制（`ResourceZZDelayedPalette_<>` / `TextureOverride_VB_ZZDelayed_<>`）已整体废弃删除**。导出子集时未生成部件保持原版渲染即可。
 
 ## 6. 任务拆解（TDD，每步可独立验收）
 
@@ -242,7 +244,8 @@ if (
 | 3 | `ZZMISkeletonMergeHelper.ensure_skeleton_data`：回写 json + ModImpRuntime 缓存 + 幂等 | ✅ 15 子网格写回；二次运行全跳过；force 重建 |
 | 4 | 导入门控（`ui/ui_func_import_ssmt.py`，ZZMI + 复选框）；VGMap 消费走 `create_mesh_from_json` 既有双条件路径（零导入改动） | ✅ |
 | 5 | 导出侧：`common/submesh_model.py` ZZMI 预处理分支（补缺/剔 ignore/排序/紧凑改名，`g.group` == 全局 id）；无需升宽 | ✅ buffer 实测：全局 id 正确写入（64d7d56f/454ff522 全为 7；b20f90ea 51 个使用 id 含 13 个跨部件引用） |
-| 6 | Merged Skeleton CS + INI（按 ZZZ 从零编写）：`Toolset/zzmi_merged_skeleton_attach.hlsl` + `ExportZZMI` 生成 Constants/Resource(RWStructuredBuffer stride 48)/CustomShader 段 + 逐 deform VB 段注入换绑/attach | ✅ 生成 INI 校验通过；单测 `tests/test_zzmi_merged_skeleton_ini.py` 6/6 |
+| 6 | Merged Skeleton CS + INI（按 ZZZ 从零编写）：`Toolset/zzmi_merged_skeleton_attach.hlsl` + `ExportZZMI` 生成 Constants/Resource(RWStructuredBuffer stride 48)/CustomShader 段 + 逐 deform VB 段注入换绑/attach | ✅ 生成 INI 校验通过；单测 `tests/test_zzmi_merged_skeleton_ini.py`（含跨组引用守卫用例） |
+| 6.5 | **移除 CB1 校准（2026-08-25 用户拍板）**：删校准 CS/捕获段/`SkeletonGroupCb1SourceIb` 字段/校准数学测试；attach 退化为逐部件纯直拷；导出侧新增跨组别引用大声报警 | ✅ 单测 + 真实数据 e2e 全绿 |
 | 7 | **端到端**：Blender headless（`.dbg/run_zzmi_headless_validation.ps1` + `bl_zzmi_headless_validate.py`）导入+导出 [PASS]；**游戏内实测（ZZMIv1 加载、跨部件权重、帧内一致性）待用户侧执行** | ⏳ headless ✅ / 游戏内待测 |
 | 8 | 文档：CONTEXT.md 增补词条（Deform pass / Merged skeleton / VGMap） | ✅ |
 
@@ -270,25 +273,35 @@ if (
 - palette 缓存的跨工作空间复用/共享池。
 - ZZZ shapekey（CS morph 池）与 mod 的联动（48625d6d 类脸部部件）。
 
-**游戏内 dump 实证记录**（FrameAnalysis-2026-08-22-094614 / 212619 / 224434 / 08-23-001555）：换绑生效（hooked pass 的 vs-t0 无 dump、未 hook 的正常）、attach 偏移与 json 逐一吻合、合并网格内头发顶点用 live palette 重建 ≈ 实际 SO 输出（残差 0~0.0004、零系统性偏移）、各部件渲染 draw 的 CB 窗口完全一致（无逐部件原点差）、跨部件内容位置在带内。**用户游戏内持续观察到的偏移在三份出错 dump 的数据层均不存在**——2026-08-24 起按两个新根因修复（刚性锚点抓帧重合误并 + cb1 对象空间分组），待游戏内复验证；若仍在，回到"偏移正显示的那一帧抓 dump + 截图"的诊断路线。
+**游戏内 dump 实证记录**（FrameAnalysis-2026-08-22-094614 / 212619 / 224434 / 08-23-001555）：换绑生效（hooked pass 的 vs-t0 无 dump、未 hook 的正常）、attach 偏移与 json 逐一吻合、合并网格内头发顶点用 live palette 重建 ≈ 实际 SO 输出（残差 0~0.0004、零系统性偏移）、各部件渲染 draw 的 CB 窗口完全一致（无逐部件原点差）、跨部件内容位置在带内。**用户游戏内持续观察到的偏移在三份出错 dump 的数据层均不存在**——2026-08-24 起按两个新根因修复（刚性锚点抓帧重合误并 + cb1 对象空间分组）；2026-08-25 用户拍板放弃 CB1 校准（组内统一骨架 + 禁止跨组别合并），等待重导 + 重导出后游戏内复验证；若仍在，回到"偏移正显示的那一帧抓 dump + 截图"的诊断路线。
 
-**分组实测（dump 122152，按渲染 cb1 对象变换，2026-08-24 校准版定案口径）**：5 组——
-| 组 | 部件 | 对象变换平移（row3） | 全局槽位范围 | cb1 捕获源 |
-|---|---|---|---|---|
-| G0 | 19086112 | (-15.537, 2.381, -5.661) | 0..6 | 无（其帧内最后渲染 draw 绑共享数组，attach 直拷兜底） |
-| G1 头部 | 454ff522 / 48625d6d / 64d7d56f / b51bdd59 | (-15.212, 2.115, -5.556) | 7..29 | 48625d6d |
-| G2 头发 | 84618ee0 | (-15.209, 2.047, -5.561) | 30..78 | 84618ee0 |
-| G3 身体 | a23aa8a3 / b20f90ea / b30db54e（共享 13/2/6 根） | (-15.223, 1.585, -5.513) | 79..248 | a23aa8a3 |
-| G4 | add6ff13 + d892c658（同空间） | (-15.459, 1.815, -5.629) | 249..265 | add6ff13 |
-全局合计 266 槽（组基址拼接组内槽位）；组内去重后唯一骨骼总计 244；每组运行时骨架全宽 array=266，本组直拷 + 外来校准乘写入。cb1 提取口径：dump 行逐 draw 反查 vs-cb1（绑定调用是持久状态、多数 draw 不重发，不可靠），只解析 ≤512B 的逐部件块（>512B 是多对象共享变换数组+窗口索引，首条未必是本 draw 的对象），rows 0-3 即对象→世界矩阵（w 列 0/0/0/1 校验）。
+**2026-08-23 修复链（三帧游戏内 dump 实证：164525 / 170515 / 171955，用户复验通过）**——此前"偏移离谱/炸模/消失"的真根因不在时序，而在 attach CS 的两个运行时细节：
+
+1. **ini 参数布局（本 fork 与标准版不同）**：标准 3DMigoto 的 CustomShader 参数是 4 个一组从 `IniParams[0]` 起（`IniParams[0]=(x1,y1,z1,w1)`，mouse.hlsl/3dvision2sbs.hlsl 实证）；**本 3DMigoto-Armor fork 的 `y1` 在 `IniParams[1].y`**。读错位置的行为差异（同一 CS 三帧实测）：
+   - 读 `IniParams[1].y`（=y1）：count=vg_count 正确 → attach 执行；
+   - 读 `IniParams[0].y`（=x1=0）：count=0 → attach 一根不写 → **G3 全零 → 蒙皮全部塌向原点 → 模型消失**。
+   - 结论：`#define ZZ_ATTACH_COUNT IniParams[1].y`（`Toolset/zzmi_merged_skeleton_attach.hlsl`）。
+2. **vg_map 多行 data 只写第 0 个元素**：`[ResourceZZVgMap_<DrawIB>] type=Buffer format=R32G32B32A32_UINT data = <slot> 0 0 0`（每行一个元素）在本 fork 上**只写入第 0 个元素**——CS 其余线程 `vg_map[i]` 越界读到 0 → **全部骨骼塌进 slot 0**，G3 仅 3 槽非零（`[0, 79, 88]`，slot 79/88 = 各部件 palette[0] 写入正确、slot 0 = 塌陷）→ 蒙皮 246/249 骨骼用零矩阵 → **模型炸裂**。修复：导出器把 vg_map 写成**二进制文件**（`Meshes/zz_vgmap_<DrawIB>.buf`，每元素 4×uint32 = 槽位值,0,0,0），INI 改 `filename` 加载（与 VB 资源同一路径，buffer 大小由文件决定，视图必然覆盖全部元素）；HLSL 侧 `Buffer<uint4> vg_map` 与 `format=R32G32B32A32_UINT` 精确匹配（`ui/universal/zzmi.py` `add_merged_skeleton_sections`）。
+3. **合并网格自动重定向（任意 IB 挂载兑现）**：palette 是 per-pass 独立 Map 上传的 ring scratch（同资源 hash 帧内两次 dump 内容不同，141c7638→8a40ccd0/0b9416aa 实证），早 deform pass 时刻读不到晚 pass 部件的当帧骨骼——因此**合并网格（同组跨部件 join 成一个对象）物理上只能在组内最后一个 deform draw 蒙皮**。为兑现「用户可自由 join 到任意 IB」的设计承诺，导出器自动重定向（`_build_merged_mesh_redirect_plan`）：carrier（合并网格挂载的 DrawIB）deform 退化为 3 顶点 stub（保留 copy palette + attach 写当帧骨骼）；组内最后 deform draw 的 DrawIB（target）deform 追加画合并网格（绑定 carrier 的 vb0/vb2，SO 按 [target 真实几何][merged...] 拼接）；carrier 的 render override 重挂 target 的 render draw（match_first_index 用 target 子网格的，drawindexed 带 base_vertex 偏移）；target 的 stub 子网格 render 改 ib=null；VertexLimitRaise 按 SO 实际大小重排（carrier=3 / target=Σ）；合并网格的渲染换绑 `vb1 = Resource<carrier>Texcoord`（导出顶点超原部件顶点时，防 OOB UV）。支撑数据：json 新增 `DeformDrawIndex`/`OriginalVertexCount`（`common/zzmi_skeleton.py` 反查写回；幂等门控纳入，旧缓存自动整批刷新），透传到导出侧（`common/submesh_model.py`/`common/submesh_metadata.py`）。无法自动重定向的情形（缺 DeformDrawIndex / 配置跨 IB）由 `_warn_merged_mesh_timing` 大声报警并给出改名指引。
+4. **游戏内复验（用户确认 2026-08-23）**：同组内合并（组 3 全部部件 join 成一个对象）蒙皮正确、不再炸裂/消失。G3 骨架由「3/249 槽非零」修复为全量写入（170 槽左右，分布 79..248）。
+
+**分组实测（dump 122152，按渲染 cb1 对象变换，2026-08-24 分组定案口径）**：5 组——
+| 组 | 部件 | 对象变换平移（row3） | 全局槽位范围 |
+|---|---|---|---|
+| G0 | 19086112 | (-15.537, 2.381, -5.661) | 0..6 |
+| G1 头部 | 454ff522 / 48625d6d / 64d7d56f / b51bdd59 | (-15.212, 2.115, -5.556) | 7..29 |
+| G2 头发 | 84618ee0 | (-15.209, 2.047, -5.561) | 30..78 |
+| G3 身体 | a23aa8a3 / b20f90ea / b30db54e（共享 13/2/6 根） | (-15.223, 1.585, -5.513) | 79..248 |
+| G4 | add6ff13 + d892c658（同空间） | (-15.459, 1.815, -5.629) | 249..265 |
+全局合计 266 槽（组基址拼接组内槽位）；组内去重后唯一骨骼总计 244；每组运行时骨架全宽 array=266，**只直拷本组骨骼（无校准，2026-08-25 起）**。cb1 提取口径（仅用于分组键）：dump 行逐 draw 反查 vs-cb1（绑定调用是持久状态、多数 draw 不重发，不可靠），只解析 ≤512B 的逐部件块（>512B 是多对象共享变换数组+窗口索引，首条未必是本 draw 的对象），rows 0-3 即对象→世界矩阵（w 列 0/0/0/1 校验）。
 
 ## 8. 验收标准
 
 1. 对测试工作空间 `希格莉德·空岛传奇` 执行导入：15 个子网格全部生成并写回 VGMap/VGOffset/VGCount；palette buf 落入各 `<子网格>/ModImpRuntime/`。
-2. 去重结果与实测一致：5 个骨架组（身体/头部/头发/19086112/add6ff13+d892c658），全局骨骼编号按组基址拼接（0..6/7..29/30..78/79..248/249..265，Σ 266）；头部组内 `454ff522#0` ↔ `48625d6d#2`（质心距 0.034）合并为全局槽 7、`64d7d56f` 头顶件与 `b51bdd59#0` 后脑发饰骨被刚性门控拆开（槽 18/19）；身体组 b20f90ea 38 新 + 13 共享等（对照 §2.5）；**同部件内部零合并；48625d6d 的 `#1/#8/#9`（同骨骼异帧）保持独立不被误并；跨组部件的骨骼分占各组槽位，运行时经校准乘保证各自对象→世界变换正常**。
+2. 去重结果与实测一致：5 个骨架组（身体/头部/头发/19086112/add6ff13+d892c658），全局骨骼编号按组基址拼接（0..6/7..29/30..78/79..248/249..265，Σ 266）；头部组内 `454ff522#0` ↔ `48625d6d#2`（质心距 0.034）合并为全局槽 7、`64d7d56f` 头顶件与 `b51bdd59#0` 后脑发饰骨被刚性门控拆开（槽 18/19）；身体组 b20f90ea 38 新 + 13 共享等（对照 §2.5）；**同部件内部零合并；48625d6d 的 `#1/#8/#9`（同骨骼异帧）保持独立不被误并；跨组部件的骨骼分占各组槽位，运行时各自组内直拷（无校准）**。
 3. 幂等：二次导入不重复反查（跳过并提示）；`force=True` 可重建。
-4. **统一顶点组**：复选框开导入后，所有子网格对象共用同一套全局顶点组（组名 = 全局骨骼 id）；**任意组件 A 可以刷任意组件 B 的骨骼权重（跨组合法，运行时经校准乘保证变换正确）**；导入对象按 `SkeletonGroup` 归入对应 `SkeletonGroup_<N>` 合集。
-5. **导出合并骨架**：复选框开 + 有 VGMap 时，导出 vb2 的 BLENDINDICES = 全局骨骼 id；INI 含 Merged Skeleton 全套（init 守卫 + 每组全宽 `ResourceZZMergedSkeleton_G<N>`（array=266）+ 每组 `ResourceZZCb1_G<N>` 捕获段（TextureOverrideVB 按代表部件 SO 输出 hash 匹配，last-wins copy vs-cb1 unless_null）+ 逐（部件 × 组）校准 attach CustomShader + 逐 deform pass 换绑本组骨架）。
-6. **游戏内实测**：导出的 mod 在 ZZMIv1 加载端下姿态正确，跨部件权重生效（deform pass vs-t0 成功换绑合并骨架；全角色统一使用上一帧完整骨架，帧内无部件间不一致）；渲染 draw 无 R3 异常。
+4. **统一顶点组**：复选框开导入后，所有子网格对象共用同一套全局顶点组（组名 = 全局骨骼 id）；**同组部件可互刷权重（组内统一骨架）；跨组别引用被禁止——导出时 `_warn_cross_group_bone_references` 大声报警**；导入对象按 `SkeletonGroup` 归入对应 `SkeletonGroup_<N>` 合集。
+5. **导出合并骨架**：复选框开 + 有 VGMap 时，导出 vb2 的 BLENDINDICES = 全局骨骼 id；INI 含 Merged Skeleton 全套（init 守卫 + 每组全宽 `ResourceZZMergedSkeleton_G<N>`（array=266）+ 逐部件直拷 attach CustomShader（`cs = ./res/zzmi_merged_skeleton_attach.hlsl`，无 cb1 引用）+ 逐 deform pass 换绑本组骨架 + [Present] 帧尾逐部件 attach）。**INI 不得含任何 cb1 捕获段/捕获资源/校准着色器引用**。
+6. **游戏内实测**：导出的 mod 在 ZZMIv1 加载端下姿态正确，同组跨部件权重生效（deform pass vs-t0 成功换绑合并骨架；全角色统一使用上一帧完整骨架，帧内无部件间不一致）；渲染 draw 无 R3 异常。
 7. 复选框关闭：导入与导出行为均与现状完全一致（无 VGMap 读写、无 ModImpRuntime 写入、BLENDINDICES 走 `g.group` 原路径、无 Merged Skeleton 段）。
 8. 单测全绿 + Blender headless e2e [PASS]。

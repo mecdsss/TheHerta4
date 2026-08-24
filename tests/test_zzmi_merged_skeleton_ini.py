@@ -49,6 +49,7 @@ class _FakeIniBuilder:
 class _FakeIniSectionType:
     TextureOverrideIB = "TextureOverrideIB"
     TextureOverrideVB = "TextureOverrideVB"
+    TextureOverrideVertexLimitRaise = "TextureOverrideVertexLimitRaise"
     ResourceBuffer = "ResourceBuffer"
     MergedSkeleton = "MergedSkeleton"
 
@@ -61,11 +62,23 @@ class _FakeExportUnity:
     def add_unity_vs_resource_vb_sections(self, ini_builder, drawib_model):
         pass
 
+    def add_unity_vs_texture_override_vlr_section(
+        self, ini_builder, drawib_model, include_uav_byte_stride=True
+    ):
+        pass
 
-_fake_global_properties = types.SimpleNamespace(import_merged_vgmap=lambda: True)
+
+_fake_global_properties = types.SimpleNamespace(
+    import_merged_vgmap=lambda: True,
+    forbid_auto_texture_ini=lambda: False,
+    zzz_use_slot_fix=lambda: False,
+)
+# vg_map 导出写文件：path_generate_mod_folder 必须指向临时目录，防止测试残留
+# 污染仓库根（2026-08-23 曾把 Meshes/zz_vgmap_*.buf 写到仓库根）
+_FAKE_MOD_FOLDER = tempfile.mkdtemp(prefix="zzmi_mod_folder_")
 _fake_global_config = types.SimpleNamespace(
     path_generatemod_buffer_folder=lambda: "",
-    path_generate_mod_folder=lambda: "",
+    path_generate_mod_folder=lambda: _FAKE_MOD_FOLDER,
     get_workspace_name=lambda: "",
     path_workspace_folder=lambda: "",
 )
@@ -189,7 +202,12 @@ _install_module(
 )
 _install_module(
     f"{PKG}.common.m_ini_helper",
-    M_IniHelper=types.SimpleNamespace(),
+    M_IniHelper=types.SimpleNamespace(
+        get_drawindexed_str_list=lambda drawcall_list, obj_name_draw_offset_dict=None: [
+            f"drawindexed = {dc.index_count},{dc.index_offset},0" for dc in drawcall_list
+        ],
+        is_slot_binding_mark_type=lambda mark_type: False,
+    ),
 )
 _install_module(
     f"{PKG}.common.m_ini_helper_gui",
@@ -216,6 +234,7 @@ _spec.loader.exec_module(_zzmi_module)
 
 class _FakeGameType:
     OrderedCategoryNameList = ["Position", "Texcoord", "Blend"]
+    GPU_PreSkinning = True
     CategoryDrawCategoryDict = {
         "Position": "Position",
         "Texcoord": "Texcoord",
@@ -234,15 +253,27 @@ class _FakeGameType:
 
 
 class _FakeSubmesh:
-    def __init__(self, unique_str, vg_offset=0, vg_count=0, skeleton_group=0,
-                 cb1_source_ib="", cb1_source_so=""):
+    def __init__(self, unique_str, vg_offset=0, vg_count=0, skeleton_group=0, vg_map=None,
+                 deform_draw=0, original_vertex_count=0, vertex_count=0,
+                 exported_vertex_count=0, match_first_index=0):
         self.unique_str = unique_str
-        self.match_first_index = 0
+        self.match_first_index = match_first_index
         self.vg_offset = vg_offset
         self.vg_count = vg_count
         self.skeleton_group = skeleton_group
-        self.skeleton_group_cb1_source_ib = cb1_source_ib
-        self.skeleton_group_cb1_source_so = cb1_source_so
+        # 缺省 identity：local -> vg_offset + local（与真实反查写回一致）
+        self.vg_map = vg_map if vg_map is not None else {
+            local: vg_offset + local for local in range(vg_count)
+        }
+        # ZZMI 导出侧守卫元数据（反查写回）：deform draw 序号 / 原部件顶点数
+        self.deform_draw_index = deform_draw
+        self.original_vertex_count = original_vertex_count
+        self.vertex_count = vertex_count
+        # 导出 buffer 顶点数（去重后；_submesh_exported_vertex_count 用）
+        self.index_vertex_id_dict = (
+            list(range(exported_vertex_count)) if exported_vertex_count else None
+        )
+        self.category_buffer_dict = {}
         self.drawcall_model_list = []
 
 
@@ -251,6 +282,7 @@ class _FakeDrawIBModel:
         self.draw_ib = draw_ib
         self.draw_ib_alias = draw_ib
         self.draw_number = 4643
+        self.vertex_limit_hash = "dd9c8d5e"
         self.d3d11GameType = _FakeGameType()
         self.category_hash_dict = {
             "Position": "122883aa",
@@ -259,6 +291,19 @@ class _FakeDrawIBModel:
         }
         self.submesh_model_list = submesh_model_list
         self.match_first_index_partname_dict = part_map or {}
+        self.submesh_ib_dict = {
+            submesh.unique_str: b"\x00\x00\x00\x00" for submesh in submesh_model_list
+        }
+        self.obj_name_draw_offset = {}
+
+    def get_submesh_texture_override_suffix(self, submesh_model):
+        return submesh_model.unique_str.replace("-", "_")
+
+    def get_submesh_ib_resource_name(self, submesh_model):
+        return "Resource_" + submesh_model.unique_str.replace("-", "_") + "_Index"
+
+    def get_submesh_texture_markup_info_list(self, submesh_model):
+        return []
 
 
 def _make_exporter(drawib_models, merged_vgmap=True, ordered_drawcalls=None):
@@ -328,15 +373,15 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         lines = self._build_vb_section(with_merged=True)
         text = "\n".join(lines)
 
-        # palette 持久副本在 draw 之前；换绑本组骨架；attach 不在 VB 段（挪到 [Present]）
+        # 零延迟逐 pass attach：deform 段内 copy 当帧 palette -> run attach -> 换绑本组骨架
         idx_copy = text.index("ResourceZZPalette_b20f90ea = copy vs-t0 unless_null")
+        idx_run = text.index("run = CustomShaderZZMIMergedSkeletonAttach_C0")
         idx_swap = text.index("vs-t0 = ResourceZZMergedSkeleton_G0")
         idx_draw = text.index("draw = 4643, 0")
-        self.assertLess(idx_copy, idx_swap)
+        self.assertLess(idx_copy, idx_run)
+        self.assertLess(idx_run, idx_swap)
         self.assertLess(idx_swap, idx_draw)
-        # VB 段不再做 attach（帧对齐：attach 统一在 [Present] 帧尾执行）
-        self.assertNotIn("run = CustomShaderZZMIMergedSkeletonAttach", text)
-        self.assertNotIn("cs-t0", text)
+        # [Present] 仅兜底 run（无变量参数）
         self.assertNotIn("$zz_ms_attach_offset", text)
 
     def test_vb_section_without_merged_stays_legacy(self):
@@ -359,47 +404,59 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         )
         builder = _FakeIniBuilder()
         exporter.add_merged_skeleton_sections(builder)
-        text = "\n".join(builder.sections[0].SectionLineList)
+        lines = builder.sections[0].SectionLineList
+        text = "\n".join(lines)
 
         self.assertIn("global $zz_ms_initialized = 0", text)
         self.assertIn("[ResourceZZMergedSkeleton_G0]", text)
         self.assertIn("type = RWStructuredBuffer", text)
         self.assertIn("stride = 48", text)
         self.assertIn("array = 156", text)  # 全宽 = max(0+105, 105+51) = 156
-        self.assertIn("[ResourceZZCb1_G0]", text)
-        # 无捕获源（fake 未设 cb1_source_ib）：不出捕获段，attach 段不带 cb1 引用（CS 直拷兜底）
+        # 无 CB1 校准：不出捕获资源/捕获段/校准引用
+        self.assertNotIn("ResourceZZCb1", text)
         self.assertNotIn("Cb1Capture", text)
-        # palette 持久副本资源（Present 时序 attach 的输入）
+        self.assertNotIn("cs-cb1", text)
+        self.assertNotIn("cs-cb2", text)
+        # palette 持久副本资源 + vg_map 表（attach CS 按此写槽位；data 行 = float4 元素流）
         self.assertIn("[ResourceZZPalette_a23aa8a3]", text)
         self.assertIn("[ResourceZZPalette_b20f90ea]", text)
-        self.assertIn("[CustomShaderZZMIMergedSkeletonAttach_C0_G0]", text)
-        self.assertIn("[CustomShaderZZMIMergedSkeletonAttach_C1_G0]", text)
+        # identity 映射：a23aa8a3 槽位 0..104（vg_map 用 filename 二进制加载——
+        # 多行 data 在本 3DMigoto fork 上只写第 0 个元素，2026-08-23 实证）
+        self.assertIn("[ResourceZZVgMap_a23aa8a3]", text)
+        self.assertIn("type = Buffer", text)
+        self.assertIn("format = R32G32B32A32_UINT", text)
+        self.assertIn("filename = Meshes/zz_vgmap_a23aa8a3.buf", text)
+        self.assertIn("[ResourceZZVgMap_b20f90ea]", text)
+        self.assertIn("filename = Meshes/zz_vgmap_b20f90ea.buf", text)
+        # 逐部件 attach 段（参数写死：x1=0 / y1=vg_count；cs-t1 = vg_map）
+        self.assertIn("[CustomShaderZZMIMergedSkeletonAttach_C0]", lines)
+        self.assertIn("[CustomShaderZZMIMergedSkeletonAttach_C1]", lines)
+        self.assertNotIn("CustomShaderZZMIMergedSkeletonAttach_C0_G0", text)
+        self.assertIn("cs = ./res/zzmi_merged_skeleton_attach.hlsl", text)
+        self.assertIn("x1 = 0", text)
+        self.assertIn("y1 = 105", text)
         self.assertIn("cs-t0 = ref ResourceZZPalette_a23aa8a3", text)
+        self.assertIn("cs-t1 = ref ResourceZZVgMap_a23aa8a3", text)
         self.assertIn("cs-t0 = ref ResourceZZPalette_b20f90ea", text)
-        self.assertIn("cs = ./res/zzmi_merged_skeleton_attach_calibrated.hlsl", text)
-        self.assertIn("x1 = $zz_ms_attach_offset", text)
-        self.assertIn("y1 = $zz_ms_attach_count", text)
         self.assertIn("cs-u0 = ref ResourceZZMergedSkeleton_G0", text)
         self.assertIn("Dispatch = 8, 1, 1", text)
-        self.assertNotIn("cs-t1 = ref", text)
-        self.assertNotIn("cs-t2 = ref", text)
-        # attach 运行在 [Present]（帧尾统一对齐），且逐 run 前带本部件 offset/count
+        # [Present] 兜底 run：每部件一次（无变量参数）
         self.assertIn("[Present]", text)
         present_text = text.split("[Present]")[1]
-        idx_offset = present_text.index("$zz_ms_attach_offset = 0")
-        idx_count = present_text.index("$zz_ms_attach_count = 105")
-        idx_run = present_text.index("run = CustomShaderZZMIMergedSkeletonAttach_C0_G0")
-        self.assertLess(idx_offset, idx_count)
-        self.assertLess(idx_count, idx_run)
-        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C1_G0", present_text)
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C0", present_text)
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C1", present_text)
+        self.assertEqual(present_text.count("run = CustomShaderZZMIMergedSkeletonAttach_"), 2)
+        self.assertNotIn("$zz_ms_attach_offset", present_text)
+        self.assertNotIn("$zz_ms_attach_count", present_text)
+
     def test_merged_skeleton_sections_per_group(self):
-        """校准版：每组一套全宽骨架资源；逐（部件 × 组）attach；有捕获源的组出捕获段。"""
-        # 组 0（身体）：a23aa8a3(0,105) + b20f90ea(105,51)，捕获源 = a23aa8a3（SO=01b35c45）
-        # 组 1（头部）：64d7d56f(156,1) + b51bdd59(157,11)，捕获源 = 48625d6d（本例缺席）
+        """组内统一骨架版：每组一套全宽骨架资源；逐部件直拷 attach 到本组；无任何捕获/校准段。"""
+        # 组 0（身体）：a23aa8a3(0,105) + b20f90ea(105,51)
+        # 组 1（头部）：64d7d56f(156,1) + b51bdd59(157,11)
         exporter = _make_exporter(
             [
-                _FakeDrawIBModel("a23aa8a3", [_FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, 0, "a23aa8a3", "01b35c45")]),
-                _FakeDrawIBModel("b20f90ea", [_FakeSubmesh("LOD0.b20f90ea-19182-0", 105, 51, 0, "a23aa8a3", "01b35c45")]),
+                _FakeDrawIBModel("a23aa8a3", [_FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, 0)]),
+                _FakeDrawIBModel("b20f90ea", [_FakeSubmesh("LOD0.b20f90ea-19182-0", 105, 51, 0)]),
                 _FakeDrawIBModel("64d7d56f", [_FakeSubmesh("LOD0.64d7d56f-900-0", 156, 1, 1)]),
                 _FakeDrawIBModel("b51bdd59", [_FakeSubmesh("LOD0.b51bdd59-864-0", 157, 11, 1)]),
             ],
@@ -410,37 +467,36 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         )
         builder = _FakeIniBuilder()
         exporter.add_merged_skeleton_sections(builder)
-        text = "\n".join(builder.sections[0].SectionLineList)
+        lines = builder.sections[0].SectionLineList
+        text = "\n".join(lines)
 
         self.assertIn("[ResourceZZMergedSkeleton_G0]", text)
         self.assertIn("[ResourceZZMergedSkeleton_G1]", text)
         # 两组全宽 array = 全局 max(157+11) = 168（只数骨架资源的 array 行；
         # palette 副本资源自带 array=vg_count 行，需排除——骨架段结构：header/type/stride/array）
-        section_lines = builder.sections[0].SectionLineList
         skeleton_arrays = [
-            section_lines[i + 3]
-            for i, line in enumerate(section_lines)
+            lines[i + 3]
+            for i, line in enumerate(lines)
             if line.startswith("[ResourceZZMergedSkeleton_G")
         ]
         self.assertEqual(skeleton_arrays, ["array = 168", "array = 168"])
-        # 组 0 有捕获源（SO=01b35c45）-> 捕获段按 SO hash 匹配 + attach 带 cs-cb1/cs-cb2；
-        # 组 1 无 -> 无捕获段
-        self.assertIn("[TextureOverrideVB_Cb1Capture_G0_so01b35c45]", text)
-        self.assertIn("hash = 01b35c45", text)
-        self.assertIn("match_instance_count = 0", text)
-        self.assertIn("ResourceZZCb1_G0 = copy vs-cb1 unless_null", text)
-        self.assertNotIn("Cb1Capture_G1", text)
-        # 逐（部件 × 组）attach：4 部件 × 2 组 = 8 段
+        # 无捕获段、无校准资源、无 cb 引用
+        self.assertNotIn("Cb1Capture", text)
+        self.assertNotIn("ResourceZZCb1", text)
+        self.assertNotIn("cs-cb1", text)
+        self.assertNotIn("cs-cb2", text)
+        # 逐部件 attach：4 段，各自写回**本组**骨架，带 vg_map 表
         for cid in range(4):
-            for g in (0, 1):
-                self.assertIn(f"[CustomShaderZZMIMergedSkeletonAttach_C{cid}_G{g}]", text)
-        # 组 0 的 attach：cs-cb1（本组 cb1）在 C0/C1（组 0 部件）上，cs-cb2（目标组 cb1）在 G0 目标上
-        c0_g0 = text.split("[CustomShaderZZMIMergedSkeletonAttach_C0_G0]")[1].split("[")[0]
-        self.assertIn("cs-cb1 = ref ResourceZZCb1_G0", c0_g0)   # C0 属组 0（资源名 ZZCb1，槽 cb1）
-        self.assertIn("cs-cb2 = ref ResourceZZCb1_G0", c0_g0)   # 目标组 0（资源名 ZZCb1，槽 cb2）
-        c2_g0 = text.split("[CustomShaderZZMIMergedSkeletonAttach_C2_G0]")[1].split("[")[0]
-        self.assertNotIn("cs-cb1 = ref", c2_g0)                # C2 属组 1（无捕获源）
-        self.assertNotIn("cs-t1 = ref", c2_g0)                 # 不得错绑到 SRV 槽
+            self.assertIn(f"[CustomShaderZZMIMergedSkeletonAttach_C{cid}]", lines)
+        c0 = text.split("[CustomShaderZZMIMergedSkeletonAttach_C0]")[1].split("[")[0]
+        self.assertIn("cs-u0 = ref ResourceZZMergedSkeleton_G0", c0)  # C0 属组 0
+        self.assertIn("cs-t1 = ref ResourceZZVgMap_a23aa8a3", c0)
+        c2 = text.split("[CustomShaderZZMIMergedSkeletonAttach_C2]")[1].split("[")[0]
+        self.assertIn("cs-u0 = ref ResourceZZMergedSkeleton_G1", c2)  # C2 属组 1
+        self.assertIn("cs-t1 = ref ResourceZZVgMap_64d7d56f", c2)
+        # [Present] 每部件只 run 一次（4 部件 = 4 次）
+        present_text = text.split("[Present]")[1]
+        self.assertEqual(present_text.count("run = CustomShaderZZMIMergedSkeletonAttach_"), 4)
 
     def test_vb_section_rebinds_to_own_group_resource(self):
         """每个 deform VB 段 copy 当帧 palette 成持久副本并换绑本组骨架（attach 在 [Present]）。"""
@@ -455,22 +511,24 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         exporter.add_unity_vs_texture_override_vb_sections(builder0, model_g0)
         text0 = "\n".join(builder0.sections[0].SectionLineList)
         self.assertIn("ResourceZZPalette_a23aa8a3 = copy vs-t0 unless_null", text0)
+        # 零延迟逐 pass attach：deform 段内 copy -> run attach -> 换绑本组骨架
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C0", text0)
         self.assertIn("vs-t0 = ResourceZZMergedSkeleton_G0", text0)
-        self.assertNotIn("run = CustomShaderZZMIMergedSkeletonAttach", text0)
 
         builder1 = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder1, model_g1)
         text1 = "\n".join(builder1.sections[0].SectionLineList)
         self.assertIn("ResourceZZPalette_64d7d56f = copy vs-t0 unless_null", text1)
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C1", text1)
         self.assertIn("vs-t0 = ResourceZZMergedSkeleton_G1", text1)
 
-        # 逐（部件 × 组）attach 运行在 [Present]：2 部件 × 2 组 = 4 次
+        # [Present] 兜底 run：2 部件 = 2 次（无变量参数）
         builder = _FakeIniBuilder()
         exporter.add_merged_skeleton_sections(builder)
         present_text = "\n".join(builder.sections[0].SectionLineList).split("[Present]")[1]
-        for cid, draw_ib in ((0, "a23aa8a3"), (1, "64d7d56f")):
-            for g in (0, 1):
-                self.assertIn(f"run = CustomShaderZZMIMergedSkeletonAttach_C{cid}_G{g}", present_text)
+        for cid in (0, 1):
+            self.assertIn(f"run = CustomShaderZZMIMergedSkeletonAttach_C{cid}", present_text)
+        self.assertEqual(present_text.count("run = CustomShaderZZMIMergedSkeletonAttach_"), 2)
 
     def test_merged_skeleton_buffer_covers_offset_gap(self):
         """回归：中间部件缺失时 buffer 必须按 max(vg_offset+vg_count) 声明，而非 sum(vg_count)。
@@ -494,6 +552,91 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         text = "\n".join(builder.sections[0].SectionLineList)
 
         self.assertIn("array = 51", text)  # max(0+11, 31+20) = 51，而非 sum=31
+
+
+class ZZMICrossGroupGuardTests(unittest.TestCase):
+    """跨组别引用守卫（无校准模式）：引用非本组骨骼 id 必须大声报警。"""
+
+    def setUp(self):
+        _fake_bpy_data.objects._items.clear()
+        _fake_bpy_data.meshes._items.clear()
+
+    def _register_obj(self, name, bone_ids, stub=False):
+        """注册 fake 对象：顶点 i 权重挂顶点组 i，组名 = bone_ids[i]（全局骨骼 id）。"""
+        mesh = _fake_bpy_data.meshes.new(name=name + "_mesh")
+        mesh.vertices = [
+            types.SimpleNamespace(
+                groups=[types.SimpleNamespace(group=i, weight=1.0)]
+            )
+            for i in range(len(bone_ids))
+        ]
+        obj = _fake_bpy_data.objects.new(name=name, object_data=mesh)
+        obj.vertex_groups = _FakeVertexGroups()
+        for bone_id in bone_ids:
+            obj.vertex_groups.append(_FakeVertexGroup(str(bone_id)))
+        if stub:
+            obj["ZZMI_STUB"] = 1
+        return obj
+
+    def _make_component_exporter(self, draw_ib, submesh, components):
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        submesh.drawcall_model_list = [dcm(obj_name=submesh.unique_str)]
+        exporter = _make_exporter([_FakeDrawIBModel(draw_ib, [submesh])], merged_vgmap=True)
+        exporter.merged_skeleton_components = components
+        exporter.merged_skeleton_component_id_dict = {
+            c["draw_ib"]: i for i, c in enumerate(components)
+        }
+        return exporter
+
+    def _capture_warnings(self, exporter):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            exporter._warn_cross_group_bone_references()
+        return buf.getvalue()
+
+    def test_cross_group_reference_warns(self):
+        """a23aa8a3（组 0，槽 0~104）的顶点引用了组 1 的骨骼 id 105 -> 报警。"""
+        self._register_obj("LOD0.a23aa8a3-42759-0", [0, 100, 105])
+        submesh = _FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, 0)
+        components = [
+            {"draw_ib": "a23aa8a3", "vg_offset": 0, "vg_count": 105, "skeleton_group": 0},
+            {"draw_ib": "b20f90ea", "vg_offset": 105, "vg_count": 51, "skeleton_group": 1},
+        ]
+        exporter = self._make_component_exporter("a23aa8a3", submesh, components)
+        out = self._capture_warnings(exporter)
+        self.assertIn("禁止跨组别骨骼合并", out)
+        self.assertIn("a23aa8a3", out)
+        self.assertIn("骨架组 G0", out)
+        self.assertIn("105", out)
+        self.assertIn("归属组: [1]", out)
+
+    def test_same_group_reference_silent(self):
+        """同组骨骼引用（含并入本组其它部件的骨骼 id）不报警。"""
+        self._register_obj("LOD0.b20f90ea-19182-0", [105, 106, 0])
+        submesh = _FakeSubmesh("LOD0.b20f90ea-19182-0", 105, 51, 0)
+        components = [
+            {"draw_ib": "a23aa8a3", "vg_offset": 0, "vg_count": 105, "skeleton_group": 0},
+            {"draw_ib": "b20f90ea", "vg_offset": 105, "vg_count": 51, "skeleton_group": 0},
+        ]
+        exporter = self._make_component_exporter("b20f90ea", submesh, components)
+        out = self._capture_warnings(exporter)
+        self.assertEqual(out, "")
+
+    def test_stub_object_skipped(self):
+        """占位小三角面（ZZMI_STUB，权重挂组 "0"）不触发跨组报警。"""
+        # 组 1 的范围是 [156,157)：stub 引用骨骼 0（组外）——若不跳过会误报
+        self._register_obj("LOD0.64d7d56f-900-0", [0], stub=True)
+        submesh = _FakeSubmesh("LOD0.64d7d56f-900-0", 156, 1, 1)
+        components = [
+            {"draw_ib": "a23aa8a3", "vg_offset": 0, "vg_count": 105, "skeleton_group": 0},
+            {"draw_ib": "64d7d56f", "vg_offset": 156, "vg_count": 1, "skeleton_group": 1},
+        ]
+        exporter = self._make_component_exporter("64d7d56f", submesh, components)
+        out = self._capture_warnings(exporter)
+        self.assertEqual(out, "")
 
 
 class ZZSIMissingPartsGuardTests(unittest.TestCase):
@@ -630,6 +773,328 @@ class ZZMIStubObjectTests(unittest.TestCase):
         self.assertNotIn("LOD0.84618ee0-22296-0", names)
         self.assertNotIn("LOD0.84618ee0-1164-22296", names)
         self.assertEqual(exporter._zzmi_stub_object_names, [])
+
+
+class ZZSIMergedMeshRedirectTests(unittest.TestCase):
+    """合并网格自动重定向（2026-08-25 设计兑现：合并网格可挂在任意 DrawIB）。
+
+    逐 pass attach 只在各部件自己的 deform draw 前写入**本部件**骨骼；palette 是
+    per-pass 独立上传的 ring scratch，早 pass 时刻读不到晚 pass 部件的当帧骨骼。
+    因此挂在早 pass 的合并网格由导出器**自动**把 deform+render 挪到组内最后一个
+    deform draw——用户无感，任意 IB 挂载均正确。
+    """
+
+    def setUp(self):
+        _fake_bpy_data.objects._items.clear()
+        _fake_bpy_data.meshes._items.clear()
+
+    def _register_obj(self, name, bone_ids):
+        """fake 对象：顶点 i 权重挂顶点组 i，组名 = bone_ids[i]（全局骨骼 id）。"""
+        mesh = _fake_bpy_data.meshes.new(name=name + "_mesh")
+        mesh.vertices = [
+            types.SimpleNamespace(groups=[types.SimpleNamespace(group=i, weight=1.0)])
+            for i in range(len(bone_ids))
+        ]
+        obj = _fake_bpy_data.objects.new(name=name, object_data=mesh)
+        obj.vertex_groups = _FakeVertexGroups()
+        for bone_id in bone_ids:
+            obj.vertex_groups.append(_FakeVertexGroup(str(bone_id)))
+        return obj
+
+    def _attach_drawcalls(self, submesh, index_count=0):
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        draw_call = dcm(obj_name=submesh.unique_str)
+        draw_call.index_count = index_count
+        submesh.drawcall_model_list = [draw_call]
+        return submesh
+
+    def _make_exporter(self, models, components):
+        exporter = _make_exporter(models, merged_vgmap=True)
+        exporter.merged_skeleton_components = components
+        exporter.merged_skeleton_component_id_dict = {
+            c["draw_ib"]: i for i, c in enumerate(components)
+        }
+        return exporter
+
+    def _group3_components(self):
+        """组 3 实测（按 vg_offset 升序 = _collect_merged_skeleton_components 排序）：
+        a23aa8a3(draw 20) b20f90ea(draw 2) b30db54e(draw 8)。"""
+        return [
+            {
+                "draw_ib": "a23aa8a3", "unique_str": "LOD0.a23aa8a3-42759-0",
+                "vg_offset": 79, "vg_count": 105, "skeleton_group": 3,
+                "vg_map": {i: 79 + i for i in range(105)}, "deform_draw": 20,
+            },
+            {
+                "draw_ib": "b20f90ea", "unique_str": "LOD0.b20f90ea-19182-0",
+                "vg_offset": 184, "vg_count": 51, "skeleton_group": 3,
+                "vg_map": {i: 184 + i for i in range(51)}, "deform_draw": 2,
+            },
+            {
+                "draw_ib": "b30db54e", "unique_str": "LOD0.b30db54e-7383-0",
+                "vg_offset": 235, "vg_count": 14, "skeleton_group": 3,
+                "vg_map": {i: 235 + i for i in range(14)}, "deform_draw": 8,
+            },
+        ]
+
+    def _build_and_apply_plan(self, exporter):
+        """构建重定向计划并写回 exporter 字段（模拟 _export_impl 的接线）。"""
+        carrier_map, target_map, unredirected = exporter._build_merged_mesh_redirect_plan()
+        exporter._redirect_carrier_map = carrier_map
+        exporter._redirect_target_map = target_map
+        return carrier_map, target_map, unredirected
+
+    def _group3_exporter(self, merged_vertex_count=18776, target_real_vertices=0,
+                         target_registered=False, cross_ib=()):
+        """构造用户实测场景（合并网格挂最早 draw 的 b20f90ea）的 exporter。"""
+        self._register_obj("LOD0.b20f90ea-19182-0", [79, 88, 105, 229, 248])
+        if target_registered:
+            self._register_obj("LOD0.a23aa8a3-42759-0", [79, 80])
+        sub_b = self._attach_drawcalls(
+            _FakeSubmesh(
+                "LOD0.b20f90ea-19182-0", 184, 51,
+                vertex_count=31015, original_vertex_count=4643,
+                exported_vertex_count=merged_vertex_count,
+            ),
+            index_count=69612,
+        )
+        sub_a = self._attach_drawcalls(
+            _FakeSubmesh(
+                "LOD0.a23aa8a3-42759-0", 79, 105,
+                exported_vertex_count=target_real_vertices,
+            )
+        )
+        sub_c = self._attach_drawcalls(
+            _FakeSubmesh("LOD0.b30db54e-7383-0", 235, 14)
+        )
+        models = [
+            _FakeDrawIBModel("b20f90ea", [sub_b]),
+            _FakeDrawIBModel("a23aa8a3", [sub_a]),
+            _FakeDrawIBModel("b30db54e", [sub_c]),
+        ]
+        exporter = self._make_exporter(models, self._group3_components())
+        if cross_ib:
+            exporter.cross_ib_info_dict = dict(cross_ib)
+        return exporter, models
+
+    def _capture_stdout(self, fn):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn()
+        return buf.getvalue()
+
+    def test_early_carrier_auto_redirects_to_last_pass(self):
+        """用户实测场景：合并网格挂 b20f90ea（draw 2，最早）-> 自动重定向到
+        a23aa8a3（draw 20，最后），base_vertex=0（target 无自身几何），无报警。"""
+        exporter, _models = self._group3_exporter()
+        carrier_map, target_map, unredirected = self._build_and_apply_plan(exporter)
+
+        self.assertEqual(carrier_map["b20f90ea"]["target"], "a23aa8a3")
+        self.assertEqual(carrier_map["b20f90ea"]["base_vertex"], 0)
+        self.assertEqual(carrier_map["b20f90ea"]["vertex_count"], 18776)
+        self.assertEqual(carrier_map["b20f90ea"]["target_first_index"], 0)
+        self.assertEqual(target_map["a23aa8a3"]["so_vertex_count"], 18776)
+        self.assertEqual(target_map["a23aa8a3"]["target_own_vertices"], 0)
+        self.assertEqual(target_map["a23aa8a3"]["deform_draws"],
+                         [("Resourceb20f90eaPosition", "Resourceb20f90eaBlend", 18776)])
+        self.assertEqual(unredirected, {})
+        # 已自动重定向 -> 不再报警
+        out = self._capture_stdout(lambda: exporter._warn_merged_mesh_timing(unredirected))
+        self.assertEqual(out, "")
+
+    def test_merged_on_last_pass_no_redirect(self):
+        """合并网格已挂在组内最后一个 deform draw（a23aa8a3，draw 20）：无需重定向。"""
+        self._register_obj("LOD0.a23aa8a3-42759-0", [79, 88, 105, 188, 229])
+        sub_a = self._attach_drawcalls(_FakeSubmesh("LOD0.a23aa8a3-42759-0", 79, 105))
+        sub_b = self._attach_drawcalls(_FakeSubmesh("LOD0.b20f90ea-19182-0", 184, 51))
+        sub_c = self._attach_drawcalls(_FakeSubmesh("LOD0.b30db54e-7383-0", 235, 14))
+        models = [
+            _FakeDrawIBModel("a23aa8a3", [sub_a]),
+            _FakeDrawIBModel("b20f90ea", [sub_b]),
+            _FakeDrawIBModel("b30db54e", [sub_c]),
+        ]
+        exporter = self._make_exporter(models, self._group3_components())
+        carrier_map, target_map, unredirected = self._build_and_apply_plan(exporter)
+        self.assertEqual(carrier_map, {})
+        self.assertEqual(target_map, {})
+        self.assertEqual(unredirected, {})
+
+    def test_own_component_only_no_redirect(self):
+        """未合并（只引用自己 vg_map 值集合内的骨骼，含共享 canonical）不重定向。"""
+        self._register_obj("LOD0.b20f90ea-19182-0", [184, 185, 186])
+        sub_b = self._attach_drawcalls(_FakeSubmesh("LOD0.b20f90ea-19182-0", 184, 51))
+        sub_a = self._attach_drawcalls(_FakeSubmesh("LOD0.a23aa8a3-42759-0", 79, 105))
+        sub_c = self._attach_drawcalls(_FakeSubmesh("LOD0.b30db54e-7383-0", 235, 14))
+        models = [
+            _FakeDrawIBModel("b20f90ea", [sub_b]),
+            _FakeDrawIBModel("a23aa8a3", [sub_a]),
+            _FakeDrawIBModel("b30db54e", [sub_c]),
+        ]
+        exporter = self._make_exporter(models, self._group3_components())
+        carrier_map, target_map, unredirected = self._build_and_apply_plan(exporter)
+        self.assertEqual(carrier_map, {})
+        self.assertEqual(target_map, {})
+        self.assertEqual(unredirected, {})
+
+    def test_missing_deform_draw_not_redirected(self):
+        """反查缓存缺 DeformDrawIndex：无法重定向 -> unredirected 报警。"""
+        self._register_obj("LOD0.b20f90ea-19182-0", [79, 105, 229])
+        sub_b = self._attach_drawcalls(_FakeSubmesh("LOD0.b20f90ea-19182-0", 184, 51))
+        sub_a = self._attach_drawcalls(_FakeSubmesh("LOD0.a23aa8a3-42759-0", 79, 105))
+        components = [
+            {**c, "deform_draw": 0} for c in self._group3_components()
+        ]
+        models = [
+            _FakeDrawIBModel("b20f90ea", [sub_b]),
+            _FakeDrawIBModel("a23aa8a3", [sub_a]),
+        ]
+        exporter = self._make_exporter(models, components)
+        carrier_map, target_map, unredirected = self._build_and_apply_plan(exporter)
+        self.assertEqual(carrier_map, {})
+        self.assertEqual(target_map, {})
+        self.assertEqual(unredirected["b20f90ea"]["reason"], "missing-deform-draw")
+        out = self._capture_stdout(lambda: exporter._warn_merged_mesh_timing(unredirected))
+        self.assertIn("无法自动修复", out)
+        self.assertIn("骨骼合并反查", out)
+
+    def test_cross_ib_carrier_not_redirected(self):
+        """跨 IB 配置与自动重定向暂不兼容 -> unredirected 报警。"""
+        exporter, _models = self._group3_exporter(
+            cross_ib={("b20f90ea_0",): ["a23aa8a3_0"]}
+        )
+        # cross_ib_info_dict 键是 ib_key（hash_firstindex），这里直接标记 DrawIB 为源
+        exporter.cross_ib_info_dict = {"b20f90ea_0": ["a23aa8a3_0"]}
+        carrier_map, _target_map, unredirected = self._build_and_apply_plan(exporter)
+        self.assertEqual(carrier_map, {})
+        self.assertEqual(unredirected["b20f90ea"]["reason"], "cross-ib")
+
+    def test_redirect_target_with_own_geometry_offsets(self):
+        """target（a23aa8a3）自身还有真实几何：合并网格 base_vertex = 其 SO 偏移。"""
+        exporter, _models = self._group3_exporter(
+            merged_vertex_count=18776, target_real_vertices=12314,
+            target_registered=True,
+        )
+        carrier_map, target_map, unredirected = self._build_and_apply_plan(exporter)
+        self.assertEqual(carrier_map["b20f90ea"]["base_vertex"], 12314)
+        self.assertEqual(target_map["a23aa8a3"]["so_vertex_count"], 12314 + 18776)
+        self.assertEqual(target_map["a23aa8a3"]["target_own_vertices"], 12314)
+        self.assertEqual(unredirected, {})
+
+    def test_redirect_vb_sections(self):
+        """carrier 的 deform 退化为 3 顶点 stub draw（保留 attach 写当帧骨骼）；
+        target 的 deform 追加画合并网格（绑定 carrier 的 vb0/vb2）。"""
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+
+        builder_b = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vb_sections(builder_b, models[0])
+        text_b = "\n".join(builder_b.sections[0].SectionLineList)
+        # carrier（b20f90ea，组件 C1）：copy + attach + draw 3（不再画 18776）
+        self.assertIn("ResourceZZPalette_b20f90ea = copy vs-t0 unless_null", text_b)
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C1", text_b)
+        self.assertIn("draw = 3, 0", text_b)
+        self.assertNotIn("draw = 18776, 0", text_b)
+
+        builder_a = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vb_sections(builder_a, models[1])
+        text_a = "\n".join(builder_a.sections[0].SectionLineList)
+        # target（a23aa8a3）：attach C0 + 绑定 carrier buffer + draw 合并网格
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C0", text_a)
+        self.assertIn("vb2 = Resourceb20f90eaBlend", text_a)
+        self.assertIn("vb0 = Resourceb20f90eaPosition", text_a)
+        self.assertIn("draw = 18776, 0", text_a)
+
+        # 未参与重定向的 b30db54e 保持原样
+        builder_c = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vb_sections(builder_c, models[2])
+        text_c = "\n".join(builder_c.sections[0].SectionLineList)
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C2", text_c)
+        self.assertNotIn("draw = 3, 0", text_c)
+
+    def test_redirect_ib_sections(self):
+        """carrier 的 render override 重挂 target 的 render draw（base_vertex 偏移 +
+        vb1 换绑）；target 的 stub 子网格 ib=null（不画）；carrier 原 render 被 IB 级
+        skip 抑制。"""
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+
+        builder = _FakeIniBuilder()
+        for model in models:
+            exporter.add_unity_vs_texture_override_ib_sections(builder, model)
+        text = "\n".join(
+            line for section in builder.sections for line in section.SectionLineList
+        )
+
+        # carrier 的 render override：hash 改挂 a23aa8a3，画合并 IB，带 vb1
+        self.assertIn("[TextureOverride_LOD0.b20f90ea_19182_0]", text)
+        self.assertIn("hash = a23aa8a3", text)
+        self.assertIn("ib = Resource_LOD0.b20f90ea_19182_0_Index", text)
+        self.assertIn("vb1 = Resourceb20f90eaTexcoord", text)
+        self.assertIn("drawindexed = 69612,0,0", text)  # base_vertex=0
+        # carrier 的原 render draw 被 IB 级 skip 抑制
+        self.assertIn("[TextureOverride_IB_b20f90ea]", text)
+        # target 的 stub 子网格：ib = null（不画，防多余三角形）
+        self.assertIn("[TextureOverride_LOD0.a23aa8a3_42759_0]", text)
+        self.assertIn("ib = null", text)
+
+    def test_redirect_vlr_section(self):
+        """VertexLimitRaise：carrier = 3（stub SO），target = SO 总大小。"""
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+
+        builder_b = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vlr_section(builder_b, models[0])
+        text_b = "\n".join(builder_b.sections[0].SectionLineList)
+        self.assertIn("override_vertex_count = 3", text_b)
+
+        builder_a = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vlr_section(builder_a, models[1])
+        text_a = "\n".join(builder_a.sections[0].SectionLineList)
+        self.assertIn("override_vertex_count = 18776", text_a)
+
+
+class ZZSIMergedMeshRenderRebindTests(unittest.TestCase):
+    """合并网格渲染换绑：导出顶点数超过原部件顶点数时，渲染 draw 必须把 vb1
+    换绑为本 mod 的 Texcoord buffer（游戏原 vb1 只覆盖原部件顶点数，合并网格
+    索引会越界读 -> UV 糊到 (0,0) 角落）。"""
+
+    def _render_override_text(self, submesh, draw_ib="b20f90ea"):
+        model = _FakeDrawIBModel(draw_ib, [submesh])
+        exporter = _make_exporter([model], merged_vgmap=True)
+        builder = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_ib_sections(builder, model)
+        return "\n".join(builder.sections[0].SectionLineList)
+
+    def test_oversized_mesh_binds_vb1(self):
+        submesh = _FakeSubmesh(
+            "LOD0.b20f90ea-19182-0", 184, 51,
+            vertex_count=31015, original_vertex_count=4643,
+        )
+        text = self._render_override_text(submesh)
+        self.assertIn("ib = Resource_LOD0.b20f90ea_19182_0_Index", text)
+        self.assertIn("vb1 = Resourceb20f90eaTexcoord", text)
+        self.assertLess(
+            text.index("ib = "), text.index("vb1 = Resourceb20f90eaTexcoord")
+        )
+
+    def test_same_size_mesh_keeps_game_vb1(self):
+        submesh = _FakeSubmesh(
+            "LOD0.b20f90ea-19182-0", 184, 51,
+            vertex_count=4643, original_vertex_count=4643,
+        )
+        text = self._render_override_text(submesh)
+        self.assertNotIn("vb1 = Resource", text)
+
+    def test_stub_smaller_than_original_keeps_game_vb1(self):
+        submesh = _FakeSubmesh(
+            "LOD0.a23aa8a3-42759-0", 79, 105,
+            vertex_count=3, original_vertex_count=12314,
+        )
+        text = self._render_override_text(submesh, draw_ib="a23aa8a3")
+        self.assertNotIn("vb1 = Resource", text)
 
 
 if __name__ == "__main__":

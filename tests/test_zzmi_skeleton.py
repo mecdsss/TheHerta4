@@ -299,7 +299,10 @@ class TestZZMISkeletonMergeHelper(unittest.TestCase):
                 with open(json_path, encoding="utf-8") as f:
                     payload = json.load(f)
                 changed = False
-                for field in ("VGMap", "VGOffset", "VGCount", "BoneMatrixFileName"):
+                for field in (
+                    "VGMap", "VGOffset", "VGCount", "BoneMatrixFileName",
+                    "SkeletonGroupCb1SourceIb", "DeformDrawIndex", "OriginalVertexCount",
+                ):
                     if field in payload:
                         payload.pop(field)
                         changed = True
@@ -375,7 +378,7 @@ class TestZZMISkeletonMergeHelper(unittest.TestCase):
         # 同组判定的刚性门控拆分不改变分组：头顶件与头部组同组（同空间，仅锚点不同）
         self.assertEqual(group_of["64d7d56f"], group_of["454ff522"])
 
-        # 校准版全局骨骼编号（组基址拼接；组序按组内最小 draw_ib）：
+        # 全局骨骼编号（组基址拼接；组序按组内最小 draw_ib）：
         # G0={19086112}(7) base 0 / G1=头部(23) base 7 / G2={84618ee0}(49) base 30 /
         # G3=身体(170) base 79 / G4={add6ff13,d892c658}(17) base 249
         jsons_by_ib = {u.split(".", 1)[-1].split("-")[0]: j for u, _p, j in _list_submesh_jsons(self.tmp)}
@@ -389,34 +392,24 @@ class TestZZMISkeletonMergeHelper(unittest.TestCase):
         for draw_ib, expected_offset in expected_offsets.items():
             self.assertEqual(jsons_by_ib[draw_ib]["VGOffset"], expected_offset, draw_ib)
 
-        # 每组 cb1 捕获源部件（校准用）：其帧内最后一个渲染 draw 的 vs-cb1 是逐部件块
-        # 才合格（捕获段按 DrawIB 触发、last-wins 覆盖生效，最后一击是共享变换数组的
-        # 部件宁可不捕获——19086112 的最后一个 draw（229）绑 2048B 数组，故无捕获源，
-        # 其组 attach 直拷兜底：本组直拷本组骨骼无需校准，外来写入才会受影响）
-        expected_cb1_source = {
-            "19086112": "",
-            "454ff522": "48625d6d", "48625d6d": "48625d6d", "64d7d56f": "48625d6d", "b51bdd59": "48625d6d",
-            "84618ee0": "84618ee0",
-            "a23aa8a3": "a23aa8a3", "b20f90ea": "a23aa8a3", "b30db54e": "a23aa8a3",
-            "add6ff13": "add6ff13", "d892c658": "add6ff13",
-        }
-        for draw_ib, expected_source in expected_cb1_source.items():
-            self.assertEqual(
-                jsons_by_ib[draw_ib].get("SkeletonGroupCb1SourceIb", ""), expected_source, draw_ib
-            )
+        # 无 CB1 校准（2026-08-25 用户拍板）：不再写 cb1 捕获源字段
+        for draw_ib, submesh_json in jsons_by_ib.items():
+            self.assertNotIn("SkeletonGroupCb1SourceIb", submesh_json, draw_ib)
 
-        # 捕获段匹配键 = 源部件 SO 输出 hash（渲染 draw vb0 恒为游戏 SO 资源，
-        # 不受 mod 换 ib 影响；按原 IB hash 匹配全量合并后永不触发——dump 124705 踩坑）
-        expected_cb1_source_so = {
-            "19086112": "",
-            "454ff522": "9b76d1d7", "48625d6d": "9b76d1d7", "64d7d56f": "9b76d1d7", "b51bdd59": "9b76d1d7",
-            "84618ee0": "840c1713",
-            "a23aa8a3": "01b35c45", "b20f90ea": "01b35c45", "b30db54e": "01b35c45",
-            "add6ff13": "fab82e2f", "d892c658": "fab82e2f",
+        # 导出侧守卫元数据：deform draw 序号 + 原部件顶点数（合并网格时序校验/vb1 换绑）
+        for unique_str, _json_path, submesh_json in _list_submesh_jsons(self.tmp):
+            draw_ib = unique_str.split(".", 1)[-1].split("-")[0]
+            expected_draw = int(EXPECTED_DEFORM_DRAW[draw_ib])
+            self.assertEqual(submesh_json.get("DeformDrawIndex"), expected_draw, unique_str)
+            self.assertGreater(submesh_json.get("OriginalVertexCount", 0), 0, unique_str)
+        # 实测原部件顶点数（deform draw vertex count）：组 3 三个部件的 Blend.buf 行数
+        original_counts = {
+            "b20f90ea": 4643, "a23aa8a3": 12314, "b30db54e": 1744,
+            "84618ee0": 5846, "19086112": 3288, "b51bdd59": 345,
         }
-        for draw_ib, expected_so in expected_cb1_source_so.items():
+        for draw_ib, expected_count in original_counts.items():
             self.assertEqual(
-                jsons_by_ib[draw_ib].get("SkeletonGroupCb1SourceSO", ""), expected_so, draw_ib
+                jsons_by_ib[draw_ib]["OriginalVertexCount"], expected_count, draw_ib
             )
 
     def test_idempotent_second_run_skips(self):

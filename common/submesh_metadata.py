@@ -92,6 +92,9 @@ class SubmeshMetadata:
     vg_offset: int = field(init=False, default=0)
     vg_count: int = field(init=False, default=0)
     vg_map: dict = field(init=False, default_factory=dict)
+    # ZZMI 导出侧守卫元数据（反查写回；缺省 0）
+    deform_draw_index: int = field(init=False, default=0)
+    original_vertex_count: int = field(init=False, default=0)
 
     def __post_init__(self):
         """初始化后处理"""
@@ -120,14 +123,9 @@ class SubmeshMetadata:
         self.vg_map = dict(self.submesh_json_dict.get("VGMap", {}) or {})
         # ZZMI 骨架分组号（渲染 cb1 对象变换配对；缺省 0 = 单骨架旧语义）
         self.skeleton_group = int(self.submesh_json_dict.get("SkeletonGroup", 0) or 0)
-        # ZZMI 校准版：本组 cb1 捕获源部件 DrawIB（空串 = 无捕获源，attach 退化为直拷）
-        self.skeleton_group_cb1_source_ib = str(
-            self.submesh_json_dict.get("SkeletonGroupCb1SourceIb", "") or ""
-        )
-        # 本组 cb1 捕获段的 SO 输出 hash（渲染 draw vb0 恒为游戏 SO 资源，不受 mod 换 ib 影响）
-        self.skeleton_group_cb1_source_so = str(
-            self.submesh_json_dict.get("SkeletonGroupCb1SourceSO", "") or ""
-        )
+        # ZZMI 导出侧守卫元数据：deform pass draw 序号 + 原部件顶点数
+        self.deform_draw_index = int(self.submesh_json_dict.get("DeformDrawIndex", 0) or 0)
+        self.original_vertex_count = int(self.submesh_json_dict.get("OriginalVertexCount", 0) or 0)
         self.d3d11_game_type = self._build_d3d11_game_type()
 
     def _build_d3d11_game_type(self) -> D3D11GameType:

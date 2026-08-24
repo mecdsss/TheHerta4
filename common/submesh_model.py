@@ -53,10 +53,12 @@ class SubMeshModel:
     vg_count:int = field(init=False, default=0)
     # ZZMI 骨架分组号（渲染 cb1 对象变换配对；缺省 0 = 单骨架旧语义）
     skeleton_group:int = field(init=False, default=0)
-    # ZZMI 校准版：本组 cb1 捕获源部件 DrawIB（缺省 "" = 无捕获源）
-    skeleton_group_cb1_source_ib:str = field(init=False, default="")
-    # 本组 cb1 捕获段的 SO 输出 hash（VertexLimitVB）
-    skeleton_group_cb1_source_so:str = field(init=False, default="")
+    # ZZMI 逐部件 VGMap（局部骨骼 id -> 全局槽位；attach CS 按此写合并骨架）
+    vg_map:dict = field(init=False, default_factory=dict)
+    # ZZMI 导出侧守卫元数据（反查写回；缺省 0）：
+    # deform pass draw 序号（合并网格时序校验）+ 原部件顶点数（渲染 vb1 换绑判定）
+    deform_draw_index:int = field(init=False, default=0)
+    original_vertex_count:int = field(init=False, default=0)
 
     # 读取工作空间中的 Import.json 选择数据类型目录，再从对应的 SubmeshJson 获取 d3d11GameType
     d3d11_game_type:D3D11GameType = field(init=False,repr=False,default=None)
@@ -93,14 +95,11 @@ class SubMeshModel:
         self.vg_count = int(getattr(submesh_metadata, "vg_count", 0) or 0)
         # ZZMI 骨架分组号（渲染 cb1 对象变换配对；缺省 0 = 单骨架旧语义）
         self.skeleton_group = int(getattr(submesh_metadata, "skeleton_group", 0) or 0)
-        # ZZMI 校准版：本组 cb1 捕获源部件 DrawIB（空串 = 无捕获源）
-        self.skeleton_group_cb1_source_ib = str(
-            getattr(submesh_metadata, "skeleton_group_cb1_source_ib", "") or ""
-        )
-        # 本组 cb1 捕获段的 SO 输出 hash（VertexLimitVB）
-        self.skeleton_group_cb1_source_so = str(
-            getattr(submesh_metadata, "skeleton_group_cb1_source_so", "") or ""
-        )
+        # ZZMI 逐部件 VGMap（局部骨骼 id -> 全局槽位；attach CS 按此写合并骨架）
+        self.vg_map = dict(getattr(submesh_metadata, "vg_map", {}) or {})
+        # ZZMI 导出侧守卫元数据（deform draw 序号 / 原部件顶点数）
+        self.deform_draw_index = int(getattr(submesh_metadata, "deform_draw_index", 0) or 0)
+        self.original_vertex_count = int(getattr(submesh_metadata, "original_vertex_count", 0) or 0)
 
         # EFMI 骨骼合并：合并骨架场景下 BLENDINDICES 无条件升宽到 16 位
         # （全局骨骼索引可能超过 255；INI 侧由 ExportEFMI 输出 ElementFormat 行配套）

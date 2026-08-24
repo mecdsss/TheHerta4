@@ -69,6 +69,9 @@ class ExportZZMI(ExportUnity):
         self.merged_skeleton_components = []
         self.merged_skeleton_component_id_dict = {}
         self.has_merged_skeleton = False
+        # 合并网格自动重定向计划（_build_merged_mesh_redirect_plan 产出，INI 生成时查询）
+        self._redirect_carrier_map: dict = {}
+        self._redirect_target_map: dict = {}
 
         print(f"[CrossIB ZZMI] 初始化: has_cross_ib={self.has_cross_ib}")
         print(f"[CrossIB ZZMI] cross_ib_info_dict={self._format_cross_ib_info_dict(self.cross_ib_info_dict)}")
@@ -184,7 +187,8 @@ class ExportZZMI(ExportUnity):
         """判定整个缺席的 DrawIB 是否被合并进了其它对象。
 
         判据（用户定义）：该 DrawIB VGMap 的全局骨骼 id 有被现存对象顶点引用（权重>0）。
-        （校准版为全局骨骼命名空间，跨组引用合法，故按全局集合比对。）
+        全局骨骼编号命名空间下引用判定无歧义；跨组别引用会被
+        _warn_cross_group_bone_references 在导出时大声报警（无校准模式下已禁止）。
         """
         vg_values = self._load_drawib_vg_values(draw_ib, workspace_root)
         if not vg_values:
@@ -270,14 +274,21 @@ class ExportZZMI(ExportUnity):
                 if vg_count > 0:
                     components.append({
                         "draw_ib": drawib_model.draw_ib,
+                        "unique_str": str(getattr(submesh_model, "unique_str", "") or ""),
                         "vg_offset": int(getattr(submesh_model, "vg_offset", 0) or 0),
                         "vg_count": vg_count,
                         "skeleton_group": int(getattr(submesh_model, "skeleton_group", 0) or 0),
-                        "cb1_source_ib": str(
-                            getattr(submesh_model, "skeleton_group_cb1_source_ib", "") or ""
-                        ),
-                        "cb1_source_so": str(
-                            getattr(submesh_model, "skeleton_group_cb1_source_so", "") or ""
+                        # 局部骨骼 id -> 全局槽位（attach CS 按此写合并骨架，
+                        # 本部件引用的共享 canonical 槽位当帧覆盖）
+                        "vg_map": {
+                            int(k): int(v)
+                            for k, v in (getattr(submesh_model, "vg_map", {}) or {}).items()
+                        },
+                        # 导出侧守卫元数据（反查写回）：deform pass draw 序号 +
+                        # 原部件顶点数；缺省 0（旧缓存未刷新）
+                        "deform_draw": int(getattr(submesh_model, "deform_draw_index", 0) or 0),
+                        "original_vertex_count": int(
+                            getattr(submesh_model, "original_vertex_count", 0) or 0
                         ),
                     })
                     break
@@ -535,28 +546,54 @@ class ExportZZMI(ExportUnity):
 
             draw_category_name = d3d11_game_type.CategoryDrawCategoryDict.get("Blend", None)
             if draw_category_name is not None and category_name == draw_category_name:
-                # ZZMI 骨骼合并（整体延迟一帧、全数据同帧对齐）：
+                # ZZMI 骨骼合并（零延迟逐 pass attach，2026-08-25 定案）：
                 # 1. deform draw 前把当帧 palette **copy** 成持久资源 ResourceZZPalette_<DrawIB>
                 #    （ring buffer 同帧内会被后续 pass 重写，别名撑不到帧尾）；
-                # 2. vs-t0 换绑为本组骨架（内容是上一帧完整 attach 的版本）后 draw 蒙皮；
-                # 3. attach 不在此执行——挪到 [Present]（帧尾）：那时当帧 palette 副本与
-                #    当帧 cb1 捕获（渲染 draw 处 copy）同时在手，一次写出的骨架全部
-                #    同属当帧，无"部分当帧部分上一帧"的帧内/校准混帧抖动。
+                # 2. **立即 run attach CS**：按 vg_map 表把当帧 palette 写入本组骨架
+                #    （本部件引用的骨骼——含跨部件共享 canonical——此刻即为当帧，
+                #    与渲染侧当帧绑定矩阵 vs-cb2 一致，杜绝慢一帧错位）；
+                # 3. vs-t0 换绑为本组骨架后 draw 蒙皮（读当帧姿态）。
+                #    （渲染侧存在当帧角色级绑定表 vs-cb2（身体正向+头部逆向，每帧
+                #    Map 更新）——"慢一帧"SO × 当帧绑定 = 运动时错位，已废弃。）
                 merged_component = self.merged_skeleton_component_id_dict.get(draw_ib)
                 component = (
                     self.merged_skeleton_components[merged_component]
                     if merged_component is not None else None
                 )
                 if component is not None:
-                    skeleton_group = component["skeleton_group"]
                     texture_override_vb_section.append(
                         f"ResourceZZPalette_{draw_ib} = copy vs-t0 unless_null"
                     )
                     texture_override_vb_section.append(
-                        f"vs-t0 = ResourceZZMergedSkeleton_G{skeleton_group}"
+                        f"run = CustomShaderZZMIMergedSkeletonAttach_C{merged_component}"
+                    )
+                    texture_override_vb_section.append(
+                        f"vs-t0 = ResourceZZMergedSkeleton_G{component['skeleton_group']}"
                     )
                 texture_override_vb_section.append("handling = skip")
-                texture_override_vb_section.append("draw = " + str(drawib_model.draw_number) + ", 0")
+
+                # 合并网格自动重定向：carrier 的 deform 退化为 3 顶点 stub draw
+                # （保留 copy palette + attach 写当帧骨骼）；target 的 deform 追加
+                # 画重定向的合并网格（绑定 carrier 的 vb0/vb2，SO 按序拼接）。
+                redirect_carrier = self._redirect_carrier_map.get(draw_ib)
+                redirect_target_plan = self._redirect_target_map.get(draw_ib)
+                if redirect_carrier is not None:
+                    texture_override_vb_section.append("draw = 3, 0")
+                elif redirect_target_plan is not None:
+                    if redirect_target_plan.get("target_own_vertices", 0) > 0:
+                        texture_override_vb_section.append(
+                            "draw = " + str(redirect_target_plan["target_own_vertices"]) + ", 0"
+                        )
+                    for vb0_resource, vb2_resource, draw_count in redirect_target_plan.get(
+                        "deform_draws", []
+                    ):
+                        texture_override_vb_section.append("vb2 = " + vb2_resource)
+                        texture_override_vb_section.append("vb0 = " + vb0_resource)
+                        texture_override_vb_section.append("draw = " + str(draw_count) + ", 0")
+                else:
+                    texture_override_vb_section.append(
+                        "draw = " + str(drawib_model.draw_number) + ", 0"
+                    )
                 for so0_source_resource_name in so0_source_resource_names:
                     texture_override_vb_section.append(so0_source_resource_name + " = ref so0")
 
@@ -570,38 +607,437 @@ class ExportZZMI(ExportUnity):
 
         ini_builder.append_section(texture_override_vb_section)
 
+    def add_unity_vs_texture_override_vlr_section(
+        self, ini_builder: M_IniBuilder, drawib_model, include_uav_byte_stride: bool = True
+    ):
+        """VertexLimitRaise 段（覆盖基类）：合并网格自动重定向时按 SO 实际大小声明。
+
+        carrier（被重定向的合并网格挂载 IB）SO 退化为 3 顶点 stub；
+        target（组内最后 deform draw 的 IB）SO = 自身真实几何 + 全部重定向
+        合并网格之和。
+        """
+        d3d11_game_type = getattr(drawib_model, "d3d11GameType", None)
+        if d3d11_game_type is None or not getattr(d3d11_game_type, "GPU_PreSkinning", False):
+            return
+        draw_ib = drawib_model.draw_ib
+        redirect_carrier = self._redirect_carrier_map.get(draw_ib)
+        redirect_target = self._redirect_target_map.get(draw_ib)
+        if redirect_carrier is None and redirect_target is None:
+            super().add_unity_vs_texture_override_vlr_section(
+                ini_builder=ini_builder,
+                drawib_model=drawib_model,
+                include_uav_byte_stride=include_uav_byte_stride,
+            )
+            return
+
+        vertex_count = (
+            3
+            if redirect_carrier is not None
+            else redirect_target["so_vertex_count"]
+        )
+        vertexlimit_section = M_IniSection(M_SectionType.TextureOverrideVertexLimitRaise)
+        vertexlimit_section.append(
+            "[TextureOverride_" + draw_ib + "_" + drawib_model.draw_ib_alias
+            + "_VertexLimitRaise]"
+        )
+        vertexlimit_section.append("hash = " + drawib_model.vertex_limit_hash)
+        vertexlimit_section.append(
+            "override_byte_stride = "
+            + str(d3d11_game_type.CategoryStrideDict["Position"])
+        )
+        vertexlimit_section.append("override_vertex_count = " + str(vertex_count))
+        if include_uav_byte_stride:
+            vertexlimit_section.append("uav_byte_stride = 4")
+        vertexlimit_section.new_line()
+        ini_builder.append_section(vertexlimit_section)
+
     def _merged_skeleton_groups(self) -> list[int]:
         """当前导出组件涉及的骨架组列表（升序）。"""
         return sorted({c["skeleton_group"] for c in self.merged_skeleton_components})
 
-    def add_merged_skeleton_sections(self, ini_builder: M_IniBuilder):
-        """生成 ZZMI 合并骨架段（校准版：全局骨骼编号 + 逐组校准 + Present 时序 attach）。
+    # ------------------------------------------------------------------
+    # 跨组别引用守卫（无校准模式：禁止跨组别骨骼合并）
+    # ------------------------------------------------------------------
 
-        架构（2026-08-24 用户拍板，详见计划书 §3.3-5/§5.4-3）：
-        - 骨骼 id = 全局编号（组基址拼接组内槽位）；Blender 侧 join 无组号歧义，
-          跨组权重可表达。
+    def _collect_drawib_referenced_bone_ids(self, draw_ib: str) -> set[int]:
+        """该 DrawIB 全部子网格源对象实际引用（权重>0）的骨骼 id 集合。
+
+        骨骼 id 取顶点组**名字**（导入约定：组名 = 全局骨骼 id；join 按名合并，
+        组名恒为骨骼 id，而索引不保证）。非数字组名跳过（不是骨骼）。
+        占位小三角面对象（ZZMI_STUB，权重挂在组 "0"）跳过——它是不可见标记，
+        不是真实几何，不该触发跨组报警。
+        """
+        used: set[int] = set()
+        for drawib_model in self.drawib_model_list:
+            if drawib_model.draw_ib != draw_ib:
+                continue
+            for submesh_model in drawib_model.submesh_model_list:
+                for draw_call in submesh_model.drawcall_model_list:
+                    try:
+                        obj_name = draw_call.get_blender_obj_name()
+                    except Exception:
+                        continue
+                    obj = bpy.data.objects.get(obj_name) if obj_name else None
+                    if obj is None or obj.get("ZZMI_STUB"):
+                        continue
+                    mesh = getattr(obj, "data", None)
+                    vertices = getattr(mesh, "vertices", None)
+                    groups = getattr(obj, "vertex_groups", None)
+                    if vertices is None or groups is None:
+                        continue
+                    for vertex in vertices:
+                        for group_elem in vertex.groups:
+                            if group_elem.weight <= 0:
+                                continue
+                            if group_elem.group >= len(groups):
+                                continue
+                            name = str(groups[group_elem.group].name)
+                            if not name.isdigit():
+                                continue
+                            used.add(int(name))
+        return used
+
+    def _warn_cross_group_bone_references(self):
+        """禁止跨组别骨骼合并（无校准模式）守卫：逐部件校验引用骨骼都在本组内。
+
+        无 CB1 校准的运行时，每组骨架只写入本组骨骼（[Present] 直拷 attach）；
+        顶点引用其它组的骨骼 id 时，对应槽位永远不会被写入 = 原点塌陷。
+        检出即大声报警（列出越界骨骼 id 与归属组），不中断导出——
+        与 _warn_missing_drawib_parts 同款"让用户看见"口径。
+        """
+        if not self.merged_skeleton_components:
+            return
+        # 每组合法骨骼 id 集合 = 该组全部导出组件槽位并集（缺席部件的骨骼不会
+        # attach，也不可被引用——同组缺席部件被并入现成对象同样会报警）
+        group_legal: dict[int, set[int]] = {}
+        id_to_group: dict[int, int] = {}
+        for component in self.merged_skeleton_components:
+            skeleton_group = component["skeleton_group"]
+            legal = group_legal.setdefault(skeleton_group, set())
+            for bone_id in range(
+                component["vg_offset"], component["vg_offset"] + component["vg_count"]
+            ):
+                legal.add(bone_id)
+                id_to_group.setdefault(bone_id, skeleton_group)
+
+        for component in self.merged_skeleton_components:
+            draw_ib = component["draw_ib"]
+            skeleton_group = component["skeleton_group"]
+            legal = group_legal[skeleton_group]
+            offending = sorted(
+                bone_id
+                for bone_id in self._collect_drawib_referenced_bone_ids(draw_ib)
+                if bone_id not in legal
+            )
+            if not offending:
+                continue
+            offending_groups = sorted(
+                {
+                    id_to_group.get(bone_id, "未知（不在导出组件范围）")
+                    for bone_id in offending
+                }
+            )
+            print(
+                f"[ZZMI骨骼合并] !!! 禁止跨组别骨骼合并: DrawIB {draw_ib} "
+                f"（骨架组 G{skeleton_group}）的顶点引用了非本组骨骼 id "
+                f"{offending}（归属组: {offending_groups}）——无校准模式下这些槽位"
+                f"永远不会被写入本组骨架，游戏内将渲染为原点塌陷。"
+            )
+            print(
+                "[ZZMI骨骼合并] 请只把同一骨架组（相同对象空间）的部件合并到同一对象，"
+                "或把这些顶点的权重改刷到本组骨骼。"
+            )
+
+    def _warn_merged_mesh_timing(self, unredirected: dict | None = None):
+        """无法自动重定向的合并网格时序报警（见 _build_merged_mesh_redirect_plan）。
+
+        可自动重定向的合并网格已由导出器挪到组内最后 deform draw（用户无感，
+        任意 IB 挂载均正确）；这里只对**无法**重定向的情况大声报警。
+        """
+        unredirected = unredirected or {}
+        if not unredirected:
+            return
+        by_group: dict[int, list[tuple[str, str, str]]] = {}
+        for component in self.merged_skeleton_components:
+            info = unredirected.get(component["draw_ib"])
+            if info is None:
+                continue
+            by_group.setdefault(int(component["skeleton_group"]), []).append(
+                (component["draw_ib"], info.get("reason", ""), info.get("target", ""))
+            )
+        for skeleton_group, entries in by_group.items():
+            for draw_ib, reason, target_ib in entries:
+                print(
+                    f"[ZZMI骨骼合并] !!! 合并网格时序无法自动修复: DrawIB {draw_ib}"
+                    f"（骨架组 G{skeleton_group}）引用了其它部件的骨骼，但其 deform "
+                    f"pass 早于组内最后一个 deform draw"
+                    + (
+                        "，且反查缓存缺少 DeformDrawIndex（请先重新执行「骨骼合并"
+                        "反查」刷新缓存后再导出）。"
+                        if reason == "missing-deform-draw"
+                        else "，且该部件配置了跨 IB 重定向（暂不与自动重定向兼容）。"
+                    )
+                )
+                if target_ib:
+                    print(
+                        "[ZZMI骨骼合并] 手动修复：把合并后的物体改名为组内最后一个 "
+                        f"deform draw 部件的子网格名（{target_ib} 或带 _copy 后缀）"
+                        "后重新导出。"
+                    )
+
+    # ------------------------------------------------------------------
+    # 合并网格自动重定向（2026-08-25 设计兑现：合并网格可挂在任意 DrawIB）
+    # ------------------------------------------------------------------
+    #
+    # 背景：palette 是 per-pass 独立 Map 上传的 ring scratch（dump 实测：
+    # 同一资源 hash 帧内两次 dump 内容不同），早 pass 时刻读不到晚 pass 部件
+    # 的当帧骨骼——所以合并网格（引用组内多个部件骨骼）物理上只能在组内
+    # **最后一个 deform draw** 蒙皮。为兑现「用户可自由 join 到任意 IB」的
+    # 设计承诺，导出侧自动重定向：
+    #   - 合并网格挂载的 DrawIB（carrier）的 deform override 退化为 stub draw
+    #     （3 顶点，保留 copy palette + attach 写当帧骨骼）；
+    #   - 组内最后一个 deform draw 的 DrawIB（target）的 deform override 追加
+    #     画合并网格（绑定 carrier 的 vb0/vb2），其 SO 按 [target 真实几何][
+    #     merged...] 拼接；
+    #   - carrier 的 render override 改挂 target 的 render draw（match_first_index
+    #     用 target 子网格的，base_vertex = target 真实几何 SO 偏移；纹理/IB 保留
+    #     carrier 的）；
+    #   - target 的 stub 子网格 render override 改 ib = null（不画，防多余三角）；
+    #   - VertexLimitRaise：carrier = 3，target = SO 总大小。
+    # 对用户完全透明：任意 IB 挂载都正确，无需改名。
+
+    def _submesh_is_stub(self, submesh_model) -> bool:
+        """子网格是否只有占位小三角面对象（无真实几何）。"""
+        for draw_call in getattr(submesh_model, "drawcall_model_list", []) or []:
+            try:
+                obj_name = draw_call.get_blender_obj_name()
+            except Exception:
+                continue
+            obj = bpy.data.objects.get(obj_name) if obj_name else None
+            if obj is not None and not obj.get("ZZMI_STUB"):
+                return False
+        return True
+
+    def _submesh_exported_vertex_count(self, submesh_model) -> int:
+        """子网格导出 buffer 顶点数（去重后；与 drawib_model.vertex_count 口径一致）。"""
+        index_vertex_id_dict = getattr(submesh_model, "index_vertex_id_dict", None)
+        if index_vertex_id_dict:
+            try:
+                return int(len(index_vertex_id_dict))
+            except TypeError:
+                pass
+        category_buffer_dict = getattr(submesh_model, "category_buffer_dict", None) or {}
+        position_buffer = category_buffer_dict.get("Position")
+        d3d11_game_type = getattr(submesh_model, "d3d11_game_type", None)
+        if position_buffer is None or d3d11_game_type is None:
+            return 0
+        position_stride = int(
+            (getattr(d3d11_game_type, "CategoryStrideDict", {}) or {}).get("Position", 0) or 0
+        )
+        if position_stride <= 0:
+            return 0
+        return int(len(position_buffer) / position_stride)
+
+    def _drawib_real_vertex_count(self, draw_ib: str) -> int:
+        """DrawIB 真实子网格（非 stub）的导出顶点数之和。"""
+        total = 0
+        for drawib_model in self.drawib_model_list:
+            if drawib_model.draw_ib != draw_ib:
+                continue
+            for submesh_model in drawib_model.submesh_model_list:
+                if self._submesh_is_stub(submesh_model):
+                    continue
+                total += self._submesh_exported_vertex_count(submesh_model)
+        return total
+
+    def _drawib_stub_submeshes(self, draw_ib: str) -> list:
+        """DrawIB 的 stub 子网格列表（占位对象，无真实几何）。"""
+        result = []
+        for drawib_model in self.drawib_model_list:
+            if drawib_model.draw_ib != draw_ib:
+                continue
+            for submesh_model in drawib_model.submesh_model_list:
+                if self._submesh_is_stub(submesh_model):
+                    result.append(submesh_model)
+        return result
+
+    def _drawib_first_match_first_index(self, draw_ib: str) -> list[int]:
+        """DrawIB 子网格的 match_first_index 列表（升序；重挂 render override 用）。"""
+        indices = []
+        for drawib_model in self.drawib_model_list:
+            if drawib_model.draw_ib != draw_ib:
+                continue
+            for submesh_model in drawib_model.submesh_model_list:
+                try:
+                    indices.append(int(submesh_model.match_first_index))
+                except (TypeError, ValueError):
+                    continue
+        return sorted(indices)
+
+    def _drawib_is_cross_ib(self, draw_ib: str) -> bool:
+        """DrawIB 是否参与跨 IB 重定向（source 或 target）——暂不与自动重定向兼容。
+
+        cross_ib_info_dict 的键/值是 ib_key（`<draw_ib>_<first_index>`），按前缀匹配。
+        """
+        prefix = draw_ib + "_"
+        if any(str(key).startswith(prefix) for key in (self.cross_ib_info_dict or {})):
+            return True
+        return any(
+            str(target).startswith(prefix)
+            for targets in (self.cross_ib_info_dict or {}).values()
+            for target in targets
+        )
+
+    def _build_merged_mesh_redirect_plan(self):
+        """构建合并网格自动重定向计划。
+
+        返回 (carrier_map, target_map, unredirected)：
+        - carrier_map: draw_ib -> {"target": 目标 DrawIB,
+                                   "base_vertex": 该合并网格在 target SO 中的偏移,
+                                   "target_first_index": 重挂 render 用的 match_first_index,
+                                   "vertex_count": 合并网格导出顶点数}
+        - target_map: draw_ib -> {"deform_draws": [(vb0 资源名, vb2 资源名, 顶点数), ...],
+                                  "so_vertex_count": target SO 总大小（含自身真实几何）,
+                                  "target_own_vertices": target 自身真实几何顶点数}
+        - unredirected: draw_ib -> {"reason": str, "target": str|""}（无法自动重定向）
+        """
+        carrier_map: dict[str, dict] = {}
+        target_map: dict[str, dict] = {}
+        unredirected: dict[str, dict] = {}
+
+        groups: dict[int, list[dict]] = {}
+        for component in self.merged_skeleton_components:
+            groups.setdefault(int(component["skeleton_group"]), []).append(component)
+
+        for skeleton_group, components in groups.items():
+            legal: set[int] = set()
+            for component in components:
+                for bone_id in range(
+                    int(component["vg_offset"]),
+                    int(component["vg_offset"]) + int(component["vg_count"]),
+                ):
+                    legal.add(bone_id)
+
+            with_draw = [c for c in components if int(c.get("deform_draw", 0) or 0) > 0]
+            if not with_draw:
+                for component in components:
+                    if (
+                        self._collect_drawib_referenced_bone_ids(component["draw_ib"])
+                        - set((component.get("vg_map") or {}).values())
+                    ) & legal:
+                        unredirected[component["draw_ib"]] = {
+                            "reason": "missing-deform-draw",
+                            "target": "",
+                        }
+                continue
+
+            last = max(with_draw, key=lambda c: int(c.get("deform_draw", 0) or 0))
+            target_ib = last["draw_ib"]
+            # target 自身真实几何的 SO 顶点数（无真实几何 = 0，stub 顶点不进 SO）
+            target_own_vertices = self._drawib_real_vertex_count(target_ib)
+            target_first_indices = self._drawib_first_match_first_index(target_ib)
+            target_first_index = target_first_indices[0] if target_first_indices else 0
+
+            carriers: list[dict] = []
+            for component in components:
+                referenced = self._collect_drawib_referenced_bone_ids(component["draw_ib"])
+                own = set((component.get("vg_map") or {}).values())
+                absorbed = (referenced - own) & legal
+                if not absorbed:
+                    continue  # 未合并其它部件
+                if int(component.get("deform_draw", 0) or 0) == int(last["deform_draw"]):
+                    continue  # 已挂在最后 pass：无需重定向
+                if int(component.get("deform_draw", 0) or 0) <= 0:
+                    unredirected[component["draw_ib"]] = {
+                        "reason": "missing-deform-draw",
+                        "target": last.get("unique_str") or "",
+                    }
+                    continue  # 缺 DeformDrawIndex：无法确定时序
+                if self._drawib_is_cross_ib(component["draw_ib"]) or self._drawib_is_cross_ib(target_ib):
+                    unredirected[component["draw_ib"]] = {
+                        "reason": "cross-ib",
+                        "target": last.get("unique_str") or "",
+                    }
+                    continue  # 跨 IB 重定向与合并网格自动重定向暂不兼容
+                # 合并网格的导出顶点数（该 DrawIB 全部子网格——合并场景下通常一个）
+                merged_vertices = 0
+                for drawib_model in self.drawib_model_list:
+                    if drawib_model.draw_ib != component["draw_ib"]:
+                        continue
+                    for submesh_model in drawib_model.submesh_model_list:
+                        merged_vertices += self._submesh_exported_vertex_count(submesh_model)
+                carriers.append({
+                    "draw_ib": component["draw_ib"],
+                    "vertex_count": merged_vertices,
+                })
+
+            if not carriers:
+                continue
+
+            # target 的 SO 布局：[target 真实几何][carrier1 merged][carrier2 merged]...
+            base_vertex = target_own_vertices
+            deform_draws = []
+            so_total = target_own_vertices
+            for carrier in carriers:
+                deform_draws.append((
+                    f"Resource{carrier['draw_ib']}Position",
+                    f"Resource{carrier['draw_ib']}Blend",
+                    carrier["vertex_count"],
+                ))
+                carrier_map[carrier["draw_ib"]] = {
+                    "target": target_ib,
+                    "base_vertex": base_vertex,
+                    "target_first_index": target_first_index,
+                    "vertex_count": carrier["vertex_count"],
+                }
+                base_vertex += carrier["vertex_count"]
+                so_total += carrier["vertex_count"]
+            target_map[target_ib] = {
+                "deform_draws": deform_draws,
+                "so_vertex_count": so_total,
+                "target_own_vertices": target_own_vertices,
+            }
+            print(
+                f"[ZZMI骨骼合并] 合并网格自动重定向: "
+                f"{[c['draw_ib'] for c in carriers]} -> DrawIB {target_ib}"
+                f"（组 G{skeleton_group} 最后 deform draw {last['deform_draw']}，"
+                f"SO={so_total} 顶点，base_vertex 依次 "
+                f"{[carrier_map[c['draw_ib']]['base_vertex'] for c in carriers]}）"
+            )
+
+        return carrier_map, target_map, unredirected
+
+    def add_merged_skeleton_sections(self, ini_builder: M_IniBuilder):
+        """生成 ZZMI 合并骨架段（组内统一骨架版：全局骨骼编号 + 零延迟逐 pass attach）。
+
+        架构（2026-08-24 用户拍板分组；2026-08-25 用户拍板**移除 CB1 校准**；
+        2026-08-25 定案**零延迟逐 pass attach**，详见计划书）：
+        - 骨骼 id = 全局编号（组基址拼接组内槽位）；Blender 侧组内 join 无歧义。
         - 每组一套**全宽**合并骨架 `ResourceZZMergedSkeleton_G<N>`（array = 全局
-          max(vg_offset+vg_count)）：本组骨骼直拷，外来骨骼经校准乘
-          （inv(cb1_本组) × cb1_源组 × M）写入。
-        - **帧对齐（用户拍板：全部数据同帧、整体延迟一帧，杜绝混帧抖动）**：
-          attach 挪到 [Present]（帧尾）执行——当帧 palette 副本（deform 处
-          `copy vs-t0` 成持久资源 `ResourceZZPalette_<DrawIB>`；ring buffer 同帧内
-          会被后续 pass 重写，别名撑不到帧尾）与当帧 cb1 捕获（渲染 draw 处
-          `copy vs-cb1`，last-wins）此刻同时在手，一次写出的骨架全部同属当帧；
-          下一帧各 deform draw 读到的就是干净的上一帧完整骨架。
-          （对照被否方案："全部当前帧"在 ZZZ 管线物理不可行——当帧全套 palette
-          因逐 pass Map + ring 复用从不并存，cb1 只在渲染 draw 才绑得到而渲染
-          在 deform 之后。）
-        - 每组 cb1 捕获：`ResourceZZCb1_G<N>` 在该组代表部件（json
-          SkeletonGroupCb1SourceIb + SkeletonGroupCb1SourceSO）的渲染 draw 处
-          copy vs-cb1（last-wins，逐帧更新）；捕获段按源部件 **SO 输出 hash** 匹配
-          （渲染 draw 的 vb0 恒为游戏 SO 资源、不受 mod 换 ib 影响）。
+          max(vg_offset+vg_count)）：**只写本组骨骼**（无任何校准乘）。
+        - **禁止跨组别骨骼合并**：各组骨架只含本组骨骼；跨组别引用在导出时大声
+          报警（`_warn_cross_group_bone_references`，无校准的运行时这些槽位
+          永远不会被写入 = 原点塌陷）。
+        - **零延迟逐 pass attach（2026-08-25 定案，替代"整体慢一帧"）**：
+          deform 段挂钩 = copy 当帧 palette（`ResourceZZPalette_<DrawIB>`）→
+          **立即 run attach CS**（按 vg_map 表 cs-t1 写入本组骨架；本部件引用的
+          全部骨骼——含跨部件共享的 canonical 槽位——此刻即为当帧内容）→
+          换绑 vs-t0 到本组骨架 → draw。**deform 读到的 = 当帧姿态**。
+          背景：渲染侧存在**当帧**的角色级绑定矩阵（dump 143256 实证：
+          vs-cb2 含身体正向+头部逆向绑定表，每帧 Map 更新；渲染 VS/PS 消费
+          当帧绑定）——"慢一帧"的 SO 与当帧绑定相乘，运动时逐帧错位（静止
+          时帧差≈0 所以 dump 数据层正常），这正是"只要采用骨骼合并就错位"、
+          "不合并（SO 当帧）不错位"的根因。逐 pass attach 只需本部件当帧
+          palette（copy 时刻有效），不依赖"当帧全套并存"（旧设计否决的只是
+          帧尾拿全套）。
+        - **[Present] 帧尾兜底**：再次 run 各部件 attach（同帧内容，写全部
+          槽位作为下一帧基线/异常兜底），无变量参数。
+        - 未生成组件**无需任何延迟机制**（2026-08-25 废弃双缓冲延迟）：走游戏
+          原渲染（当帧 palette），与合并部件（当帧）天然同帧一致。
         """
         section = M_IniSection(M_SectionType.MergedSkeleton)
         section.append("[Constants]")
         section.append("global $zz_ms_initialized = 0")
-        section.append("global $zz_ms_attach_offset = 0")
-        section.append("global $zz_ms_attach_count = 0")
         section.new_line()
 
         groups = self._merged_skeleton_groups()
@@ -609,13 +1045,6 @@ class ExportZZMI(ExportUnity):
         # （导出子集时 vg_offset 是工作空间全局槽位，可能远超导出内 sum——
         # 同组 3 部件 0~10/11~30/31~50 且中间缺席时 sum=31 但 max=51，按 max 声明）。
         bones_count = max(c["vg_offset"] + c["vg_count"] for c in self.merged_skeleton_components)
-
-        # 每组的 cb1 捕获源部件（取该组组件里声明了捕获源 SO hash 的 DrawIB）
-        group_cb1_source: dict[int, str] = {}
-        for component in self.merged_skeleton_components:
-            source_so = component.get("cb1_source_so") or ""
-            if source_so and component["skeleton_group"] not in group_cb1_source:
-                group_cb1_source[component["skeleton_group"]] = source_so
 
         # 每部件 palette 持久副本资源声明（deform VB 段里 copy vs-t0 写入当帧内容）。
         # type=stride 必须显式声明：副本要作为 CS 的 cs-t0（SRV）按
@@ -628,6 +1057,35 @@ class ExportZZMI(ExportUnity):
             section.append(f"array = {component['vg_count']}")
             section.new_line()
 
+        # 每部件 vg_map 表（局部骨骼 id -> 合并骨架全局槽位）：attach CS 的 cs-t1
+        # 按此写槽位——本部件引用的共享 canonical 槽位当帧覆盖，后续 deform 的
+        # 部件读到当帧内容（同帧 bitwise 相同，覆盖无害）。
+        # **改用 filename 加载二进制文件（2026-08-23 双帧实证）**：多行 data 在
+        # 本 3DMigoto fork 上只写入第 0 个元素（G3 仅 slot 0/79/88 非零，其余
+        # 线程 vg_map 读到 0 -> 全部骨骼塌进 slot 0，蒙皮炸裂）。filename 与
+        # VB 资源同一加载路径，buffer 大小由文件内容决定，与 format 视图精确
+        # 匹配。文件格式：每元素 4×uint32（槽位值, 0, 0, 0）= R32G32B32A32_UINT。
+        import struct as _struct
+
+        mod_meshes_dir = os.path.join(GlobalConfig.path_generate_mod_folder(), "Meshes")
+        for component in self.merged_skeleton_components:
+            vg_map = component.get("vg_map") or {}
+            section.append(f"[ResourceZZVgMap_{component['draw_ib']}]")
+            section.append("type = Buffer")
+            section.append("format = R32G32B32A32_UINT")
+            vgmap_filename = f"zz_vgmap_{component['draw_ib']}.buf"
+            section.append("filename = Meshes/" + vgmap_filename)
+            section.new_line()
+            try:
+                os.makedirs(mod_meshes_dir, exist_ok=True)
+                with open(os.path.join(mod_meshes_dir, vgmap_filename), "wb") as vgmap_file:
+                    for local in range(component["vg_count"]):
+                        slot = int(vg_map.get(local, 0))
+                        vgmap_file.write(_struct.pack("<4I", slot, 0, 0, 0))
+            except Exception as e:
+                print(f"[ZZMI骨骼合并] 写 vg_map 文件失败 {component['draw_ib']}: {e}")
+
+        # 每组一套合并骨架（组内统一：只直拷本组骨骼，跨组别禁止合并）
         for skeleton_group in groups:
             section.append(f"[ResourceZZMergedSkeleton_G{skeleton_group}]")
             section.append("type = RWStructuredBuffer")
@@ -635,75 +1093,42 @@ class ExportZZMI(ExportUnity):
             section.append("array = " + str(bones_count))
             section.new_line()
 
-            # 本组 cb1 捕获资源（无捕获源 -> 不生成捕获段，attach CS 直拷兜底）
-            section.append(f"[ResourceZZCb1_G{skeleton_group}]")
-            section.new_line()
-            if skeleton_group not in group_cb1_source:
-                print(
-                    f"[ZZMI骨骼合并] 警告: 骨架组 G{skeleton_group} 没有 cb1 捕获源部件，"
-                    f"该组 attach 将直拷（跨组引用该组数据会保持源空间，可能错位）"
-                )
-
-        # cb1 捕获段（TextureOverrideVB 按源部件的 SO 输出 hash 匹配：渲染 draw 的
-        # vb0 恒为游戏 SO 资源（不受我方 mod 换 ib 影响；按原 IB hash 匹配在全量合并后
-        # 永不触发，dump 124705 实测捕获资源只剩垃圾/统一内容导致校准失真）；
-        # 该源部件帧内最后一个渲染 draw 的 vs-cb1 是可解析逐部件块 -> last-wins 正确）
-        for skeleton_group in groups:
-            source_so = group_cb1_source.get(skeleton_group, "")
-            if not source_so:
-                continue
-            section.append(f"[TextureOverrideVB_Cb1Capture_G{skeleton_group}_so{source_so}]")
-            section.append("hash = " + source_so)
-            section.append("match_instance_count = 0")
-            section.append(f"ResourceZZCb1_G{skeleton_group} = copy vs-cb1 unless_null")
-            section.new_line()
-
-        # 逐（部件 × 组）校准 attach 段（声明；运行在 [Present]）
+        # 逐部件 attach 段（参数写死：y1 = vg_count；deform VB 段与 [Present] 共用）
         for component_id, component in enumerate(self.merged_skeleton_components):
-            own_group = component["skeleton_group"]
-            for skeleton_group in groups:
-                section.append(
-                    f"[CustomShaderZZMIMergedSkeletonAttach_C{component_id}_G{skeleton_group}]"
-                )
-                section.append("flags = optimization_level3 all_resources_bound skip_validation")
-                section.append("cs = ./res/zzmi_merged_skeleton_attach_calibrated.hlsl")
-                section.append("x1 = $zz_ms_attach_offset")
-                section.append("y1 = $zz_ms_attach_count")
-                section.append(f"cs-t0 = ref ResourceZZPalette_{component['draw_ib']}")
-                if own_group in group_cb1_source:
-                    section.append(f"cs-cb1 = ref ResourceZZCb1_G{own_group}")
-                if skeleton_group in group_cb1_source:
-                    section.append(f"cs-cb2 = ref ResourceZZCb1_G{skeleton_group}")
-                section.append(f"cs-u0 = ref ResourceZZMergedSkeleton_G{skeleton_group}")
-                section.append("Dispatch = 8, 1, 1")
-                section.append("cs-u0 = null")
-                section.new_line()
+            section.append(f"[CustomShaderZZMIMergedSkeletonAttach_C{component_id}]")
+            section.append("flags = optimization_level3 all_resources_bound skip_validation")
+            section.append("cs = ./res/zzmi_merged_skeleton_attach.hlsl")
+            section.append("x1 = 0")
+            section.append(f"y1 = {component['vg_count']}")
+            section.append(f"cs-t0 = ref ResourceZZPalette_{component['draw_ib']}")
+            section.append(f"cs-t1 = ref ResourceZZVgMap_{component['draw_ib']}")
+            section.append(
+                f"cs-u0 = ref ResourceZZMergedSkeleton_G{component['skeleton_group']}"
+            )
+            section.append("Dispatch = 8, 1, 1")
+            section.append("cs-u0 = null")
+            section.new_line()
 
-        # [Present]（帧尾）统一 attach：当帧 palette 副本 × 当帧 cb1 捕获 -> 全部同帧
+        # [Present]（帧尾）兜底 attach：当帧 palette 副本 -> 本组骨架（写全部槽位）
         section.append("[Present]")
-        for component_id, component in enumerate(self.merged_skeleton_components):
-            section.append("$zz_ms_attach_offset = " + str(component["vg_offset"]))
-            section.append("$zz_ms_attach_count = " + str(component["vg_count"]))
-            for skeleton_group in groups:
-                section.append(
-                    f"run = CustomShaderZZMIMergedSkeletonAttach_C{component_id}_G{skeleton_group}"
-                )
+        for component_id in range(len(self.merged_skeleton_components)):
+            section.append(f"run = CustomShaderZZMIMergedSkeletonAttach_C{component_id}")
             section.new_line()
 
         ini_builder.append_section(section)
 
     def _copy_merged_skeleton_shader_to_mod(self):
-        """把校准版 attach CS 着色器复制到生成 Mod 的 res/ 目录。"""
+        """把 attach CS 着色器（组内直拷版）复制到生成 Mod 的 res/ 目录。"""
         import shutil
 
         addon_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        shader_src = os.path.join(addon_root, "Toolset", "zzmi_merged_skeleton_attach_calibrated.hlsl")
+        shader_src = os.path.join(addon_root, "Toolset", "zzmi_merged_skeleton_attach.hlsl")
         if not os.path.isfile(shader_src):
-            print(f"[ZZMI骨骼合并] 警告: 未找到校准 attach CS 着色器 {shader_src}")
+            print(f"[ZZMI骨骼合并] 警告: 未找到 attach CS 着色器 {shader_src}")
             return
         res_dir = os.path.join(GlobalConfig.path_generate_mod_folder(), "res")
         os.makedirs(res_dir, exist_ok=True)
-        shutil.copy2(shader_src, os.path.join(res_dir, "zzmi_merged_skeleton_attach_calibrated.hlsl"))
+        shutil.copy2(shader_src, os.path.join(res_dir, "zzmi_merged_skeleton_attach.hlsl"))
 
     def add_unity_vs_resource_vb_sections(self, ini_builder: M_IniBuilder, drawib_model):
         super().add_unity_vs_resource_vb_sections(ini_builder=ini_builder, drawib_model=drawib_model)
@@ -784,17 +1209,44 @@ class ExportZZMI(ExportUnity):
                 )
                 texture_override_ib_section.new_line()
 
+            # 合并网格自动重定向：carrier 的 render override 改挂 target 的
+            # render draw（match_first_index 用 target 子网格的）；target 的
+            # stub 子网格改 ib=null（不画，防止多余三角形读出合并几何）。
+            redirect_carrier_info = self._redirect_carrier_map.get(draw_ib)
+            target_stub_submesh = (
+                draw_ib in self._redirect_target_map
+                and self._submesh_is_stub(submesh_model)
+            )
+            override_hash = redirect_carrier_info["target"] if redirect_carrier_info else draw_ib
+            override_first_index = (
+                redirect_carrier_info["target_first_index"]
+                if redirect_carrier_info
+                else submesh_model.match_first_index
+            )
+
             texture_override_ib_section.append("[TextureOverride_" + texture_override_name_suffix + "]")
-            texture_override_ib_section.append("hash = " + draw_ib)
-            texture_override_ib_section.append("match_first_index = " + str(submesh_model.match_first_index))
+            texture_override_ib_section.append("hash = " + override_hash)
+            texture_override_ib_section.append("match_first_index = " + str(override_first_index))
 
             ib_buf = drawib_model.submesh_ib_dict.get(submesh_model.unique_str, None)
-            if ib_buf is None or len(ib_buf) == 0:
+            if ib_buf is None or len(ib_buf) == 0 or target_stub_submesh:
                 texture_override_ib_section.append("ib = null")
                 texture_override_ib_section.new_line()
                 continue
 
             texture_override_ib_section.append("ib = " + ib_resource_name)
+
+            # 合并网格渲染换绑：导出顶点数超过原部件顶点数时（= 本对象把同组
+            # 其它部件的几何也合并了进来），渲染 draw 必须把 vb1 换绑为本 mod
+            # 的 Texcoord buffer——游戏原 vb1 只覆盖原部件顶点数，合并网格的
+            # 索引会越界读（D3D11 OOB 返回 0，UV 全糊到 (0,0) 角落）。
+            # 数量不超时保持游戏原绑定（数据同源，零行为变化）。
+            if (
+                int(getattr(submesh_model, "vertex_count", 0) or 0)
+                > int(getattr(submesh_model, "original_vertex_count", 0) or 0)
+                and int(getattr(submesh_model, "original_vertex_count", 0) or 0) > 0
+            ):
+                texture_override_ib_section.append(f"vb1 = Resource{draw_ib}Texcoord")
 
             texture_markup_info_list = drawib_model.get_submesh_texture_markup_info_list(submesh_model)
             if not GlobalProterties.forbid_auto_texture_ini() and texture_markup_info_list:
@@ -837,11 +1289,23 @@ class ExportZZMI(ExportUnity):
                 )
             else:
                 print(f"[CrossIB ZZMI] 非源块绘制物体: {len(submesh_model.drawcall_model_list)} 个")
-                self._append_drawindexed_with_shader_replace(
-                    texture_override_ib_section,
-                    submesh_model.drawcall_model_list,
-                    drawib_model.obj_name_draw_offset,
-                )
+                if redirect_carrier_info is not None:
+                    # 合并网格重定向：drawindexed 带 base_vertex——从 target 的 SO
+                    # 中读本合并网格的区段（offset 保持本 submesh 的索引偏移）
+                    base_vertex = redirect_carrier_info["base_vertex"]
+                    for drawcall_model in submesh_model.drawcall_model_list:
+                        draw_offset = drawib_model.obj_name_draw_offset.get(
+                            drawcall_model.obj_name, drawcall_model.index_offset
+                        )
+                        texture_override_ib_section.append(
+                            f"drawindexed = {drawcall_model.index_count},{draw_offset},{base_vertex}"
+                        )
+                else:
+                    self._append_drawindexed_with_shader_replace(
+                        texture_override_ib_section,
+                        submesh_model.drawcall_model_list,
+                        drawib_model.obj_name_draw_offset,
+                    )
 
             if is_cross_ib_target and source_ib_list_for_target:
                 print(f"[CrossIB ZZMI] 目标块处理: source_ib_list={source_ib_list_for_target}")
@@ -973,6 +1437,15 @@ class ExportZZMI(ExportUnity):
                 f"[ZZMI骨骼合并] 合并骨架: {len(self.merged_skeleton_components)} 个部件, "
                 f"缓冲 {buffer_slots} 槽（max(vg_offset+vg_count)）"
             )
+            # 跨组别引用守卫（无校准模式）：引用其它组骨骼 = 运行时塌陷，大声报警
+            self._warn_cross_group_bone_references()
+            # 合并网格自动重定向：挂在早 pass 的合并网格自动挪到组内最后一个
+            # deform draw 蒙皮/渲染（任意 IB 挂载均正确，用户无感）
+            self._redirect_carrier_map, self._redirect_target_map, unredirected = (
+                self._build_merged_mesh_redirect_plan()
+            )
+            # 无法自动重定向的合并网格（缺反查缓存/跨 IB）大声报警
+            self._warn_merged_mesh_timing(unredirected)
 
         # 部件缺失守卫：DrawIB 内若有部件没有任何对应对象（物体被合并/删除/改名），
         # 该部件会输出空 IB（ib=null）并在游戏内整个消失——大声报警而非静默。
