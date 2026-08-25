@@ -528,10 +528,12 @@ void ComputeNextPhysics(
 }
 
 // ============================================================
-// COLLISION (anti-clipping) — mode 3 (drag) only, per-hit vertices
-// Staged search: L0 fast reject → coarse broad-phase → fine narrow-phase
-// (boundary-aware neighbor expansion, ≤8 cells) → confirm/adjust
-// (fixed 5-step bisection for hard, normal-clamp + tangent-preserve for soft).
+// COLLISION (anti-clipping) — mode 2 (drag) only, per-hit vertices
+// 设计语义：导出时为每个权重顶点烘焙「到碰撞体表面的带符号距离」t0 作阈值
+// （ColliderVertexL0）。运行时任何位移后，顶点到碰撞体表面的距离不得低于 t0：
+// 低于则停在阈值处（硬=沿位移路径二分到边界；软=沿表面法线推回、保留切向滑动）。
+// 判定用带符号表面距离 s = dot(p - nearestQ, nearestN)（负 = 已穿透）；
+// 旧实现用「距最近采样点」的无符号距离 bestD 做触发，稀疏点云下恒放行 → 无效果。
 // ============================================================
 
 static const uint COLLISION_K_MAX = 32u;
@@ -616,65 +618,103 @@ float3 CollisionSolve(uint i, float3 p0, float3 offset)
 {
     float3 p1 = p0 + offset;
     float margin = COLLISION_PARAMS.y;
-    float safety = COLLISION_PARAMS.w;
 
-    // Stage 0: L0 fast reject（每顶点预烘焙接触平面；绝大多数顶点在此退出）
+    // ============================================================
+    // 设计语义（逐顶点导出距离阈值）：
+    // 导出时对每个权重顶点烘焙「到碰撞体表面的带符号距离」t0（ColliderVertexL0
+    // 布局：l0[2i]=(q0.xyz,t0)，l0[2i+1]=(n0.xyz,valid)，仅权重顶点 valid=1）。
+    // 运行时任何位移（拖拽/回弹）后，顶点到碰撞体表面的距离不得低于 t0：
+    //   低于阈值 → 停在阈值处（硬=沿位移路径二分到边界；软=沿法线推回，保留切向滑动）
+    //   不低于阈值 → 放行。
+    // ============================================================
     float4 l0q = ColliderVertexL0[i * 2u];
     float4 l0n = ColliderVertexL0[i * 2u + 1u];
     if (l0n.w > 0.5)
     {
-        if (dot(offset, l0n.xyz) >= -safety * l0q.w)
+        float threshold = l0q.w;   // 导出时刻表面距离 = 最小距离阈值
+
+        // 粗网格下界拒绝：到粗格包络（质心+半径）的距离 > 阈值 ⇒ 必未低于阈值
+        // （仅阈值非负时成立；导出已穿透的顶点阈值<0，直接走细查询）
+        int3 cdims = int3(COLLISION_META.yzw);
+        float4 coarse = ColliderCellsCoarse[CollisionCoarseCellIndex(p1, cdims)];
+        float dc = distance(p1, coarse.xyz);
+        if (threshold >= 0.0 && dc - coarse.w > threshold)
             return p1;
+
+        // 细网格：当前到碰撞体表面的带符号距离（最近采样点 + 外法线）
+        float bestD = 1e30;
+        float3 bestN = float3(0.0, 0.0, 1.0);
+        float3 bestQ = p1;
+        CollisionQueryFine(p1, bestD, bestN, bestQ);
+        float s1 = dot(p1 - bestQ, bestN);
+        if (s1 >= threshold)
+            return p1;   // 未低于阈值 → 放行
+
+        if (COLLISION_PARAMS.z > 0.5)
+        {
+            // 硬模式：沿位移路径固定 5 次二分到阈值边界（该帧停止，不滑动）
+            float tLo = 0.0;
+            float tHi = 1.0;
+            [unroll]
+            for (uint b = 0u; b < 5u; ++b)
+            {
+                float tMid = (tLo + tHi) * 0.5;
+                float3 query = p0 + offset * tMid;
+                float d = 1e30;
+                float3 n = float3(0.0, 0.0, 1.0);
+                float3 q = query;
+                CollisionQueryFine(query, d, n, q);
+                if (dot(query - q, n) >= threshold)
+                    tLo = tMid;
+                else
+                    tHi = tMid;
+            }
+            return p0 + offset * tLo;
+        }
+        // 软模式：沿表面法线推回至阈值，保留切向（贴表滑动）。
+        // 二次迭代：最近点/法线随曲面变化，一次投影在曲率处会欠量，再收敛一次。
+        float3 clamped = p1 - bestN * (s1 - threshold);
+        float d2 = 1e30;
+        float3 n2 = float3(0.0, 0.0, 1.0);
+        float3 q2 = clamped;
+        CollisionQueryFine(clamped, d2, n2, q2);
+        float s2 = dot(clamped - q2, n2);
+        if (s2 < threshold)
+            clamped = clamped - n2 * (s2 - threshold);
+        return clamped;
     }
 
-    // Stage 1: 粗网格大范围扫描（整格拒绝）
-    int3 cdims = int3(COLLISION_META.yzw);
-    float4 coarse = ColliderCellsCoarse[CollisionCoarseCellIndex(p1, cdims)];
-    float dc = distance(p1, coarse.xyz);
-    if (dc - coarse.w > margin)
+    // ============================================================
+    // 回退（无 L0 阈值，防御性）：最近点带符号距离 + margin 净空
+    // ============================================================
+    float bestD2 = 1e30;
+    float3 bestN2 = float3(0.0, 0.0, 1.0);
+    float3 bestQ2 = p1;
+    CollisionQueryFine(p1, bestD2, bestN2, bestQ2);
+    float s2 = dot(p1 - bestQ2, bestN2);
+    if (s2 > -margin)
         return p1;
-
-    // Stage 2: 细网格收窄精确评估（最近表面点 + 法线）
-    float bestD = 1e30;
-    float3 bestN = float3(0.0, 0.0, 1.0);
-    float3 bestQ = p1;
-    CollisionQueryFine(p1, bestD, bestN, bestQ);
-
-    if (bestD > margin)
-        return p1;
-
-    // Stage 3: 确认 + 调整
     if (COLLISION_PARAMS.z > 0.5)
     {
-        // 硬模式：沿位移路径固定 5 次二分
         float tLo = 0.0;
         float tHi = 1.0;
         [unroll]
         for (uint b = 0u; b < 5u; ++b)
         {
             float tMid = (tLo + tHi) * 0.5;
+            float3 query = p0 + offset * tMid;
             float d = 1e30;
             float3 n = float3(0.0, 0.0, 1.0);
-            float3 q = p0 + offset * tMid;
-            CollisionQueryFine(q, d, n, q);
-            if (d >= margin)
+            float3 q = query;
+            CollisionQueryFine(query, d, n, q);
+            if (dot(query - q, n) >= -margin)
                 tLo = tMid;
             else
                 tHi = tMid;
         }
         return p0 + offset * tLo;
     }
-    else
-    {
-        // 软模式：只裁法向分量、保留切向（沿碰撞体面滑动）。
-        // 法线优先取 L0 预烘焙平滑法线以降低帧间抖动。
-        float3 n = (l0n.w > 0.5) ? l0n.xyz : bestN;
-        float t0 = (l0n.w > 0.5) ? l0q.w : bestD;
-        float dn = dot(offset, n);
-        float maxIn = max(t0 - margin, 0.0);
-        float s = clamp(dn, -maxIn, maxIn);
-        return p0 + (offset - n * dn) + n * s;
-    }
+    return p1 - bestN2 * (s2 + margin);
 }
 
 // ============================================================
@@ -1007,7 +1047,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
         v.position += pathOffset;
     }
 
-    // 碰撞检测（防穿模）：仅在模式三（拉扯模式）且该顶点确实被移动时。
+    // 碰撞检测（防穿模）：仅在拉扯模式（模式 2）且该顶点确实被移动时。
     // 门控为 wave-uniform（COLLISION_PARAMS.x / COLLISION_META.x 是统一参数），
     // 空闲/非拉扯帧整波跳过，零成本。
     if (COLLISION_PARAMS.x > 0.5 && COLLISION_META.x >= 2.0 && (influence > 0.0 || hasPathOffset))

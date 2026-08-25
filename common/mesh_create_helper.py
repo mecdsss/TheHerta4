@@ -285,11 +285,11 @@ class MeshCreateHelper:
         elif GlobalConfig.logic_name == LogicName.EFMI:
             if (
                 GlobalProterties.import_skip_empty_vertex_groups()
-                and not GlobalProterties.import_merged_vgmap()
+                and wwmi_vg_map is None
             ):
                 # 删除空顶点组会重排组 index，而导出按组 index 取骨骼 id。
-                # EFMI 骨骼合并模式下组名=全局骨骼 id，删空组后必须按名称排序，
-                # 使 index == 全局骨骼 id（与参考插件 Merged Skeleton 的排序纪律一致）。
+                # 只有本对象实际拿到合并 VGMap 时才禁止普通清理；预生成失败的
+                # 导入级覆盖会传 None，即使 UI 选项此前为 True 也必须走普通路径。
                 try:
                     VertexGroupUtils.remove_unused_vertex_groups(obj)
                     if obj.vertex_groups:

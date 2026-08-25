@@ -92,6 +92,7 @@ class SubmeshMetadata:
     vg_offset: int = field(init=False, default=0)
     vg_count: int = field(init=False, default=0)
     vg_map: dict = field(init=False, default_factory=dict)
+    merged_skeleton_metadata_valid: bool = field(init=False, default=True)
     # ZZMI 导出侧守卫元数据（反查写回；缺省 0）
     deform_draw_index: int = field(init=False, default=0)
     original_vertex_count: int = field(init=False, default=0)
@@ -106,6 +107,9 @@ class SubmeshMetadata:
         self.extract_gametype_folder_path = os.path.join(os.path.dirname(submesh_json_path), "")
         self.submesh_json = SubmeshJson(submesh_json_path)
         self.submesh_json_dict = self.submesh_json.JsonDict
+        self.merged_skeleton_metadata_valid = bool(
+            getattr(self.submesh_json, "MergedSkeletonMetadataValid", True)
+        )
         self.work_game_type = self.submesh_json.WorkGameType
         self.vertex_limit_hash = self.submesh_json.VertexLimitVB
         self.match_cs = self.submesh_json.MatchCS

@@ -5,6 +5,56 @@ from ..utils.json_utils import JsonUtils
 from .d3d11_element import D3D11Element
 
 
+def _strict_uint32(value) -> int:
+	"""解析骨骼元数据整数；拒绝 bool、非整数浮点和越界值。"""
+	if isinstance(value, bool):
+		raise ValueError("bool 不是骨骼元数据整数")
+	if isinstance(value, float) and not value.is_integer():
+		raise ValueError("非整数浮点骨骼元数据")
+	parsed = int(value)
+	if parsed < 0 or parsed > 0xFFFFFFFF:
+		raise ValueError("骨骼元数据超出 uint32 范围")
+	return parsed
+
+
+def _merged_skeleton_metadata_valid(payload: dict) -> bool:
+	"""在导入/导出共同入口拒绝被截断的 VGMap/骨架元数据。
+
+	缓存生成器已经有严格门控；这里额外检查原始 JSON，避免 ``int(1.5)``
+	在 SubmeshJson 解析阶段被静默截断后继续生成错误的运行时文件。
+	"""
+	if not isinstance(payload, dict):
+		return False
+	fields = (
+		"VGOffset", "VGCount", "VGMap", "SkeletonGroup",
+		"DeformDrawIndex", "OriginalVertexCount",
+	)
+	if not any(field in payload for field in fields):
+		return True
+	try:
+		vg_count = _strict_uint32(payload.get("VGCount", 0) or 0)
+		_strict_uint32(payload.get("VGOffset", 0) or 0)
+		for field in ("SkeletonGroup", "DeformDrawIndex", "OriginalVertexCount"):
+			if field in payload:
+				_strict_uint32(payload[field])
+		if "VGMap" not in payload:
+			return vg_count == 0
+		vg_map = payload["VGMap"]
+		if not isinstance(vg_map, dict):
+			return False
+		normalized = {}
+		for raw_key, raw_value in vg_map.items():
+			key = _strict_uint32(raw_key)
+			if key in normalized:
+				return False
+			normalized[key] = _strict_uint32(raw_value)
+		if vg_count == 0:
+			return not normalized
+		return set(normalized) == set(range(vg_count))
+	except (TypeError, ValueError, OverflowError):
+		return False
+
+
 @dataclass
 class SubmeshIndexBuffer:
 	DXGI_FORMAT:str
@@ -56,6 +106,7 @@ class SubmeshJson:
 	VGOffset:int = field(init=False, default=0)
 	VGCount:int = field(init=False, default=0)
 	VGMap:dict = field(init=False, default_factory=dict)
+	MergedSkeletonMetadataValid:bool = field(init=False, default=True)
 	ShapeKeysInfo:dict = field(init=False, default_factory=dict)
 	IndexBufferList:list[SubmeshIndexBuffer] = field(init=False, default_factory=list)
 	CategoryBufferList:list[SubmeshCategoryBuffer] = field(init=False, default_factory=list)
@@ -65,6 +116,7 @@ class SubmeshJson:
 		self.FileName = os.path.basename(self.JsonFilePath)
 		self.DirPath = os.path.dirname(self.JsonFilePath)
 		self.JsonDict = JsonUtils.LoadFromFile(self.JsonFilePath)
+		self.MergedSkeletonMetadataValid = _merged_skeleton_metadata_valid(self.JsonDict)
 		self.parse_json_dict()
 
 	def parse_json_dict(self):

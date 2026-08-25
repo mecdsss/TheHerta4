@@ -961,6 +961,15 @@ class ExportEFMI:
         components = []
         if GlobalProterties.import_merged_vgmap():
             for submesh_model in self.submesh_model_list:
+                if not bool(
+                    getattr(submesh_model, "merged_skeleton_metadata_valid", True)
+                ):
+                    print(
+                        f"[EFMI骨骼合并] 警告 {getattr(submesh_model, 'unique_str', '?')}: "
+                        "骨骼合并元数据含非整数/越界值，该部件不进入合并骨架；"
+                        "请重新生成骨骼合并缓存"
+                    )
+                    continue
                 vg_count = int(getattr(submesh_model, "vg_count", 0) or 0)
                 if vg_count > 0:
                     components.append({

@@ -220,12 +220,18 @@ def ImprotFromWorkSpaceFull(self, context):
         self.report({'ERROR'}, "当前工作空间未找到可导入的子模型目录。")
         return False
 
+    # None = 非 EFMI/ZZMI 或未请求合并，沿用全局选项；True = 本次整批
+    # 预生成完整成功；False = 任一目标失败/异常，整批必须普通导入，不能让
+    # JSON 残留 VGMap 造成“部分全局组 + 部分局部组”的混合命名空间。
+    merged_vgmap_ready: bool | None = None
+
     # EFMI 骨骼合并数据预生成：导入前把 FrameAnalysis 反查的 VGMap 写回工作空间 json，
     # 使导入流程走全局骨骼索引（json 有 VGMap 且 import_merged_vgmap 开启时自动生效）。
     if (
         GlobalConfig.logic_name == LogicName.EFMI
         and GlobalProterties.import_merged_vgmap()
     ):
+        merged_vgmap_ready = False
         try:
             from ..common.efmi_skeleton import EFMISkeletonMergeHelper
             import_keys = [target["import_key"] for target in import_targets]
@@ -235,6 +241,7 @@ def ImprotFromWorkSpaceFull(self, context):
                 lod_group_projection=GlobalProterties.efmi_lod_group_projection(),
             )
             print(f"[EFMI骨骼合并] {message}")
+            merged_vgmap_ready = bool(ok)
             if ok:
                 self.report({'INFO'}, message)
             else:
@@ -257,6 +264,7 @@ def ImprotFromWorkSpaceFull(self, context):
         and GlobalProterties.import_merged_vgmap()
     )
     if is_zzmi_merged:
+        merged_vgmap_ready = False
         try:
             from ..common.zzmi_skeleton import ZZMISkeletonMergeHelper
             import_keys = [target["import_key"] for target in import_targets]
@@ -265,6 +273,7 @@ def ImprotFromWorkSpaceFull(self, context):
                 unique_str_list=import_keys,
             )
             print(f"[ZZMI骨骼合并] {message}")
+            merged_vgmap_ready = bool(ok)
             if ok:
                 self.report({'INFO'}, message)
             else:
@@ -277,6 +286,17 @@ def ImprotFromWorkSpaceFull(self, context):
             print(f"[ZZMI骨骼合并] 预生成失败（不阻断导入）: {e}")
             traceback.print_exc()
             self.report({'WARNING'}, f"ZZMI 骨骼合并预生成异常，已回退普通导入：{e}")
+
+    if merged_vgmap_ready is False:
+        # 失败后若继续保留复选框，当前对象虽按普通组导入，后续导出器却仍会
+        # 按合并骨架生成运行时段，形成导入/导出模式分裂。显式关闭选项，确保
+        # 本次普通导入与随后导出保持同一契约；用户修好来源后可再次手动开启。
+        GlobalProterties.set_import_merged_vgmap(False)
+        self.report(
+            {'WARNING'},
+            "本次已整体回退普通顶点组，并关闭“使用融合统一顶点组”；"
+            "修复骨骼来源后可重新开启并再次导入",
+        )
 
     foldername_gametypename_dict = {}
     imported_objects = []
@@ -303,6 +323,7 @@ def ImprotFromWorkSpaceFull(self, context):
                 imported_obj = SSMTImportHelper.create_mesh_from_json(
                     json_file_path=json_file_path,
                     import_collection=target["import_collection"],
+                    use_merged_vgmap=merged_vgmap_ready,
                 )
                 if imported_obj is None:
                     continue
@@ -324,7 +345,7 @@ def ImprotFromWorkSpaceFull(self, context):
 
                 imported_obj.name = display_name
                 imported_obj.data.name = imported_obj.name
-                if is_zzmi_merged:
+                if is_zzmi_merged and merged_vgmap_ready is True:
                     # 分组版骨骼合并：导入对象按 json SkeletonGroup 归入对应骨架组合集，
                     # 让"同一对象空间的部件"在大纲视图里聚在一起（跨组不共享骨架）。
                     try:

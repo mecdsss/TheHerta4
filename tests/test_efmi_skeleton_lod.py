@@ -193,6 +193,108 @@ class ResolveFrameAnalysisDirsByLodTests(unittest.TestCase):
         self.assertEqual(default_dir, str(self.dump_b))
 
 
+class PartitionWorkspaceBuildTests(unittest.TestCase):
+    """分区工作空间必须沿真实分区根定位 json，并完成同一条骨骼生成链。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="efmi_partition_ws_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.dump = _make_dump(
+            Path(self.tmp) / "dump", "000100", CB_HASH, T0_HASH_A, 1.5
+        )
+        self.ws = Path(self.tmp) / "ws"
+        (self.ws / "Config").mkdir(parents=True, exist_ok=True)
+        _write_json(
+            self.ws / "Config" / "FrameAnalysisPath.json",
+            {"frameAnalysisFolderPath": str(self.dump)},
+        )
+        self.partition = self.ws / "PartA"
+        _write_json(self.partition / "Config.json", {"name": "PartA"})
+        self.unique_str = _make_submesh(
+            self.partition, "LOD0", "aaaabbbb-100-0"
+        )
+        _write_json(
+            self.partition / "Import.json",
+            {self.unique_str: GAMETYPE},
+        )
+        _write_json(
+            self.partition / "LOD0" / "ComponentName_DrawCallIndexList.json",
+            {"aaaabbbb-100-0": ["000100"]},
+        )
+
+    def test_partition_json_resolution_reaches_full_generation_chain(self):
+        json_path = EFMISkeletonMergeHelper._resolve_submesh_json_path(
+            str(self.ws), self.unique_str
+        )
+        self.assertTrue(json_path.startswith(str(self.partition)), json_path)
+
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.unique_str],
+        )
+        self.assertTrue(ok, message)
+        payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        self.assertEqual(payload.get("VGMap"), {"0": 0})
+
+    def test_duplicate_partition_key_is_rejected_as_ambiguous(self):
+        partition_b = self.ws / "PartB"
+        _write_json(partition_b / "Config.json", {"name": "PartB"})
+        _make_submesh(partition_b, "LOD0", "aaaabbbb-100-0")
+        _write_json(
+            partition_b / "Import.json",
+            {self.unique_str: GAMETYPE},
+        )
+        self.assertEqual(
+            EFMISkeletonMergeHelper._resolve_submesh_json_path(
+                str(self.ws), self.unique_str
+            ),
+            "",
+        )
+
+
+class EFMICacheSchemaTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="efmi_cache_schema_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.bare = "aaaabbbb-100-0"
+        self.json_path = (
+            Path(self.tmp) / self.bare / ("TYPE_" + GAMETYPE)
+            / f"{self.bare}.json"
+        )
+        _write_json(self.json_path, {})
+        runtime = Path(self.tmp) / self.bare / "ModImpRuntime"
+        runtime.mkdir(parents=True, exist_ok=True)
+        (runtime / f"{self.bare}-BoneMatrix.buf").write_bytes(b"\x00" * 96)
+        self.payload = {
+            "VGMapAlgorithmVersion": VG_MAP_ALGORITHM_VERSION,
+            "VGMapDedupEnabled": bool(_efmi._DEDUP_ENABLED),
+            "VGCount": 2,
+            "VGOffset": 0,
+            "VGMap": {"0": 0, "1": 1},
+            "BoneMatrixFileName": f"{self.bare}-BoneMatrix.buf",
+        }
+
+    def test_full_map_is_valid_but_sparse_or_duplicate_map_is_not(self):
+        self.assertTrue(EFMISkeletonMergeHelper._efmi_cache_intact(
+            self.payload, str(self.json_path), self.bare
+        ))
+
+        sparse = dict(self.payload, VGMap={"0": 0})
+        self.assertFalse(EFMISkeletonMergeHelper._efmi_cache_intact(
+            sparse, str(self.json_path), self.bare
+        ))
+
+        duplicate = dict(self.payload, VGCount=1, VGMap={"0": 0, "00": 1})
+        self.assertFalse(EFMISkeletonMergeHelper._efmi_cache_intact(
+            duplicate, str(self.json_path), self.bare
+        ))
+
+        oversized = dict(self.payload, VGMap={"0": 0, "1": 0x100000000})
+        self.assertFalse(EFMISkeletonMergeHelper._efmi_cache_intact(
+            oversized, str(self.json_path), self.bare
+        ))
+
+
 class MultiLodBuildTests(unittest.TestCase):
     """构建端 e2e：两个 LOD 各自用自己的 dump，LOD1 复用 LOD0 分区。"""
 
@@ -268,6 +370,89 @@ class MultiLodBuildTests(unittest.TestCase):
         mat1 = pool1[7:10].reshape(12)
         self.assertAlmostEqual(float(mat0[9]), 1.5, places=4, msg="LOD0 骨骼应来自 dump A")
         self.assertAlmostEqual(float(mat1[9]), 2.5, places=4, msg="LOD1 骨骼应来自 dump B")
+
+    def test_clear_vgmap_then_delete_all_lod_dumps_rebuilds_identically(self):
+        """多 LOD 清缓存后必须只靠各自工作空间原始文件重建相同结果。"""
+        ok1, message1 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_lod1],
+        )
+        self.assertTrue(ok1, message1)
+        before0 = self._read_submesh_json("LOD0", "aaaabbbb-100-0")
+        before1 = self._read_submesh_json("LOD1", "ccccdddd-200-0")
+        for lod, bare, dump_dir, draw, cb_hash, payload in (
+            ("LOD0", "aaaabbbb-100-0", self.dump_a, "000100", CB_HASH, before0),
+            ("LOD1", "ccccdddd-200-0", self.dump_b, "000200", CB_HASH_B, before1),
+        ):
+            self.assertEqual(payload.get("InstanceConfigFirstConstant"), 0)
+            self.assertEqual(
+                payload.get("InstanceConfigFileName"),
+                f"{bare}-InstanceConfig.buf",
+            )
+            cached_instance = (
+                self.ws / lod / bare / "ModImpRuntime"
+                / f"{bare}-InstanceConfig.buf"
+            )
+            source_instance = (
+                dump_dir / "deduped" / f"{draw}-vs-cb2={cb_hash}.buf"
+            )
+            self.assertEqual(cached_instance.read_bytes(), source_instance.read_bytes())
+
+        cleaned, _scanned = EFMISkeletonMergeHelper.clear_vgmap_cache(str(self.ws))
+        self.assertEqual(cleaned, 2)
+        shutil.rmtree(self.dump_a)
+        shutil.rmtree(self.dump_b)
+
+        ok2, message2 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_lod1],
+        )
+        self.assertTrue(ok2, message2)
+        after0 = self._read_submesh_json("LOD0", "aaaabbbb-100-0")
+        after1 = self._read_submesh_json("LOD1", "ccccdddd-200-0")
+        for key in (
+            "VGMap", "VGOffset", "VGCount", "EFMILODReference",
+            "EFMILODProjection", "EFMILODBaselineGroupCount",
+            "EFMILODGroupCount", "EFMILODActualGroupCount",
+            "EFMILODMissingBaselineCount", "EFMILODCorrespondence",
+        ):
+            self.assertEqual(after0.get(key), before0.get(key), f"LOD0 {key}")
+            self.assertEqual(after1.get(key), before1.get(key), f"LOD1 {key}")
+
+    def test_multi_lod_legacy_cache_is_migrated_before_joint_fast_path(self):
+        """跨 LOD 幂等门控也必须趁 dump 尚在补齐旧版来源缓存。"""
+        ok1, message1 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_lod1],
+        )
+        self.assertTrue(ok1, message1)
+
+        lod = "LOD1"
+        bare = "ccccdddd-200-0"
+        json_path = next(
+            path
+            for path in (self.ws / lod / bare).glob("TYPE_*/*.json")
+            if path.name == f"{bare}.json"
+        )
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        payload.pop("InstanceConfigFileName", None)
+        payload.pop("InstanceConfigFirstConstant", None)
+        json_path.write_text(json.dumps(payload), encoding="utf-8")
+        instance_path = (
+            self.ws / lod / bare / "ModImpRuntime"
+            / f"{bare}-InstanceConfig.buf"
+        )
+        instance_path.unlink()
+
+        ok2, message2 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_lod1],
+        )
+        self.assertTrue(ok2, message2)
+        self.assertNotIn("无需重新生成", message2)
+        migrated = self._read_submesh_json(lod, bare)
+        self.assertEqual(migrated.get("InstanceConfigFirstConstant"), 0)
+        self.assertTrue(instance_path.is_file())
 
     def test_without_tabs_both_lod_use_default_dump(self):
         """WorkPageTabs 缺失时共用默认目录：查不到自己 drawcall 的 LOD 被跳过。
@@ -699,6 +884,117 @@ class SingleLodAtomicCacheTests(unittest.TestCase):
         self.assertTrue(ok2, message2)
         self.assertIn("无需重新生成", message2)
 
+    def test_clear_vgmap_then_delete_dump_rebuilds_from_workspace_cache(self):
+        """清掉 VGMap 后即使原始 dump 已删除，也必须复用工作空间骨骼池重建。"""
+        ok1, message1 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_a, self.u_b],
+        )
+        self.assertTrue(ok1, message1)
+        before_a = self._read_json("aaaabbbb-100-0")
+        before_b = self._read_json("ccccdddd-200-0")
+
+        cleaned, _scanned = EFMISkeletonMergeHelper.clear_vgmap_cache(str(self.ws))
+        self.assertEqual(cleaned, 2)
+        shutil.rmtree(self.dump)
+
+        ok2, message2 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_a, self.u_b],
+        )
+        self.assertTrue(ok2, message2)
+        after_a = self._read_json("aaaabbbb-100-0")
+        after_b = self._read_json("ccccdddd-200-0")
+        self.assertEqual(after_a["VGMap"], before_a["VGMap"])
+        self.assertEqual(after_b["VGMap"], before_b["VGMap"])
+        self.assertEqual(after_a["VGOffset"], before_a["VGOffset"])
+        self.assertEqual(after_b["VGOffset"], before_b["VGOffset"])
+
+    def test_missing_instance_config_cache_fails_honestly_without_dump(self):
+        """EFMI 回退源缺件时必须失败，不能只凭 BoneMatrix 伪造成功。"""
+        ok1, message1 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_a, self.u_b],
+        )
+        self.assertTrue(ok1, message1)
+
+        cleaned, _scanned = EFMISkeletonMergeHelper.clear_vgmap_cache(str(self.ws))
+        self.assertEqual(cleaned, 2)
+        instance_b = (
+            self.ws / "ccccdddd-200-0" / "ModImpRuntime"
+            / "ccccdddd-200-0-InstanceConfig.buf"
+        )
+        instance_b.unlink()
+        shutil.rmtree(self.dump)
+
+        ok2, message2 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_a, self.u_b],
+        )
+        self.assertFalse(ok2)
+        self.assertIn("未生成骨骼数据", message2)
+        self.assertIn("ccccdddd-200-0", message2)
+        self.assertNotIn("VGMap", self._read_json("ccccdddd-200-0"))
+
+    def test_legacy_complete_cache_is_migrated_while_dump_is_available(self):
+        """旧 VGMap 命中快路径前，应趁 dump 尚在自动补齐 EFMI 双来源缓存。"""
+        ok1, message1 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_a, self.u_b],
+        )
+        self.assertTrue(ok1, message1)
+        before = {
+            bare: self._read_json(bare)
+            for bare in ("aaaabbbb-100-0", "ccccdddd-200-0")
+        }
+
+        # 模拟 v4.4.32 及更早工作空间：VGMap/BoneMatrix 完整，但没有
+        # InstanceConfig 原文件和 first_constant 元数据。
+        for bare in before:
+            for type_dir in (self.ws / bare).iterdir():
+                json_path = type_dir / f"{bare}.json"
+                if type_dir.is_dir() and json_path.is_file():
+                    payload = json.loads(json_path.read_text(encoding="utf-8"))
+                    payload.pop("InstanceConfigFileName", None)
+                    payload.pop("InstanceConfigFirstConstant", None)
+                    payload.pop("SkeletonSourceDrawIndex", None)
+                    json_path.write_text(json.dumps(payload), encoding="utf-8")
+                    break
+            (
+                self.ws / bare / "ModImpRuntime"
+                / f"{bare}-InstanceConfig.buf"
+            ).unlink()
+
+        ok2, message2 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_a, self.u_b],
+        )
+        self.assertTrue(ok2, message2)
+        self.assertNotIn("无需重新生成", message2)
+        for bare in before:
+            migrated = self._read_json(bare)
+            self.assertEqual(migrated["VGMap"], before[bare]["VGMap"])
+            self.assertEqual(migrated["VGOffset"], before[bare]["VGOffset"])
+            self.assertIn("InstanceConfigFirstConstant", migrated)
+            self.assertTrue(
+                (
+                    self.ws / bare / "ModImpRuntime"
+                    / f"{bare}-InstanceConfig.buf"
+                ).is_file()
+            )
+
+        EFMISkeletonMergeHelper.clear_vgmap_cache(str(self.ws))
+        shutil.rmtree(self.dump)
+        ok3, message3 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_a, self.u_b],
+        )
+        self.assertTrue(ok3, message3)
+        for bare in before:
+            rebuilt = self._read_json(bare)
+            self.assertEqual(rebuilt["VGMap"], before[bare]["VGMap"])
+            self.assertEqual(rebuilt["VGOffset"], before[bare]["VGOffset"])
+
     def test_missing_target_directory_invalidates_gate_and_fails(self):
         """P2 回归：目标目录被删后不得报“全部已缓存”并静默遗漏该目标。"""
         ok1, message1 = EFMISkeletonMergeHelper.ensure_skeleton_data(
@@ -735,6 +1031,118 @@ class SingleLodAtomicCacheTests(unittest.TestCase):
             cache_path = self.ws / bare / "ModImpRuntime" / f"{bare}-BoneMatrix.buf"
             self.assertFalse(cache_path.exists())
             self.assertNotIn("BoneMatrixFileName", self._read_json(bare))
+
+    def test_instance_config_copy_failure_does_not_commit_partial_json(self):
+        """BoneMatrix 已复制但 InstanceConfig 失败时，JSON 事务不得部分提交。"""
+        real_copy2 = _efmi.shutil.copy2
+
+        def fail_instance_config(source, destination, *args, **kwargs):
+            if "-vs-cb2=" in str(source):
+                raise OSError("instance config copy failed")
+            return real_copy2(source, destination, *args, **kwargs)
+
+        with mock.patch.object(
+            _efmi.shutil, "copy2", side_effect=fail_instance_config
+        ):
+            ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=str(self.ws),
+                unique_str_list=[self.u_a, self.u_b],
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("未生成骨骼数据", message)
+        for bare in ("aaaabbbb-100-0", "ccccdddd-200-0"):
+            payload = self._read_json(bare)
+            self.assertFalse(
+                (
+                    self.ws / bare / "ModImpRuntime"
+                    / f"{bare}-BoneMatrix.buf"
+                ).exists(),
+                "第二份来源暂存失败时，第一份也不得提前发布",
+            )
+            self.assertNotIn("BoneMatrixFileName", payload)
+            self.assertNotIn("InstanceConfigFileName", payload)
+            self.assertNotIn("InstanceConfigFirstConstant", payload)
+
+    def test_json_stage_failure_does_not_publish_source_files(self):
+        """JSON 暂存失败时，双来源文件也必须保持未发布。"""
+        with mock.patch.object(
+            _efmi.JsonUtils,
+            "SaveToFile",
+            side_effect=OSError("json write failed"),
+        ):
+            ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=str(self.ws),
+                unique_str_list=[self.u_a, self.u_b],
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("未生成骨骼数据", message)
+        for bare in ("aaaabbbb-100-0", "ccccdddd-200-0"):
+            runtime = self.ws / bare / "ModImpRuntime"
+            self.assertFalse((runtime / f"{bare}-BoneMatrix.buf").exists())
+            self.assertFalse((runtime / f"{bare}-InstanceConfig.buf").exists())
+            self.assertNotIn("VGMap", self._read_json(bare))
+
+    def test_commit_failure_rolls_back_all_existing_artifacts(self):
+        """提交第二份文件失败时，应恢复旧双来源文件和旧 JSON。"""
+        ok1, message1 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_a],
+        )
+        self.assertTrue(ok1, message1)
+        bare = "aaaabbbb-100-0"
+        runtime = self.ws / bare / "ModImpRuntime"
+        pool_cache = runtime / f"{bare}-BoneMatrix.buf"
+        instance_cache = runtime / f"{bare}-InstanceConfig.buf"
+        json_path = next(
+            path
+            for path in (self.ws / bare).glob("TYPE_*/*.json")
+            if path.name == f"{bare}.json"
+        )
+        before_pool = pool_cache.read_bytes()
+        before_instance = instance_cache.read_bytes()
+        before_json = json_path.read_bytes()
+
+        source_pool = self.dump / "deduped" / f"000100-vs-t0={T0_HASH_A}.buf"
+        changed_pool = bytearray(source_pool.read_bytes())
+        changed_pool[0:4] = numpy.float32(123.0).tobytes()
+        source_pool.write_bytes(changed_pool)
+        source_instance = self.dump / "deduped" / f"000100-vs-cb2={CB_HASH}.buf"
+        changed_instance = bytearray(source_instance.read_bytes())
+        changed_instance[-4:] = numpy.float32(456.0).tobytes()
+        source_instance.write_bytes(changed_instance)
+
+        real_replace = _efmi.os.replace
+        injected = {"done": False}
+
+        def fail_instance_commit(source, destination, *args, **kwargs):
+            if (
+                not injected["done"]
+                and str(source).endswith(".tmp")
+                and str(destination).endswith("-InstanceConfig.buf")
+            ):
+                injected["done"] = True
+                raise OSError("replace failed")
+            return real_replace(source, destination, *args, **kwargs)
+
+        with mock.patch.object(
+            _efmi.os, "replace", side_effect=fail_instance_commit
+        ):
+            ok2, message2 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=str(self.ws),
+                unique_str_list=[self.u_a],
+                force=True,
+            )
+
+        self.assertTrue(injected["done"], "必须实际命中第二文件提交阶段")
+        self.assertFalse(ok2)
+        self.assertIn("未生成骨骼数据", message2)
+        self.assertEqual(pool_cache.read_bytes(), before_pool)
+        self.assertEqual(instance_cache.read_bytes(), before_instance)
+        self.assertEqual(json_path.read_bytes(), before_json)
+        self.assertEqual(list(self.ws.rglob("*.tmp")), [])
+        self.assertEqual(list(self.ws.rglob("*.bak")), [])
 
     def test_group_rebuild_refreshes_same_size_cache(self):
         """整组重建必须刷新当前 dump；同尺寸旧文件不能继续冒充最新缓存。"""

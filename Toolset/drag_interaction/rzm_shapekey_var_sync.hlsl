@@ -47,9 +47,9 @@
 // IniParams (packed 4 variables per float4, from index 81; 76-80 are used
 // by the drive CS, 100+ by the shape-key anim CS):
 //   [81 + i/4][i%4] = current value of binding i's export variable
-//   [83 + i/4][i%4] = CPU readback pull flag of binding i (1 = the value
-//                     change this frame came from the buffer pull; suppress
-//                     the variable->buffer push this frame to avoid echo)
+//   [90 + i/4][i%4] = CPU/GPU arbitration mode of binding i
+//                     (0 = normal, 1 = suppress readback echo,
+//                      2 = force-push until delayed readback acknowledges)
 // IniParams[75] gate inputs (fixed below the drive CS range):
 //   x = drag system mode (1 = hit only), y = grab modifier + LMB/X held,
 //   z = target drawn this frame, w = input mode (0 = game)

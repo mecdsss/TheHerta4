@@ -24,7 +24,17 @@ class SSMTImportHelper:
 		return workspace_unique_str
 
 	@staticmethod
-	def create_mesh_from_json(json_file_path:str, import_collection:bpy.types.Collection | None = None):
+	def create_mesh_from_json(
+		json_file_path:str,
+		import_collection:bpy.types.Collection | None = None,
+		use_merged_vgmap:bool | None = None,
+	):
+		"""从子网格 JSON 创建对象。
+
+		``use_merged_vgmap`` 是一次导入操作的显式覆盖：完整预生成失败时，
+		调用方传 False，整批忽略 JSON 中可能残留的 VGMap，真正回退普通导入。
+		None 保留其它调用点按全局复选框决定的旧行为。
+		"""
 		apply_import_render_environment()
 		submesh_json = SubmeshJson(json_file_path)
 
@@ -34,8 +44,15 @@ class SSMTImportHelper:
 		mesh_name = os.path.splitext(submesh_json.FileName)[0]
 		logic_name = submesh_json.GamePreset
 		gametypename = submesh_json.WorkGameType
+		merged_vgmap_enabled = (
+			GlobalProterties.import_merged_vgmap()
+			if use_merged_vgmap is None
+			else bool(use_merged_vgmap)
+		)
 		wwmi_vg_map = submesh_json.VGMap if (
-			GlobalProterties.import_merged_vgmap() and int(submesh_json.VGCount or 0) > 0
+			merged_vgmap_enabled
+			and bool(getattr(submesh_json, "MergedSkeletonMetadataValid", True))
+			and int(submesh_json.VGCount or 0) > 0
 		) else None
 
 		obj = MeshCreateHelper.create_mesh_object(

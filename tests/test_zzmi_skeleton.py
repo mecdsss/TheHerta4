@@ -710,6 +710,30 @@ def _write_zzmi_json(ws: Path, bare: str, payload: dict):
     raise AssertionError(f"未找到 {bare} 的子网格 json")
 
 
+class ZZMIPartitionResolverTests(unittest.TestCase):
+    def test_zzmi_reuses_partition_aware_json_resolution(self):
+        with tempfile.TemporaryDirectory(prefix="zzmi_partition_") as tmp:
+            ws = Path(tmp)
+            partition = ws / "PartA"
+            partition.mkdir(parents=True, exist_ok=True)
+            (partition / "Config.json").write_text("{}", encoding="utf-8")
+            bare = "aaaa1111-100-0"
+            type_dir = partition / "LOD0" / bare / "TYPE_GPU_P12_"
+            type_dir.mkdir(parents=True, exist_ok=True)
+            json_path = type_dir / f"{bare}.json"
+            json_path.write_text("{}", encoding="utf-8")
+            (partition / "Import.json").write_text(
+                json.dumps({f"LOD0.{bare}": "GPU_P12_"}),
+                encoding="utf-8",
+            )
+
+            resolved = ZZMISkeletonMergeHelper._resolve_submesh_json_path(
+                str(ws), f"LOD0.{bare}"
+            )
+            self.assertTrue(resolved)
+            self.assertTrue(os.path.samefile(resolved, json_path))
+
+
 class ZZMIWorkspaceCacheOnlyTests(unittest.TestCase):
     """P2 回归：FrameAnalysis 被搬走/删除后，仍能靠工作空间缓存正常重建。"""
 
@@ -795,6 +819,270 @@ class ZZMIWorkspaceCacheOnlyTests(unittest.TestCase):
         )
         self.assertTrue(ok3, message3)
         self.assertIn("幂等跳过", message3)
+
+    def test_clear_vgmap_then_delete_dump_rebuilds_from_workspace_cache(self):
+        """用户先清理 VGMap、再删除 dump 后，ZZMI 仍应只靠工作空间缓存重建。"""
+        ok1, message1 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok1, message1)
+        before = {
+            bare: _read_zzmi_json(self.ws, bare)
+            for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+        }
+
+        cleaned, _scanned = _efmi.EFMISkeletonMergeHelper.clear_vgmap_cache(
+            str(self.ws)
+        )
+        self.assertEqual(cleaned, 2)
+        shutil.rmtree(self.dump)
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        after = {
+            bare: _read_zzmi_json(self.ws, bare)
+            for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+        }
+        self.assertEqual(after["aaaa1111-100-0"]["VGMap"],
+                         before["aaaa1111-100-0"]["VGMap"])
+        self.assertEqual(after["bbbb2222-200-0"]["VGMap"],
+                         before["bbbb2222-200-0"]["VGMap"])
+        self.assertEqual(after["aaaa1111-100-0"]["SkeletonGroup"],
+                         after["bbbb2222-200-0"]["SkeletonGroup"])
+
+    def test_cache_only_rebuild_uses_same_valid_cb1_as_dump_rebuild(self):
+        """多个 CB1 候选时，缓存必须复制实际用于分组的有效文件，而非首个坏文件。"""
+        invalid_cb1 = self.dump / "deduped" / "invalid_cb1.buf"
+        invalid_cb1.write_bytes(numpy.zeros((16,), dtype=numpy.float32).tobytes())
+        deduped_abs = (self.dump / "deduped").resolve()
+        with (self.dump / "log.txt").open("a", encoding="utf-8") as handle:
+            handle.write(
+                "000009 DrawIndexedInstanced(IndexCountPerInstance:3, InstanceCount:1, "
+                "StartIndexLocation:0, BaseVertexLocation:0, StartInstanceLocation:0)\n"
+            )
+            handle.write(
+                "000009 3DMigoto Dumping Buffer "
+                "000009-vs-cb1=99999999-vs=aaaaaaaaaaaaaaaa.buf "
+                f"-> {deduped_abs / 'invalid_cb1.buf'}\n"
+            )
+        mapping_path = self.ws / "LOD0" / "ComponentName_DrawCallIndexList.json"
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        mapping["aaaa1111-100-0"] = ["000009", "000010"]
+        mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+
+        ok1, message1 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok1, message1)
+        before = {
+            bare: _read_zzmi_json(self.ws, bare)
+            for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+        }
+        self.assertEqual(before["aaaa1111-100-0"]["SkeletonGroup"],
+                         before["bbbb2222-200-0"]["SkeletonGroup"])
+        cached_cb1 = (
+            self.ws / "LOD0" / "aaaa1111-100-0" / "ModImpRuntime"
+            / "aaaa1111-100-0-ObjectCB1.buf"
+        )
+        self.assertEqual(
+            cached_cb1.read_bytes(),
+            (self.dump / "deduped" / "shared_cb1.buf").read_bytes(),
+            "必须复制实际参与 SkeletonGroup 计算的有效 CB1",
+        )
+
+        # 模拟旧版工作空间：缓存文件被错误写成首个无效候选，且没有新版
+        # ObjectCB1CacheValid 标记。dump 仍在时，普通幂等导入必须自动迁移。
+        for bare in before:
+            runtime_cb1 = (
+                self.ws / "LOD0" / bare / "ModImpRuntime"
+                / f"{bare}-ObjectCB1.buf"
+            )
+            runtime_cb1.write_bytes(invalid_cb1.read_bytes())
+            payload = _read_zzmi_json(self.ws, bare)
+            payload.pop("ObjectCB1CacheValid", None)
+            _write_zzmi_json(self.ws, bare, payload)
+
+        ok_migrate, message_migrate = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok_migrate, message_migrate)
+        self.assertNotIn("幂等跳过", message_migrate)
+        for bare in before:
+            payload = _read_zzmi_json(self.ws, bare)
+            self.assertIs(payload.get("ObjectCB1CacheValid"), True)
+            runtime_cb1 = (
+                self.ws / "LOD0" / bare / "ModImpRuntime"
+                / f"{bare}-ObjectCB1.buf"
+            )
+            self.assertEqual(
+                runtime_cb1.read_bytes(),
+                (self.dump / "deduped" / "shared_cb1.buf").read_bytes(),
+            )
+
+        _efmi.EFMISkeletonMergeHelper.clear_vgmap_cache(str(self.ws))
+        shutil.rmtree(self.dump)
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        after = {
+            bare: _read_zzmi_json(self.ws, bare)
+            for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+        }
+        for bare in after:
+            self.assertEqual(after[bare]["VGMap"], before[bare]["VGMap"], bare)
+            self.assertEqual(after[bare]["VGOffset"], before[bare]["VGOffset"], bare)
+            self.assertEqual(after[bare]["SkeletonGroup"],
+                             before[bare]["SkeletonGroup"], bare)
+
+    def test_missing_required_cb1_cache_fails_without_silent_regroup(self):
+        """标记为有效的 CB1 缓存丢失后，无 dump 重建必须失败且不得改写分组。"""
+        ok1, message1 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok1, message1)
+        before = {
+            bare: _read_zzmi_json(self.ws, bare)
+            for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+        }
+        self.assertTrue(all(
+            payload.get("ObjectCB1CacheValid") is True
+            for payload in before.values()
+        ))
+
+        _efmi.EFMISkeletonMergeHelper.clear_vgmap_cache(str(self.ws))
+        shutil.rmtree(self.dump)
+        for bare in before:
+            cb1_path = (
+                self.ws / "LOD0" / bare / "ModImpRuntime"
+                / f"{bare}-ObjectCB1.buf"
+            )
+            cb1_path.unlink()
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertFalse(ok2)
+        self.assertIn("ObjectCB1", message2)
+        for bare in before:
+            payload = _read_zzmi_json(self.ws, bare)
+            self.assertIs(payload.get("ObjectCB1CacheValid"), True)
+            self.assertNotIn("VGMap", payload)
+            self.assertNotIn("SkeletonGroup", payload)
+
+    def test_missing_required_cb1_with_log_but_no_source_fails(self):
+        """日志目录仍在但 CB1 原文件被删时，也不得静默改成独立分组。"""
+        ok1, message1 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok1, message1)
+        before = {
+            bare: _read_zzmi_json(self.ws, bare)
+            for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+        }
+        self.assertTrue(all(
+            payload.get("ObjectCB1CacheValid") is True
+            for payload in before.values()
+        ))
+        for bare in before:
+            cb1_path = (
+                self.ws / "LOD0" / bare / "ModImpRuntime"
+                / f"{bare}-ObjectCB1.buf"
+            )
+            cb1_path.unlink()
+        # 保留 log.txt 让 parser 仍可创建，但删除其实际 CB1 来源。
+        (self.dump / "deduped" / "shared_cb1.buf").unlink()
+        _efmi.EFMISkeletonMergeHelper.clear_vgmap_cache(str(self.ws))
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs, force=True
+        )
+        self.assertFalse(ok2)
+        self.assertIn("ObjectCB1", message2)
+        for bare in before:
+            payload = _read_zzmi_json(self.ws, bare)
+            self.assertIs(payload.get("ObjectCB1CacheValid"), True)
+            self.assertNotIn("SkeletonGroup", payload)
+
+    def test_invalid_fast_path_metadata_is_rebuilt(self):
+        """分组/时序元数据必须是非负整数，不能仅凭字段存在进入幂等快路径。"""
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        bare = "aaaa1111-100-0"
+        invalid_cases = (
+            ("SkeletonGroup", -1),
+            ("DeformDrawIndex", "bad"),
+            ("OriginalVertexCount", -1),
+            ("SkeletonGroup", 1.5),
+        )
+        for field, invalid_value in invalid_cases:
+            with self.subTest(field=field):
+                payload = _read_zzmi_json(self.ws, bare)
+                payload[field] = invalid_value
+                _write_zzmi_json(self.ws, bare, payload)
+
+                ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+                    workspace_root=str(self.ws), unique_str_list=self.unique_strs
+                )
+                self.assertTrue(ok2, message2)
+                self.assertNotIn("幂等跳过", message2)
+                repaired = _read_zzmi_json(self.ws, bare)
+                self.assertIsInstance(repaired[field], int)
+                self.assertGreaterEqual(repaired[field], 0)
+
+    def test_invalid_vgmap_schema_is_rebuilt_before_import(self):
+        """规范化重复键、非整数值和 uint32 越界槽位都不能通过缓存快路径。"""
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        bare = "aaaa1111-100-0"
+        invalid_maps = (
+            {"0": 0, "00": 1},
+            {"0": 1.5},
+            {"0": 0x100000000},
+        )
+        for invalid_map in invalid_maps:
+            with self.subTest(vg_map=invalid_map):
+                payload = _read_zzmi_json(self.ws, bare)
+                payload["VGMap"] = invalid_map
+                _write_zzmi_json(self.ws, bare, payload)
+
+                ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+                    workspace_root=str(self.ws), unique_str_list=self.unique_strs
+                )
+                self.assertTrue(ok2, message2)
+                self.assertNotIn("幂等跳过", message2)
+                repaired = _read_zzmi_json(self.ws, bare)
+                self.assertEqual(repaired["VGMap"], {"0": 0})
+
+    def test_cb1_stage_failure_does_not_publish_palette_or_json(self):
+        """CB1 是第二份来源；其复制失败时 palette/JSON 也不能提前提交。"""
+        real_copy2 = _efmi.shutil.copy2
+
+        def fail_cb1(source, destination, *args, **kwargs):
+            if str(source).endswith("shared_cb1.buf"):
+                raise OSError("cb1 copy failed")
+            return real_copy2(source, destination, *args, **kwargs)
+
+        with mock.patch.object(_efmi.shutil, "copy2", side_effect=fail_cb1):
+            ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=str(self.ws), unique_str_list=self.unique_strs
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("未生成", message)
+        for bare in ("aaaa1111-100-0", "bbbb2222-200-0"):
+            runtime = self.ws / "LOD0" / bare / "ModImpRuntime"
+            self.assertFalse((runtime / f"{bare}-BoneMatrix.buf").exists())
+            self.assertFalse((runtime / f"{bare}-ObjectCB1.buf").exists())
+            payload = _read_zzmi_json(self.ws, bare)
+            self.assertNotIn("VGMap", payload)
+            self.assertNotIn("BoneMatrixFileName", payload)
 
     def test_cache_incomplete_submesh_not_skipped(self):
         """P2#6 回归：复制骨骼缓存失败/漏掉 ModImpRuntime 时不得幂等跳过。"""
@@ -1087,6 +1375,28 @@ class ZZMISiblingCacheTests(unittest.TestCase):
         self.assertTrue(ok2, message2)
         self.assertEqual(cache_a.read_bytes(), source_palette.read_bytes())
         self.assertEqual(cb1_a.read_bytes(), source_cb1.read_bytes())
+
+        dump_groups = {
+            bare: _read_zzmi_json(self.ws, bare)["SkeletonGroup"]
+            for bare in self.bares
+        }
+        for bare in self.bares:
+            payload = _read_zzmi_json(self.ws, bare)
+            self.assertIs(payload.get("ObjectCB1CacheValid"), False)
+
+        # 当前 dump 的 CB1 已被判定无效。即使保留了原始副本用于诊断，
+        # 清掉 VGMap 并删除 dump 后也不得把该文件重新当作有效对象变换。
+        _efmi.EFMISkeletonMergeHelper.clear_vgmap_cache(str(self.ws))
+        shutil.rmtree(self.dump)
+        ok3, message3 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok3, message3)
+        cache_groups = {
+            bare: _read_zzmi_json(self.ws, bare)["SkeletonGroup"]
+            for bare in self.bares
+        }
+        self.assertEqual(cache_groups, dump_groups)
 
 
 if __name__ == "__main__":

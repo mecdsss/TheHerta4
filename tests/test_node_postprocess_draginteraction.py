@@ -1457,6 +1457,8 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("#define VAR_SYNC_INIPARAM_BASE 81", content)
         self.assertIn("#define VAR_SYNC_GATE_PARAMS 75", content)
         self.assertIn("#define VAR_SYNC_MODE_BASE 90", content)
+        self.assertIn("[90 + i/4][i%4] = CPU/GPU arbitration mode", content)
+        self.assertNotIn("[83 + i/4][i%4] = CPU readback pull flag", content)
         self.assertIn("IniParams[VAR_SYNC_INIPARAM_BASE + (i >> 2)][i & 3]", content)
         # 与驱动 CS 同一命中判定，每帧重算每区域激活标志
         self.assertIn("ZoneActive[z] = (hasHit && z == hoverZone) ? 1.0 : 0.0;", content)
@@ -2789,9 +2791,57 @@ class DragNodeZoneFilterTests(unittest.TestCase):
         settings = self._settings(include_names=["A"])
         self.assertTrue(mod._zone_allowed_by_target(settings, "A"))
         self.assertFalse(mod._zone_allowed_by_target(settings, "B"))
-        # 去重后缀：包含 Body.001 也能命中 Body
+        # 导出追加后缀：包含 Body_copy 也能命中 Body（运行时后缀剥离）
+        runtime = self._settings(include_names=["Body_copy"])
+        self.assertTrue(mod._zone_allowed_by_target(runtime, "Body"))
+        # Blender 去重后缀 .001 是正常物体名的一部分，不折叠：
+        # 包含 Body.001 命中 Body.001，但不再连带命中 Body（独立网格互不串）
         suffix = self._settings(include_names=["Body.001"])
-        self.assertTrue(mod._zone_allowed_by_target(suffix, "Body"))
+        self.assertFalse(mod._zone_allowed_by_target(suffix, "Body"))
+        self.assertTrue(mod._zone_allowed_by_target(suffix, "Body.001"))
+
+    def test_zone_allowed_vertex_mask_treats_dot001_as_distinct_mesh(self):
+        """ZZMI 合并网格回归：导出 ini 里 .001 后缀是真实独立 draw（独立 IB 区间），
+        包含 .001 只放行该段顶点，不得折叠到基础名把整组件全放行。"""
+        mod = self.mod
+        triangles = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+        tri_part_names = np.array([
+            "LOD0.b30db54e-7383-0_copy",
+            "LOD0.b30db54e-7383-0.001_copy",
+        ], dtype=object)
+        # 只包含 .001 小物体 → 只放行第二段
+        settings_small = self._settings(include_names=["LOD0.b30db54e-7383-0.001"])
+        mask_small = mod._zone_allowed_vertex_mask(settings_small, 6, triangles, tri_part_names)
+        np.testing.assert_array_equal(
+            mask_small, np.array([False, False, False, True, True, True])
+        )
+        # 只包含主物体 → 只放行第一段
+        settings_main = self._settings(include_names=["LOD0.b30db54e-7383-0"])
+        mask_main = mod._zone_allowed_vertex_mask(settings_main, 6, triangles, tri_part_names)
+        np.testing.assert_array_equal(
+            mask_main, np.array([True, True, True, False, False, False])
+        )
+
+    def test_collider_vertex_mask_treats_dot001_as_distinct_mesh(self):
+        """碰撞体同规约：.001 后缀按真实独立网格精确匹配，不折叠到基础名。"""
+        mod = self.mod
+        triangles = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+        tri_part_names = np.array([
+            "LOD0.b30db54e-7383-0_copy",
+            "LOD0.b30db54e-7383-0.001_copy",
+        ], dtype=object)
+        colliders = [
+            types.SimpleNamespace(object=types.SimpleNamespace(
+                name="LOD0.b30db54e-7383-0.001", name_full=None))
+        ]
+        settings = types.SimpleNamespace(
+            enabled=True, brush_strength=1.0, brush_falloff_k=4.6,
+            radius=0.0, strength=0.0, max_offset=0.0, falloff=0.0, damping=0.0,
+            grabbable=True, include_objects=[], collider_objects=colliders,
+            collision_override=0,
+        )
+        mask = mod._collider_vertex_mask(settings, 6, triangles, tri_part_names)
+        np.testing.assert_array_equal(mask, np.array([False, False, False, True, True, True]))
 
     def test_include_list_with_invalid_entries_defaults_to_all(self):
         """包含列表项存在但物体指针已失效（如物体被删除）→ 视为无有效过滤，
@@ -3224,6 +3274,29 @@ class DragCollisionTests(unittest.TestCase):
             np.testing.assert_allclose(l0[2 * i + 1, 0:3], expected_n, atol=1e-4)
             self.assertEqual(float(l0[2 * i + 1, 3]), 1.0)
 
+    def test_bake_collider_l0_signed_threshold_with_normals(self):
+        """设计语义：传点云法线时 t0 = 导出时刻到表面的带符号距离（阈值），
+        n0 = 表面法线（而非指向顶点的方向）。"""
+        positions = np.array([
+            [0.0, 0.0, 0.05],   # 表面外 5cm（表面在 z=0，外法线 +z）
+            [0.0, 0.0, -0.02],  # 导出时已穿透 2cm
+        ], dtype=np.float32)
+        points = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+        normals = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+        l0 = self.NodeCls._bake_collider_l0(positions, points, None, normals=normals)
+        # t0 = 带符号表面距离
+        self.assertAlmostEqual(float(l0[0, 3]), 0.05, places=5)
+        self.assertAlmostEqual(float(l0[2, 3]), -0.02, places=5)
+        # n0 = 表面法线（不是 (v-q0) 方向）
+        np.testing.assert_allclose(l0[1, 0:3], normals[0], atol=1e-6)
+        np.testing.assert_allclose(l0[3, 0:3], normals[0], atol=1e-6)
+        self.assertEqual(float(l0[1, 3]), 1.0)
+        # 掩码：只烘焙权重顶点
+        masked = np.array([True, False], dtype=bool)
+        l0m = self.NodeCls._bake_collider_l0(positions, points, masked, normals=normals)
+        self.assertEqual(float(l0m[1, 3]), 1.0)   # 顶点0 valid
+        self.assertEqual(float(l0m[3, 3]), 0.0)   # 顶点1 未遮 → valid=0
+
     def test_collider_vertex_mask_selects_objects(self):
         triangles = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
         tri_part_names = np.array(["Thigh", "Stocking"], dtype=object)
@@ -3304,6 +3377,13 @@ class DragCollisionTests(unittest.TestCase):
         self.assertIn("#define COLLISION_META      IniParams[104]", shader)
         # 模式三门控（拉扯模式）在 shader 内显式再确认
         self.assertIn("COLLISION_META.x >= 2.0", shader)
+        # 设计契约：触发用带符号表面距离（旧 bestD > margin 在稀疏点云下
+        # 最近邻间距 ≫ margin，约束恒放行 → 防穿模从不触发）
+        self.assertIn("float s1 = dot(p1 - bestQ, bestN);", shader)
+        self.assertNotIn("if (bestD > margin)", shader)
+        # 设计契约：逐顶点导出距离阈值（任何位移后距离不得低于 t0）
+        self.assertIn("float threshold = l0q.w;", shader)
+        self.assertIn("if (s1 >= threshold)", shader)
         # 无 while 循环（固定二分 + 固定上限扫描）；排除注释里的 "While" 字样
         self.assertNotIn("while (", shader)
         self.assertNotIn("while(", shader)

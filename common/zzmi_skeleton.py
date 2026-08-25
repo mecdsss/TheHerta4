@@ -627,43 +627,77 @@ class ZZMISkeletonMergeHelper:
 
         任何一项缺失都判定缓存不完整，走整批重建——复制骨骼缓存失败或工作空间
         搬迁漏掉 ModImpRuntime 时，绝不允许带着半成品 VGMap 永久幂等跳过。校验项：
-        - SkeletonGroup / DeformDrawIndex / OriginalVertexCount 存在；
+        - SkeletonGroup / DeformDrawIndex / OriginalVertexCount 是非负整数；
         - VGMapAlgorithmVersion == 当前算法版本；
         - VGCount / VGOffset 存在且非负；
         - VGMap 键完整覆盖 0..VGCount-1、len(VGMap) == VGCount、全局槽位非负
-          （缺键会让导出侧 vg_map.get(local, 0) 静默映射到槽位 0，蒙皮塌缩）；
+          （缺键或规范化重复键会让导入/导出映射口径不一致）；
         - BoneMatrixFileName 指向的 ModImpRuntime 文件存在且大小
           >= VGCount * 48 字节（每骨骼 4x3 float32）。
         """
+        def _strict_int(value) -> int:
+            if isinstance(value, bool):
+                raise TypeError("bool 不是缓存整数")
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError("非整数浮点值")
+            return int(value)
+
         try:
-            cache_version = int(submesh_json.get("VGMapAlgorithmVersion", 0) or 0)
+            cache_version = _strict_int(
+                submesh_json.get("VGMapAlgorithmVersion", 0) or 0
+            )
         except (TypeError, ValueError):
             cache_version = 0
         if cache_version != _ZZMI_VG_MAP_ALGORITHM_VERSION:
             return False
-        if "SkeletonGroup" not in submesh_json:
+        try:
+            metadata_values = (
+                submesh_json["SkeletonGroup"],
+                submesh_json["DeformDrawIndex"],
+                submesh_json["OriginalVertexCount"],
+            )
+            skeleton_group, deform_draw_index, original_vertex_count = (
+                _strict_int(value) for value in metadata_values
+            )
+        except (KeyError, TypeError, ValueError):
             return False
-        if "DeformDrawIndex" not in submesh_json:
-            return False
-        if "OriginalVertexCount" not in submesh_json:
+        if (
+            skeleton_group < 0
+            or deform_draw_index < 0
+            or original_vertex_count < 0
+            or skeleton_group > 0xFFFFFFFF
+            or deform_draw_index > 0xFFFFFFFF
+            or original_vertex_count > 0xFFFFFFFF
+        ):
             return False
 
         vg_map = submesh_json.get("VGMap")
         if not isinstance(vg_map, dict) or not vg_map:
             return False
         try:
-            vg_count = int(submesh_json.get("VGCount"))
-            vg_offset = int(submesh_json.get("VGOffset"))
-            mapped = {int(key): int(value) for key, value in vg_map.items()}
+            vg_count = _strict_int(submesh_json.get("VGCount"))
+            vg_offset = _strict_int(submesh_json.get("VGOffset"))
+            mapped = {}
+            for key, value in vg_map.items():
+                normalized_key = _strict_int(key)
+                if normalized_key in mapped:
+                    return False
+                mapped[normalized_key] = _strict_int(value)
         except (TypeError, ValueError):
             return False
-        if vg_count <= 0 or vg_offset < 0:
+        if (
+            vg_count <= 0
+            or vg_count > 0xFFFFFFFF
+            or vg_offset < 0
+            or vg_offset > 0xFFFFFFFF
+            or vg_offset + vg_count > 0x100000000
+        ):
             return False
-        if len(mapped) != vg_count:
+        if len(vg_map) != vg_count or len(mapped) != vg_count:
             return False
         if set(mapped.keys()) != set(range(vg_count)):
             return False
-        if any(slot < 0 for slot in mapped.values()):
+        if any(slot < 0 or slot > 0xFFFFFFFF for slot in mapped.values()):
             return False
 
         bone_matrix_path = cls._runtime_cache_path(submesh_json, json_path, unique_str)
@@ -672,6 +706,36 @@ class ZZMISkeletonMergeHelper:
         if not EFMIBoneMapBuilder.cache_file_size_ok(bone_matrix_path, vg_count):
             return False
         return True
+
+    @classmethod
+    def _zzmi_source_cache_intact(
+        cls,
+        submesh_json: dict,
+        json_path: str,
+        unique_str: str,
+    ) -> bool:
+        """校验可供未来无 dump 重建的 ZZMI CB1 来源缓存契约。
+
+        新版每次生成都会显式写入 ``ObjectCB1CacheValid``：True 必须指向
+        可解析的实际 CB1，False 表示当前 dump 没有可用对象变换、应独立分组。
+        缺少该字段的是旧版缓存，不能证明目录中的 CB1 就是当时实际参与分组的
+        候选；dump 尚在时必须迁移，dump 已删后的重建则按不可信处理。
+        """
+        marker = submesh_json.get("ObjectCB1CacheValid")
+        if not isinstance(marker, bool):
+            return False
+        if marker is False:
+            return True
+        cb1_path = cls._runtime_cache_path(
+            submesh_json,
+            json_path,
+            unique_str,
+            cb1_file_name="ObjectCB1",
+        )
+        return bool(
+            os.path.isfile(cb1_path)
+            and ZZMIBoneMapBuilder.parse_object_transform(cb1_path) is not None
+        )
 
     @classmethod
     def ensure_skeleton_data(
@@ -775,6 +839,7 @@ class ZZMISkeletonMergeHelper:
                     "signatures": {},
                     "transform": None,
                     "cb1_path": "",
+                    "cb1_cache_valid": False,
                     "skip_reason": "",
                     "representative": unique_str,
                 }
@@ -782,7 +847,20 @@ class ZZMISkeletonMergeHelper:
             group["members"].append(unique_str)
             group["json_paths"][unique_str] = json_path
 
-            if not force and cls._zzmi_cache_intact(submesh_json, json_path, unique_str):
+            cache_intact = cls._zzmi_cache_intact(
+                submesh_json, json_path, unique_str
+            )
+            if (
+                cache_intact
+                and parser is not None
+                and not cls._zzmi_source_cache_intact(
+                    submesh_json, json_path, unique_str
+                )
+            ):
+                # dump 尚在时自动迁移旧版/缺件来源缓存，避免本次幂等跳过后
+                # 用户清 VGMap、删 dump 才发现 CB1 不可复现。
+                cache_intact = False
+            if not force and cache_intact:
                 continue  # 该子网格缓存完整（临时计数，见下）
             stale += 1
 
@@ -1000,11 +1078,14 @@ class ZZMISkeletonMergeHelper:
 
             # 骨架分组键：渲染 draw 的 vs-cb1 对象→世界矩阵（palette 蒙皮到对象空间，
             # 渲染 VS 用 cb1 摆到世界，两者逐物体 1:1 配对）。取该部件渲染 draw 列表中
-            # 第一个可解析的逐部件 cb1 块；全部失败则 None -> 独立成组（不共享，安全）。
+            # 第一个可解析的逐部件 cb1 块。当前 dump 明确无有效 CB1 时可独立成组；
+            # 仅靠工作空间重建时，标记为有效/未标记的来源缺失必须显式失败。
             # 解析顺序：当前 dump（按候选路径延迟解析）-> 上次导入复制到工作空间的
             # ObjectCB1 缓存（dump 已删除时仍能重建出相同的骨架分组）。同 DrawIB
             # 成员共享同一对象变换，代表子网格缓存缺失时遍历兄弟子网格。
             cb1_cache_paths = []
+            cb1_cache_required = False
+            cb1_cache_contract_unknown = False
             for member in group["members"]:
                 member_json_path = group["json_paths"].get(member, "")
                 if not member_json_path:
@@ -1015,6 +1096,18 @@ class ZZMISkeletonMergeHelper:
                     member_json = None
                 if not isinstance(member_json, dict):
                     member_json = {}
+                marker = member_json.get("ObjectCB1CacheValid")
+                if marker is True:
+                    cb1_cache_required = True
+                elif marker is False:
+                    # 只有新版明确验证过的 CB1 才能参与 cache-only 分组。False
+                    # 表示当前 dump 曾判定无效，必须忽略残留文件。
+                    continue
+                else:
+                    # 未标记的旧版来源无法证明曾参与 SkeletonGroup；有 dump 时
+                    # 可以迁移，无 dump 时不得静默按独立对象重分组。
+                    cb1_cache_contract_unknown = True
+                    continue
                 member_cb1 = cls._runtime_cache_path(
                     member_json, member_json_path, member, cb1_file_name="ObjectCB1"
                 )
@@ -1022,23 +1115,28 @@ class ZZMISkeletonMergeHelper:
                     cb1_cache_paths.append(member_cb1)
             cb1_path = ""
             dump_cb1_seen = False
+            first_dump_cb1_path = ""
             for render_draw in sorted(render_draws):
                 candidate = parser.get_render_cb1_path(render_draw) if parser is not None else None
                 if candidate:
                     dump_cb1_seen = True
-                    # 缓存发布必须跟随当前 dump，即使这帧矩阵因数值异常不适合
-                    # 用作分组键，也不能退回旧缓存并把陈旧字节继续发布。
-                    if not cb1_path:
-                        cb1_path = candidate
+                    if not first_dump_cb1_path:
+                        first_dump_cb1_path = candidate
                     transform = ZZMIBoneMapBuilder.parse_object_transform(candidate)
                     if transform is not None:
                         group["transform"] = transform
+                        # 必须缓存“实际用于分组”的同一个有效 CB1。旧实现先记住
+                        # 首个候选，即使它无效、后续候选才有效，也会把首个坏文件
+                        # 发布到工作空间，导致删 dump 后 SkeletonGroup 改变。
+                        cb1_path = candidate
+                        group["cb1_cache_valid"] = True
                         break
             if group["transform"] is None and not dump_cb1_seen:
                 for member_cb1 in cb1_cache_paths:
                     transform = ZZMIBoneMapBuilder.parse_object_transform(member_cb1)
                     if transform is not None:
                         group["transform"] = transform
+                        group["cb1_cache_valid"] = True
                         if not cb1_path:
                             cb1_path = member_cb1
                         print(
@@ -1046,6 +1144,27 @@ class ZZMISkeletonMergeHelper:
                             f"已回退工作空间 ObjectCB1 缓存（{os.path.basename(os.path.dirname(os.path.dirname(member_cb1)))}）"
                         )
                         break
+                if (
+                    group["transform"] is None
+                    and (
+                        cb1_cache_required
+                        or (cb1_cache_contract_unknown and parser is None)
+                    )
+                ):
+                    group["skip_reason"] = (
+                        "工作空间 ObjectCB1 来源缓存缺失、损坏或未标记，"
+                        "无法保持原 SkeletonGroup"
+                    )
+                    # 来源契约不完整时禁止进入 ready_groups；否则后续会把
+                    # transform=None 当作独立对象，静默改写正确分组。
+                    group["palette"] = None
+                    print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: {group['skip_reason']}")
+                    continue
+            elif group["transform"] is None and first_dump_cb1_path:
+                # 当前 dump 确实给出了 CB1，但其内容不适合作为对象变换。
+                # 仍刷新原始文件副本（便于诊断/保持“当前源覆盖旧源”），同时
+                # 以 ObjectCB1CacheValid=False 明确禁止 cache-only 路径使用它。
+                cb1_path = first_dump_cb1_path
             group["cb1_path"] = cb1_path
             if group["transform"] is None:
                 print(f"[ZZMI骨骼合并] 提示 {draw_ib}: 未能解析对象变换（渲染 cb1），独立成组")
@@ -1150,40 +1269,51 @@ class ZZMISkeletonMergeHelper:
                     group.get("original_vertex_counts", {}).get(unique_str, 0) or 0
                 )
 
-                # palette / CB1 缓存发布与 JSON 写回属于同一事务。重建时始终刷新
-                # 当前源；任何发布失败都不得提交半成品 JSON 或计入 written。
+                # palette / CB1 / JSON 作为同一可回滚文件事务发布。重建时始终
+                # 刷新当前源；任一文件失败都不得留下新旧混合状态或计入 written。
                 try:
                     bare_name = unique_str.split(".", 1)[-1]
                     submesh_dir = os.path.dirname(os.path.dirname(json_path))
                     runtime_dir = os.path.join(submesh_dir, "ModImpRuntime")
                     dest_name = f"{bare_name}-BoneMatrix.buf"
                     dest_path = os.path.join(runtime_dir, dest_name)
-                    EFMISkeletonMergeHelper._atomic_publish_cache(
-                        group["palette_path"],
-                        dest_path,
-                        vg_count=vg_count,
-                    )
                     submesh_json["BoneMatrixFileName"] = dest_name
+                    cache_entries = [{
+                        "source_path": group["palette_path"],
+                        "dest_path": dest_path,
+                        "vg_count": vg_count,
+                        "min_size": 4,
+                    }]
 
                     # 对象变换 CB 是分组稳定性的缓存来源；存在源时同样原子刷新。
                     if group.get("cb1_path"):
                         cb1_dest_name = f"{bare_name}-ObjectCB1.buf"
                         cb1_dest_path = os.path.join(runtime_dir, cb1_dest_name)
-                        EFMISkeletonMergeHelper._atomic_publish_cache(
-                            group["cb1_path"],
-                            cb1_dest_path,
-                            min_size=4,
-                        )
+                        cache_entries.append({
+                            "source_path": group["cb1_path"],
+                            "dest_path": cb1_dest_path,
+                            "vg_count": 0,
+                            "min_size": 4,
+                        })
                         submesh_json["ObjectCB1FileName"] = cb1_dest_name
+                        submesh_json["ObjectCB1CacheValid"] = bool(
+                            group.get("cb1_cache_valid", False)
+                        )
+                    else:
+                        # 显式沉淀“本次没有有效 CB1”；缓存读取必须忽略可能残留的
+                        # 旧文件，才能复现 dump 路径的独立分组语义。
+                        submesh_json.pop("ObjectCB1FileName", None)
+                        submesh_json["ObjectCB1CacheValid"] = False
+                    EFMISkeletonMergeHelper._atomic_publish_skeleton_transaction(
+                        cache_entries,
+                        submesh_json,
+                        json_path,
+                    )
                 except Exception as e:
-                    print(f"[ZZMI骨骼合并] 发布运行时缓存失败 {unique_str}: {e}")
+                    print(f"[ZZMI骨骼合并] 提交运行时缓存/JSON 事务失败 {unique_str}: {e}")
                     continue
 
-                try:
-                    JsonUtils.SaveToFile(json_dict=submesh_json, filepath=json_path)
-                    written += 1
-                except Exception as e:
-                    print(f"[ZZMI骨骼合并] 写回 json 失败 {unique_str}: {e}")
+                written += 1
 
         success_message = (
             f"已为 {written} 个子网格生成骨骼合并数据"

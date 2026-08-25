@@ -21,6 +21,8 @@ EFMI（明日方舟：终末地）骨骼合并支持模块
 产出：
 - 每个子网格 json 写回 `VGMap` / `VGOffset` / `VGCount`（缓存，幂等；提取端重导可覆盖）。
 - 骨骼池 buffer 复制到 `<submesh>/ModImpRuntime/<bare>-BoneMatrix.buf`（参照 NTEMI 缓存模式）。
+- instance-config buffer 同时复制到 `<submesh>/ModImpRuntime/<bare>-InstanceConfig.buf`，
+  并记录 first_constant 窗口；清理 VGMap、删除 dump 后可只靠工作空间原始文件重建。
 
 多 LOD：LOD0 / LOD1 用**自己**的 FrameAnalysis dump 提取目录（Config/WorkPageTabs.json
 的 tab 名即 LOD 名，每个 tab 的 Config/Tabs/<tabid>.json 记录自己的路径）读取原始
@@ -51,15 +53,20 @@ _BONE_SEGMENT_FLOAT4 = 256 * 3
 _INSTANCE_CONFIG_BONE_OFFSET_ROW = 5
 # 写回 json 的算法版本。旧版只保存 VGMap，没有扩散采样判据，不能继续
 # 作为当前策略的幂等缓存使用；版本不匹配时 ensure_skeleton_data 自动重算。
-# v14：在 v13 的层级兼容最近点和 Component 对内一对一动态收紧基础上，
-# 全局并入顺序也按矩阵差优先；矩阵歧义只按 1e-3 → 1e-4 → 1e-5 → 1e-6
-# 有限级联，不进入 1e-7。
-_VG_MAP_ALGORITHM_VERSION = 14
+# v15：全零骨骼仍不参与跨 Component 去重，但会保留独立稳定槽位，使 VGMap
+# 始终完整覆盖 0..VGCount-1；旧版稀疏映射不能继续通过导入/导出完整性门控。
+_VG_MAP_ALGORITHM_VERSION = 15
 _MATRIX_AMBIGUITY_FLOOR = 1e-6
 
 # 跨 LOD 原始候选对应层版本。它和 VGMap 算法版本分开记录，便于以后只调整
 # 对应评分而不误把旧的运行时槽位当成新布局。
-_CROSS_LOD_LAYOUT_VERSION = 3
+# v5: cross-LOD local correspondence is geometry-led; matrix is no longer a
+# hard acceptance gate and is only a bounded secondary score term.
+_CROSS_LOD_LAYOUT_VERSION = 5
+# LOD0/LOD1 may be captured in different poses or after mesh simplification;
+# this is the scale used for the secondary matrix score. Same-LOD deduplication
+# continues to use its independent 1e-3 hard gate.
+_CROSS_LOD_MATRIX_SCORE_SCALE = 1.5
 
 # 跨子网格骨骼去重总开关。
 # 分层判据（矩阵硬门控 + 权重扩散确认）：矩阵 diff >= match_tolerance 永不合并；
@@ -1128,43 +1135,32 @@ class EFMIBoneMapBuilder:
     # 骨骼矩阵读取
     # ------------------------------------------------------------------
 
-    def get_skeleton_buffer(self, draw_index: str) -> numpy.ndarray | None:
-        """读取 draw 调用对应组件骨骼段矩阵数组（(N, 12) floats）。
+    @staticmethod
+    def load_skeleton_buffer_from_sources(
+        instance_config_path: str,
+        pool_path: str,
+        first_constant: int,
+    ) -> numpy.ndarray | None:
+        """从 instance-config 原文件和骨骼池原文件提取组件骨骼段。
 
-        流程（对齐参考插件）：
-        1. instance config cb（num_constants==4096）→ first_constant 窗口 16 float4
-           → 第 6 个 float4 的 xy（uint32 位型）= 骨骼段偏移（float4 单位）；
-        2. vs-t0（骨骼池）按偏移取 256*3 float4 → reshape(-1, 12)。
+        该函数同时服务 FrameAnalysis 路径和工作空间缓存路径，保证两条路径执行
+        完全相同的切片逻辑；``first_constant`` 是 log 绑定窗口起点，首次生成时
+        会写入子网格 json，后续不再依赖 log。
         """
-        instance_cb = self.parser.get_instance_config_cb(draw_index)
-        if instance_cb is None:
-            return None
-
-        first_constant = int(instance_cb.get("first_constant", 0) or 0)
-        cb_hash = instance_cb.get("hash", "")
-
-        cb_logical = f"{draw_index}-vs-cb{self._find_cb_slot(draw_index, cb_hash)}={cb_hash}"
-        cb_path = self.parser.get_deduped_path(cb_logical)
-        if not cb_path:
-            return None
-
         try:
-            cb_data = numpy.fromfile(cb_path, dtype=numpy.float32).reshape(-1, 4)
+            cb_data = numpy.fromfile(
+                instance_config_path, dtype=numpy.float32
+            ).reshape(-1, 4)
         except Exception:
             return None
 
+        first_constant = int(first_constant)
+        if first_constant < 0:
+            return None
         if first_constant + 16 > len(cb_data):
             return None
         instance_config = cb_data[first_constant:first_constant + 16]
         skeleton_offsets = instance_config[_INSTANCE_CONFIG_BONE_OFFSET_ROW][0:2].view(numpy.uint32)
-
-        skeleton_t0_hash = self.parser.get_vs_t0(draw_index)
-        if not skeleton_t0_hash:
-            return None
-        pool_logical = f"{draw_index}-vs-t0={skeleton_t0_hash}"
-        pool_path = self.parser.get_deduped_path(pool_logical)
-        if not pool_path:
-            return None
 
         try:
             pool_data = numpy.fromfile(pool_path, dtype=numpy.float32).reshape(-1, 4)
@@ -1184,6 +1180,49 @@ class EFMIBoneMapBuilder:
             skeleton = skeleton_raw[:usable].reshape(-1, _BONE_MATRIX_FLOATS)
             return skeleton
         return None
+
+    def get_skeleton_source(self, draw_index: str) -> dict | None:
+        """解析 draw 的完整可缓存骨骼来源及已切出的组件骨骼段。"""
+        instance_cb = self.parser.get_instance_config_cb(draw_index)
+        if instance_cb is None:
+            return None
+
+        first_constant = int(instance_cb.get("first_constant", 0) or 0)
+        cb_hash = instance_cb.get("hash", "")
+        cb_logical = (
+            f"{draw_index}-vs-cb{self._find_cb_slot(draw_index, cb_hash)}={cb_hash}"
+        )
+        instance_config_path = self.parser.get_deduped_path(cb_logical)
+        if not instance_config_path:
+            return None
+
+        skeleton_t0_hash = self.parser.get_vs_t0(draw_index)
+        if not skeleton_t0_hash:
+            return None
+        pool_logical = f"{draw_index}-vs-t0={skeleton_t0_hash}"
+        pool_path = self.parser.get_deduped_path(pool_logical)
+        if not pool_path:
+            return None
+
+        skeleton_buffer = self.load_skeleton_buffer_from_sources(
+            instance_config_path,
+            pool_path,
+            first_constant,
+        )
+        if skeleton_buffer is None:
+            return None
+        return {
+            "skeleton_buffer": skeleton_buffer,
+            "instance_config_path": instance_config_path,
+            "pool_path": pool_path,
+            "first_constant": first_constant,
+            "draw_index": str(draw_index),
+        }
+
+    def get_skeleton_buffer(self, draw_index: str) -> numpy.ndarray | None:
+        """兼容接口：读取 draw 调用对应组件骨骼段矩阵数组。"""
+        source = self.get_skeleton_source(draw_index)
+        return source["skeleton_buffer"] if source is not None else None
 
     def _find_cb_slot(self, draw_index: str, cb_hash: str) -> int:
         for (idx, stage, slot), binding in self.parser.cb_bindings.items():
@@ -1300,8 +1339,7 @@ class EFMIBoneMapBuilder:
             vg_offsets[unique_str] = offset
             for vg_id in range(vg_count):
                 bone = skeleton_buffer[vg_id]
-                if numpy.all(bone == 0):
-                    continue
+                is_zero_bone = bool(numpy.all(bone == 0))
                 weighted_count = (
                     int(weighted_vertex_counts[vg_id])
                     if weighted_vertex_counts is not None and vg_id < len(weighted_vertex_counts)
@@ -1314,6 +1352,9 @@ class EFMIBoneMapBuilder:
                     "weighted_vertex_count": weighted_count,
                     "bone": bone,
                     "signature": signatures.get(vg_id),
+                    # 全零矩阵没有可比较的骨骼语义：保留自己的运行时槽位，
+                    # 但绝不能因 bitwise 相同而跨 Component 合并。
+                    "is_zero_bone": is_zero_bone,
                 })
             offset += vg_count
 
@@ -1503,7 +1544,11 @@ class EFMIBoneMapBuilder:
         def pair_evaluation(a, b) -> dict:
             key = (a, b) if a < b else (b, a)
             if key not in pair_evaluation_cache:
-                if is_protected(a, b):
+                if (
+                    candidates[a].get("is_zero_bone")
+                    or candidates[b].get("is_zero_bone")
+                    or is_protected(a, b)
+                ):
                     pair_evaluation_cache[key] = {
                         "passes": False,
                         "evidence_rank": 3,
@@ -1848,7 +1893,7 @@ class EFMIBoneMapBuilder:
     def build_cross_lod_correspondence(
         lod_submesh_skeletons: dict[str, dict[str, tuple]],
         reference_lod: str = "LOD0",
-        match_tolerance: float = 1.25,
+        match_tolerance: float = _CROSS_LOD_MATRIX_SCORE_SCALE,
         centroid_tolerance: float = 0.10,
     ) -> dict:
         """用原始顶点组的矩阵 + 加权中心建立跨 LOD 对应，并生成去重保护边。
@@ -1861,9 +1906,11 @@ class EFMIBoneMapBuilder:
         对应不是按文件夹名配对：LOD 提取时组件 hash、局部索引和顶点数量都可能
         轻微变化。先为每个部件聚合其权重扩散点云，使用对称最近邻几何距离、包围盒
         和整体中心做一对一部件匹配；再**只在匹配的部件对内部**按局部加权中心配对
-        原始顶点组，矩阵只作为第二排序键和异常过滤。LOD 之间的矩阵本身可能因为
-        简化网格/捕获帧不同而有明显差异，因此这里的 1.25 仅是跨 LOD 参考门槛，不会
-        改变各 LOD 内部 build_vg_maps 的 1e-3 硬门控。
+        原始顶点组，权重中心是主排序证据，矩阵只作为有限的第二排序项；有有效
+        权重中心时，矩阵差异不会直接拒绝对应。只有两侧都缺少几何中心时，才保守
+        要求矩阵近似一致，避免在完全没有几何证据时凭局部编号乱配。LOD 之间的
+        矩阵本身可能因为简化网格/捕获帧不同而有明显差异，因此这里的 1.5 只是
+        矩阵次级评分的尺度，不改变各 LOD 内部 build_vg_maps 的 1e-3 硬门控。
         不要求两个 LOD 的整片驱动区域完全重合（例如平面和贴合物体）。
         同一参考候选在目标 LOD 可以有多个命中，表示目标 LOD 的额外细分；反向
         保护只在两个候选分别对应不同参考候选时触发。
@@ -2188,10 +2235,10 @@ class EFMIBoneMapBuilder:
 
         def _pair_score(left: dict, right: dict):
             matrix_diff = float(numpy.max(numpy.abs(left["bone"] - right["bone"])))
-            if matrix_diff >= float(match_tolerance):
+            if not numpy.isfinite(matrix_diff):
                 return None
-            # 没有任何权重中心时不能靠宽松的跨 LOD 矩阵门槛硬配；这类数据
-            # 只有逐位矩阵才足够安全，否则把“缺少几何证据”当成对应关系。
+            # 跨 LOD 对应由几何证据建立。没有任何权重中心时不能凭宽松的矩阵
+            # 差异硬配；这类旧缓存/退化数据只有近似矩阵才足够安全。
             if left["centroid"] is None or right["centroid"] is None:
                 if matrix_diff >= 1e-3:
                     return None
@@ -2220,7 +2267,9 @@ class EFMIBoneMapBuilder:
                 # 做硬拒绝，只把它作为候选排序项。
             # 跨 LOD 以加权中心为第一排序键，矩阵只做次级稳定器；不能把
             # LOD0/LOD1 的捕获姿态差异误当成不同骨骼的硬拒绝。
-            score = center_term + matrix_diff / max(float(match_tolerance), 1e-8) * 0.05
+            matrix_scale = max(float(match_tolerance), 1e-8)
+            matrix_term = min(matrix_diff / matrix_scale, 8.0) * 0.05
+            score = center_term + matrix_term
             score += weight_ratio * 0.03
             return score, matrix_diff, centroid_distance
 
@@ -2528,52 +2577,171 @@ class EFMISkeletonMergeHelper:
     """EFMI 骨骼合并总流程：定位 FrameAnalysis -> 解析 log -> 构建映射 -> 写回工作空间。"""
 
     @staticmethod
+    def _atomic_publish_cache_bundle(entries: list[dict]) -> None:
+        """先完整暂存、再成组提交文件；失败时恢复所有旧目标。
+
+        单文件 ``os.replace`` 只能保证一个目标原子更新。EFMI 需要同时发布
+        BoneMatrix + InstanceConfig，ZZMI 需要 BoneMatrix + 可选 CB1；若第二份
+        复制失败而第一份已经覆盖，就会留下旧 JSON 指向新原始文件的混合状态。
+        本方法先复制并校验全部来源，之后才替换目标；提交阶段异常则从同目录备份
+        逆序回滚。源就是目标（cache-only 重建）时只校验，不自拷贝。
+
+        ``entries`` 每项字段：source_path、dest_path、vg_count、min_size，及可选
+        ``float_aligned``（缓存 buffer 默认为 True；JSON 事务项为 False）。
+        """
+        prepared: list[dict] = []
+        committed: list[dict] = []
+        commit_succeeded = False
+
+        def _validate(path: str, entry: dict) -> None:
+            size = os.path.getsize(path)
+            min_size = int(entry.get("min_size", 4) or 0)
+            if size < min_size:
+                raise OSError(f"缓存文件大小无效: {path} ({size} bytes)")
+            if bool(entry.get("float_aligned", True)) and size % 4 != 0:
+                raise OSError(f"缓存文件大小未按 float32 对齐: {path} ({size} bytes)")
+            vg_count = int(entry.get("vg_count", 0) or 0)
+            if vg_count > 0 and not EFMIBoneMapBuilder.cache_file_size_ok(path, vg_count):
+                raise OSError(
+                    f"缓存文件不足以容纳 {vg_count} 根骨骼: {path} ({size} bytes)"
+                )
+
+        try:
+            # 准备阶段：任何来源复制/校验失败时，目标文件一个都不动。
+            for raw_entry in entries:
+                entry = dict(raw_entry)
+                source_path = os.path.abspath(str(entry.get("source_path", "") or ""))
+                dest_path = os.path.abspath(str(entry.get("dest_path", "") or ""))
+                entry["source_path"] = source_path
+                entry["dest_path"] = dest_path
+                entry["temp_path"] = ""
+                entry["backup_path"] = ""
+                entry["dest_existed"] = os.path.isfile(dest_path)
+                if not os.path.isfile(source_path):
+                    raise FileNotFoundError(f"骨骼缓存源文件不存在: {source_path}")
+                if source_path == dest_path:
+                    _validate(source_path, entry)
+                    prepared.append(entry)
+                    continue
+
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                fd, temp_path = tempfile.mkstemp(
+                    prefix=f".{os.path.basename(dest_path)}.",
+                    suffix=".tmp",
+                    dir=os.path.dirname(dest_path),
+                )
+                os.close(fd)
+                entry["temp_path"] = temp_path
+                prepared.append(entry)
+                shutil.copy2(source_path, temp_path)
+                _validate(temp_path, entry)
+
+            # 提交阶段：同目录 rename；每个旧目标先改名为唯一备份。
+            for entry in prepared:
+                temp_path = entry.get("temp_path", "")
+                if not temp_path:
+                    continue
+                dest_path = entry["dest_path"]
+                if entry["dest_existed"]:
+                    fd, backup_path = tempfile.mkstemp(
+                        prefix=f".{os.path.basename(dest_path)}.",
+                        suffix=".bak",
+                        dir=os.path.dirname(dest_path),
+                    )
+                    os.close(fd)
+                    os.remove(backup_path)
+                    os.replace(dest_path, backup_path)
+                    entry["backup_path"] = backup_path
+                committed.append(entry)
+                os.replace(temp_path, dest_path)
+                entry["temp_path"] = ""
+            commit_succeeded = True
+        except Exception as original_error:
+            rollback_errors = []
+            for entry in reversed(committed):
+                dest_path = entry["dest_path"]
+                backup_path = entry.get("backup_path", "")
+                try:
+                    if backup_path and os.path.exists(backup_path):
+                        if os.path.exists(dest_path):
+                            os.remove(dest_path)
+                        os.replace(backup_path, dest_path)
+                        entry["backup_path"] = ""
+                    elif not entry.get("dest_existed") and os.path.exists(dest_path):
+                        os.remove(dest_path)
+                except Exception as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            if rollback_errors:
+                raise OSError(
+                    f"文件事务失败且回滚不完整: {original_error}; "
+                    f"{'；'.join(rollback_errors)}"
+                ) from original_error
+            raise
+        finally:
+            for entry in prepared:
+                temp_path = entry.get("temp_path", "")
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                backup_path = entry.get("backup_path", "")
+                if commit_succeeded and backup_path and os.path.exists(backup_path):
+                    try:
+                        os.remove(backup_path)
+                    except OSError:
+                        pass
+
+    @classmethod
     def _atomic_publish_cache(
+        cls,
         source_path: str,
         dest_path: str,
         *,
         vg_count: int = 0,
         min_size: int = 4,
     ) -> None:
-        """原子刷新运行时缓存，并在提交前校验完整性。
+        """兼容单文件调用；实现委托给成组发布事务。"""
+        cls._atomic_publish_cache_bundle([{
+            "source_path": source_path,
+            "dest_path": dest_path,
+            "vg_count": vg_count,
+            "min_size": min_size,
+        }])
 
-        重建事务不能复用“同尺寸即最新”的旧缓存；源、目标不同时始终复制到同目录
-        临时文件，校验通过后再 ``os.replace``。源就是目标（dump 已删除后的缓存回退）
-        时只做完整性校验，避免自拷贝破坏唯一副本。
-        """
-        source_path = os.path.abspath(str(source_path or ""))
-        dest_path = os.path.abspath(str(dest_path or ""))
-        if not source_path or not os.path.isfile(source_path):
-            raise FileNotFoundError(f"骨骼缓存源文件不存在: {source_path}")
-
-        def _validate(path: str) -> None:
-            size = os.path.getsize(path)
-            if size < int(min_size) or size % 4 != 0:
-                raise OSError(f"缓存文件大小无效: {path} ({size} bytes)")
-            if not EFMIBoneMapBuilder.cache_file_size_ok(path, int(vg_count)):
-                raise OSError(
-                    f"缓存文件不足以容纳 {int(vg_count)} 根骨骼: {path} ({size} bytes)"
-                )
-
-        if source_path == dest_path:
-            _validate(source_path)
-            return
-
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        fd, temp_path = tempfile.mkstemp(
-            prefix=f".{os.path.basename(dest_path)}.",
+    @classmethod
+    def _atomic_publish_skeleton_transaction(
+        cls,
+        cache_entries: list[dict],
+        submesh_json: dict,
+        json_path: str,
+    ) -> None:
+        """将全部来源缓存和 UTF-8 JSON 作为一个可回滚文件事务提交。"""
+        json_dir = os.path.dirname(os.path.abspath(json_path))
+        fd, staged_json_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(json_path)}.",
             suffix=".tmp",
-            dir=os.path.dirname(dest_path),
+            dir=json_dir,
         )
         os.close(fd)
         try:
-            shutil.copy2(source_path, temp_path)
-            _validate(temp_path)
-            os.replace(temp_path, dest_path)
+            JsonUtils.SaveToFile(
+                filepath=staged_json_path,
+                json_dict=submesh_json,
+            )
+            entries = list(cache_entries)
+            entries.append({
+                "source_path": staged_json_path,
+                "dest_path": json_path,
+                "vg_count": 0,
+                "min_size": 2,
+                "float_aligned": False,
+            })
+            cls._atomic_publish_cache_bundle(entries)
         finally:
-            if os.path.exists(temp_path):
+            if os.path.exists(staged_json_path):
                 try:
-                    os.remove(temp_path)
+                    os.remove(staged_json_path)
                 except OSError:
                     pass
 
@@ -2789,33 +2957,73 @@ class EFMISkeletonMergeHelper:
         if "." in unique_str and unique_str.split(".", 1)[0].upper().startswith("LOD"):
             lod_name, bare = unique_str.split(".", 1)
 
-        base = workspace_root
-        if lod_name:
-            base = os.path.join(base, lod_name)
-        submesh_dir = os.path.join(base, bare)
-        if not os.path.isdir(submesh_dir):
-            # 分区工作空间兜底（不含 LOD 前缀，或带 Config.json 的分区）
-            return ""
+        # 分区工作空间不会把分区名编码进 import_key；调用方仍传全局根目录。
+        # 因此必须在这里沿与 WorkSpaceHelper 相同的 Config.json 契约枚举分区，
+        # 再用真实命中的分区根读取它自己的 Import.json。多个分区出现同一
+        # LOD/bare 时无法可靠消歧，宁可返回空并显式失败，也不能写错 JSON。
+        base_candidates = [os.path.abspath(workspace_root)]
+        if os.path.isdir(workspace_root):
+            try:
+                partition_entries = sorted(
+                    (
+                        entry
+                        for entry in os.scandir(workspace_root)
+                        if entry.is_dir()
+                        and os.path.isfile(os.path.join(entry.path, "Config.json"))
+                    ),
+                    key=lambda entry: entry.name.casefold(),
+                )
+            except OSError:
+                partition_entries = []
+            base_candidates.extend(os.path.abspath(entry.path) for entry in partition_entries)
 
-        import_json_path = os.path.join(workspace_root, "Import.json")
-        import_json = JsonUtils.LoadFromFile(import_json_path) if os.path.isfile(import_json_path) else {}
-        gametype = import_json.get(unique_str, "")
-
-        if gametype:
-            candidate = os.path.join(submesh_dir, "TYPE_" + gametype, bare + ".json")
-            if os.path.isfile(candidate):
-                return candidate
-
-        found = []
-        for dirname in os.listdir(submesh_dir):
-            if not dirname.startswith("TYPE_"):
+        found: list[str] = []
+        for candidate_base in base_candidates:
+            base = os.path.join(candidate_base, lod_name) if lod_name else candidate_base
+            submesh_dir = os.path.join(base, bare)
+            if not os.path.isdir(submesh_dir):
                 continue
-            candidate = os.path.join(submesh_dir, dirname, bare + ".json")
-            if os.path.isfile(candidate):
-                found.append(candidate)
-        if len(found) == 1:
-            return found[0]
-        return ""
+
+            import_json = {}
+            # 根目录映射先读，分区自己的映射后读并覆盖同名项。
+            for import_root in (workspace_root, candidate_base):
+                import_json_path = os.path.join(import_root, "Import.json")
+                if not os.path.isfile(import_json_path):
+                    continue
+                try:
+                    loaded = JsonUtils.LoadFromFile(import_json_path)
+                except Exception:
+                    loaded = None
+                if isinstance(loaded, dict):
+                    import_json.update(loaded)
+            gametype = str(
+                import_json.get(unique_str, "") or import_json.get(bare, "") or ""
+            ).strip()
+
+            if gametype:
+                candidate = os.path.join(
+                    submesh_dir, "TYPE_" + gametype, bare + ".json"
+                )
+                if os.path.isfile(candidate):
+                    found.append(os.path.abspath(candidate))
+                    continue
+
+            try:
+                type_directories = os.listdir(submesh_dir)
+            except OSError:
+                continue
+            local_found = []
+            for dirname in type_directories:
+                if not dirname.startswith("TYPE_"):
+                    continue
+                candidate = os.path.join(submesh_dir, dirname, bare + ".json")
+                if os.path.isfile(candidate):
+                    local_found.append(os.path.abspath(candidate))
+            if len(local_found) == 1:
+                found.extend(local_found)
+
+        unique_found = sorted(set(found), key=str.casefold)
+        return unique_found[0] if len(unique_found) == 1 else ""
 
     @classmethod
     def ensure_skeleton_data(
@@ -2827,8 +3035,9 @@ class EFMISkeletonMergeHelper:
     ) -> tuple[bool, str]:
         """为 EFMI 工作空间的子网格生成并写回骨骼合并数据（幂等）。
 
-        多 LOD 语义：unique_str_list 按 LOD 前缀分组，每组用**自己的 dump** 解析
-        原始骨骼候选；先按部件点云建立原始候选对应。lod_group_projection=True
+        多 LOD 语义：unique_str_list 按 LOD 前缀分组，每组优先用**自己的 dump**
+        解析原始骨骼候选；dump 不可用时改用该 LOD 子网格中已复制的工作空间
+        原始文件缓存。先按部件点云建立原始候选对应。lod_group_projection=True
         时只对 LOD0 执行一次权重扩散去重，再将分区投影到 LOD1；为 False 时
         两边各自独立执行去重。没有对应的额外 LOD1 候选保留恒等槽位。
         运行时槽位仍按 LOD 独立从 0 起，避免把不同 dump 的骨骼池混写；对应事实
@@ -2840,17 +3049,40 @@ class EFMISkeletonMergeHelper:
             return False, "没有子网格需要处理。"
 
         lod_map, default_dir = cls.resolve_frame_analysis_dirs_by_lod(workspace_root)
-        if not default_dir and not lod_map:
-            return False, (
-                "未找到 FrameAnalysis 目录：请检查工作空间 "
-                f"{os.path.join(workspace_root, 'Config', 'FrameAnalysisPath.json')}"
-            )
 
         # 按 LOD 分组（同 LOD 内保持输入顺序）
         groups: dict[str, list[str]] = {}
         for unique_str in unique_str_list:
             groups.setdefault(cls._parse_lod_name(unique_str), []).append(unique_str)
         lod_group_projection = bool(lod_group_projection)
+
+        parsers_by_lod: dict[str, EFMILogParser | None] = {}
+
+        def _parser_for_lod(lod_name: str) -> EFMILogParser | None:
+            if lod_name in parsers_by_lod:
+                return parsers_by_lod[lod_name]
+            frame_analysis_dir = lod_map.get(lod_name) or default_dir
+            label = lod_name or "工作空间根目录"
+            parser = None
+            log_path = (
+                os.path.join(frame_analysis_dir, "log.txt")
+                if frame_analysis_dir else ""
+            )
+            if log_path and os.path.isfile(log_path):
+                try:
+                    parser = EFMILogParser(log_path)
+                except Exception as e:
+                    print(
+                        f"[EFMI骨骼合并] {label}: FrameAnalysis log 解析失败（{e}），"
+                        "将仅用工作空间缓存重建"
+                    )
+            else:
+                print(
+                    f"[EFMI骨骼合并] {label}: FrameAnalysis 不可用，"
+                    "将仅用工作空间 BoneMatrix/InstanceConfig 缓存重建"
+                )
+            parsers_by_lod[lod_name] = parser
+            return parser
 
         # 多 LOD 先收集原始候选，再建立跨 LOD 对应。分组投影模式下 LOD0 是唯一
         # 执行权重扩散去重的基准侧；LOD1 只把该分区投影到自己的原始槽位，避免
@@ -2859,7 +3091,8 @@ class EFMISkeletonMergeHelper:
         # 已有完整联合缓存时保持幂等，不重复读取大型 Position/Blend 缓冲。
         if len(groups) > 1:
             joint_cache_ready = True
-            for group_list in groups.values():
+            for lod_name, group_list in groups.items():
+                parser = _parser_for_lod(lod_name)
                 for unique_str in group_list:
                     json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
                     if not json_path:
@@ -2877,6 +3110,16 @@ class EFMISkeletonMergeHelper:
                         joint_cache_ready = False
                         break
                     if not cls._efmi_cache_intact(payload, json_path, unique_str):
+                        joint_cache_ready = False
+                        break
+                    if (
+                        parser is not None
+                        and cls._load_workspace_skeleton_source(
+                            payload, json_path, unique_str
+                        ) is None
+                    ):
+                        # 与单 LOD 快路径一致：dump 尚在时自动迁移旧版 EFMI
+                        # 工作空间，把未来无 dump 重建需要的双来源缓存补齐。
                         joint_cache_ready = False
                         break
                     try:
@@ -2897,29 +3140,10 @@ class EFMISkeletonMergeHelper:
                 return True, "全部子网格已有跨 LOD 骨骼合并缓存（VGMap），无需重新生成。"
 
             collected_by_lod = {}
-            group_meta_by_lod = {}
             for lod_name in sorted(groups.keys()):
                 group_list = groups[lod_name]
-                frame_analysis_dir = lod_map.get(lod_name) or default_dir
-                label = lod_name or "工作空间根目录"
-                if not frame_analysis_dir:
-                    print(
-                        f"[EFMI骨骼合并] {label}: 无 FrameAnalysis 目录，"
-                        f"跳过 {len(group_list)} 个子网格"
-                    )
-                    collected_by_lod[lod_name] = {}
-                    group_meta_by_lod[lod_name] = {}
-                    continue
-                log_path = os.path.join(frame_analysis_dir, "log.txt")
-                if not os.path.isfile(log_path):
-                    print(
-                        f"[EFMI骨骼合并] {label}: FrameAnalysis 缺少 log.txt: {log_path}"
-                    )
-                    collected_by_lod[lod_name] = {}
-                    group_meta_by_lod[lod_name] = {}
-                    continue
-                parser = EFMILogParser(log_path)
-                collected, metadata, _skipped = cls._ensure_skeleton_data_for_group(
+                parser = _parser_for_lod(lod_name)
+                collected, _metadata, _skipped = cls._ensure_skeleton_data_for_group(
                     workspace_root=workspace_root,
                     unique_str_list=group_list,
                     parser=parser,
@@ -2927,7 +3151,6 @@ class EFMISkeletonMergeHelper:
                     collect_only=True,
                 )
                 collected_by_lod[lod_name] = collected
-                group_meta_by_lod[lod_name] = metadata
 
             correspondence = EFMIBoneMapBuilder.build_cross_lod_correspondence(
                 collected_by_lod,
@@ -2991,18 +3214,8 @@ class EFMISkeletonMergeHelper:
             total_skipped = 0
             for lod_name in sorted(groups.keys()):
                 group_list = groups[lod_name]
-                frame_analysis_dir = lod_map.get(lod_name) or default_dir
                 label = lod_name or "工作空间根目录"
-                if not frame_analysis_dir or not os.path.isfile(
-                    os.path.join(frame_analysis_dir, "log.txt")
-                ):
-                    # 不可用的 LOD 必须显式进入结果，不能静默 continue——
-                    # 否则外层会把部分完成误判为全部完成。
-                    group_results.append(
-                        f"{label}: FrameAnalysis 不可用，{len(group_list)} 个目标未生成骨骼数据"
-                    )
-                    continue
-                parser = EFMILogParser(os.path.join(frame_analysis_dir, "log.txt"))
+                parser = _parser_for_lod(lod_name)
                 written, skipped, message = cls._ensure_skeleton_data_for_group(
                     workspace_root=workspace_root,
                     unique_str_list=group_list,
@@ -3032,27 +3245,8 @@ class EFMISkeletonMergeHelper:
         total_skipped = 0
         for lod_name in sorted(groups.keys()):
             group_list = groups[lod_name]
-            frame_analysis_dir = lod_map.get(lod_name) or default_dir
             label = lod_name or "工作空间根目录"
-            if not frame_analysis_dir:
-                print(
-                    f"[EFMI骨骼合并] {label}: 无 FrameAnalysis 目录，"
-                    f"跳过 {len(group_list)} 个子网格"
-                )
-                group_results.append(
-                    f"{label}: FrameAnalysis 不可用，{len(group_list)} 个目标未生成骨骼数据"
-                )
-                continue
-            log_path = os.path.join(frame_analysis_dir, "log.txt")
-            if not os.path.isfile(log_path):
-                print(
-                    f"[EFMI骨骼合并] {label}: FrameAnalysis 缺少 log.txt: {log_path}"
-                )
-                group_results.append(
-                    f"{label}: FrameAnalysis 缺少 log.txt，{len(group_list)} 个目标未生成骨骼数据"
-                )
-                continue
-            parser = EFMILogParser(log_path)
+            parser = _parser_for_lod(lod_name)
             written, skipped, message = cls._ensure_skeleton_data_for_group(
                 workspace_root=workspace_root,
                 unique_str_list=group_list,
@@ -3080,7 +3274,7 @@ class EFMISkeletonMergeHelper:
         cls,
         workspace_root: str,
         unique_str_list: list[str],
-        parser: EFMILogParser,
+        parser: EFMILogParser | None,
         force: bool = False,
         protected_pairs: set[tuple[tuple[str, int], tuple[str, int]]] | None = None,
         constraint_labels: dict[tuple[str, int], object] | None = None,
@@ -3124,9 +3318,22 @@ class EFMISkeletonMergeHelper:
             if not isinstance(cached_json, dict):
                 resolved_cache[unique_str] = False
                 continue
-            resolved_cache[unique_str] = cls._efmi_cache_intact(
+            cache_intact = cls._efmi_cache_intact(
                 cached_json, json_path, unique_str
             )
+            if (
+                cache_intact
+                and parser is not None
+                and cls._load_workspace_skeleton_source(
+                    cached_json, json_path, unique_str
+                ) is None
+            ):
+                # 兼容旧版工作空间：旧 VGMap 本身可以完整，但没有复制
+                # InstanceConfig/first_constant，日后清 VGMap + 删 dump 就无法重建。
+                # 只在当前 dump 仍可用时打破快路径，借本次重建自动补齐来源缓存；
+                # dump 已删除时仍保留现有完整 VGMap，不做无法完成的破坏性迁移。
+                cache_intact = False
+            resolved_cache[unique_str] = cache_intact
         if (
             not force
             and not collect_only
@@ -3180,7 +3387,7 @@ class EFMISkeletonMergeHelper:
                 drawcall_index_list = role_mapping_root.get(os.path.basename(submesh_dir), [])
 
             # 兜底：ComponentName 映射缺失/被重置时，从 dump 按 ib hash + index_count + first_index 反查
-            if not drawcall_index_list:
+            if not drawcall_index_list and parser is not None:
                 submesh_name = os.path.basename(submesh_dir)
                 parts = submesh_name.split("-")
                 if len(parts) >= 3:
@@ -3199,25 +3406,41 @@ class EFMISkeletonMergeHelper:
                     except (ValueError, IndexError):
                         pass
 
-            if not drawcall_index_list:
-                print(f"[EFMI骨骼合并] 跳过 {unique_str}: 未找到 drawcall 映射")
-                continue
-
+            # 优先从当前 dump 读取；dump 不可用/相关原文件被删时，回退首次导入
+            # 复制到工作空间的骨骼池 + instance-config 原文件和 first_constant。
             # 取第一个有有效骨骼数据的 drawcall，并记录实际成功的 draw_index。
             # 后备 drawcall 成功后元数据仍必须指向它——骨骼池复制（vs-t0）按
             # draw_index 反查，指向第一个失败的候选会拿到错误骨骼池或根本没有。
-            skeleton_buffer = None
-            skeleton_draw_index = None
-            for draw_index in drawcall_index_list:
-                candidate_buffer = EFMIBoneMapBuilder(parser).get_skeleton_buffer(draw_index)
-                if candidate_buffer is not None:
-                    skeleton_buffer = candidate_buffer
-                    skeleton_draw_index = draw_index
-                    break
+            skeleton_source = None
+            if parser is not None:
+                builder = EFMIBoneMapBuilder(parser)
+                for draw_index in drawcall_index_list:
+                    candidate_source = builder.get_skeleton_source(draw_index)
+                    if candidate_source is not None:
+                        skeleton_source = candidate_source
+                        break
+            if skeleton_source is None:
+                skeleton_source = cls._load_workspace_skeleton_source(
+                    submesh_json,
+                    json_path,
+                    unique_str,
+                )
+                if skeleton_source is not None:
+                    print(
+                        f"[EFMI骨骼合并] {unique_str}: dump 骨骼来源不可用，"
+                        "已回退工作空间 BoneMatrix/InstanceConfig 缓存"
+                    )
 
-            if skeleton_buffer is None or skeleton_draw_index is None:
-                print(f"[EFMI骨骼合并] 跳过 {unique_str}: 无法从 FrameAnalysis 读取骨骼数据")
+            if skeleton_source is None:
+                source_reason = (
+                    "未找到 drawcall 映射，且工作空间骨骼来源缓存不完整"
+                    if not drawcall_index_list
+                    else "dump 与工作空间均无法读取完整骨骼来源"
+                )
+                print(f"[EFMI骨骼合并] 跳过 {unique_str}: {source_reason}")
                 continue
+            skeleton_buffer = skeleton_source["skeleton_buffer"]
+            skeleton_draw_index = str(skeleton_source.get("draw_index", "") or "")
 
             try:
                 blend_indices = EFMIBoneMapBuilder.parse_blendindices_from_buf(blend_buf_path, element_info)
@@ -3270,6 +3493,11 @@ class EFMISkeletonMergeHelper:
                 # 实际成功读到骨骼数据的 draw_index（后备 drawcall 成功时
                 # 绝不能回落到 drawcall_index_list[0] 的失败候选）
                 "draw_index": skeleton_draw_index,
+                "pool_path": skeleton_source["pool_path"],
+                "instance_config_path": skeleton_source["instance_config_path"],
+                "instance_config_first_constant": int(
+                    skeleton_source["first_constant"]
+                ),
             }
 
         if collect_only:
@@ -3378,32 +3606,45 @@ class EFMISkeletonMergeHelper:
                 ) if current_lod != reference_lod else 0
                 submesh_json["EFMILODCorrespondence"] = correspondence_rows
 
-            # 缓存发布与 JSON 写回属于同一事务；发布失败的目标不得计入 written。
+            # 双来源缓存与 JSON 作为同一可回滚文件事务提交；任一准备/替换失败
+            # 都不能留下“新 BoneMatrix + 旧 InstanceConfig/JSON”的混合状态。
             try:
-                pool_path = cls._resolve_skeleton_pool_path(parser, meta["draw_index"])
-                if not pool_path:
-                    raise FileNotFoundError(
-                        f"draw {meta['draw_index']} 未解析到骨骼池 buffer"
-                    )
                 runtime_dir = os.path.join(meta["submesh_dir"], "ModImpRuntime")
                 dest_name = f"{meta['bare_name']}-BoneMatrix.buf"
                 dest_path = os.path.join(runtime_dir, dest_name)
-                cls._atomic_publish_cache(
-                    pool_path,
-                    dest_path,
-                    vg_count=vg_count,
-                )
                 submesh_json["BoneMatrixFileName"] = dest_name
+
+                instance_dest_name = f"{meta['bare_name']}-InstanceConfig.buf"
+                instance_dest_path = os.path.join(runtime_dir, instance_dest_name)
+                first_constant = int(meta["instance_config_first_constant"])
+                submesh_json["InstanceConfigFileName"] = instance_dest_name
+                submesh_json["InstanceConfigFirstConstant"] = first_constant
+                if meta.get("draw_index"):
+                    submesh_json["SkeletonSourceDrawIndex"] = str(meta["draw_index"])
+                cls._atomic_publish_skeleton_transaction(
+                    [
+                        {
+                            "source_path": meta["pool_path"],
+                            "dest_path": dest_path,
+                            "vg_count": vg_count,
+                            "min_size": 4,
+                        },
+                        {
+                            "source_path": meta["instance_config_path"],
+                            "dest_path": instance_dest_path,
+                            "vg_count": 0,
+                            "min_size": (first_constant + 16) * 16,
+                        },
+                    ],
+                    submesh_json,
+                    json_path,
+                )
             except Exception as e:
-                print(f"[EFMI骨骼合并] 复制骨骼池缓存失败 {unique_str}: {e}")
+                print(f"[EFMI骨骼合并] 提交骨骼来源/JSON 事务失败 {unique_str}: {e}")
                 continue
 
-            try:
-                JsonUtils.SaveToFile(json_dict=submesh_json, filepath=json_path)
-                written += 1
-                written_targets.add(unique_str)
-            except Exception as e:
-                print(f"[EFMI骨骼合并] 写回 json 失败 {unique_str}: {e}")
+            written += 1
+            written_targets.add(unique_str)
 
         # 完整性：written + skipped 必须覆盖全部请求目标；重建过程中任何
         # 读取失败/生成失败的目标都会让 unprocessed > 0，由外层据此判定失败。
@@ -3435,6 +3676,59 @@ class EFMISkeletonMergeHelper:
         submesh_dir = os.path.dirname(os.path.dirname(json_path))
         return os.path.join(submesh_dir, "ModImpRuntime", file_name)
 
+    @staticmethod
+    def _instance_config_cache_path(
+        submesh_json: dict,
+        json_path: str,
+        unique_str: str,
+    ) -> str:
+        """解析 EFMI instance-config 原文件的工作空间缓存路径。"""
+        file_name = str(
+            submesh_json.get("InstanceConfigFileName", "") or ""
+        ).strip()
+        if not file_name or os.path.basename(file_name) != file_name:
+            bare_name = unique_str.split(".", 1)[-1]
+            file_name = f"{bare_name}-InstanceConfig.buf"
+        submesh_dir = os.path.dirname(os.path.dirname(json_path))
+        return os.path.join(submesh_dir, "ModImpRuntime", file_name)
+
+    @classmethod
+    def _load_workspace_skeleton_source(
+        cls,
+        submesh_json: dict,
+        json_path: str,
+        unique_str: str,
+    ) -> dict | None:
+        """仅靠工作空间缓存恢复 EFMI 骨骼段及其两份原始来源文件。"""
+        pool_path = cls._runtime_cache_path(submesh_json, json_path, unique_str)
+        instance_config_path = cls._instance_config_cache_path(
+            submesh_json, json_path, unique_str
+        )
+        if not os.path.isfile(pool_path) or not os.path.isfile(instance_config_path):
+            return None
+        try:
+            first_constant = int(submesh_json.get("InstanceConfigFirstConstant"))
+        except (TypeError, ValueError):
+            return None
+        if first_constant < 0:
+            return None
+        skeleton_buffer = EFMIBoneMapBuilder.load_skeleton_buffer_from_sources(
+            instance_config_path,
+            pool_path,
+            first_constant,
+        )
+        if skeleton_buffer is None:
+            return None
+        return {
+            "skeleton_buffer": skeleton_buffer,
+            "instance_config_path": instance_config_path,
+            "pool_path": pool_path,
+            "first_constant": first_constant,
+            "draw_index": str(
+                submesh_json.get("SkeletonSourceDrawIndex", "") or ""
+            ),
+        }
+
     @classmethod
     def _efmi_cache_intact(cls, submesh_json: dict, json_path: str, unique_str: str) -> bool:
         """EFMI 缓存快路径完整性校验（版本 + schema + 映射覆盖 + 骨骼缓存文件）。
@@ -3444,13 +3738,22 @@ class EFMISkeletonMergeHelper:
         缓存都不允许带着半成品 VGMap 永久幂等跳过。校验项：
         - VGMapAlgorithmVersion == 当前算法版本、VGMapDedupEnabled == 全局开关；
         - VGCount/VGOffset 存在且非负；
-        - VGMap 非空、键为 0..VGCount-1 的子集且槽位非负（EFMI 会跳过全零
-          矩阵骨骼，因此键可以合法地不满集，但不能越界）；
+        - VGMap 非空、键完整覆盖 0..VGCount-1 且槽位非负；全零矩阵骨骼
+          不参与去重，但从 v15 起也必须保留独立稳定槽位；
         - BoneMatrixFileName 指向的 ModImpRuntime 文件存在且大小
           >= VGCount * 48 字节（每骨骼 4x3 float32）。
         """
+        def _strict_int(value) -> int:
+            if isinstance(value, bool):
+                raise TypeError("bool 不是缓存整数")
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError("非整数浮点值")
+            return int(value)
+
         try:
-            cache_version = int(submesh_json.get("VGMapAlgorithmVersion", 0) or 0)
+            cache_version = _strict_int(
+                submesh_json.get("VGMapAlgorithmVersion", 0) or 0
+            )
         except (TypeError, ValueError):
             cache_version = 0
         if cache_version != _VG_MAP_ALGORITHM_VERSION:
@@ -3463,21 +3766,29 @@ class EFMISkeletonMergeHelper:
         if not isinstance(vg_map, dict) or not vg_map:
             return False
         try:
-            vg_count = int(submesh_json.get("VGCount"))
-            vg_offset = int(submesh_json.get("VGOffset"))
-            mapped = {int(key): int(value) for key, value in vg_map.items()}
+            vg_count = _strict_int(submesh_json.get("VGCount"))
+            vg_offset = _strict_int(submesh_json.get("VGOffset"))
+            mapped = {}
+            for key, value in vg_map.items():
+                normalized_key = _strict_int(key)
+                if normalized_key in mapped:
+                    return False
+                mapped[normalized_key] = _strict_int(value)
         except (TypeError, ValueError):
             return False
-        if vg_count <= 0 or vg_offset < 0:
+        if (
+            vg_count <= 0
+            or vg_count > 0xFFFFFFFF
+            or vg_offset < 0
+            or vg_offset > 0xFFFFFFFF
+            or vg_offset + vg_count > 0x100000000
+        ):
             return False
-        # EFMI 的 build_vg_maps 会跳过全零矩阵骨骼（零矩阵不参与候选），
-        # 因此合法缓存的 VGMap 键可以是 0..VGCount-1 的子集，但不能越界、
-        # 不能为空、槽位必须非负。
-        if not mapped or len(mapped) > vg_count:
+        if len(vg_map) != vg_count or len(mapped) != vg_count:
             return False
-        if not set(mapped.keys()) <= set(range(vg_count)):
+        if set(mapped.keys()) != set(range(vg_count)):
             return False
-        if any(slot < 0 for slot in mapped.values()):
+        if any(slot < 0 or slot > 0xFFFFFFFF for slot in mapped.values()):
             return False
 
         cache_path = cls._runtime_cache_path(submesh_json, json_path, unique_str)
@@ -3495,8 +3806,9 @@ class EFMISkeletonMergeHelper:
         按当前策略重新生成；正常导入也会通过 VGMapAlgorithmVersion 自动
         使旧策略缓存失效。SkeletonGroup 是 ZZMI 分组版字段（EFMI json 没有，
         一并列出无副作用）。
-        ModImpRuntime/*-BoneMatrix.buf 与 BoneMatrixFileName 不删：
-        那是原始骨骼池拷贝，与去重策略无关，重新生成时会复用/覆写同名文件。
+        ModImpRuntime/*-BoneMatrix.buf、*-InstanceConfig.buf 及其来源元数据不删：
+        它们是原始骨骼池与 instance-config 的工作空间副本，与去重策略无关；
+        即使 FrameAnalysis 已删除，重新生成也会复用这些文件。
 
         返回 (清理的子网格 json 数, 扫描的 json 文件总数)。
         """
@@ -3533,11 +3845,3 @@ class EFMISkeletonMergeHelper:
                 except Exception as e:
                     print(f"[EFMI骨骼合并] 清理 VGMap 缓存失败 {path}: {e}")
         return cleaned, scanned
-
-    @classmethod
-    def _resolve_skeleton_pool_path(cls, parser: EFMILogParser, draw_index: str) -> str | None:
-        skeleton_t0_hash = parser.get_vs_t0(draw_index)
-        if not skeleton_t0_hash:
-            return None
-        pool_logical = f"{draw_index}-vs-t0={skeleton_t0_hash}"
-        return parser.get_deduped_path(pool_logical)

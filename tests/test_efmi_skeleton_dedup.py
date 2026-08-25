@@ -207,6 +207,75 @@ class DedupGateTests(unittest.TestCase):
             for row in correspondence["matches"]
         ))
 
+    def test_cross_lod_keeps_geometry_match_when_pose_matrix_diff_is_160(self):
+        """跨 LOD 姿态差异约 1.60 时仍须建立原始候选对应。
+
+        同一 LOD 的去重仍以 1e-3 矩阵硬门控为准；这里只验证跨 LOD
+        的对应层不能因两个捕获姿态的矩阵差异，把几何上明确对应的骨骼
+        当成缺口。真实 EFMI 工作空间中的 LOD0/LOD1 目标正是这个量级。
+        """
+        reference_bone = _bone(0.0)
+        target_bone = list(reference_bone)
+        target_bone[0] = -0.60  # max(abs(diff)) == 1.60
+        lod0 = {
+            "LOD0.reference": _entry(
+                [reference_bone],
+                {0: _sig((0.0, 0.0, 0.0))},
+            ),
+        }
+        lod1 = {
+            "LOD1.target": _entry(
+                [target_bone],
+                {0: _sig((0.004, 0.0, 0.0))},
+            ),
+        }
+        correspondence = EFMIBoneMapBuilder.build_cross_lod_correspondence(
+            {"LOD0": lod0, "LOD1": lod1},
+        )
+        self.assertEqual(len(correspondence["matches"]), 1)
+        row = correspondence["matches"][0]
+        self.assertEqual(row["reference_local_vg_id"], 0)
+        self.assertEqual(row["target_local_vg_id"], 0)
+        self.assertAlmostEqual(row["matrix_diff"], 1.60, places=6)
+
+    def test_cross_lod_projection_merges_reference_group_at_matrix_diff_160(self):
+        """高姿态差异的两条对应仍须把 LOD0 合并组投影到 LOD1。"""
+        reference_bone = _bone(0.0)
+        target_bone = list(reference_bone)
+        target_bone[0] = -0.60  # max(abs(diff)) == 1.60
+        lod0 = {
+            "LOD0.a": _entry(
+                [reference_bone],
+                {0: _sig((0.0, 0.0, 0.0))},
+            ),
+            "LOD0.b": _entry(
+                [reference_bone],
+                {0: _sig((0.01, 0.0, 0.0))},
+            ),
+        }
+        lod1 = {
+            "LOD1.x": _entry(
+                [target_bone],
+                {0: _sig((0.004, 0.0, 0.0))},
+            ),
+            "LOD1.y": _entry(
+                [target_bone],
+                {0: _sig((0.014, 0.0, 0.0))},
+            ),
+        }
+        reference_maps, _ = EFMIBoneMapBuilder.build_vg_maps(lod0)
+        correspondence = EFMIBoneMapBuilder.build_cross_lod_correspondence(
+            {"LOD0": lod0, "LOD1": lod1},
+        )
+        target_maps, _ = EFMIBoneMapBuilder.build_lod_maps_from_reference(
+            lod0,
+            reference_maps,
+            lod1,
+            correspondence,
+        )
+        self.assertEqual(len(correspondence["matches"]), 2)
+        self.assertEqual(target_maps["LOD1.x"][0], target_maps["LOD1.y"][0])
+
     def test_lod1_sync_reuses_lod0_partition_without_rededup(self):
         """LOD1 只复用 LOD0 的语义分组，不能再次按自身点云重算出另一套分组。"""
         same = _bone(0.0)
@@ -341,15 +410,17 @@ class DedupGateTests(unittest.TestCase):
         # C 与 A 近似+质心近，但与 B 质心远；A 是扩散桥，整组仍然连续。
         self.assertEqual(vg_maps["cc_part"][0], vg_maps["aa_part"][0])
 
-    def test_zero_bone_skipped(self):
-        """全零骨骼不参与去重也不进 vg_map（原有行为锚定）。"""
+    def test_zero_bone_keeps_an_independent_mapping_slot(self):
+        """全零骨骼不参与去重，但必须保留独立槽位以满足导入/导出满映射契约。"""
         submesh = {
             "aa_part": _entry([_bone(0.1), [0.0] * 12]),
             "bb_part": _entry([[0.0] * 12, _bone(0.1)]),
         }
         vg_maps, _ = EFMIBoneMapBuilder.build_vg_maps(submesh)
-        self.assertNotIn(1, vg_maps["aa_part"])
-        self.assertNotIn(0, vg_maps["bb_part"])
+        self.assertEqual(set(vg_maps["aa_part"]), {0, 1})
+        self.assertEqual(set(vg_maps["bb_part"]), {0, 1})
+        # 全零骨骼不能因为矩阵 bitwise 相同而跨部件互相合并。
+        self.assertNotEqual(vg_maps["aa_part"][1], vg_maps["bb_part"][0])
         # 非零骨骼 bitwise 相同 -> 合并
         self.assertEqual(vg_maps["aa_part"][0], vg_maps["bb_part"][1])
 

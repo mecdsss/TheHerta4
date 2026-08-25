@@ -219,7 +219,13 @@ def _zone_propagate(settings, node):
 
 
 def _zone_allowed_names(settings):
-    """包含列表内物体的候选名（含去重后缀形式，如 Body.001 → Body）。"""
+    """包含列表内物体的候选名（仅按导出运行时后缀归一化，不折叠 Blender 去重后缀）。
+
+    Blender 去重后缀（如 Body.001）在导出 ini 里是真实独立 draw 的物体名一部分
+    （ZZMI 合并网格里 .001 与基础名是两个独立网格/IB 区间），不能被折叠——否则
+    包含 .001 会连带放行基础名网格，包含列表失效。归一化只做
+    ``_blender_object_key`` 的运行时后缀（_copy/_chainN/_dupN/...）剥离。
+    """
     include = getattr(settings, "include_objects", None) or ()
     names = set()
     for item in include:
@@ -231,11 +237,9 @@ def _zone_allowed_names(settings):
             if not candidate:
                 continue
             names.add(str(candidate))
-            names.add(str(candidate).rsplit(".", 1)[0])
             key = _blender_object_key(candidate)
             if key:
                 names.add(key)
-                names.add(key.rsplit(".", 1)[0])
     return names
 
 
@@ -311,7 +315,7 @@ def _zone_allowed_vertex_mask(settings, vertex_count, triangles, tri_part_names)
 
 
 def _collider_allowed_names(settings):
-    """碰撞体列表内物体的候选名（含去重后缀形式，与 _zone_allowed_names 同规约）。"""
+    """碰撞体列表内物体的候选名（仅按导出运行时后缀归一化，与 _zone_allowed_names 同规约）。"""
     colliders = getattr(settings, "collider_objects", None) or ()
     names = set()
     for item in colliders:
@@ -323,11 +327,9 @@ def _collider_allowed_names(settings):
             if not candidate:
                 continue
             names.add(str(candidate))
-            names.add(str(candidate).rsplit(".", 1)[0])
             key = _blender_object_key(candidate)
             if key:
                 names.add(key)
-                names.add(key.rsplit(".", 1)[0])
     return names
 
 
@@ -2237,10 +2239,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         }
 
     @staticmethod
-    def _bake_collider_l0(positions, points, masked):
-        """每顶点 L0 接触数据：最近碰撞点 q0、表面距离 t0、外向单位法线 n0。
+    def _bake_collider_l0(positions, points, masked, normals=None):
+        """每顶点 L0 接触数据（设计语义）：q0=最近碰撞点、t0=导出时刻到碰撞体表面的
+        带符号距离（运行时阈值：任何位移后该顶点到表面的距离不得低于 t0）、
+        n0=q0 处外向表面法线。
 
         布局：l0[2i]=(q0.xyz,t0)、l0[2i+1]=(n0.xyz,valid)。未遮顶点 valid=0。
+        传 normals（与 points 对齐的单位法线）时 t0 取带符号表面距离、n0 取表面法线；
+        不传（旧调用）回退「到最近点的无符号距离 + 指向顶点的方向」。
         分块向量化全量对拍，避免 (V×Nc×3) 一次性内存爆炸。
         """
         V = len(positions)
@@ -2252,6 +2258,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if len(idx) == 0 or len(points) == 0:
             return l0
         pts = np.asarray(points, dtype=np.float32)
+        nrm = np.asarray(normals, dtype=np.float32) if normals is not None else None
         pos = np.asarray(positions, dtype=np.float32)
         chunk = 512
         for start in range(0, len(idx), chunk):
@@ -2262,11 +2269,19 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             j = np.argmin(d2, axis=1)
             rows = np.arange(len(sel))
             q0 = pts[j]
-            t0 = np.sqrt(d2[rows, j])
-            n0 = q - q0
-            nn = np.linalg.norm(n0, axis=1, keepdims=True)
-            nn[nn < 1e-12] = 1.0
-            n0 = n0 / nn
+            if nrm is not None:
+                # 设计语义：带符号表面距离（负 = 导出时已穿透）+ 表面法线
+                n0 = nrm[j]
+                nn = np.linalg.norm(n0, axis=1, keepdims=True)
+                nn[nn < 1e-12] = 1.0
+                n0 = n0 / nn
+                t0 = np.einsum("ci,ci->c", q - q0, n0)
+            else:
+                n0 = q - q0
+                nn = np.linalg.norm(n0, axis=1, keepdims=True)
+                nn[nn < 1e-12] = 1.0
+                n0 = n0 / nn
+                t0 = np.linalg.norm(q - q0, axis=1)
             l0[2 * sel, 0:3] = q0.astype(np.float32)
             l0[2 * sel, 3] = t0.astype(np.float32)
             l0[2 * sel + 1, 0:3] = n0.astype(np.float32)
@@ -2328,13 +2343,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         grid = self._build_collider_grid(points, cell_size, margin)
 
         masked = self._collider_l0_mask(mod_export_path, sections, comp)
-        l0 = self._bake_collider_l0(positions, grid["sorted_points"], masked)
+        # 点云交错布局：每点 2×float4（位置 + 单位法线），法线按网格 count-sort 同一 order 重排
+        reordered_normals = np.asarray(point_normals, dtype=np.float32)[grid["order"]]
+        l0 = self._bake_collider_l0(
+            positions, grid["sorted_points"], masked, normals=reordered_normals
+        )
 
         out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
         os.makedirs(out_dir, exist_ok=True)
         stem = comp["base_name"]
-        # 点云交错布局：每点 2×float4（位置 + 单位法线），法线按网格 count-sort 同一 order 重排
-        reordered_normals = np.asarray(point_normals, dtype=np.float32)[grid["order"]]
         interleaved = np.zeros((len(grid["sorted_points"]) * 2, 4), dtype=np.float32)
         interleaved[0::2, 0:3] = grid["sorted_points"]
         interleaved[1::2, 0:3] = reordered_normals

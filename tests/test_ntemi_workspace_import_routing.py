@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 def _install_module(name, **attrs):
@@ -253,6 +254,109 @@ class NTEMIWorkspaceImportRoutingTests(unittest.TestCase):
             [call["workspace_unique_str"] for call in _created_mesh_calls],
             ["LOD0.0bebac08-1002-0", "LOD1.a351bef7-4500-0"],
         )
+
+
+class MergedSkeletonFallbackRoutingTests(unittest.TestCase):
+    def _run_efmi_import(self, ensure_ok):
+        target = {
+            "import_key": "LOD0.aaaabbbb-100-0",
+            "submesh_folder_path": "X:/Workspace/EFMI/LOD0/aaaabbbb-100-0",
+            "submesh_folder_name": "aaaabbbb-100-0",
+            "display_name": "LOD0.aaaabbbb-100-0",
+            "import_collection": _FakeCollection("LOD0"),
+        }
+        create_calls = []
+        option_updates = []
+        skeleton_module_name = f"{PKG}.common.efmi_skeleton"
+        previous_skeleton_module = sys.modules.get(skeleton_module_name)
+        _install_module(
+            skeleton_module_name,
+            EFMISkeletonMergeHelper=types.SimpleNamespace(
+                ensure_skeleton_data=lambda **_kwargs: (
+                    ensure_ok,
+                    "完整" if ensure_ok else "一个目标未生成",
+                )
+            ),
+        )
+
+        global_properties = sys.modules[
+            f"{PKG}.common.global_properties"
+        ].GlobalProterties
+        logic_names = sys.modules[f"{PKG}.common.logic_name"].LogicName
+        workspace_helper = sys.modules[
+            f"{PKG}.common.workspace_helper"
+        ].WorkSpaceHelper
+        import_helper = sys.modules[
+            f"{PKG}.common.ssmt_import_helper"
+        ].SSMTImportHelper
+
+        try:
+            with (
+                mock.patch.object(ui_func_import_ssmt, "_detect_ntemi_workspace", return_value=False),
+                mock.patch.object(
+                    ui_func_import_ssmt,
+                    "_build_workspace_import_targets",
+                    return_value=iter([target]),
+                ),
+                mock.patch.object(
+                    ui_func_import_ssmt.GlobalConfig, "logic_name", "EFMI"
+                ),
+                mock.patch.object(logic_names, "EFMI", "EFMI", create=True),
+                mock.patch.object(logic_names, "ZZMI", "ZZMI", create=True),
+                mock.patch.object(
+                    global_properties,
+                    "import_merged_vgmap",
+                    side_effect=lambda: True,
+                    create=True,
+                ),
+                mock.patch.object(
+                    global_properties,
+                    "efmi_lod_group_projection",
+                    side_effect=lambda: True,
+                    create=True,
+                ),
+                mock.patch.object(
+                    global_properties,
+                    "set_import_merged_vgmap",
+                    side_effect=lambda value: option_updates.append(bool(value)),
+                    create=True,
+                ),
+                mock.patch.object(
+                    workspace_helper,
+                    "get_ordered_gpu_cpu_import_folderpath_list",
+                    side_effect=lambda _path: ["X:/Workspace/EFMI/TYPE_GPU_TEST"],
+                    create=True,
+                ),
+                mock.patch.object(
+                    import_helper,
+                    "create_mesh_from_json",
+                    side_effect=lambda **kwargs: create_calls.append(kwargs),
+                    create=True,
+                ),
+            ):
+                operator = _FakeOperator()
+                context = types.SimpleNamespace(scene=types.SimpleNamespace())
+                result = ui_func_import_ssmt.ImprotFromWorkSpaceFull(operator, context)
+        finally:
+            if previous_skeleton_module is None:
+                sys.modules.pop(skeleton_module_name, None)
+            else:
+                sys.modules[skeleton_module_name] = previous_skeleton_module
+        return result, create_calls, option_updates
+
+    def test_failed_pre_generation_forces_whole_batch_ordinary_and_disables_option(self):
+        result, create_calls, option_updates = self._run_efmi_import(False)
+        self.assertFalse(result)  # fake importer returns None; routing assertions remain valid
+        self.assertEqual(len(create_calls), 1)
+        self.assertIs(create_calls[0]["use_merged_vgmap"], False)
+        self.assertEqual(option_updates, [False])
+
+    def test_successful_pre_generation_keeps_merged_batch(self):
+        result, create_calls, option_updates = self._run_efmi_import(True)
+        self.assertFalse(result)
+        self.assertEqual(len(create_calls), 1)
+        self.assertIs(create_calls[0]["use_merged_vgmap"], True)
+        self.assertEqual(option_updates, [])
 
 
 if __name__ == "__main__":

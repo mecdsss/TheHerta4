@@ -51,6 +51,7 @@ class SubMeshModel:
     # EFMI 骨骼合并元数据（由 SubmeshMetadata 透传）
     vg_offset:int = field(init=False, default=0)
     vg_count:int = field(init=False, default=0)
+    merged_skeleton_metadata_valid:bool = field(init=False, default=True)
     # ZZMI 骨架分组号（渲染 cb1 对象变换配对；缺省 0 = 单骨架旧语义）
     skeleton_group:int = field(init=False, default=0)
     # ZZMI 逐部件 VGMap（局部骨骼 id -> 全局槽位；attach CS 按此写合并骨架）
@@ -93,6 +94,9 @@ class SubMeshModel:
         # EFMI 骨骼合并元数据（反查写回；无则 0/空，合并段输出时据此校验）
         self.vg_offset = int(getattr(submesh_metadata, "vg_offset", 0) or 0)
         self.vg_count = int(getattr(submesh_metadata, "vg_count", 0) or 0)
+        self.merged_skeleton_metadata_valid = bool(
+            getattr(submesh_metadata, "merged_skeleton_metadata_valid", True)
+        )
         # ZZMI 骨架分组号（渲染 cb1 对象变换配对；缺省 0 = 单骨架旧语义）
         self.skeleton_group = int(getattr(submesh_metadata, "skeleton_group", 0) or 0)
         # ZZMI 逐部件 VGMap（局部骨骼 id -> 全局槽位；attach CS 按此写合并骨架）

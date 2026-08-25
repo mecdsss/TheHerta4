@@ -434,6 +434,11 @@ class GlobalProterties(bpy.types.PropertyGroup):
         return cls._instance().import_merged_vgmap
 
     @classmethod
+    def set_import_merged_vgmap(cls, value: bool):
+        """显式切换合并 VGMap；预生成失败时用于保持导入与后续导出同一模式。"""
+        setattr(cls._instance(), "import_merged_vgmap", bool(value))
+
+    @classmethod
     def efmi_lod_group_projection(cls):
         return cls._bool_attr("efmi_lod_group_projection", True)
 

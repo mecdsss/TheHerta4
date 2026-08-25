@@ -298,6 +298,15 @@ class ExportZZMI(ExportUnity):
             return components, {}
         for drawib_model in self.drawib_model_list:
             for submesh_model in drawib_model.submesh_model_list:
+                if not bool(
+                    getattr(submesh_model, "merged_skeleton_metadata_valid", True)
+                ):
+                    print(
+                        f"[ZZMI骨骼合并] 警告 {drawib_model.draw_ib}: "
+                        "骨骼合并元数据含非整数/越界值，该部件不进入合并骨架；"
+                        "请重新生成骨骼合并缓存"
+                    )
+                    continue
                 vg_count = int(getattr(submesh_model, "vg_count", 0) or 0)
                 if vg_count <= 0:
                     continue
