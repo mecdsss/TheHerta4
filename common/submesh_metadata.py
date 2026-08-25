@@ -92,6 +92,8 @@ class SubmeshMetadata:
     vg_offset: int = field(init=False, default=0)
     vg_count: int = field(init=False, default=0)
     vg_map: dict = field(init=False, default_factory=dict)
+    # ZZMI VGMap 缓存算法版本；导出侧拒绝陈旧缓存，避免旧分组/门控结果继续生效。
+    vg_map_algorithm_version: int = field(init=False, default=0)
     merged_skeleton_metadata_valid: bool = field(init=False, default=True)
     # ZZMI 导出侧守卫元数据（反查写回；缺省 0）
     deform_draw_index: int = field(init=False, default=0)
@@ -125,6 +127,9 @@ class SubmeshMetadata:
         self.vg_offset = int(self.submesh_json_dict.get("VGOffset", 0) or 0)
         self.vg_count = int(self.submesh_json_dict.get("VGCount", 0) or 0)
         self.vg_map = dict(self.submesh_json_dict.get("VGMap", {}) or {})
+        self.vg_map_algorithm_version = int(
+            self.submesh_json_dict.get("VGMapAlgorithmVersion", 0) or 0
+        )
         # ZZMI 骨架分组号（渲染 cb1 对象变换配对；缺省 0 = 单骨架旧语义）
         self.skeleton_group = int(self.submesh_json_dict.get("SkeletonGroup", 0) or 0)
         # ZZMI 导出侧守卫元数据：deform pass draw 序号 + 原部件顶点数

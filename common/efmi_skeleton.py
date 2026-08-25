@@ -3039,7 +3039,9 @@ class EFMISkeletonMergeHelper:
         解析原始骨骼候选；dump 不可用时改用该 LOD 子网格中已复制的工作空间
         原始文件缓存。先按部件点云建立原始候选对应。lod_group_projection=True
         时只对 LOD0 执行一次权重扩散去重，再将分区投影到 LOD1；为 False 时
-        两边各自独立执行去重。没有对应的额外 LOD1 候选保留恒等槽位。
+        两边各自独立执行去重。只有 LOD0 时直接独立计算，不要求 LOD1 存在；
+        明确标记为 GPU-PreSkinning=false 的 CPU 子网格不参与骨骼合并，也不会
+        因此使 GPU 子网格整批回退。没有对应的额外 LOD1 候选保留恒等槽位。
         运行时槽位仍按 LOD 独立从 0 起，避免把不同 dump 的骨骼池混写；对应事实
         写入 EFMILODCorrespondence/EFMILOD* 字段，供导出和问题复核。
 
@@ -3050,11 +3052,48 @@ class EFMISkeletonMergeHelper:
 
         lod_map, default_dir = cls.resolve_frame_analysis_dirs_by_lod(workspace_root)
 
-        # 按 LOD 分组（同 LOD 内保持输入顺序）
+        # 按 LOD 分组（同 LOD 内保持输入顺序）。EFMI 的 CPU/非预蒙皮
+        # 子网格没有 BLENDINDICES，也没有可加入统一骨骼池的顶点组；它们
+        # 不应因为被完整导入批次一起传入，就把真正的 GPU 蒙皮子网格整批
+        # 判成“合并骨骼生成失败”。保留无法定位/无法解析的目标进入后续
+        # 失败路径，只有明确声明 GPU-PreSkinning=false 的目标才安全跳过。
         groups: dict[str, list[str]] = {}
+        non_skeletal_unique_str_list: list[str] = []
         for unique_str in unique_str_list:
+            json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+            payload = None
+            if json_path:
+                try:
+                    payload = JsonUtils.LoadFromFile(json_path)
+                except Exception:
+                    payload = None
+            if (
+                isinstance(payload, dict)
+                and payload.get("GPU-PreSkinning") is False
+            ):
+                non_skeletal_unique_str_list.append(unique_str)
+                continue
             groups.setdefault(cls._parse_lod_name(unique_str), []).append(unique_str)
         lod_group_projection = bool(lod_group_projection)
+
+        if not groups:
+            skipped_label = "、".join(non_skeletal_unique_str_list[:5])
+            suffix = "…" if len(non_skeletal_unique_str_list) > 5 else ""
+            if skipped_label:
+                return True, (
+                    "没有需要合并骨骼的 GPU 蒙皮子网格，已跳过非蒙皮子网格: "
+                    f"{skipped_label}{suffix}。"
+                )
+            return False, "没有子网格需要处理。"
+
+        skipped_non_skeletal_message = ""
+        if non_skeletal_unique_str_list:
+            skipped_label = "、".join(non_skeletal_unique_str_list[:5])
+            suffix = "…" if len(non_skeletal_unique_str_list) > 5 else ""
+            skipped_non_skeletal_message = (
+                "；已跳过非蒙皮子网格: "
+                f"{skipped_label}{suffix}"
+            )
 
         parsers_by_lod: dict[str, EFMILogParser | None] = {}
 
@@ -3084,12 +3123,15 @@ class EFMISkeletonMergeHelper:
             parsers_by_lod[lod_name] = parser
             return parser
 
-        # 多 LOD 先收集原始候选，再建立跨 LOD 对应。分组投影模式下 LOD0 是唯一
+        # 多 LOD 先收集原始候选，再建立跨 LOD 对应。单独只有一个 LOD（包括
+        # 关闭分组投影时只有 LOD0）必须直接走下面的单组路径，不能把 LOD1
+        # 当成合并计算的前置条件。分组投影模式下 LOD0 是唯一
         # 执行权重扩散去重的基准侧；LOD1 只把该分区投影到自己的原始槽位，避免
         # 两侧各自计算后出现“同一对应关系被拆成两套 global group”的回退。独立
         # 模式仍使用同一份部件对应账本，但两侧分别调用 build_vg_maps。
         # 已有完整联合缓存时保持幂等，不重复读取大型 Position/Blend 缓冲。
-        if len(groups) > 1:
+        has_multiple_lods = len(groups) > 1
+        if has_multiple_lods:
             joint_cache_ready = True
             for lod_name, group_list in groups.items():
                 parser = _parser_for_lod(lod_name)
@@ -3229,13 +3271,16 @@ class EFMISkeletonMergeHelper:
                 total_skipped += skipped
                 group_results.append(f"{label}: {message}")
 
-            expected_targets = len(set(unique_str_list))
+            expected_targets = sum(
+                len(set(group_list)) for group_list in groups.values()
+            )
             processed = total_written + total_skipped
             if processed == 0:
                 if group_results:
                     return False, "没有子网格成功生成骨骼数据（" + "；".join(group_results) + "）"
                 return False, "没有子网格成功生成骨骼数据。"
             message = "；".join(group_results)
+            message += skipped_non_skeletal_message
             if processed < expected_targets:
                 message += f"；共 {expected_targets - processed} 个目标未生成骨骼数据"
             return processed == expected_targets, message
@@ -3257,13 +3302,16 @@ class EFMISkeletonMergeHelper:
             total_skipped += skipped
             group_results.append(f"{label}: {message}")
 
-        expected_targets = len(set(unique_str_list))
+        expected_targets = sum(
+            len(set(group_list)) for group_list in groups.values()
+        )
         processed = total_written + total_skipped
         if processed == 0:
             if group_results:
                 return False, "没有子网格成功生成骨骼数据（" + "；".join(group_results) + "）"
             return False, "没有子网格成功生成骨骼数据。"
         message = "；".join(group_results)
+        message += skipped_non_skeletal_message
         if processed < expected_targets:
             message += f"；共 {expected_targets - processed} 个目标未生成骨骼数据"
         # 全部命中缓存（无新写入）也视为成功；但只要存在未处理目标就必须失败

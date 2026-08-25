@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import types
@@ -54,6 +55,14 @@ class _FakeMesh:
 
     def update(self):
         pass
+
+
+class _FakeVertices(list):
+    def foreach_get(self, attribute, target):
+        if attribute != "co":
+            raise ValueError(attribute)
+        for index, vertex in enumerate(self):
+            target[index * 3:index * 3 + 3] = vertex.co
 
 
 class _FakeVertexGroup:
@@ -237,20 +246,45 @@ class EFMIStubLodTests(unittest.TestCase):
         with open(os.path.join(lod_dir, "DrawIB-Component.json"), "w", encoding="utf-8") as f:
             json.dump(component_map, f)
 
-    def _write_vgmap_json(self, lod, bare, gid):
+    def _write_vgmap_json(self, lod, bare, gid, positions=None):
         type_dir = os.path.join(self.tmp, lod, bare, "TYPE_GPU_TEST_")
         os.makedirs(type_dir, exist_ok=True)
-        payload = {"VGMap": {"0": str(gid)}, "VGOffset": 0, "VGCount": 1}
+        payload = {
+            "VGMap": {"0": str(gid)} if gid is not None else {},
+            "VGOffset": 0,
+            "VGCount": 1 if gid is not None else 0,
+        }
+        if positions is not None:
+            payload["CategoryBufferList"] = [{
+                "D3D11ElementList": [{
+                    "Category": "Position",
+                    "ByteWidth": 12,
+                }],
+            }]
         with open(os.path.join(type_dir, bare + ".json"), "w", encoding="utf-8") as f:
             json.dump(payload, f)
+        if positions is not None:
+            with open(os.path.join(type_dir, bare + "-Position.buf"), "wb") as f:
+                for position in positions:
+                    f.write(struct.pack("<3f", *position))
 
-    def _register_object_with_groups(self, name, used_gids):
+    def _register_object_with_groups(self, name, used_gids, positions=None):
         mesh = _fake_bpy_data.meshes.new(name=name + "_mesh")
-        mesh.vertices = [
-            types.SimpleNamespace(groups=[types.SimpleNamespace(group=gid, weight=1.0)])
-            for gid in used_gids
-        ]
-        return _fake_bpy_data.objects.new(name=name, object_data=mesh)
+        if positions is None:
+            positions = [(0.0, 0.0, 0.0)] * len(used_gids)
+        obj = _fake_bpy_data.objects.new(name=name, object_data=mesh)
+        group_indices = []
+        for gid in used_gids:
+            group_indices.append(len(obj.vertex_groups))
+            obj.vertex_groups.new(name=str(gid))
+        mesh.vertices = _FakeVertices(
+            types.SimpleNamespace(
+                co=position,
+                groups=[types.SimpleNamespace(group=group_index, weight=1.0)],
+            )
+            for group_index, position in zip(group_indices, positions)
+        )
+        return obj
 
     def _workspace_unique_strs(self, ordered):
         return [str(dc.get_workspace_unique_str()) for dc in ordered]
@@ -294,6 +328,73 @@ class EFMIStubLodTests(unittest.TestCase):
 
         names = self._workspace_unique_strs(ordered)
         self.assertIn("LOD1.26ab840d-24570-0", names)
+        self.assertEqual(len(exporter._efmi_stub_object_names), 1)
+        exporter._cleanup_stub_objects()
+
+    def test_replacement_model_uses_vgmap_when_geometry_differs(self):
+        """替换模型即使几何不同且组下标被压缩，也按数字组名识别统一骨骼。"""
+        self._write_component_map("LOD0", {
+            "b20f90ea": {"0": "b20f90ea-19182-0"},
+        })
+        self._write_vgmap_json(
+            "LOD0",
+            "b20f90ea-19182-0",
+            7,
+            positions=[(0.0, 0.0, 0.0)],
+        )
+        self._register_object_with_groups(
+            "LOD0.84618ee0-22296-0",
+            [7],
+            positions=[(10.0, 10.0, 10.0)],
+        )
+        ordered = [DrawCallModel(obj_name="LOD0.84618ee0-22296-0")]
+        exporter = _make_exporter(ordered)
+
+        names = self._workspace_unique_strs(ordered)
+        self.assertIn("LOD0.b20f90ea-19182-0", names)
+        self.assertEqual(len(exporter._efmi_stub_object_names), 1)
+        exporter._cleanup_stub_objects()
+
+    def test_geometry_overlap_without_vgmap_relation_does_not_create_stub(self):
+        """只有几何重合不能证明 Component 被合并；占位判定必须只认统一顶点组。"""
+        self._write_component_map("LOD0", {
+            "b20f90ea": {"0": "b20f90ea-19182-0"},
+        })
+        self._write_vgmap_json(
+            "LOD0",
+            "b20f90ea-19182-0",
+            None,
+            positions=[(0.0, 0.0, 0.0)],
+        )
+        self._register_object_with_groups(
+            "LOD0.84618ee0-22296-0",
+            [7],
+            positions=[(0.0, 0.0, 0.0)],
+        )
+        ordered = [DrawCallModel(obj_name="LOD0.84618ee0-22296-0")]
+        exporter = _make_exporter(ordered)
+
+        names = self._workspace_unique_strs(ordered)
+        self.assertNotIn("LOD0.b20f90ea-19182-0", names)
+        self.assertEqual(exporter._efmi_stub_object_names, [])
+
+    def test_new_stub_group_zero_is_not_absorption_evidence(self):
+        """本轮刚创建的占位组 0 不能误触发后续缺席 Component。"""
+        self._write_component_map("LOD0", {
+            "aaaa1111": {
+                "0": "aaaa1111-300-0",
+                "1": "aaaa1111-300-300",
+            },
+            "bbbb2222": {"0": "bbbb2222-600-0"},
+        })
+        self._write_vgmap_json("LOD0", "bbbb2222-600-0", 0)
+        self._register_object_with_groups("LOD0.aaaa1111-300-0", [7])
+        ordered = [DrawCallModel(obj_name="LOD0.aaaa1111-300-0")]
+        exporter = _make_exporter(ordered)
+
+        names = self._workspace_unique_strs(ordered)
+        self.assertIn("LOD0.aaaa1111-300-300", names)
+        self.assertNotIn("LOD0.bbbb2222-600-0", names)
         self.assertEqual(len(exporter._efmi_stub_object_names), 1)
         exporter._cleanup_stub_objects()
 

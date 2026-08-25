@@ -80,8 +80,8 @@ class ExportEFMI:
         合并骨架模式下用户可自由 join/删改。占位规则（与 ZZMI 一致）：
         - **部分缺失的 DrawIB**：缺失组件直接补占位（其几何显然被同 DrawIB 的
           幸存对象接管）；
-        - **整个 DrawIB 缺席**：看它绑定姿势顶点坐标/VGMap 全局骨骼 id 是否被现存
-          对象实际引用——被引用 = 几何被合并进了别的对象 → 全组件补占位（EntryPoint
+        - **整个 DrawIB 缺席**：看它 VGMap 的全局骨骼 id 是否被现存对象实际引用——
+          被引用 = 几何被合并进了别的对象 → 全组件补占位（EntryPoint
           照常触发、画不可见小三角，抑制原版绘制防重影）；零引用 = 用户故意不生成
           → 不插桩（该 DrawIB 不进 mod，游戏内显示原版）。
         无反查数据（json 无 VGMap）的缺席 DrawIB 一律不插桩。
@@ -89,7 +89,7 @@ class ExportEFMI:
         多 LOD 语义（2026-08 实测定案）：LOD0 / LOD1 相互独立——每个 LOD 目录
         （LOD0/LOD1/...）有自己的 DrawIB-Component.json，各自按上述规则独立
         插桩；「被引用」判定只查**同 LOD** 现存对象的顶点组（跨 LOD 组 id 各自
-        从 0 起会碰撞，混查会误判），几何判定无命名空间问题可全局查。
+        从 0 起会碰撞，混查会误判）。
         返回创建的对象名列表（export() 结束后清理）。
         """
         workspace_root = GlobalConfig.path_workspace_folder()
@@ -144,8 +144,6 @@ class ExportEFMI:
                 bpy.data.objects.remove(obj, do_unlink=True)
 
         used_group_ids_by_lod = None  # 惰性计算：首个全缺 DrawIB 需要判定时才算
-        present_positions = None
-
         def _get_used_group_ids(lod_name: str) -> set[int]:
             nonlocal used_group_ids_by_lod
             if used_group_ids_by_lod is None:
@@ -168,29 +166,23 @@ class ExportEFMI:
                     # 部分缺失：缺失组件补占位
                     stub_members = [member for member in members if member not in present]
                 else:
-                    # 整个 DrawIB 缺席：判定几何是否被合并进其它对象
-                    # 主判据 = 顶点坐标存在性（部件独有，无误判）；
-                    # 位置数据缺失时回退 VGMap 引用判定（只查同 LOD 对象的组 id，
-                    # 跨 LOD 组 id 各自从 0 起，混查会因命名空间碰撞误判）。
-                    absorbed = False
-                    positions = self._load_drawib_bind_positions(draw_ib, search_dir)
-                    if positions is not None and len(positions) > 0:
-                        if present_positions is None:
-                            present_positions = self._collect_present_positions(ordered)
-                        absorbed = self._is_drawib_absorbed_by_geometry(positions, present_positions)
-                    else:
-                        vg_values = self._load_drawib_vg_values(draw_ib, search_dir)
-                        absorbed = bool(vg_values and vg_values & _get_used_group_ids(lod_name))
+                    # 整个 DrawIB 缺席：与 ZZMI 一致，只认统一顶点组包含关系。
+                    # B 的 VGMap 全局组被同 LOD 现存对象 A 实际引用，说明 B 已并入 A。
+                    absorbed = self._is_drawib_absorbed(
+                        draw_ib,
+                        search_dir,
+                        _get_used_group_ids(lod_name),
+                    )
 
                     if absorbed:
                         stub_members = members
                         print(
                             f"[EFMI骨骼合并] DrawIB {draw_ib}（{lod_label}）没有对象，"
-                            f"但其几何/骨骼被其它模型引用（已被合并），全组件补占位小三角面"
+                            f"但其 VGMap 顶点组被其它模型引用（已被合并），全组件补占位小三角面"
                         )
                     else:
                         print(
-                            f"[EFMI骨骼合并] DrawIB {draw_ib}（{lod_label}）无对象且几何未被合并，"
+                            f"[EFMI骨骼合并] DrawIB {draw_ib}（{lod_label}）无对象且顶点组未被引用，"
                             f"按用户意图不生成"
                         )
                         continue
@@ -235,93 +227,25 @@ class ExportEFMI:
                         continue
         return values
 
-    def _load_drawib_bind_positions(self, draw_ib: str, search_dir: str):
-        """读取 DrawIB 首个组件的绑定姿势顶点坐标（采样，用于几何存在性判定）。
-
-        search_dir 为所属 LOD 的目录（LOD1 部件必须查 LOD1/，硬编码 LOD0 会漏）。
-        """
-        import numpy
-
-        if not os.path.isdir(search_dir):
-            return None
-        for name in sorted(os.listdir(search_dir)):
-            if not name.startswith(draw_ib + "-"):
-                continue
-            submesh_dir = os.path.join(search_dir, name)
-            if not os.path.isdir(submesh_dir):
-                continue
-            for type_dir in os.listdir(submesh_dir):
-                if not type_dir.startswith("TYPE_"):
-                    continue
-                type_path = os.path.join(submesh_dir, type_dir)
-                json_path = os.path.join(type_path, name + ".json")
-                pos_path = os.path.join(type_path, name + "-Position.buf")
-                if not os.path.isfile(json_path) or not os.path.isfile(pos_path):
-                    continue
-                payload = JsonUtils.LoadFromFile(json_path)
-                stride = 0
-                for category_buffer in payload.get("CategoryBufferList", []):
-                    for element in category_buffer.get("D3D11ElementList", []):
-                        if str(element.get("Category", "") or "").strip().lower() == "position":
-                            stride += int(element.get("ByteWidth", 0) or 0)
-                if stride <= 0:
-                    return None
-                raw = numpy.fromfile(pos_path, dtype=numpy.uint8)
-                if len(raw) == 0 or len(raw) % stride != 0:
-                    return None
-                verts = raw.reshape(-1, stride)[:, 0:12].copy().view(numpy.float32).reshape(-1, 3)
-                if len(verts) > 256:
-                    sample_idx = numpy.linspace(0, len(verts) - 1, 256).astype(numpy.int64)
-                    verts = verts[sample_idx]
-                return verts
-        return None
-
-    def _collect_present_positions(self, ordered):
-        """收集蓝图内全部对象的顶点坐标（numpy Nx3）。"""
-        import numpy
-
-        chunks = []
-        for draw_call in ordered:
-            try:
-                obj_name = draw_call.get_blender_obj_name()
-            except Exception:
-                continue
-            obj = bpy.data.objects.get(obj_name) if obj_name else None
-            mesh = getattr(obj, "data", None) if obj is not None else None
-            vertices = getattr(mesh, "vertices", None)
-            if not vertices:
-                continue
-            coords = numpy.empty(len(vertices) * 3, dtype=numpy.float32)
-            vertices.foreach_get("co", coords)
-            chunks.append(coords.reshape(-1, 3))
-        if not chunks:
-            return None
-        return numpy.concatenate(chunks, axis=0)
-
-    def _is_drawib_absorbed_by_geometry(self, positions, present_positions) -> bool:
-        """几何存在性判定：该 DrawIB 绑定姿势顶点坐标（采样）有 >=30% 出现在现存
-        对象的网格里（<=1e-4 近似）= 几何被合并进别的对象。
-        """
-        import numpy
-
-        if present_positions is None or len(present_positions) == 0:
+    def _is_drawib_absorbed(
+        self,
+        draw_ib: str,
+        search_dir: str,
+        used_group_ids: set[int],
+    ) -> bool:
+        """按统一顶点组关系判定整个缺席的 DrawIB 是否已并入现存对象。"""
+        vg_values = self._load_drawib_vg_values(draw_ib, search_dir)
+        if not vg_values:
             return False
-        sample = positions.astype(numpy.float64)
-        present = present_positions.astype(numpy.float64)
-        hits = 0
-        chunk = 64
-        for start in range(0, len(sample), chunk):
-            part = sample[start:start + chunk]
-            diff = numpy.abs(part[:, None, :] - present[None, :, :]).max(axis=2)
-            hits += int((diff < 1e-4).any(axis=1).sum())
-        ratio = hits / len(sample)
-        return ratio >= 0.3
+        return bool(vg_values & used_group_ids)
 
     def _collect_used_group_ids_by_lod(self, ordered) -> dict[str, set[int]]:
-        """收集蓝图内全部对象实际引用（权重>0）的顶点组 id，按 LOD 分组。
+        """收集蓝图内全部对象实际引用（权重>0）的全局顶点组 id，按 LOD 分组。
 
         跨 LOD 组 id 各自从 0 起（命名空间独立），判定某 LOD 的缺席 DrawIB
         是否被吸收时必须只用**同 LOD** 对象的组 id，混查会因编号碰撞误判。
+        全局 id 取数字顶点组名称，不取 Blender 内部 group index；替换模型删除
+        空组后内部下标会压缩，但统一顶点组名称仍保持全局骨骼编号。
         """
         used: dict[str, set[int]] = {}
         for draw_call in ordered:
@@ -337,15 +261,27 @@ class ExportEFMI:
                 if prefix[3:].isdigit():
                     lod_name = prefix
             obj = bpy.data.objects.get(obj_name) if obj_name else None
+            if obj is not None and obj.get("EFMI_STUB"):
+                # 本轮先创建的占位固定带组 0；它不是用户模型，不能反过来成为
+                # 后续缺席 Component “已并入其它对象”的关系证据。
+                continue
             mesh = getattr(obj, "data", None) if obj is not None else None
             vertices = getattr(mesh, "vertices", None)
-            if vertices is None:
+            vertex_groups = getattr(obj, "vertex_groups", None) if obj is not None else None
+            if vertices is None or vertex_groups is None:
                 continue
             bucket = used.setdefault(lod_name, set())
             for vertex in vertices:
                 for group_elem in vertex.groups:
-                    if group_elem.weight > 0:
-                        bucket.add(group_elem.group)
+                    if group_elem.weight <= 0:
+                        continue
+                    try:
+                        group_name = vertex_groups[group_elem.group].name
+                        global_group_id = int(str(group_name).strip())
+                    except (IndexError, KeyError, TypeError, ValueError):
+                        continue
+                    if global_group_id >= 0:
+                        bucket.add(global_group_id)
         return used
 
     def _create_stub_object(self, bare_unique_str: str, lod_name: str = "LOD0") -> str:
@@ -971,7 +907,16 @@ class ExportEFMI:
                     )
                     continue
                 vg_count = int(getattr(submesh_model, "vg_count", 0) or 0)
-                if vg_count > 0:
+                if (
+                    vg_count > 0
+                    and bool(
+                        getattr(
+                            getattr(submesh_model, "d3d11_game_type", None),
+                            "GPU_PreSkinning",
+                            False,
+                        )
+                    )
+                ):
                     components.append({
                         "unique_str": submesh_model.unique_str,
                         "lod": self._lod_name_from_unique_str(submesh_model.unique_str),

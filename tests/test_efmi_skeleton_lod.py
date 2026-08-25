@@ -321,6 +321,59 @@ class MultiLodBuildTests(unittest.TestCase):
                 return json.loads((type_dir / f"{bare}.json").read_text(encoding="utf-8"))
         return None
 
+    def test_independent_single_lod_does_not_require_lod1(self):
+        """关闭 LOD 分组投影时，仅 LOD0 也必须独立完成合并计算。"""
+        original = EFMIBoneMapBuilder.build_cross_lod_correspondence
+
+        def unexpected_cross_lod_call(*_args, **_kwargs):
+            raise AssertionError("单 LOD 独立模式不应建立跨 LOD 对应")
+
+        EFMIBoneMapBuilder.build_cross_lod_correspondence = staticmethod(
+            unexpected_cross_lod_call
+        )
+        try:
+            ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=str(self.ws),
+                unique_str_list=[self.u_lod0],
+                force=True,
+                lod_group_projection=False,
+            )
+        finally:
+            EFMIBoneMapBuilder.build_cross_lod_correspondence = staticmethod(original)
+
+        self.assertTrue(ok, message)
+        json0 = self._read_submesh_json("LOD0", "aaaabbbb-100-0")
+        self.assertEqual(json0.get("VGMap"), {"0": 0})
+        self.assertNotIn("EFMILODReference", json0)
+
+    def test_non_skinned_efmi_targets_do_not_abort_gpu_merge_batch(self):
+        """EFMI CPU 子网格无 BLENDINDICES，不应导致 GPU 合并批次整体回退。"""
+        cpu_unique = _make_submesh(self.ws, "LOD0", "cpu11111-300-0")
+        cpu_json_path = next(
+            (self.ws / "LOD0" / "cpu11111-300-0").glob("TYPE_*/*.json")
+        )
+        cpu_payload = json.loads(cpu_json_path.read_text(encoding="utf-8"))
+        cpu_payload["GamePreset"] = "EFMI"
+        cpu_payload["GPU-PreSkinning"] = False
+        cpu_json_path.write_text(
+            json.dumps(cpu_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, cpu_unique],
+            force=True,
+            lod_group_projection=False,
+        )
+
+        self.assertTrue(ok, message)
+        self.assertIn("非蒙皮子网格", message)
+        json0 = self._read_submesh_json("LOD0", "aaaabbbb-100-0")
+        cpu_json = json.loads(cpu_json_path.read_text(encoding="utf-8"))
+        self.assertEqual(json0.get("VGMap"), {"0": 0})
+        self.assertNotIn("VGMap", cpu_json)
+
     def test_each_lod_uses_own_dump_and_own_slot_space(self):
         ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
             workspace_root=str(self.ws),

@@ -51,6 +51,7 @@ class SubMeshModel:
     # EFMI 骨骼合并元数据（由 SubmeshMetadata 透传）
     vg_offset:int = field(init=False, default=0)
     vg_count:int = field(init=False, default=0)
+    vg_map_algorithm_version:int = field(init=False, default=0)
     merged_skeleton_metadata_valid:bool = field(init=False, default=True)
     # ZZMI 骨架分组号（渲染 cb1 对象变换配对；缺省 0 = 单骨架旧语义）
     skeleton_group:int = field(init=False, default=0)
@@ -94,6 +95,9 @@ class SubMeshModel:
         # EFMI 骨骼合并元数据（反查写回；无则 0/空，合并段输出时据此校验）
         self.vg_offset = int(getattr(submesh_metadata, "vg_offset", 0) or 0)
         self.vg_count = int(getattr(submesh_metadata, "vg_count", 0) or 0)
+        self.vg_map_algorithm_version = int(
+            getattr(submesh_metadata, "vg_map_algorithm_version", 0) or 0
+        )
         self.merged_skeleton_metadata_valid = bool(
             getattr(submesh_metadata, "merged_skeleton_metadata_valid", True)
         )
@@ -105,13 +109,16 @@ class SubMeshModel:
         self.deform_draw_index = int(getattr(submesh_metadata, "deform_draw_index", 0) or 0)
         self.original_vertex_count = int(getattr(submesh_metadata, "original_vertex_count", 0) or 0)
 
-        # EFMI 骨骼合并：合并骨架场景下 BLENDINDICES 无条件升宽到 16 位
-        # （全局骨骼索引可能超过 255；INI 侧由 ExportEFMI 输出 ElementFormat 行配套）
+        # EFMI 骨骼合并：只有 GPU-PreSkinning 子网格才有统一骨架和
+        # BLENDINDICES。CPU-PreSkinning 子网格在 ensure_skeleton_data 阶段
+        # 会被明确跳过，必须继续走普通局部组导出，不能因为同一批次开启
+        # 复选框就强制要求它存在 BLENDINDICES。
         self.blendindices_widened = False
         if (
             self.d3d11_game_type is not None
             and GlobalConfig.logic_name == LogicName.EFMI
             and GlobalProterties.import_merged_vgmap()
+            and bool(getattr(self.d3d11_game_type, "GPU_PreSkinning", False))
         ):
             self.blendindices_widened = self.d3d11_game_type.widen_blendindices()
             blend_layouts = self.d3d11_game_type.get_blendindices_layouts()
@@ -324,7 +331,10 @@ class SubMeshModel:
         # 复选框关闭或无反查数据时完全保持旧逻辑。
         run_merged_skeleton_preprocess = False
         if GlobalProterties.import_merged_vgmap():
-            if GlobalConfig.logic_name == LogicName.EFMI:
+            if (
+                GlobalConfig.logic_name == LogicName.EFMI
+                and bool(getattr(self.d3d11_game_type, "GPU_PreSkinning", False))
+            ):
                 run_merged_skeleton_preprocess = True
             elif GlobalConfig.logic_name == LogicName.ZZMI and self.vg_count > 0:
                 run_merged_skeleton_preprocess = True

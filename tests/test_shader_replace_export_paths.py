@@ -229,8 +229,17 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         _install_module(
             f"{self.pkg}.common.m_ini_helper",
             M_IniHelper=types.SimpleNamespace(
-                get_drawindexed_str_list=lambda drawcall_list, obj_name_draw_offset_dict=None: [
-                    f"drawindexed = {item.obj_name}" for item in drawcall_list
+                get_drawindexed_str_list=lambda drawcall_list, obj_name_draw_offset_dict=None, base_vertex=0: [
+                    line
+                    for item in drawcall_list
+                    for line in (
+                        f"; [mesh:{item.obj_name}] [vertex_count:{item.vertex_count}]",
+                        (
+                            f"drawindexed = {item.obj_name}"
+                            if base_vertex == 0
+                            else f"drawindexed = {item.obj_name},base={base_vertex}"
+                        ),
+                    )
                 ],
                 get_drawindexed_instanced_str_list=lambda drawcall_list, obj_name_draw_offset_dict=None: [
                     f"drawindexedinstanced = {item.obj_name}" for item in drawcall_list
@@ -341,6 +350,24 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         self.assertIn("drawindexed = mesh_normal", lines)
         self.assertTrue(any("run = CustomShader_Rain_drawhash_56_0_12_34_0_World" in line for line in lines))
         self.assertFalse(any(line == "drawindexed = mesh_sr" for line in lines))
+
+    def test_zzmi_redirect_uses_same_drawindexed_path_with_base_vertex(self):
+        """合并网格重定向仍走统一输出路径：备注、base_vertex 和 shader replace 都保留。"""
+        exporter = self.zzmi_module.ExportZZMI(self._make_blueprint_model())
+        section = _FakeIniSection(_FakeSectionType.TextureOverrideIB)
+
+        exporter._append_drawindexed_with_shader_replace(
+            section,
+            [_FakeDrawCall("mesh_sr"), _FakeDrawCall("mesh_normal")],
+            {},
+            base_vertex=123,
+        )
+
+        lines = section.SectionLineList
+        self.assertIn("; [mesh:mesh_sr] [vertex_count:77]", lines)
+        self.assertIn("; [mesh:mesh_normal] [vertex_count:77]", lines)
+        self.assertIn("drawindexed = mesh_normal,base=123", lines)
+        self.assertTrue(any("_34_123_World" in line for line in lines))
 
     def test_efmi_shader_replace_replaces_drawindexedinstanced_for_marked_objects(self):
         exporter = self.efmi_module.ExportEFMI.__new__(self.efmi_module.ExportEFMI)
@@ -1030,6 +1057,41 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         section_names = {section.SectionName for section in builder.ini_section_list}
         self.assertIn("CustomShader_Rain_drawhash_56_0_12_91_0_World", section_names)
         self.assertNotIn("CustomShader_Rain_drawhash_56_0_12_34_0_World", section_names)
+
+    def test_shader_sections_use_redirect_base_vertex_and_close_run_references(self):
+        """重定向 draw 的 run 引用必须对应生成同一 base_vertex 的 CustomShader 段。"""
+        info = {
+            "name_prefix": "Rain",
+            "toggle_key": "",
+            "component_index": 0,
+            "shaders": [{
+                "variant_name": "World",
+                "shader_file_path": "",
+                "shader_hash": "",
+                "env_value": 1,
+            }],
+        }
+        draw_call = _FakeDrawCall(
+            "mesh",
+            shader_replace_info_list=[info],
+            shader_replace_info_resolved=True,
+        )
+        builder = _FakeIniBuilder()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.actual_m_ini_module.M_IniHelper.add_shader_replace_sections(
+                ini_builder=builder,
+                shader_replace_info_list=[info],
+                shader_replace_object_names={"mesh"},
+                draw_call_models=[draw_call],
+                mod_export_path=tmpdir,
+                draw_call_base_vertex_map={id(draw_call): 123},
+            )
+
+        sections = {section.SectionName: section.SectionLineList for section in builder.ini_section_list}
+        target_name = "CustomShader_Rain_drawhash_56_0_12_34_123_World"
+        self.assertIn(target_name, sections)
+        self.assertIn("drawindexed = 12,34,123", sections[target_name])
 
     def test_shader_export_allows_source_file_already_at_destination(self):
         builder = _FakeIniBuilder()

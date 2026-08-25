@@ -190,6 +190,7 @@ class M_IniHelper:
         cls,
         ordered_draw_obj_model_list: list[DrawCallModel],
         obj_name_draw_offset_dict: dict[str, int] | None = None,
+        base_vertex: int = 0,
     ) -> list[str]:
         """获取 drawindexed 命令字符串列表
         
@@ -199,6 +200,7 @@ class M_IniHelper:
         Args:
             ordered_draw_obj_model_list: DrawCallModel 列表，按绘制顺序排列
             obj_name_draw_offset_dict: 对象名称到绘制偏移的映射字典
+            base_vertex: drawindexed 的 base_vertex，合并网格重定向时使用
             
         Returns:
             list[str]: drawindexed 命令字符串列表
@@ -221,13 +223,29 @@ class M_IniHelper:
                 for obj_model in obj_model_list:
                     display_name = str(getattr(obj_model, 'obj_name', '') or getattr(obj_model, 'display_name', '') or '')
                     drawindexed_str_list.append("  ; [mesh:" + display_name + "] [vertex_count:" + str(obj_model.vertex_count) + "]" )
-                    drawindexed_str_list.append("  " + obj_model.get_drawindexed_str(obj_name_draw_offset_dict))
+                    drawindexed = (
+                        obj_model.get_drawindexed_str(obj_name_draw_offset_dict)
+                        if base_vertex == 0
+                        else obj_model.get_drawindexed_str(
+                            obj_name_draw_offset_dict,
+                            base_vertex=base_vertex,
+                        )
+                    )
+                    drawindexed_str_list.append("  " + drawindexed)
                 drawindexed_str_list.append("endif")
             else:
                 for obj_model in obj_model_list:
                     display_name = str(getattr(obj_model, 'obj_name', '') or getattr(obj_model, 'display_name', '') or '')
                     drawindexed_str_list.append("; [mesh:" + display_name + "] [vertex_count:" + str(obj_model.vertex_count) + "]" )
-                    drawindexed_str_list.append(obj_model.get_drawindexed_str(obj_name_draw_offset_dict))
+                    drawindexed = (
+                        obj_model.get_drawindexed_str(obj_name_draw_offset_dict)
+                        if base_vertex == 0
+                        else obj_model.get_drawindexed_str(
+                            obj_name_draw_offset_dict,
+                            base_vertex=base_vertex,
+                        )
+                    )
+                    drawindexed_str_list.append(drawindexed)
             drawindexed_str_list.append("")
 
         return drawindexed_str_list
@@ -955,6 +973,7 @@ class M_IniHelper:
         use_instanced_draw: bool = False,
         shader_replace_object_info_map: dict = None,
         draw_call_offset_map: dict = None,
+        draw_call_base_vertex_map: dict = None,
     ):
         """生成着色器替换相关的 INI 段。
 
@@ -971,6 +990,7 @@ class M_IniHelper:
             mod_export_path: 导出路径（用于复制着色器文件）
             use_instanced_draw: 是否生成 drawindexedinstanced 绘制命令
             draw_call_offset_map: DrawCall 对象身份到最终 IB 绘制偏移的映射
+            draw_call_base_vertex_map: DrawCall 对象身份到重定向 base_vertex 的映射
         """
         if not shader_replace_info_list:
             return
@@ -1138,7 +1158,13 @@ class M_IniHelper:
                 first_index = dm.match_first_index if dm.match_first_index else "0"
                 index_count = dm.index_count or 0
                 index_offset = (draw_call_offset_map or {}).get(id(dm), dm.index_offset) or 0
-                base_vertex = 0
+                # 普通绘制为 0；ZZMI 合并网格重定向会把 carrier 的 draw
+                # 放到 target SO，并在 run 逻辑中携带非零 base_vertex。这里
+                # 必须使用同一身份映射生成 CustomShader 段，否则 run 会
+                # 引用一个没有被创建的 section。
+                base_vertex = int(
+                    (draw_call_base_vertex_map or {}).get(id(dm), 0) or 0
+                )
                 if use_instanced_draw:
                     drawindexed_str = (
                         f"drawindexedinstanced = {index_count},INSTANCE_COUNT,"

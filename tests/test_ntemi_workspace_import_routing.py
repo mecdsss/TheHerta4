@@ -30,6 +30,9 @@ class _FakeCollection:
         self.name = name
         self.children = types.SimpleNamespace(link=lambda _child: None)
 
+    def as_pointer(self):
+        return id(self)
+
 
 class _FakeImportedObject(dict):
     def __init__(self, name=""):
@@ -221,12 +224,93 @@ sys.modules[spec.name] = ui_func_import_ssmt
 spec.loader.exec_module(ui_func_import_ssmt)
 
 
+class _FakeCollectionRegistry(dict):
+    pass
+
+
+class _FakeCollectionChildren:
+    def __init__(self):
+        self.linked = []
+
+    def link(self, collection):
+        self.linked.append(collection)
+
+
+class _FakeCollectionParent:
+    def __init__(self):
+        self.children = _FakeCollectionChildren()
+
+    def as_pointer(self):
+        return id(self)
+
+
 class _FakeOperator:
     def __init__(self):
         self.reports = []
 
     def report(self, level, message):
         self.reports.append((set(level), message))
+
+
+class ZZMISkeletonGroupCollectionTests(unittest.TestCase):
+    def test_existing_group_name_creates_dot_001_and_reuses_it_within_batch(self):
+        registry = _FakeCollectionRegistry({
+            "SkeletonGroup_3": _FakeCollection("SkeletonGroup_3"),
+        })
+        parent = _FakeCollectionParent()
+        batch_cache = {}
+
+        def create_collection(collection_name, color_tag=None):
+            collection = _FakeCollection(collection_name)
+            collection.color_tag = color_tag
+            registry[collection_name] = collection
+            return collection
+
+        with (
+            mock.patch.object(ui_func_import_ssmt.bpy.data, "collections", registry, create=True),
+            mock.patch.object(
+                ui_func_import_ssmt.CollectionUtils,
+                "create_new_collection",
+                side_effect=create_collection,
+            ) as create_mock,
+        ):
+            first = ui_func_import_ssmt._zzmi_get_or_create_skeleton_group_collection(
+                parent, 3, batch_cache
+            )
+            second = ui_func_import_ssmt._zzmi_get_or_create_skeleton_group_collection(
+                parent, 3, batch_cache
+            )
+
+        self.assertEqual(first.name, "SkeletonGroup_3.001")
+        self.assertIs(second, first)
+        self.assertEqual(parent.children.linked, [first])
+        self.assertEqual(create_mock.call_count, 1)
+
+    def test_next_import_batch_creates_next_suffix(self):
+        registry = _FakeCollectionRegistry({
+            "SkeletonGroup_3": _FakeCollection("SkeletonGroup_3"),
+            "SkeletonGroup_3.001": _FakeCollection("SkeletonGroup_3.001"),
+        })
+        parent = _FakeCollectionParent()
+
+        def create_collection(collection_name, color_tag=None):
+            collection = _FakeCollection(collection_name)
+            registry[collection_name] = collection
+            return collection
+
+        with (
+            mock.patch.object(ui_func_import_ssmt.bpy.data, "collections", registry, create=True),
+            mock.patch.object(
+                ui_func_import_ssmt.CollectionUtils,
+                "create_new_collection",
+                side_effect=create_collection,
+            ),
+        ):
+            collection = ui_func_import_ssmt._zzmi_get_or_create_skeleton_group_collection(
+                parent, 3, {}
+            )
+
+        self.assertEqual(collection.name, "SkeletonGroup_3.002")
 
 
 class NTEMIWorkspaceImportRoutingTests(unittest.TestCase):

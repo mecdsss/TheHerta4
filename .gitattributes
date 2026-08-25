@@ -2,3 +2,4 @@
 .gitattributes text eol=lf
 *.py text eol=lf
 *.hlsl text eol=lf
+*.md text eol=lf

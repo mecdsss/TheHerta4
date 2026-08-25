@@ -67,7 +67,71 @@ _SKELETON_GROUP_COLORS = [
 ]
 
 
-def _zzmi_move_to_skeleton_group_collection(obj, import_key: str, parent_collection) -> None:
+def _zzmi_collection_name_exists(collection_name: str) -> bool:
+    """检查 Blender 数据库中是否已有该合集名。"""
+    collections = getattr(getattr(bpy, "data", None), "collections", None)
+    if collections is None:
+        return False
+    try:
+        return collections.get(collection_name) is not None
+    except (AttributeError, TypeError):
+        try:
+            return collection_name in collections
+        except (TypeError, AttributeError):
+            return False
+
+
+def _zzmi_unique_collection_name(base_name: str) -> str:
+    """返回 Blender 合集名；已有名称时显式生成 ``.001``、``.002``。"""
+    if not _zzmi_collection_name_exists(base_name):
+        return base_name
+    suffix = 1
+    while True:
+        candidate = f"{base_name}.{suffix:03d}"
+        if not _zzmi_collection_name_exists(candidate):
+            return candidate
+        suffix += 1
+
+
+def _zzmi_get_or_create_skeleton_group_collection(
+    parent_collection,
+    skeleton_group: int,
+    collection_cache: dict | None = None,
+):
+    """获取本次导入的骨架组合集，不复用其它导入遗留的同名合集。
+
+    ``collection_cache`` 由一次完整导入独占：同一父合集和 SkeletonGroup 的多个
+    Component 仍共享一个合集；下一次导入使用新的 cache，即使父合集下已有
+    ``SkeletonGroup_N``，也会创建 ``SkeletonGroup_N.001``。
+    """
+    if collection_cache is None:
+        collection_cache = {}
+    try:
+        parent_key = int(parent_collection.as_pointer())
+    except (AttributeError, TypeError, ValueError):
+        parent_key = id(parent_collection)
+    cache_key = (parent_key, int(skeleton_group))
+    group_collection = collection_cache.get(cache_key)
+    if group_collection is not None:
+        return group_collection
+
+    base_name = f"SkeletonGroup_{int(skeleton_group)}"
+    collection_name = _zzmi_unique_collection_name(base_name)
+    group_collection = CollectionUtils.create_new_collection(
+        collection_name=collection_name,
+        color_tag=_SKELETON_GROUP_COLORS[int(skeleton_group) % len(_SKELETON_GROUP_COLORS)],
+    )
+    parent_collection.children.link(group_collection)
+    collection_cache[cache_key] = group_collection
+    return group_collection
+
+
+def _zzmi_move_to_skeleton_group_collection(
+    obj,
+    import_key: str,
+    parent_collection,
+    collection_cache: dict | None = None,
+) -> None:
     """ZZMI 分组版骨骼合并：把导入对象移入其骨架组合集（SkeletonGroup_<N>）。
 
     合集挂在该对象的父合集（LOD 合集）下；对象从原合集移出、链接进组集合。
@@ -91,14 +155,11 @@ def _zzmi_move_to_skeleton_group_collection(obj, import_key: str, parent_collect
     except (TypeError, ValueError):
         return
 
-    collection_name = f"SkeletonGroup_{skeleton_group}"
-    group_collection = parent_collection.children.get(collection_name)
-    if group_collection is None:
-        group_collection = CollectionUtils.create_new_collection(
-            collection_name=collection_name,
-            color_tag=_SKELETON_GROUP_COLORS[skeleton_group % len(_SKELETON_GROUP_COLORS)],
-        )
-        parent_collection.children.link(group_collection)
+    group_collection = _zzmi_get_or_create_skeleton_group_collection(
+        parent_collection,
+        skeleton_group,
+        collection_cache=collection_cache,
+    )
 
     for coll in list(obj.users_collection):
         coll.objects.unlink(obj)
@@ -301,6 +362,9 @@ def ImprotFromWorkSpaceFull(self, context):
     foldername_gametypename_dict = {}
     imported_objects = []
     import_records = []
+    # 一次完整导入独占：同一批 Component 共享对应骨架组合集；下一次导入不得
+    # 复用旧批次留下的同名合集，而应由 Blender 风格命名生成 .001/.002。
+    zzmi_skeleton_group_collections = {}
 
     for target in import_targets:
         submesh_folder_name = target["submesh_folder_name"]
@@ -353,6 +417,7 @@ def ImprotFromWorkSpaceFull(self, context):
                             imported_obj,
                             target["import_key"],
                             target["import_collection"],
+                            collection_cache=zzmi_skeleton_group_collections,
                         )
                     except Exception as e:
                         print(f"[ZZMI骨骼合并] 分组合集归组失败（不影响导入）: {e}")

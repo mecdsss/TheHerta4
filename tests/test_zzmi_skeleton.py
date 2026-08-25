@@ -122,6 +122,7 @@ class TestZZMILogParser(unittest.TestCase):
     def test_render_draw_vb0_and_ib(self):
         # 渲染 draw 000039: ib=84618ee0, vb0=840c1713（= deform 000004 的 SO 输出）
         self.assertEqual(self.parser.draws["000039"]["ib"], "84618ee0")
+        self.assertEqual(self.parser.get_ib_hash("000039"), "84618ee0")
         self.assertEqual(self.parser.get_vb_hash("000039", 0), "840c1713")
         self.assertEqual(self.parser.get_vb_hash("000040", 0), "01b35c45")
 
@@ -162,11 +163,88 @@ class TestZZMIDeformResolver(unittest.TestCase):
     def test_resolve_path_c_fallback(self):
         # 只用渲染 draw 列表（路径 C）：b20f90ea-19182-0 -> 渲染 draw 38/44/192/213/225
         draw, deform_pass, via = self.resolver.resolve(
-            render_draw_indices=["000038", "000044", "000192", "000213", "000225"]
+            render_draw_indices=["000038", "000044", "000192", "000213", "000225"],
+            expected_draw_ib="b20f90ea",
         )
         self.assertEqual(via, "C")
         self.assertEqual(draw, "000002")
         self.assertEqual(deform_pass["so_hash"], "dd9c8d5e")
+
+
+class TestZZMIDeformResolverIBGate(unittest.TestCase):
+    """路径 C 必须按目标 DrawIB 过滤渲染 draw，避免相似模型串台。"""
+
+    class _Parser:
+        def get_deform_passes(self):
+            return {
+                "000001": {
+                    "vertex_count": 10,
+                    "so_hash": "shared-so",
+                    "palette_hash": "palette-a",
+                    "vb0_hash": "bind-a",
+                }
+            }
+
+        def get_vb_hash(self, draw_index, slot):
+            return "shared-so" if draw_index in {"000101", "000102"} and slot == 0 else ""
+
+        def get_ib_hash(self, draw_index):
+            return {"000101": "other-model", "000102": "target-model"}.get(draw_index, "")
+
+    def setUp(self):
+        self.resolver = ZZMIDeformResolver(self._Parser())
+
+    def test_path_c_skips_same_so_from_other_ib(self):
+        draw, _deform_pass, via = self.resolver.resolve(
+            render_draw_indices=["000101"],
+            expected_draw_ib="target-model",
+        )
+        self.assertEqual((draw, via), ("", ""))
+
+    def test_path_c_accepts_target_ib_after_skipping_other_model(self):
+        draw, deform_pass, via = self.resolver.resolve(
+            render_draw_indices=["000101", "000102"],
+            expected_draw_ib="target-model",
+        )
+        self.assertEqual(draw, "000001")
+        self.assertEqual(deform_pass["so_hash"], "shared-so")
+        self.assertEqual(via, "C")
+
+
+class TestZZMILogParserDrawIndexed(unittest.TestCase):
+    """新旧 3Dmigoto 构建的两种 indexed draw 都必须保留渲染身份。"""
+
+    def test_non_instanced_draw_indexed_is_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "log.txt"
+            log_path.write_text(
+                "000001 IASetIndexBuffer(format:R32_UINT, offset:0) hash=abcdef12\n"
+                "000001 IASetVertexBuffers(StartSlot:0, NumBuffers:1, ppVertexBuffers:0x0, pStrides:0x0, pOffsets:0x0)\n"
+                " 0: view=0x0 resource=0x0 hash=12345678\n"
+                "000001 DrawIndexed(IndexCount:6, StartIndexLocation:12, BaseVertexLocation:4)\n",
+                encoding="utf-8",
+            )
+            parser = ZZMILogParser(str(log_path))
+            self.assertEqual(parser.get_ib_hash("000001"), "abcdef12")
+            self.assertEqual(parser.get_vb_hash("000001", 0), "12345678")
+            self.assertEqual(
+                parser.draws["000001"]["draw_indexed"],
+                {"index_count": 6, "start_index": 12, "base_vertex": 4},
+            )
+
+    def test_index_buffer_binding_is_inherited_by_later_draw(self):
+        """IASetIndexBuffer 是持久状态时，后续 DrawIndexed 仍须保留 DrawIB 身份。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "log.txt"
+            log_path.write_text(
+                "000001 IASetIndexBuffer(format:R32_UINT, offset:0) hash=abcdef12\n"
+                "000001 DrawIndexed(IndexCount:6, StartIndexLocation:0, BaseVertexLocation:0)\n"
+                "000002 DrawIndexed(IndexCount:3, StartIndexLocation:6, BaseVertexLocation:0)\n",
+                encoding="utf-8",
+            )
+            parser = ZZMILogParser(str(log_path))
+            self.assertEqual(parser.get_ib_hash("000001"), "abcdef12")
+            self.assertEqual(parser.get_ib_hash("000002"), "abcdef12")
 
 
 @unittest.skipUnless(os.path.isfile(LOG_PATH) and os.path.isdir(WORKSPACE), "提取数据不在本机")
@@ -648,8 +726,9 @@ def _make_zzmi_dump_and_workspace(root: Path):
             f"{draw_index} 3DMigoto Dumping Buffer {draw_index}-vs-t0={t0}.buf "
             f"-> {deduped_abs / pal_file}",
         ]
-    for render_draw in ("000010", "000020"):
+    for render_draw, render_ib in (("000010", "aaaa1111"), ("000020", "bbbb2222")):
         lines += [
+            f"{render_draw} IASetIndexBuffer(format:R32_UINT, offset:0) hash={render_ib}",
             f"{render_draw} DrawIndexedInstanced(IndexCountPerInstance:3, InstanceCount:1, "
             "StartIndexLocation:0, BaseVertexLocation:0, StartInstanceLocation:0)",
             f"{render_draw} 3DMigoto Dumping Buffer "
@@ -775,6 +854,33 @@ class ZZMIWorkspaceCacheOnlyTests(unittest.TestCase):
         self.assertEqual(after["aaaa1111-100-0"]["SkeletonGroup"],
                          after["bbbb2222-200-0"]["SkeletonGroup"])
 
+    def test_same_ib_with_different_object_cb1_is_rejected(self):
+        """同一 IB 的多个对象实例不能共用一份合并骨架。"""
+        foreign_cb = numpy.zeros((16,), dtype=numpy.float32)
+        foreign_cb[[0, 5, 10, 15]] = 1.0
+        foreign_cb[12] = 9.0
+        (self.dump / "deduped" / "foreign_cb1.buf").write_bytes(foreign_cb.tobytes())
+        deduped_abs = (self.dump / "deduped").resolve()
+        with (self.dump / "log.txt").open("a", encoding="utf-8") as handle:
+            handle.write(
+                "000011 IASetIndexBuffer(format:R32_UINT, offset:0) hash=aaaa1111\n"
+                "000011 DrawIndexedInstanced(IndexCountPerInstance:3, InstanceCount:1, "
+                "StartIndexLocation:0, BaseVertexLocation:0, StartInstanceLocation:0)\n"
+                "000011 3DMigoto Dumping Buffer "
+                f"000011-vs-cb1=88888888-vs=aaaaaaaaaaaaaaaa.buf -> "
+                f"{deduped_abs / 'foreign_cb1.buf'}\n"
+            )
+
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertFalse(ok)
+        rejected = _read_zzmi_json(self.ws, "aaaa1111-100-0")
+        accepted = _read_zzmi_json(self.ws, "bbbb2222-200-0")
+        self.assertNotIn("VGMapAlgorithmVersion", rejected)
+        self.assertEqual(accepted.get("VGMapAlgorithmVersion"), 3)
+        self.assertIn("不同对象 CB1 实例", message)
+
     def test_dump_deleted_rebuilds_from_workspace_cache_only(self):
         ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
             workspace_root=str(self.ws), unique_str_list=self.unique_strs
@@ -820,6 +926,50 @@ class ZZMIWorkspaceCacheOnlyTests(unittest.TestCase):
         self.assertTrue(ok3, message3)
         self.assertIn("幂等跳过", message3)
 
+    def test_deleted_explicit_dump_does_not_fallback_to_latest_other_dump(self):
+        """删除已记录 dump 后，ZZMI 不得静默选当前目录的另一帧。"""
+        shutil.rmtree(self.dump)
+        latest = Path(self.tmp) / "FrameAnalysis-latest"
+        latest.mkdir()
+        with mock.patch.object(
+            _efmi.EFMISkeletonMergeHelper,
+            "resolve_frame_analysis_dir",
+            return_value=str(latest),
+        ):
+            self.assertEqual(
+                ZZMISkeletonMergeHelper.resolve_frame_analysis_dir(str(self.ws)),
+                "",
+            )
+
+    def test_legacy_cache_without_log_signature_upgrades_from_workspace_sources(self):
+        """源缓存契约完整时，旧工作区不应因缺少后来新增的日志指纹而依赖 dump。"""
+        ok1, message1 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok1, message1)
+
+        before = {}
+        for bare in ("aaaa1111-100-0", "bbbb2222-200-0"):
+            payload = _read_zzmi_json(self.ws, bare)
+            before[bare] = payload
+            self.assertIs(payload.get("ObjectCB1CacheValid"), True)
+            payload["VGMapAlgorithmVersion"] = 1
+            payload.pop("FrameAnalysisLogSignature", None)
+            _write_zzmi_json(self.ws, bare, payload)
+
+        shutil.rmtree(self.dump)
+
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        for bare in before:
+            rebuilt = _read_zzmi_json(self.ws, bare)
+            self.assertEqual(rebuilt["VGMapAlgorithmVersion"], 3)
+            self.assertEqual(rebuilt["VGMap"], before[bare]["VGMap"])
+            self.assertEqual(rebuilt["SkeletonGroup"], before[bare]["SkeletonGroup"])
+            self.assertIs(rebuilt.get("ObjectCB1CacheValid"), True)
+
     def test_clear_vgmap_then_delete_dump_rebuilds_from_workspace_cache(self):
         """用户先清理 VGMap、再删除 dump 后，ZZMI 仍应只靠工作空间缓存重建。"""
         ok1, message1 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
@@ -858,6 +1008,9 @@ class ZZMIWorkspaceCacheOnlyTests(unittest.TestCase):
         invalid_cb1.write_bytes(numpy.zeros((16,), dtype=numpy.float32).tobytes())
         deduped_abs = (self.dump / "deduped").resolve()
         with (self.dump / "log.txt").open("a", encoding="utf-8") as handle:
+            handle.write(
+                "000009 IASetIndexBuffer(format:R32_UINT, offset:0) hash=aaaa1111\n"
+            )
             handle.write(
                 "000009 DrawIndexedInstanced(IndexCountPerInstance:3, InstanceCount:1, "
                 "StartIndexLocation:0, BaseVertexLocation:0, StartInstanceLocation:0)\n"
@@ -1187,6 +1340,9 @@ class ZZMISiblingCacheTests(unittest.TestCase):
         cb = numpy.zeros((16,), dtype=numpy.float32)
         cb[[0, 5, 10, 15]] = 1.0
         (self.dump / "deduped" / "shared_cb1.buf").write_bytes(cb.tobytes())
+        foreign_cb = cb.copy()
+        foreign_cb[12] = 9.0  # 另一 IB 的对象空间，不能污染 aaaa1111
+        (self.dump / "deduped" / "foreign_cb1.buf").write_bytes(foreign_cb.tobytes())
 
         lines = []
         for draw_index, vb0, so, t0, pal_file in parts:
@@ -1201,8 +1357,16 @@ class ZZMISiblingCacheTests(unittest.TestCase):
                 f"{draw_index} 3DMigoto Dumping Buffer {draw_index}-vs-t0={t0}.buf "
                 f"-> {deduped_abs / pal_file}",
             ]
-        for render_draw in ("000010", "000020"):
+        lines += [
+            "000000 IASetIndexBuffer(format:R32_UINT, offset:0) hash=foreignmodel",
+            "000000 DrawIndexedInstanced(IndexCountPerInstance:3, InstanceCount:1, "
+            "StartIndexLocation:0, BaseVertexLocation:0, StartInstanceLocation:0)",
+            f"000000 3DMigoto Dumping Buffer 000000-vs-cb1=66666666-vs=aaaaaaaaaaaaaaaa.buf "
+            f"-> {deduped_abs / 'foreign_cb1.buf'}",
+        ]
+        for render_draw, render_ib in (("000010", "aaaa1111"), ("000020", "bbbb2222")):
             lines += [
+                f"{render_draw} IASetIndexBuffer(format:R32_UINT, offset:0) hash={render_ib}",
                 f"{render_draw} DrawIndexedInstanced(IndexCountPerInstance:3, InstanceCount:1, "
                 "StartIndexLocation:0, BaseVertexLocation:0, StartInstanceLocation:0)",
                 f"{render_draw} 3DMigoto Dumping Buffer "
@@ -1237,7 +1401,7 @@ class ZZMISiblingCacheTests(unittest.TestCase):
                 numpy.array([0], dtype=numpy.uint32).tobytes()
             )
             render_draw = "000010" if bare.startswith("aaaa1111") else "000020"
-            component_map[bare] = [render_draw]
+            component_map[bare] = (["000000", render_draw] if bare.startswith("aaaa1111") else [render_draw])
             import_map[f"LOD0.{bare}"] = gametype
         (self.ws / "Import.json").write_text(json.dumps(import_map), encoding="utf-8")
         (self.ws / "LOD0" / "ComponentName_DrawCallIndexList.json").write_text(

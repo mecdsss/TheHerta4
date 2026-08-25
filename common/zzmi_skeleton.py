@@ -8,7 +8,8 @@ ZZMI（绝区零）骨骼合并支持模块
 - 工作空间子网格 json 自带 join 线索：
   `CategoryHash.Position` == deform pass 的 vb0 资源 hash（路径 A）；
   `VertexLimitVB` == deform pass 的 SO 输出资源 hash（路径 B）；
-  兜底用 `LOD0/ComponentName_DrawCallIndexList.json` 的渲染 draw -> vb0 -> SO（路径 C）。
+  兜底用 `LOD0/ComponentName_DrawCallIndexList.json` 的渲染 draw（先按目标 IB 门控）
+  -> vb0 -> SO（路径 C）。
 
 去重规则（用户拍板 + 实测修正）：
 - **同一部件内部绝不去重合并**（同部件索引为提取端权威分配，实测内部零重复）；
@@ -36,6 +37,7 @@ ZZMI（绝区零）骨骼合并支持模块
 - palette buf 复制到 `<子网格>/ModImpRuntime/<bare>-BoneMatrix.buf`（NTEMI/EFMI 缓存模式）。
 """
 
+import hashlib
 import os
 import re
 
@@ -49,7 +51,13 @@ _BONE_MATRIX_FLOATS = 12
 
 # ZZMI 骨骼合并缓存算法版本：快路径幂等判定必须与本版本一致；
 # 策略变更时递增，旧缓存会自动整批重建（同 EFMI 的 VGMapAlgorithmVersion 机制）。
-_ZZMI_VG_MAP_ALGORITHM_VERSION = 1
+# v2：路径 C 与 CB1 分组均加入目标 DrawIB 门控，旧缓存可能已串入相似模型，
+# 必须整批重建以清除污染。
+# v3：拒绝同一 DrawIB 对应多个对象 CB1 实例的歧义缓存；这类 IB 可能同时被
+# 多个相似模型绘制，继续共用一套全局骨架会把修改写入其它实例。
+_ZZMI_VG_MAP_ALGORITHM_VERSION = 3
+# 导出侧也需要知道当前缓存口径，不能只依赖导入阶段的幂等门控。
+ZZMI_VG_MAP_ALGORITHM_VERSION = _ZZMI_VG_MAP_ALGORITHM_VERSION
 
 
 class ZZMILogParser:
@@ -69,6 +77,10 @@ class ZZMILogParser:
     _DRAW_INDEXED_RE = re.compile(
         r"^DrawIndexedInstanced\(IndexCountPerInstance:(\d+), InstanceCount:(\d+), "
         r"StartIndexLocation:(\d+), BaseVertexLocation:(\d+), StartInstanceLocation:(\d+)\)$"
+    )
+    _DRAW_INDEXED_SINGLE_RE = re.compile(
+        r"^DrawIndexed\(IndexCount:(\d+), StartIndexLocation:(\d+), "
+        r"BaseVertexLocation:(\d+)\)$"
     )
     _IA_VB_RE = re.compile(r"^IASetVertexBuffers\(StartSlot:(\d+), NumBuffers:(\d+),")
     _IA_IB_RE = re.compile(r"^IASetIndexBuffer\(.*\) hash=([0-9a-f]{8})$")
@@ -117,6 +129,9 @@ class ZZMILogParser:
         # 任何带 draw 前缀的行都会重置/重设 pending；无前缀的资源描述行被当前 pending 消费。
         pending = None
         pending_draw = ""
+        # IASetIndexBuffer 与其它 IA 状态一样可以跨 DrawIndexed 持久生效。
+        # 记录最近一次绑定，供没有重复绑定行的后续 render draw 继承。
+        current_ib_hash = ""
 
         with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -158,7 +173,8 @@ class ZZMILogParser:
                 # 索引缓冲绑定（同行 hash）
                 ib_match = self._IA_IB_RE.match(payload)
                 if ib_match:
-                    self._get_draw(draw_index)["ib"] = ib_match.group(1)
+                    current_ib_hash = ib_match.group(1)
+                    self._get_draw(draw_index)["ib"] = current_ib_hash
                     continue
 
                 # Stream-Out 目标绑定（内容行跟随）
@@ -188,10 +204,27 @@ class ZZMILogParser:
                 # 渲染 draw
                 indexed_match = self._DRAW_INDEXED_RE.match(payload)
                 if indexed_match:
-                    self._get_draw(draw_index)["draw_indexed"] = {
+                    info = self._get_draw(draw_index)
+                    if not info.get("ib") and current_ib_hash:
+                        info["ib"] = current_ib_hash
+                    info["draw_indexed"] = {
                         "index_count": int(indexed_match.group(1)),
                         "start_index": int(indexed_match.group(3)),
                         "base_vertex": int(indexed_match.group(4)),
+                    }
+                    continue
+
+                # 部分 ZZZ/3Dmigoto 构建使用非 Instanced 形式；IB/VB 绑定仍然
+                # 是同一套渲染身份信息，不能因为 draw 调用形式不同就丢掉它。
+                indexed_single_match = self._DRAW_INDEXED_SINGLE_RE.match(payload)
+                if indexed_single_match:
+                    info = self._get_draw(draw_index)
+                    if not info.get("ib") and current_ib_hash:
+                        info["ib"] = current_ib_hash
+                    info["draw_indexed"] = {
+                        "index_count": int(indexed_single_match.group(1)),
+                        "start_index": int(indexed_single_match.group(2)),
+                        "base_vertex": int(indexed_single_match.group(3)),
                     }
                     continue
 
@@ -219,6 +252,27 @@ class ZZMILogParser:
     def get_vb_hash(self, draw_index: str, slot: int) -> str:
         info = self.draws.get(draw_index)
         return info["vb"].get(slot, "") if info else ""
+
+    def get_ib_hash(self, draw_index: str) -> str:
+        """返回渲染 draw 绑定的 IB hash（用于路径 C 的 DrawIB 门控）。"""
+        info = self.draws.get(draw_index)
+        return str(info.get("ib", "") or "").strip().lower() if info else ""
+
+    def get_render_draw_indices_for_ib(self, draw_ib: str) -> list[str]:
+        """返回当前 dump 中绑定目标 IB 的 indexed render draw。
+
+        工作空间的 ComponentName_DrawCallIndexList 可能来自另一帧；当它过期时，
+        仍应以当前 log 的 IB hash 反查对象 CB1，而不是静默回退到旧实例缓存。
+        """
+        expected = str(draw_ib or "").strip().lower()
+        if not expected:
+            return []
+        return sorted(
+            draw_index
+            for draw_index, info in self.draws.items()
+            if info.get("draw_indexed") is not None
+            and str(info.get("ib", "") or "").strip().lower() == expected
+        )
 
     def _deduped_candidates(self, dst_path: str | None) -> list[str]:
         """生成 deduped 候选路径：log 记录的原路径 + dump 目录 deduped/ 下的同名文件。"""
@@ -310,12 +364,18 @@ class ZZMIDeformResolver:
         position_hash: str = "",
         vertex_limit_hash: str = "",
         render_draw_indices: list[str] | None = None,
+        expected_draw_ib: str = "",
     ) -> tuple[str, dict, str]:
         """返回 (draw_index, deform_pass, 命中路径"A"/"B"/"C")；未命中返回 ("", None, "")。
 
         - 路径 A：子网格 json CategoryHash.Position == deform vb0 hash（最直接）；
         - 路径 B：子网格 json VertexLimitVB == deform SO 输出 hash；
-        - 路径 C：渲染 draw（ComponentName_DrawCallIndexList.json）的 vb0 == SO 输出 hash。
+        - 路径 C：渲染 draw（ComponentName_DrawCallIndexList.json）的 vb0 == SO 输出 hash，
+          且 IASetIndexBuffer == 目标 DrawIB。
+
+        路径 C 是兜底路径，映射列表可能来自不同帧或包含相似模型的 draw；只按
+        SO/vb0 hash 会把另一个模型的 deform pass 归给当前子网格。生产调用必须传入
+        目标 DrawIB，先做 IB 门控再做 SO hash join。
         """
         position_hash = str(position_hash or "").strip().lower()
         if position_hash and position_hash in self.by_vb0:
@@ -327,7 +387,14 @@ class ZZMIDeformResolver:
             draw_index, deform_pass = self.by_so[vertex_limit_hash]
             return draw_index, deform_pass, "B"
 
+        expected_draw_ib = str(expected_draw_ib or "").strip().lower()
+        if not expected_draw_ib:
+            # 路径 C 没有其它能确认模型身份的可靠键；宁可不生成，也不能
+            # 在相似模型之间按 SO/vb0 hash 猜一个 deform pass。
+            return "", None, ""
         for render_draw in render_draw_indices or []:
+            if self.parser.get_ib_hash(render_draw) != expected_draw_ib:
+                continue
             vb0_hash = self.parser.get_vb_hash(render_draw, 0)
             if vb0_hash and vb0_hash in self.by_so:
                 draw_index, deform_pass = self.by_so[vb0_hash]
@@ -501,9 +568,44 @@ class ZZMIBoneMapBuilder:
 class ZZMISkeletonMergeHelper:
     """ZZMI 骨骼合并总流程：定位 FrameAnalysis -> 解析 log -> 反查 deform pass -> 去重 -> 写回工作空间。"""
 
-    resolve_frame_analysis_dir = staticmethod(
-        EFMISkeletonMergeHelper.resolve_frame_analysis_dir
-    )
+    @staticmethod
+    def _configured_frame_analysis_paths(workspace_root: str) -> list[str]:
+        """读取 ZZMI 工作区显式记录的 FrameAnalysis 路径。"""
+        paths: list[str] = []
+        config_path = os.path.join(workspace_root, "Config", "FrameAnalysisPath.json")
+        if os.path.isfile(config_path):
+            try:
+                payload = JsonUtils.LoadFromFile(config_path)
+                path = str(payload.get("frameAnalysisFolderPath", "") or "").strip()
+                if path:
+                    paths.append(path)
+            except Exception:
+                pass
+
+        tabs_dir = os.path.join(workspace_root, "Config", "Tabs")
+        if os.path.isdir(tabs_dir):
+            for tab_file in sorted(os.listdir(tabs_dir)):
+                if not tab_file.startswith("ws-tab-") or not tab_file.endswith(".json"):
+                    continue
+                try:
+                    payload = JsonUtils.LoadFromFile(os.path.join(tabs_dir, tab_file))
+                    path = str(payload.get("frameAnalysisFolderPath", "") or "").strip()
+                    if path:
+                        paths.append(path)
+                except Exception:
+                    continue
+        return paths
+
+    @classmethod
+    def resolve_frame_analysis_dir(cls, workspace_root: str) -> str:
+        """定位 ZZMI 的 FrameAnalysis；显式失效路径不自动偷换成另一帧。"""
+        configured_paths = cls._configured_frame_analysis_paths(workspace_root)
+        if configured_paths and not any(os.path.isdir(path) for path in configured_paths):
+            # 工作区已经记录过提取源，但该源被用户删除/搬走：优先使用导入时
+            # 搬进 ModImpRuntime 的 palette/ObjectCB1 缓存，不能从当前游戏目录
+            # 随便挑一个最新 FrameAnalysis，尤其不能把相似模型的 CB1 混进来。
+            return ""
+        return EFMISkeletonMergeHelper.resolve_frame_analysis_dir(workspace_root)
     _resolve_submesh_json_path = staticmethod(
         EFMISkeletonMergeHelper._resolve_submesh_json_path
     )
@@ -634,6 +736,7 @@ class ZZMISkeletonMergeHelper:
           （缺键或规范化重复键会让导入/导出映射口径不一致）；
         - BoneMatrixFileName 指向的 ModImpRuntime 文件存在且大小
           >= VGCount * 48 字节（每骨骼 4x3 float32）。
+        - 有当前 dump 时，FrameAnalysisLogSignature 必须与 log.txt 内容一致。
         """
         def _strict_int(value) -> int:
             if isinstance(value, bool):
@@ -707,6 +810,15 @@ class ZZMISkeletonMergeHelper:
             return False
         return True
 
+    @staticmethod
+    def _frame_analysis_log_signature(log_path: str) -> str:
+        """返回当前 FrameAnalysis/log.txt 的内容指纹，用于缓存源一致性校验。"""
+        digest = hashlib.sha256()
+        with open(log_path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
     @classmethod
     def _zzmi_source_cache_intact(
         cls,
@@ -755,6 +867,7 @@ class ZZMISkeletonMergeHelper:
         log_path = os.path.join(frame_analysis_dir, "log.txt") if frame_analysis_dir else ""
         parser = None
         resolver = None
+        frame_analysis_signature = ""
         if frame_analysis_dir:
             if not os.path.isfile(log_path):
                 print(
@@ -764,6 +877,7 @@ class ZZMISkeletonMergeHelper:
             else:
                 parser = ZZMILogParser(log_path)
                 resolver = ZZMIDeformResolver(parser)
+                frame_analysis_signature = cls._frame_analysis_log_signature(log_path)
                 if not resolver.passes:
                     print(
                         "[ZZMI骨骼合并] 提示: FrameAnalysis log 中未识别到 deform pass，"
@@ -853,6 +967,12 @@ class ZZMISkeletonMergeHelper:
             if (
                 cache_intact
                 and parser is not None
+                and submesh_json.get("FrameAnalysisLogSignature") != frame_analysis_signature
+            ):
+                cache_intact = False
+            if (
+                cache_intact
+                and parser is not None
                 and not cls._zzmi_source_cache_intact(
                     submesh_json, json_path, unique_str
                 )
@@ -881,6 +1001,8 @@ class ZZMISkeletonMergeHelper:
 
         # 第二遍：逐组反查 deform pass -> palette，读取 Blend.buf 得 vg_count
         for draw_ib, group in groups.items():
+            if group.get("skip_reason") and parser is None:
+                continue
             representative = group["representative"]
             json_path = group["json_paths"][representative]
             submesh_json = JsonUtils.LoadFromFile(json_path)
@@ -898,6 +1020,16 @@ class ZZMISkeletonMergeHelper:
             render_draws = role_mapping.get(
                 os.path.basename(os.path.dirname(os.path.dirname(json_path))), []
             )
+            parser_render_draws_for_ib = []
+            if parser is not None:
+                # 组件索引表可能仍指向上一帧；当前 log 的 IB hash 才是本次
+                # CB1/实例判定的权威来源。合并两者，旧索引在后续 IB 门控中会
+                # 自动被过滤；新索引则能发现同一 IB 的多个对象实例。
+                parser_render_draws_for_ib = parser.get_render_draw_indices_for_ib(draw_ib)
+                render_draws = sorted(
+                    set(render_draws)
+                    | set(parser_render_draws_for_ib)
+                )
 
             draw_index, deform_pass, via = "", None, ""
             if resolver is not None:
@@ -905,6 +1037,7 @@ class ZZMISkeletonMergeHelper:
                     position_hash=position_hash,
                     vertex_limit_hash=vertex_limit_hash,
                     render_draw_indices=render_draws,
+                    expected_draw_ib=draw_ib,
                 )
 
             palette_logical = ""
@@ -1116,7 +1249,13 @@ class ZZMISkeletonMergeHelper:
             cb1_path = ""
             dump_cb1_seen = False
             first_dump_cb1_path = ""
+            dump_transform_candidates = []
             for render_draw in sorted(render_draws):
+                # ComponentName 映射可能包含相似模型的渲染 draw；CB1 是对象空间分组键，
+                # 不能只按 draw 序号/文件存在就采纳，否则当前部件会被搬进别的模型的
+                # SkeletonGroup。只有该渲染 draw 明确绑定目标 DrawIB 时才允许参与分组。
+                if parser is not None and parser.get_ib_hash(render_draw) != draw_ib:
+                    continue
                 candidate = parser.get_render_cb1_path(render_draw) if parser is not None else None
                 if candidate:
                     dump_cb1_seen = True
@@ -1124,14 +1263,45 @@ class ZZMISkeletonMergeHelper:
                         first_dump_cb1_path = candidate
                     transform = ZZMIBoneMapBuilder.parse_object_transform(candidate)
                     if transform is not None:
-                        group["transform"] = transform
-                        # 必须缓存“实际用于分组”的同一个有效 CB1。旧实现先记住
-                        # 首个候选，即使它无效、后续候选才有效，也会把首个坏文件
-                        # 发布到工作空间，导致删 dump 后 SkeletonGroup 改变。
-                        cb1_path = candidate
-                        group["cb1_cache_valid"] = True
-                        break
-            if group["transform"] is None and not dump_cb1_seen:
+                        dump_transform_candidates.append((transform, candidate))
+
+            # 一个 DrawIB 可能在同一帧被多个实例绘制；它们的 IB/VB hash 相同，
+            # 但对象 CB1 不同。旧实现无条件取第一个 CB1，随后把所有实例当成
+            # 一个 SkeletonGroup，导出时修改其中一个实例会污染另一个。没有额外
+            # 的实例选择键时，安全策略是拒绝该 DrawIB 的合并缓存，而不是猜一个。
+            unique_dump_transforms = {}
+            for transform, candidate in dump_transform_candidates:
+                unique_dump_transforms.setdefault(transform, candidate)
+            if len(unique_dump_transforms) > 1:
+                group["skip_reason"] = (
+                    f"同一 DrawIB 对应 {len(unique_dump_transforms)} 个不同对象 CB1 实例，"
+                    "无法安全确定目标模型；请使用只包含单个实例的 FrameAnalysis"
+                )
+                group["palette"] = None
+                group["cb1_path"] = ""
+                group["cb1_cache_valid"] = False
+                print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: {group['skip_reason']}")
+                continue
+            if unique_dump_transforms:
+                # 必须缓存“实际用于分组”的同一个有效 CB1。旧实现先记住首个
+                # 候选，即使后续候选才有效，也会把错误实例的 CB1 发布到工作空间。
+                group["transform"], cb1_path = next(iter(unique_dump_transforms.items()))
+                group["cb1_cache_valid"] = True
+            if (
+                group["transform"] is None
+                and parser is not None
+                and parser_render_draws_for_ib
+                and cb1_cache_required
+                and not dump_cb1_seen
+            ):
+                group["skip_reason"] = (
+                    "当前 FrameAnalysis 命中了目标 IB，但没有可用对象 CB1；"
+                    "不能回退到其它帧的 ObjectCB1 对象实例缓存"
+                )
+                group["palette"] = None
+                print(f"[ZZMI骨骼合并] 跳过 {draw_ib}: {group['skip_reason']}")
+                continue
+            if group["transform"] is None and not dump_cb1_seen and parser is None:
                 for member_cb1 in cb1_cache_paths:
                     transform = ZZMIBoneMapBuilder.parse_object_transform(member_cb1)
                     if transform is not None:
@@ -1258,6 +1428,8 @@ class ZZMISkeletonMergeHelper:
                 submesh_json["VGMap"] = {str(k): int(v) for k, v in sorted(vg_map.items())}
                 # 算法版本：快路径幂等判定依据；策略变更时递增版本使旧缓存自动失效
                 submesh_json["VGMapAlgorithmVersion"] = _ZZMI_VG_MAP_ALGORITHM_VERSION
+                if frame_analysis_signature:
+                    submesh_json["FrameAnalysisLogSignature"] = frame_analysis_signature
                 # 骨架分组（渲染 cb1 对象变换配对）：导出侧把 deform pass 换绑到本组
                 # ResourceZZMergedSkeleton_G<N>；VGMap/VGOffset 为全局骨骼编号（组基址拼接）
                 submesh_json["SkeletonGroup"] = skeleton_group

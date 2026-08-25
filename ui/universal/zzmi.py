@@ -14,6 +14,13 @@ from ...utils.json_utils import JsonUtils
 from ...utils.timer_utils import TimerUtils
 from .unity import ExportUnity
 
+# 导出模块在 Blender 启动时可以直接读取反查模块的版本；轻量 fake/旧插件环境
+# 可能未加载该模块，使用同一当前版本常量仍保持“陈旧缓存拒绝”这一安全默认。
+try:
+    from ...common.zzmi_skeleton import ZZMI_VG_MAP_ALGORITHM_VERSION
+except Exception:  # pragma: no cover - 仅兼容无完整 Blender 依赖的导入环境
+    ZZMI_VG_MAP_ALGORITHM_VERSION = 3
+
 
 class ZZMITextureMarkName:
     DiffuseMap = "DiffuseMap"
@@ -232,15 +239,37 @@ class ExportZZMI(ExportUnity):
             except Exception:
                 continue
             obj = bpy.data.objects.get(obj_name) if obj_name else None
+            if obj is None or obj.get("ZZMI_STUB"):
+                continue
             mesh = getattr(obj, "data", None) if obj is not None else None
             vertices = getattr(mesh, "vertices", None)
             if vertices is None:
                 continue
             for vertex in vertices:
                 for group_elem in vertex.groups:
-                    if group_elem.weight > 0:
-                        used.add(group_elem.group)
+                    if group_elem.weight <= 0:
+                        continue
+                    try:
+                        group_index = int(group_elem.group)
+                        group_name = str(obj.vertex_groups[group_index].name).strip()
+                    except (AttributeError, IndexError, TypeError, ValueError):
+                        continue
+                    if group_name.isdigit():
+                        used.add(int(group_name))
         return used
+
+    def _build_shader_replace_base_vertex_map(self) -> dict[int, int]:
+        """返回重定向 DrawCall 身份到 base_vertex 的映射。"""
+        base_vertex_map: dict[int, int] = {}
+        for carrier_ib, redirect_info in (self._redirect_carrier_map or {}).items():
+            base_vertex = int(redirect_info.get("base_vertex", 0) or 0)
+            for drawib_model in self.drawib_model_list:
+                if drawib_model.draw_ib != carrier_ib:
+                    continue
+                for submesh_model in getattr(drawib_model, "submesh_model_list", []) or []:
+                    for draw_call in getattr(submesh_model, "drawcall_model_list", []) or []:
+                        base_vertex_map[id(draw_call)] = base_vertex
+        return base_vertex_map
 
 
     def _create_stub_object(self, bare_unique_str: str) -> str:
@@ -309,6 +338,18 @@ class ExportZZMI(ExportUnity):
                     continue
                 vg_count = int(getattr(submesh_model, "vg_count", 0) or 0)
                 if vg_count <= 0:
+                    continue
+                cache_version = getattr(submesh_model, "vg_map_algorithm_version", None)
+                if (
+                    cache_version is not None
+                    and int(cache_version or 0) != ZZMI_VG_MAP_ALGORITHM_VERSION
+                ):
+                    print(
+                        f"[ZZMI骨骼合并] 警告 {drawib_model.draw_ib}: "
+                        f"VGMap 缓存版本 {cache_version} != 当前版本 "
+                        f"{ZZMI_VG_MAP_ALGORITHM_VERSION}，拒绝导出该部件；"
+                        "请先用当前 FrameAnalysis，或仅凭工作区缓存，重新一键导入"
+                    )
                     continue
                 # 导出侧防线：VGMap 必须完整覆盖 0..vg_count-1 且槽位非负。
                 # 缓存正常时由 ensure_skeleton_data 保证；此处兜底拦截陈旧/被
@@ -388,12 +429,19 @@ class ExportZZMI(ExportUnity):
     def _get_submesh_ib_key(self, submesh_model, draw_ib):
         return f"{draw_ib}_{submesh_model.match_first_index}"
 
-    def _append_drawindexed_with_shader_replace(self, section, drawcall_list, draw_offset_dict):
-        """将 drawcall 列表写入 section，对着色器替换物体使用条件运行逻辑替代 drawindexed。"""
+    def _append_drawindexed_with_shader_replace(
+        self, section, drawcall_list, draw_offset_dict, base_vertex=0
+    ):
+        """将 drawcall 列表写入 section，对着色器替换物体使用条件运行逻辑替代 drawindexed。
+
+        ``base_vertex`` 用于合并网格自动重定向。保持普通绘制的同一输出路径，
+        因此重定向绘制也会生成 mesh 注释、条件块和 shader-replace 逻辑。
+        """
         if not self.has_shader_replace:
-            for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
-                drawcall_list, obj_name_draw_offset_dict=draw_offset_dict,
-            ):
+            drawindexed_kwargs = {"obj_name_draw_offset_dict": draw_offset_dict}
+            if base_vertex:
+                drawindexed_kwargs["base_vertex"] = base_vertex
+            for drawindexed_str in M_IniHelper.get_drawindexed_str_list(drawcall_list, **drawindexed_kwargs):
                 section.append(drawindexed_str)
             return
 
@@ -411,10 +459,10 @@ class ExportZZMI(ExportUnity):
         ]
         for dc, obj_infos in resolved_drawcalls:
             if not obj_infos:
-                for drawindexed_str in M_IniHelper.get_drawindexed_str_list(
-                    [dc],
-                    obj_name_draw_offset_dict=draw_offset_dict,
-                ):
+                drawindexed_kwargs = {"obj_name_draw_offset_dict": draw_offset_dict}
+                if base_vertex:
+                    drawindexed_kwargs["base_vertex"] = base_vertex
+                for drawindexed_str in M_IniHelper.get_drawindexed_str_list([dc], **drawindexed_kwargs):
                     section.append(drawindexed_str)
                 continue
 
@@ -438,6 +486,7 @@ class ExportZZMI(ExportUnity):
                     info.get('component_index', 0),
                     dc.index_count,
                     draw_offset,
+                    base_vertex,
                 )
                 for line in run_lines:
                     section.append(f"{indent}{line}")
@@ -635,29 +684,34 @@ class ExportZZMI(ExportUnity):
 
             draw_category_name = d3d11_game_type.CategoryDrawCategoryDict.get("Blend", None)
             if draw_category_name is not None and category_name == draw_category_name:
-                # ZZMI 骨骼合并（零延迟逐 pass attach，2026-08-25 定案）：
-                # 1. deform draw 前把当帧 palette **copy** 成持久资源 ResourceZZPalette_<DrawIB>
-                #    （ring buffer 同帧内会被后续 pass 重写，别名撑不到帧尾）；
-                # 2. **立即 run attach CS**：按 vg_map 表把当帧 palette 写入本组骨架
-                #    （本部件引用的骨骼——含跨部件共享 canonical——此刻即为当帧，
-                #    与渲染侧当帧绑定矩阵 vs-cb2 一致，杜绝慢一帧错位）；
-                # 3. vs-t0 换绑为本组骨架后 draw 蒙皮（读当帧姿态）。
-                #    （渲染侧存在当帧角色级绑定表 vs-cb2（身体正向+头部逆向，每帧
-                #    Map 更新）——"慢一帧"SO × 当帧绑定 = 运动时错位，已废弃。）
+                # ZZMI 骨骼合并：deform draw 前把当帧 palette copy 成持久资源，
+                # 立即 attach 到本组骨架，并记录该部件本帧已到达。合并网格的
+                # 可见 draw 由依赖就绪守卫控制，避免目标先到时读取半成品骨架。
                 merged_component = self.merged_skeleton_component_id_dict.get(draw_ib)
                 component = (
                     self.merged_skeleton_components[merged_component]
                     if merged_component is not None else None
                 )
                 if component is not None:
+                    component_id = int(merged_component)
+                    skeleton_group = int(component["skeleton_group"])
+                    seen_var = f"$zz_ms_seen_c{component_id}"
                     texture_override_vb_section.append(
                         f"ResourceZZPalette_{draw_ib} = copy vs-t0 unless_null"
                     )
                     texture_override_vb_section.append(
-                        f"run = CustomShaderZZMIMergedSkeletonAttach_C{merged_component}"
+                        f"run = CustomShaderZZMIMergedSkeletonAttach_C{component_id}"
                     )
+                    texture_override_vb_section.append(f"{seen_var} = 1")
                     texture_override_vb_section.append(
-                        f"vs-t0 = ResourceZZMergedSkeleton_G{component['skeleton_group']}"
+                        f"vs-t0 = ResourceZZMergedSkeleton_G{skeleton_group}"
+                    )
+                redirect_target_plan = self._redirect_target_map.get(draw_ib)
+                if redirect_target_plan is not None:
+                    # target 先到时保存其真实 SO 输出资源；后到的依赖挂点会把
+                    # 合并 deform draw 明确回写到这块 target SO，而非 carrier SO。
+                    texture_override_vb_section.append(
+                        f"ResourceZZRedirectSO_{draw_ib} = ref so0"
                     )
                 texture_override_vb_section.append("handling = skip")
 
@@ -665,24 +719,48 @@ class ExportZZMI(ExportUnity):
                 # （保留 copy palette + attach 写当帧骨骼）；target 的 deform 追加
                 # 画重定向的合并网格（绑定 carrier 的 vb0/vb2，SO 按序拼接）。
                 redirect_carrier = self._redirect_carrier_map.get(draw_ib)
-                redirect_target_plan = self._redirect_target_map.get(draw_ib)
                 if redirect_carrier is not None:
                     texture_override_vb_section.append("draw = 3, 0")
                 elif redirect_target_plan is not None:
-                    if redirect_target_plan.get("target_own_vertices", 0) > 0:
-                        texture_override_vb_section.append(
-                            "draw = " + str(redirect_target_plan["target_own_vertices"]) + ", 0"
-                        )
-                    for vb0_resource, vb2_resource, draw_count in redirect_target_plan.get(
-                        "deform_draws", []
-                    ):
-                        texture_override_vb_section.append("vb2 = " + vb2_resource)
-                        texture_override_vb_section.append("vb0 = " + vb0_resource)
-                        texture_override_vb_section.append("draw = " + str(draw_count) + ", 0")
+                    pass  # target 自身几何也在 guarded target-SO 重放中统一绘制
                 else:
                     texture_override_vb_section.append(
                         "draw = " + str(drawib_model.draw_number) + ", 0"
                     )
+
+                # 合并网格的可见几何不再固定在 target 的 deform 顺序上：
+                # 所有依赖组件挂点都尝试，但只有依赖 palette 全部当帧 attach 后
+                # 的第一个挂点真正 draw。无论当前是 target 还是 carrier，都把
+                # SO 明确绑回已捕获的 target SO，渲染侧数据源保持不变。
+                deferred_plans = [
+                    (target_ib, plan)
+                    for target_ib, plan in self._redirect_target_map.items()
+                    if merged_component is not None
+                    and int(merged_component) in plan.get("required_component_ids", [])
+                ]
+                for deferred_target_ib, deferred_plan in deferred_plans:
+                    required_ids = deferred_plan.get("required_component_ids", [])
+                    all_seen = " && ".join(
+                        f"$zz_ms_seen_c{cid} == 1" for cid in required_ids
+                    )
+                    drawn_var = f"$zz_ms_redirect_drawn_{deferred_target_ib}"
+                    texture_override_vb_section.append(
+                        f"if {all_seen} && {drawn_var} == 0"
+                    )
+                    texture_override_vb_section.append(f"    {drawn_var} = 1")
+                    texture_override_vb_section.append(
+                        f"    so0 = ref ResourceZZRedirectSO_{deferred_target_ib}"
+                    )
+                    for vb0_resource, vb2_resource, draw_count in deferred_plan.get(
+                        "deform_draws", []
+                    ):
+                        texture_override_vb_section.append("    vb2 = " + vb2_resource)
+                        texture_override_vb_section.append("    vb0 = " + vb0_resource)
+                        texture_override_vb_section.append(
+                            "    draw = " + str(draw_count) + ", 0"
+                        )
+                    texture_override_vb_section.append("    so0 = null")
+                    texture_override_vb_section.append("endif")
                 for so0_source_resource_name in so0_source_resource_names:
                     texture_override_vb_section.append(so0_source_resource_name + " = ref so0")
 
@@ -789,7 +867,7 @@ class ExportZZMI(ExportUnity):
     def _warn_cross_group_bone_references(self):
         """禁止跨组别骨骼合并（无校准模式）守卫：逐部件校验引用骨骼都在本组内。
 
-        无 CB1 校准的运行时，每组骨架只写入本组骨骼（[Present] 直拷 attach）；
+        无 CB1 校准的运行时，每组骨架只在 deform pass 直拷本组骨骼；
         顶点引用其它组的骨骼 id 时，对应槽位永远不会被写入 = 原点塌陷。
         检出即大声报警（列出越界骨骼 id 与归属组），不中断导出——
         与 _warn_missing_drawib_parts 同款"让用户看见"口径。
@@ -997,6 +1075,10 @@ class ExportZZMI(ExportUnity):
         groups: dict[int, list[dict]] = {}
         for component in self.merged_skeleton_components:
             groups.setdefault(int(component["skeleton_group"]), []).append(component)
+        component_id_by_draw_ib = {
+            component["draw_ib"]: component_id
+            for component_id, component in enumerate(self.merged_skeleton_components)
+        }
 
         for skeleton_group, components in groups.items():
             legal: set[int] = set()
@@ -1066,8 +1148,39 @@ class ExportZZMI(ExportUnity):
             # target 的 SO 布局：[target 真实几何][carrier1 merged][carrier2 merged]...
             base_vertex = target_own_vertices
             deform_draws = []
+            if target_own_vertices > 0:
+                deform_draws.append((
+                    f"Resource{target_ib}Position",
+                    f"Resource{target_ib}Blend",
+                    target_own_vertices,
+                ))
             so_total = target_own_vertices
+            # 合并几何真正依赖哪些当帧 palette：至少包括所有 carrier，另外
+            # 把 carrier 顶点实际引用的全局骨骼所属部件也纳入守卫。这样 target
+            # 先到时不会读取半成品；最后一个依赖部件到达的 deform 挂点负责 draw。
+            slot_owner: dict[int, int] = {}
+            for component_id, component in enumerate(self.merged_skeleton_components):
+                if int(component["skeleton_group"]) != int(skeleton_group):
+                    continue
+                for bone_id in range(
+                    int(component["vg_offset"]),
+                    int(component["vg_offset"]) + int(component["vg_count"]),
+                ):
+                    slot_owner.setdefault(bone_id, component_id)
+            required_component_ids: set[int] = set()
+            target_component_id = component_id_by_draw_ib.get(target_ib)
+            if target_component_id is not None:
+                # target 的 deform 段负责捕获 ResourceZZRedirectSO_<target>；
+                # 没有它就绪，carrier 即使其它 palette 都到齐也不能回放。
+                required_component_ids.add(target_component_id)
             for carrier in carriers:
+                carrier_component_id = component_id_by_draw_ib.get(carrier["draw_ib"])
+                if carrier_component_id is not None:
+                    required_component_ids.add(carrier_component_id)
+                for bone_id in self._collect_drawib_referenced_bone_ids(carrier["draw_ib"]):
+                    owner_id = slot_owner.get(bone_id)
+                    if owner_id is not None:
+                        required_component_ids.add(owner_id)
                 deform_draws.append((
                     f"Resource{carrier['draw_ib']}Position",
                     f"Resource{carrier['draw_ib']}Blend",
@@ -1085,6 +1198,19 @@ class ExportZZMI(ExportUnity):
                 "deform_draws": deform_draws,
                 "so_vertex_count": so_total,
                 "target_own_vertices": target_own_vertices,
+                "required_component_ids": sorted(required_component_ids),
+                "so_stride": next(
+                    (
+                        int(
+                            drawib_model.d3d11GameType.CategoryStrideDict.get(
+                                "Position", 40
+                            )
+                        )
+                        for drawib_model in self.drawib_model_list
+                        if drawib_model.draw_ib == target_ib
+                    ),
+                    40,
+                ),
             }
             print(
                 f"[ZZMI骨骼合并] 合并网格自动重定向: "
@@ -1097,39 +1223,32 @@ class ExportZZMI(ExportUnity):
         return carrier_map, target_map, unredirected
 
     def add_merged_skeleton_sections(self, ini_builder: M_IniBuilder):
-        """生成 ZZMI 合并骨架段（组内统一骨架版：全局骨骼编号 + 零延迟逐 pass attach）。
+        """生成 ZZMI 合并骨架段（组内统一骨架版：全局骨骼编号 + 逐 pass attach）。
 
         架构（2026-08-24 用户拍板分组；2026-08-25 用户拍板**移除 CB1 校准**；
-        2026-08-25 定案**零延迟逐 pass attach**，详见计划书）：
+        2026-08-26 增加合并可见 draw 的依赖就绪守卫，详见计划书）：
         - 骨骼 id = 全局编号（组基址拼接组内槽位）；Blender 侧组内 join 无歧义。
         - 每组一套**全宽**合并骨架 `ResourceZZMergedSkeleton_G<N>`（array = 全局
           max(vg_offset+vg_count)）：**只写本组骨骼**（无任何校准乘）。
         - **禁止跨组别骨骼合并**：各组骨架只含本组骨骼；跨组别引用在导出时大声
           报警（`_warn_cross_group_bone_references`，无校准的运行时这些槽位
           永远不会被写入 = 原点塌陷）。
-        - **零延迟逐 pass attach（2026-08-25 定案，替代"整体慢一帧"）**：
-          deform 段挂钩 = copy 当帧 palette（`ResourceZZPalette_<DrawIB>`）→
-          **立即 run attach CS**（按 vg_map 表 cs-t1 写入本组骨架；本部件引用的
-          全部骨骼——含跨部件共享的 canonical 槽位——此刻即为当帧内容）→
-          换绑 vs-t0 到本组骨架 → draw。**deform 读到的 = 当帧姿态**。
-          背景：渲染侧存在**当帧**的角色级绑定矩阵（dump 143256 实证：
-          vs-cb2 含身体正向+头部逆向绑定表，每帧 Map 更新；渲染 VS/PS 消费
-          当帧绑定）——"慢一帧"的 SO 与当帧绑定相乘，运动时逐帧错位（静止
-          时帧差≈0 所以 dump 数据层正常），这正是"只要采用骨骼合并就错位"、
-          "不合并（SO 当帧）不错位"的根因。逐 pass attach 只需本部件当帧
-          palette（copy 时刻有效），不依赖"当帧全套并存"（旧设计否决的只是
-          帧尾拿全套）。
-        - **[Present] 帧尾兜底**：再次 run 各部件 attach（同帧内容，写全部
-          槽位作为下一帧基线/异常兜底），无变量参数。
-        - 未生成组件**无需任何延迟机制**（2026-08-25 废弃双缓冲延迟）：走游戏
-          原渲染（当帧 palette），与合并部件（当帧）天然同帧一致。
+        - **逐 pass attach + 依赖就绪 draw**：deform 段 copy 当帧 palette →
+          立即 run attach CS → 换绑本组骨架。自动重定向的合并可见几何不固定
+          绑在某一个 target 顺序上，而是在 carrier/target 挂点中等待其依赖的
+          palette 全部当帧到达后只 draw 一次；因此目标先到也不会读取半成品。
+          [Present] 只清理本帧到达/绘制标记，不重放持久 palette。
+        - 未生成组件无需任何延迟机制，继续走游戏原渲染（当帧 palette）。
         """
         section = M_IniSection(M_SectionType.MergedSkeleton)
         section.append("[Constants]")
-        section.append("global $zz_ms_initialized = 0")
+        groups = self._merged_skeleton_groups()
+        for component_id in range(len(self.merged_skeleton_components)):
+            section.append(f"global $zz_ms_seen_c{component_id} = 0")
+        for target_ib in sorted(self._redirect_target_map):
+            section.append(f"global $zz_ms_redirect_drawn_{target_ib} = 0")
         section.new_line()
 
-        groups = self._merged_skeleton_groups()
         # 全宽口径：全局骨骼编号空间的大小 = 全部组件 max(vg_offset+vg_count)
         # （导出子集时 vg_offset 是工作空间全局槽位，可能远超导出内 sum——
         # 同组 3 部件 0~10/11~30/31~50 且中间缺席时 sum=31 但 max=51，按 max 声明）。
@@ -1174,7 +1293,16 @@ class ExportZZMI(ExportUnity):
                 payload,
             )
 
-        # 每组一套合并骨架（组内统一：只直拷本组骨骼，跨组别禁止合并）
+        # 自动重定向 target 的真实 SO 资源引用。target 先到时先捕获 so0；
+        # 依赖齐全后可在任意后续组件挂点把合并 draw 回写到同一 target SO。
+        for target_ib in sorted(self._redirect_target_map):
+            plan = self._redirect_target_map[target_ib]
+            section.append(f"[ResourceZZRedirectSO_{target_ib}]")
+            section.append("type = Buffer")
+            section.append(f"stride = {int(plan.get('so_stride', 40))}")
+            section.new_line()
+
+        # 每组一套合并骨架（组内统一：只直拷本组骨骼，跨组别禁止合并）。
         for skeleton_group in groups:
             section.append(f"[ResourceZZMergedSkeleton_G{skeleton_group}]")
             section.append("type = RWStructuredBuffer")
@@ -1182,7 +1310,7 @@ class ExportZZMI(ExportUnity):
             section.append("array = " + str(bones_count))
             section.new_line()
 
-        # 逐部件 attach 段（y1 = vg_count；deform VB 段与 [Present] 共用）。
+        # 逐部件 attach 段（y1 = vg_count；仅由 deform VB 段调用）。
         # Dispatch 按 HLSL numthreads(64,1,1) 动态取整，避免 palette > 512 时
         # 固定 8 组漏掉尾部骨骼。
         for component_id, component in enumerate(self.merged_skeleton_components):
@@ -1206,11 +1334,13 @@ class ExportZZMI(ExportUnity):
             section.append("cs-u0 = null")
             section.new_line()
 
-        # [Present]（帧尾）兜底 attach：当帧 palette 副本 -> 本组骨架（写全部槽位）
+        # [Present] 只清理本帧到达/绘制标记，不再重放可能跨帧/跨对象的 palette 副本。
         section.append("[Present]")
         for component_id in range(len(self.merged_skeleton_components)):
-            section.append(f"run = CustomShaderZZMIMergedSkeletonAttach_C{component_id}")
-            section.new_line()
+            section.append(f"$zz_ms_seen_c{component_id} = 0")
+        for target_ib in sorted(self._redirect_target_map):
+            section.append(f"$zz_ms_redirect_drawn_{target_ib} = 0")
+        section.new_line()
 
         ini_builder.append_section(section)
 
@@ -1391,13 +1521,12 @@ class ExportZZMI(ExportUnity):
                     # 合并网格重定向：drawindexed 带 base_vertex——从 target 的 SO
                     # 中读本合并网格的区段（offset 保持本 submesh 的索引偏移）
                     base_vertex = redirect_carrier_info["base_vertex"]
-                    for drawcall_model in submesh_model.drawcall_model_list:
-                        draw_offset = drawib_model.obj_name_draw_offset.get(
-                            drawcall_model.obj_name, drawcall_model.index_offset
-                        )
-                        texture_override_ib_section.append(
-                            f"drawindexed = {drawcall_model.index_count},{draw_offset},{base_vertex}"
-                        )
+                    self._append_drawindexed_with_shader_replace(
+                        texture_override_ib_section,
+                        submesh_model.drawcall_model_list,
+                        drawib_model.obj_name_draw_offset,
+                        base_vertex=base_vertex,
+                    )
                 else:
                     self._append_drawindexed_with_shader_replace(
                         texture_override_ib_section,
@@ -1578,6 +1707,7 @@ class ExportZZMI(ExportUnity):
                 mod_export_path=GlobalConfig.path_generate_mod_folder(),
                 shader_replace_object_info_map=self.shader_replace_object_info_map,
                 draw_call_offset_map=M_IniHelper.build_draw_call_offset_map(self.drawib_model_list),
+                draw_call_base_vertex_map=self._build_shader_replace_base_vertex_map(),
             )
 
         if self.has_merged_skeleton:

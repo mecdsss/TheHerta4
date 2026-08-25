@@ -86,12 +86,16 @@ class DrawCallModel:
 
         return " ".join(condition_str_list)
 
-    def get_drawindexed_str(self, obj_name_draw_offset_dict: Optional[dict[str, int]] = None) -> str:
+    def get_drawindexed_str(
+        self,
+        obj_name_draw_offset_dict: Optional[dict[str, int]] = None,
+        base_vertex: int = 0,
+    ) -> str:
         draw_offset = self.index_offset if obj_name_draw_offset_dict is None else obj_name_draw_offset_dict.get(
             self.obj_name,
             self.index_offset,
         )
-        return f"drawindexed = {self.index_count},{draw_offset},0"
+        return f"drawindexed = {self.index_count},{draw_offset},{base_vertex}"
 
     def get_drawindexed_instanced_str(self, obj_name_draw_offset_dict: Optional[dict[str, int]] = None) -> str:
         draw_offset = self.index_offset if obj_name_draw_offset_dict is None else obj_name_draw_offset_dict.get(
