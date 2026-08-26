@@ -8,6 +8,7 @@ import types
 import unittest
 from collections import OrderedDict
 from pathlib import Path
+from unittest import mock
 
 
 def _install_module(name, **attrs):
@@ -83,7 +84,11 @@ _install_module(
 )
 _install_module(
     f"{PKG}.common.logic_name",
-    LogicName=types.SimpleNamespace(NTEMI="NTEMI"),
+    LogicName=types.SimpleNamespace(
+        EFMI="EFMI",
+        NTEMI="NTEMI",
+        ZZMI="ZZMI",
+    ),
 )
 
 
@@ -148,7 +153,8 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
         _fake_bpy.data.objects.clear()
         node_postprocess_material.clear_name_mapping_cache()
         _prefix_cache_state["props"] = {}
-        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HTMI"
+        logic_name = "ZZMI" if self._testMethodName.startswith("test_ttl_") else "HTMI"
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = logic_name
 
     def test_material_detect_accepts_ntmi_modimp_result_output(self):
         """测试材质检测接受 NTMI ModImp 结果输出节点类型"""
@@ -1671,6 +1677,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
 
     def test_debug_disable_fx_ttl_skips_ttl_generation(self):
         """调试开关：开启后不生成 TTL（TTLMap）段落，但透明代码仍独立生成"""
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "ZZMI"
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
             diffuse_path = os.path.join(temp_dir, "diffuse.png")
@@ -1747,6 +1754,122 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
         self.assertIn("drawindexed = 3,0,0", stripped)
         self.assertIn(auto_marker, stripped)
         self.assertIn("[CommandListTail]", stripped)
+
+    def test_execute_postprocess_processes_efmi_merged_draw_callback(self):
+        """EFMI 回调支持普通材质与 FX，但必须完全跳过 ZZMI 专属 TTL。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            texture_path = os.path.join(temp_dir, "diffuse.png")
+            with open(texture_path, "wb") as file_obj:
+                file_obj.write(b"diffuse")
+            fx_path = os.path.join(temp_dir, "fx.png")
+            with open(fx_path, "wb") as file_obj:
+                file_obj.write(b"fx")
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+
+            object_name = "LOD0.drawhash-12-56.Body"
+            obj = _FakeObject(
+                object_name,
+                {
+                    "ps-t0": {
+                        "mark_name": "DiffuseMap",
+                        "mark_type": "Slot",
+                        "mark_slot": "ps-t0",
+                    }
+                },
+                [
+                    ("DiffuseMap_Body", texture_path),
+                    ("FXMap_Body", fx_path),
+                    ("TTLMap_Body", ttl_path),
+                ],
+            )
+            _fake_bpy.data.objects[obj.name] = obj
+            sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "EFMI"
+
+            ini_path = os.path.join(temp_dir, "EFMIMerged.ini")
+            callback_name = "CommandList_Draw_LOD0.drawhash_12_56"
+            with open(ini_path, "w", encoding="utf-8") as file_obj:
+                file_obj.write(
+                    "[TextureOverride_EntryPoint_LOD0.drawhash_12_56]\n"
+                    "hash = drawhash\n"
+                    "match_first_index = 56\n"
+                    "match_index_count = 12\n"
+                    "handling = skip\n"
+                    "$\\EFMIv1\\component_id = 0\n"
+                    "CommandList\\EFMIv1\\Callback_Component_DrawCustom = ref "
+                    f"{callback_name}\n"
+                    "run = CommandList_Component_DrawInstances_LOD0\n\n"
+                    f"[{callback_name}]\n"
+                    "run = CommandList\\EFMIv1\\OverrideTextures\n"
+                    "ib = Resource_LOD0.drawhash_12_56_Index\n"
+                    "ps-t0 = Resource-old-DiffuseMap\n"
+                    f"; [mesh:{object_name}] [vertex_count:77]\n"
+                    "drawindexedinstanced = 12,INSTANCE_COUNT,34,0,FIRST_INSTANCE\n"
+                )
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.debug_disable_fx_ttl = False
+            node._create_cumulative_backup = lambda *_args, **_kwargs: None
+            node._process_ttl_sections = mock.Mock(wraps=node._process_ttl_sections)
+
+            node.execute_postprocess(temp_dir)
+
+            result = Path(ini_path).read_text(encoding="utf-8")
+            node.execute_postprocess(temp_dir)
+            self.assertEqual(Path(ini_path).read_text(encoding="utf-8"), result)
+
+            callback_body = result.split(f"[{callback_name}]", 1)[1].split("\n[", 1)[0]
+            self.assertIn("ps-t0 = Resource_DiffuseMap_Body", callback_body)
+            self.assertIn("run = CommandList\\EFMIv1\\OverrideTextures", callback_body)
+            self.assertIn(
+                "drawindexedinstanced = 12,INSTANCE_COUNT,34,0,FIRST_INSTANCE",
+                callback_body,
+            )
+            self.assertIn("[Resource_DiffuseMap_Body]", result)
+            self.assertIn(r"Resource\RabbitFX\FXMap = ref Resource_FXMap_Body", callback_body)
+            self.assertIn(r"run = CommandList\RabbitFX\Run", callback_body)
+            self.assertIn("[Resource_FXMap_Body]", result)
+            self.assertNotIn("Resource\\TTL\\", result)
+            self.assertNotIn(r"CommandList\TTL\Draw", result)
+            self.assertNotIn("[Resource_TTLMap_Body]", result)
+            node._process_ttl_sections.assert_not_called()
+
+    def test_ttl_parser_is_restricted_to_zzmi_logic(self):
+        """TTL 协议只属于 ZZMI；其它所有当前逻辑都不得进入 TTL 解析器。"""
+        sections = OrderedDict([
+            ("[TextureOverride_Body]", [
+                "hash = 12345678",
+                "[mesh:Body]",
+                "drawindexed = 3, 0, 0",
+            ]),
+            ("_config_path", ""),
+        ])
+
+        for logic_name in (
+            "EFMI", "HTMI", "NTEMI", "ZZMIDX12", "GIMI", "HIMI", "SRMI", "WWMI",
+        ):
+            with self.subTest(logic_name=logic_name):
+                sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = logic_name
+                node = node_postprocess_material.SSMTNode_PostProcess_Material()
+                node.name = "MaterialNode"
+                node.material_to_resource_override = False
+                node.debug_disable_fx_ttl = False
+                node._process_ttl_sections = mock.Mock()
+                node.process_texture_override_section(
+                    "[TextureOverride_Body]",
+                    OrderedDict((name, list(lines) if isinstance(lines, list) else lines)
+                                for name, lines in sections.items()),
+                    material_group_to_swapkey={},
+                    swap_key_prefix="$swapkey",
+                    next_swap_key_num=150,
+                    used_swap_keys=set(),
+                    transparency_sections_to_add=OrderedDict(),
+                )
+                node._process_ttl_sections.assert_not_called()
 
     def test_ini_parser_preserves_namespace_preamble(self):
         node = node_postprocess_material.SSMTNode_PostProcess_Material()

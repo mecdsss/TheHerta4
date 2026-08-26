@@ -828,6 +828,14 @@ class ZZMIStubObjectTests(unittest.TestCase):
         self.assertEqual(stub.get("ZZMI_STUB"), 1)
         self.assertEqual(stub.vertex_groups[0].name, "0")
         self.assertEqual(stub.vertex_groups[0].add_calls[0][1], 1.0)
+        stub_draw_call = next(
+            dc for dc in ordered
+            if dc.get_workspace_unique_str() == "LOD0.84618ee0-1164-22296"
+        )
+        # 占位段即使在 SubMeshModel 之前被消费，也必须是可绘制的 3 索引。
+        self.assertEqual(stub_draw_call.vertex_count, 3)
+        self.assertEqual(stub_draw_call.index_count, 3)
+        self.assertEqual(stub_draw_call.index_offset, 0)
         # 极限小三角面
         verts, _edges, faces = stub.data.from_pydata_calls[0]
         self.assertEqual(len(verts), 3)
@@ -837,6 +845,127 @@ class ZZMIStubObjectTests(unittest.TestCase):
         exporter._cleanup_stub_objects()
         self.assertIsNone(_fake_bpy_data.objects.get("LOD0.84618ee0-1164-22296"))
         self.assertEqual(exporter._zzmi_stub_object_names, [])
+        self.assertNotIn(
+            "LOD0.84618ee0-1164-22296",
+            [str(dc.get_workspace_unique_str()) for dc in ordered],
+        )
+
+    def test_constructor_failure_after_stub_injection_cleans_all_stub_state(self):
+        """基类构造失败时 export() 尚未运行，也必须清理对象、mesh 和注入 DrawCall。"""
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        ordered = [dcm(obj_name="LOD0.84618ee0-22296-0")]
+        blueprint_model = types.SimpleNamespace(
+            cross_ib_info_dict={},
+            cross_ib_method_dict={},
+            cross_ib_mapping_method={},
+            has_cross_ib=False,
+            cross_ib_object_names=set(),
+            keyname_mkey_dict={},
+            ordered_draw_obj_data_model_list=ordered,
+        )
+
+        with mock.patch.object(
+            _FakeExportUnity,
+            "__init__",
+            side_effect=RuntimeError("forced base constructor failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "forced base constructor failure"):
+                _zzmi_module.ExportZZMI(blueprint_model)
+
+        self.assertIsNone(_fake_bpy_data.objects.get("LOD0.84618ee0-1164-22296"))
+        self.assertEqual(_fake_bpy_data.meshes._items, {})
+        self.assertNotIn(
+            "LOD0.84618ee0-1164-22296",
+            [str(dc.get_workspace_unique_str()) for dc in ordered],
+        )
+
+    def test_stub_creation_failure_mid_batch_rolls_back_earlier_stub(self):
+        """批量补占位中途失败时，已创建但尚未从 helper 返回的占位也必须回滚。"""
+        lod0 = os.path.join(self.tmp, "LOD0")
+        with open(os.path.join(lod0, "DrawIB-Component.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "84618ee0": {
+                        "0": "84618ee0-22296-0",
+                        "1": "84618ee0-1164-22296",
+                        "2": "84618ee0-300-23460",
+                    }
+                },
+                f,
+            )
+
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        ordered = [dcm(obj_name="LOD0.84618ee0-22296-0")]
+        blueprint_model = types.SimpleNamespace(
+            cross_ib_info_dict={},
+            cross_ib_method_dict={},
+            cross_ib_mapping_method={},
+            has_cross_ib=False,
+            cross_ib_object_names=set(),
+            keyname_mkey_dict={},
+            ordered_draw_obj_data_model_list=ordered,
+        )
+        original_create = _zzmi_module.ExportZZMI._create_stub_object
+        create_count = 0
+
+        def fail_second_create(exporter, bare_unique_str):
+            nonlocal create_count
+            create_count += 1
+            if create_count == 2:
+                raise RuntimeError("forced second stub failure")
+            return original_create(exporter, bare_unique_str)
+
+        with mock.patch.object(
+            _zzmi_module.ExportZZMI,
+            "_create_stub_object",
+            new=fail_second_create,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "forced second stub failure"):
+                _zzmi_module.ExportZZMI(blueprint_model)
+
+        self.assertEqual(_fake_bpy_data.objects._items, {})
+        self.assertEqual(_fake_bpy_data.meshes._items, {})
+        self.assertEqual(
+            [str(dc.get_workspace_unique_str()) for dc in ordered],
+            ["LOD0.84618ee0-22296-0"],
+        )
+
+    def test_buffers_only_failure_still_cleans_stub_transaction(self):
+        """多轮导出的 buffer-only 路径也必须在失败时清理占位事务。"""
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        ordered = [dcm(obj_name="LOD0.84618ee0-22296-0")]
+        exporter = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+
+        with mock.patch.object(
+            _FakeExportUnity,
+            "export_buffers_only",
+            side_effect=RuntimeError("forced buffer export failure"),
+            create=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "forced buffer export failure"):
+                exporter.export_buffers_only()
+
+        self.assertIsNone(_fake_bpy_data.objects.get("LOD0.84618ee0-1164-22296"))
+        self.assertEqual(_fake_bpy_data.meshes._items, {})
+        self.assertEqual(
+            [str(dc.get_workspace_unique_str()) for dc in ordered],
+            ["LOD0.84618ee0-22296-0"],
+        )
+
+    def test_same_blueprint_can_inject_and_cleanup_stub_twice(self):
+        """一次导出清理后，同一 BluePrintModel 再导出不能引用已删除的旧 DrawCall。"""
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        ordered = [dcm(obj_name="LOD0.84618ee0-22296-0")]
+
+        first = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+        first._cleanup_stub_objects()
+        self.assertEqual(len(ordered), 1)
+
+        second = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+        self.assertEqual(len(second._zzmi_stub_object_names), 1)
+        self.assertEqual(len(ordered), 2)
+        second._cleanup_stub_objects()
+        self.assertEqual(len(ordered), 1)
 
     def test_no_stub_when_checkbox_off(self):
         dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
@@ -1006,6 +1135,11 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         self._register_obj("LOD0.b20f90ea-19182-0", [79, 88, 105, 229, 248])
         if target_registered:
             self._register_obj("LOD0.a23aa8a3-42759-0", [79, 80])
+            target_exported_vertices = target_real_vertices
+        else:
+            target_stub = self._register_obj("LOD0.a23aa8a3-42759-0", [79, 79, 79])
+            target_stub["ZZMI_STUB"] = 1
+            target_exported_vertices = 3
         sub_b = self._attach_drawcalls(
             _FakeSubmesh(
                 "LOD0.b20f90ea-19182-0", 184, 51,
@@ -1017,7 +1151,7 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         sub_a = self._attach_drawcalls(
             _FakeSubmesh(
                 "LOD0.a23aa8a3-42759-0", 79, 105,
-                exported_vertex_count=target_real_vertices,
+                exported_vertex_count=target_exported_vertices,
             )
         )
         sub_c = self._attach_drawcalls(
@@ -1044,18 +1178,21 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
 
     def test_early_carrier_auto_redirects_to_last_pass(self):
         """用户实测场景：合并网格挂 b20f90ea（draw 2，最早）-> 自动重定向到
-        a23aa8a3（draw 20，最后），base_vertex=0（target 无自身几何），无报警。"""
+        a23aa8a3（draw 20，最后）；target 的 3 个 stub 顶点必须先写入 SO。"""
         exporter, _models = self._group3_exporter()
         carrier_map, target_map, unredirected = self._build_and_apply_plan(exporter)
 
         self.assertEqual(carrier_map["b20f90ea"]["target"], "a23aa8a3")
-        self.assertEqual(carrier_map["b20f90ea"]["base_vertex"], 0)
+        self.assertEqual(carrier_map["b20f90ea"]["base_vertex"], 3)
         self.assertEqual(carrier_map["b20f90ea"]["vertex_count"], 18776)
         self.assertEqual(carrier_map["b20f90ea"]["target_first_index"], 0)
-        self.assertEqual(target_map["a23aa8a3"]["so_vertex_count"], 18776)
-        self.assertEqual(target_map["a23aa8a3"]["target_own_vertices"], 0)
+        self.assertEqual(target_map["a23aa8a3"]["so_vertex_count"], 3 + 18776)
+        self.assertEqual(target_map["a23aa8a3"]["target_own_vertices"], 3)
         self.assertEqual(target_map["a23aa8a3"]["deform_draws"],
-                         [("Resourceb20f90eaPosition", "Resourceb20f90eaBlend", 18776)])
+                         [
+                             ("Resourcea23aa8a3Position", "Resourcea23aa8a3Blend", 3),
+                             ("Resourceb20f90eaPosition", "Resourceb20f90eaBlend", 18776),
+                         ])
         self.assertEqual(unredirected, {})
         # 已自动重定向 -> 不再报警
         out = self._capture_stdout(lambda: exporter._warn_merged_mesh_timing(unredirected))
@@ -1172,7 +1309,10 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         exporter.add_unity_vs_texture_override_vb_sections(builder_c, models[2])
         text_c = "\n".join(builder_c.sections[0].SectionLineList)
         self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C2", text_c)
-        self.assertNotIn("draw = 3, 0", text_c)
+        self.assertIn("draw = 4643, 0", text_c)
+        # b30 本身保持原 draw；若它是最后到达的依赖挂点，guarded replay 仍须
+        # 先把 target 的 3 个 stub 顶点写进 RedirectSO，再追加 carrier。
+        self.assertIn("vb0 = Resourcea23aa8a3Position\n    draw = 3, 0", text_c)
         self.assertIn("so0 = ref ResourceZZRedirectSO_a23aa8a3", text_c)
 
     def test_redirect_draw_waits_for_dependencies_in_both_frame_orders(self):
@@ -1212,9 +1352,8 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         self.assertIn(target_component_id, required)
 
     def test_redirect_ib_sections(self):
-        """carrier 的 render override 重挂 target 的 render draw（base_vertex 偏移 +
-        vb1 换绑）；target 的 stub 子网格 ib=null（不画）；carrier 原 render 被 IB 级
-        skip 抑制。"""
+        """carrier/target 各自保留 render 身份；carrier 只换绑合并 SO，target
+        的占位 IB 仍然输出，避免共享 hash 导致物体串扰或被静默跳过。"""
         exporter, models = self._group3_exporter()
         self._build_and_apply_plan(exporter)
 
@@ -1225,18 +1364,55 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
             line for section in builder.sections for line in section.SectionLineList
         )
 
-        # carrier 的 render override：hash 改挂 a23aa8a3，画合并 IB，带 vb1
+        # carrier 的 render override：hash/first_index 仍是 b20f90ea，顶点显式
+        # 读取 target 的 RedirectSO，索引和 mesh 备注仍属于 carrier。
         self.assertIn("[TextureOverride_LOD0.b20f90ea_19182_0]", text)
-        self.assertIn("hash = a23aa8a3", text)
+        self.assertIn("hash = b20f90ea", text)
+        self.assertIn("vb0 = ResourceZZRedirectSO_a23aa8a3", text)
         self.assertIn("ib = Resource_LOD0.b20f90ea_19182_0_Index", text)
         self.assertIn("vb1 = Resourceb20f90eaTexcoord", text)
-        self.assertIn("drawindexed = 69612,0,0", text)  # base_vertex=0
+        self.assertIn("drawindexed = 69612,0,3", text)
         self.assertIn("; [mesh:LOD0.b20f90ea-19182-0]", text)
         # carrier 的原 render draw 被 IB 级 skip 抑制
         self.assertIn("[TextureOverride_IB_b20f90ea]", text)
-        # target 的 stub 子网格：ib = null（不画，防多余三角形）
+        # target 的 stub 子网格保留自己的 hash/IB；占位三角由导出阶段写入。
         self.assertIn("[TextureOverride_LOD0.a23aa8a3_42759_0]", text)
-        self.assertIn("ib = null", text)
+        self.assertIn("hash = a23aa8a3", text)
+        self.assertIn("ib = Resource_LOD0.a23aa8a3_42759_0_Index", text)
+        self.assertNotIn("ib = null", text)
+
+    def test_redirect_keeps_each_submesh_first_index(self):
+        """同一 DrawIB 的多个子网格不能共用 target 首索引，否则会再次串台。"""
+        exporter, models = self._group3_exporter()
+        second_target = self._attach_drawcalls(
+            _FakeSubmesh(
+                "LOD0.a23aa8a3-288-42759",
+                79,
+                105,
+                match_first_index=42759,
+            )
+        )
+        models[1].submesh_model_list.append(second_target)
+        models[1].submesh_ib_dict[second_target.unique_str] = b"\x00\x00\x00\x00"
+        self._build_and_apply_plan(exporter)
+
+        builder = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_ib_sections(builder, models[1])
+        text = "\n".join(builder.sections[0].SectionLineList)
+        self.assertIn("[TextureOverride_LOD0.a23aa8a3_288_42759]", text)
+        self.assertIn("hash = a23aa8a3\nmatch_first_index = 42759", text)
+        self.assertIn("ib = Resource_LOD0.a23aa8a3_288_42759_Index", text)
+
+    def test_merged_skeleton_refuses_empty_index_buffer(self):
+        """合并骨架下不能退回 ib=null；缺失占位索引必须让导出显式失败。"""
+        exporter, models = self._group3_exporter()
+        exporter.has_merged_skeleton = True
+        models[1].submesh_ib_dict["LOD0.a23aa8a3-42759-0"] = b""
+
+        with self.assertRaisesRegex(RuntimeError, "禁止以 ib=null/IB skip"):
+            exporter.add_unity_vs_texture_override_ib_sections(
+                _FakeIniBuilder(), models[1]
+            )
 
     def test_redirect_vlr_section(self):
         """VertexLimitRaise：carrier = 3（stub SO），target = SO 总大小。"""
@@ -1251,7 +1427,7 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         builder_a = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vlr_section(builder_a, models[1])
         text_a = "\n".join(builder_a.sections[0].SectionLineList)
-        self.assertIn("override_vertex_count = 18776", text_a)
+        self.assertIn("override_vertex_count = 18779", text_a)
 
 
 class ZZSIMergedMeshRenderRebindTests(unittest.TestCase):

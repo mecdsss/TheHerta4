@@ -2224,11 +2224,14 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 reset_insert_idx = self._find_mesh_block_reset_insert_index(lines, insert_index)
                 if reset_insert_idx != -1:
                     lines[reset_insert_idx:reset_insert_idx] = reset_lines
-        if not debug_disable_fx_ttl:
+        # TTL 是 ZZMI 专属的绘制重建协议；EFMI 等其它逻辑仅执行普通材质转资源
+        # 与 FX/Glowmap，不得因为某种 drawindexed 参数恰好能被正则解析就误入 TTL。
+        ttl_supported = GlobalConfig.logic_name == LogicName.ZZMI
+        if not debug_disable_fx_ttl and ttl_supported:
             next_swap_key_num = self._process_ttl_sections(
                 section_name, lines, all_sections, material_group_to_swapkey,
                 swap_key_prefix, next_swap_key_num, used_swap_keys, texture_folder)
-        else:
+        elif debug_disable_fx_ttl:
             _LOG.info(f"      调试开关已开启，跳过 {section_name} 的 FX/TTL 生成")
 
         mesh_lines_info_phase2 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
@@ -2299,6 +2302,52 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     del lines[start_move_idx:end_move_idx]
         return next_swap_key_num
 
+    @staticmethod
+    def _material_target_section_names(sections):
+        """返回需要执行材质转换的 INI 段，包含 EFMI 合并骨骼绘制回调。
+
+        普通导出把 ``[mesh:*]`` 与 draw 放在 ``TextureOverride`` 段内；EFMI
+        合并骨骼则只在 EntryPoint 中挂载 ``Callback_Component_DrawCustom``，实际
+        内容位于被引用的 ``CommandList_Draw_*``。这里只跟随该显式引用，避免把
+        用户自定义或其它后处理生成的同名前缀 CommandList 误当成绘制段。
+        """
+        target_names = []
+        seen_names = set()
+
+        texture_override_names = [
+            section_name
+            for section_name in sections
+            if section_name.startswith('[TextureOverride_')
+        ]
+        for section_name in texture_override_names:
+            seen_names.add(section_name)
+            target_names.append(section_name)
+
+        section_lookup = {
+            str(section_name).strip().strip('[]').casefold(): section_name
+            for section_name in sections
+            if str(section_name).strip().startswith('[')
+            and str(section_name).strip().endswith(']')
+        }
+        callback_pattern = re.compile(
+            r'^\s*CommandList\\EFMIv1\\Callback_Component_DrawCustom\s*=\s*'
+            r'ref\s+([^;\s]+)',
+            re.IGNORECASE,
+        )
+        for entrypoint_name in texture_override_names:
+            for line in sections.get(entrypoint_name, []):
+                callback_match = callback_pattern.match(str(line))
+                if not callback_match:
+                    continue
+                referenced_name = callback_match.group(1).strip().strip('[]')
+                section_name = section_lookup.get(referenced_name.casefold())
+                if section_name is None or section_name in seen_names:
+                    continue
+                seen_names.add(section_name)
+                target_names.append(section_name)
+
+        return target_names
+
     def execute_postprocess(self, mod_export_path, exporter=None):
         from ..utils.log_utils import LOG as _LOG
 
@@ -2338,13 +2387,12 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             swap_key_prefix = match.group(1) if match else base_swap_var
             next_swap_key_num = int(match.group(2)) if match else 0
 
-            for section_name, lines in list(sections.items()):
-                if section_name.startswith('[TextureOverride_') and section_name != '_config_path':
-                    next_swap_key_num = self.process_texture_override_section(
-                        section_name, sections,
-                        material_group_to_swapkey, swap_key_prefix, next_swap_key_num,
-                        used_swap_keys, transparency_sections_to_add
-                    )
+            for section_name in self._material_target_section_names(sections):
+                next_swap_key_num = self.process_texture_override_section(
+                    section_name, sections,
+                    material_group_to_swapkey, swap_key_prefix, next_swap_key_num,
+                    used_swap_keys, transparency_sections_to_add
+                )
 
             del sections['_config_path']
 

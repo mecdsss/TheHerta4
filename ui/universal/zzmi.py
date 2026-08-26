@@ -79,42 +79,82 @@ class ExportZZMI(ExportUnity):
     def __init__(self, blueprint_model):
         # ZZMI 骨骼合并（分支选项）：复选框开启时，为「DrawIB 内存在但蓝图里没有对象」
         # 的部件自动创建极限小三角面占位对象（必须在 super().__init__ 组装模型之前注入）
+        self.blueprint_model = blueprint_model
         self._zzmi_stub_object_names = []
-        if GlobalProterties.import_merged_vgmap():
-            try:
+        self._zzmi_stub_draw_calls = []
+        try:
+            if GlobalProterties.import_merged_vgmap():
+                # 占位是合并骨架渲染身份完整性的硬前提。创建失败时中止导出，
+                # 不能回退到旧的 ib=null/IB skip 路径让部件静默消失并串扰其它 hash。
                 self._zzmi_stub_object_names = self._ensure_stub_objects_for_missing_parts(blueprint_model)
-            except Exception as e:
-                print(f"[ZZMI骨骼合并] 占位小三角面创建失败（继续原流程）: {e}")
-                self._zzmi_stub_object_names = []
 
-        super().__init__(blueprint_model)
+            super().__init__(blueprint_model)
 
-        self.cross_ib_info_dict = blueprint_model.cross_ib_info_dict
-        self.cross_ib_method_dict = blueprint_model.cross_ib_method_dict
-        self.cross_ib_mapping_method = getattr(blueprint_model, "cross_ib_mapping_method", {})
-        self.has_cross_ib = blueprint_model.has_cross_ib
-        self.cross_ib_object_names = blueprint_model.cross_ib_object_names
+            self.cross_ib_info_dict = blueprint_model.cross_ib_info_dict
+            self.cross_ib_method_dict = blueprint_model.cross_ib_method_dict
+            self.cross_ib_mapping_method = getattr(blueprint_model, "cross_ib_mapping_method", {})
+            self.has_cross_ib = blueprint_model.has_cross_ib
+            self.cross_ib_object_names = blueprint_model.cross_ib_object_names
 
-        self.shader_replace_info_list = getattr(blueprint_model, "shader_replace_info_list", [])
-        self.shader_replace_object_names = getattr(blueprint_model, "shader_replace_object_names", set())
-        self.shader_replace_object_info_map = getattr(blueprint_model, "shader_replace_object_info_map", {})
-        self.has_shader_replace = getattr(blueprint_model, "has_shader_replace", False)
+            self.shader_replace_info_list = getattr(blueprint_model, "shader_replace_info_list", [])
+            self.shader_replace_object_names = getattr(blueprint_model, "shader_replace_object_names", set())
+            self.shader_replace_object_info_map = getattr(blueprint_model, "shader_replace_object_info_map", {})
+            self.has_shader_replace = getattr(blueprint_model, "has_shader_replace", False)
 
-        # ZZMI 骨骼合并（分支选项）：export() 时按复选框 + 反查数据收集组件信息
-        self.merged_skeleton_components = []
-        self.merged_skeleton_component_id_dict = {}
-        self.has_merged_skeleton = False
-        # 合并网格自动重定向计划（_build_merged_mesh_redirect_plan 产出，INI 生成时查询）
-        self._redirect_carrier_map: dict = {}
-        self._redirect_target_map: dict = {}
+            # ZZMI 骨骼合并（分支选项）：export() 时按复选框 + 反查数据收集组件信息
+            self.merged_skeleton_components = []
+            self.merged_skeleton_component_id_dict = {}
+            self.has_merged_skeleton = False
+            # 合并网格自动重定向计划（_build_merged_mesh_redirect_plan 产出，INI 生成时查询）
+            self._redirect_carrier_map: dict = {}
+            self._redirect_target_map: dict = {}
 
-        print(f"[CrossIB ZZMI] 初始化: has_cross_ib={self.has_cross_ib}")
-        print(f"[CrossIB ZZMI] cross_ib_info_dict={self._format_cross_ib_info_dict(self.cross_ib_info_dict)}")
-        print(f"[CrossIB ZZMI] cross_ib_object_names={self._format_name_set(self.cross_ib_object_names)}")
+            print(f"[CrossIB ZZMI] 初始化: has_cross_ib={self.has_cross_ib}")
+            print(f"[CrossIB ZZMI] cross_ib_info_dict={self._format_cross_ib_info_dict(self.cross_ib_info_dict)}")
+            print(f"[CrossIB ZZMI] cross_ib_object_names={self._format_name_set(self.cross_ib_object_names)}")
+        except Exception:
+            # 构造失败时 export() 的 finally 尚未接管；对象、mesh 与注入蓝图的
+            # DrawCall 必须作为一个事务一起回滚，否则下一次导出会引用已删除对象。
+            self._cleanup_stub_objects()
+            raise
 
     # ------------------------------------------------------------------
     # 占位小三角面（合并骨架模式：部件无对象时不再输出 ib=null）
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _draw_call_object_name(draw_call) -> str:
+        try:
+            return str(draw_call.get_blender_obj_name() or "")
+        except Exception:
+            return str(getattr(draw_call, "obj_name", "") or "")
+
+    @staticmethod
+    def _remove_stub_object_data(obj):
+        mesh = getattr(obj, "data", None)
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh is not None and getattr(mesh, "users", 0) == 0:
+            try:
+                bpy.data.meshes.remove(mesh)
+            except (AttributeError, RuntimeError):
+                pass
+
+    def _purge_stale_stub_state(self, ordered):
+        """清理上次异常残留的 stub 对象、mesh 与带标记 DrawCall。"""
+        stale_names = set()
+        for obj in list(bpy.data.objects):
+            if not obj.get("ZZMI_STUB"):
+                continue
+            stale_names.add(str(obj.name))
+            self._remove_stub_object_data(obj)
+
+        if ordered is not None:
+            ordered[:] = [
+                draw_call
+                for draw_call in ordered
+                if not getattr(draw_call, "zzmi_stub", False)
+                and self._draw_call_object_name(draw_call) not in stale_names
+            ]
 
     def _ensure_stub_objects_for_missing_parts(self, blueprint_model) -> list[str]:
         """为「需要生成但没有对象」的部件创建极限小三角面占位对象。
@@ -141,6 +181,10 @@ class ExportZZMI(ExportUnity):
         if ordered is None:
             return []
 
+        # 自愈必须早于 present 集合构建；否则残留 DrawCall 会被误判为真实部件，
+        # 随后对象又被删除，SubMeshModel 构建必然引用一个不存在的对象。
+        self._purge_stale_stub_state(ordered)
+
         present = set()
         for draw_call in ordered:
             try:
@@ -149,11 +193,6 @@ class ExportZZMI(ExportUnity):
                 continue
             if unique_str:
                 present.add(unique_str.split(".", 1)[-1])
-
-        # 自愈：清掉上次导出异常残留的占位对象，避免被当成真实部件
-        for obj in list(bpy.data.objects):
-            if obj.name.startswith("LOD") and obj.get("ZZMI_STUB"):
-                bpy.data.objects.remove(obj, do_unlink=True)
 
         used_group_ids = None  # 惰性计算：首个全缺 DrawIB 需要判定时才算
 
@@ -183,7 +222,19 @@ class ExportZZMI(ExportUnity):
             for member in stub_members:
                 obj_name = self._create_stub_object(member)
                 if obj_name:
-                    ordered.append(DrawCallModel(obj_name=obj_name))
+                    # 必须在任何后续构造步骤之前登记到实例；否则批量创建中途
+                    # 失败时 helper 尚未返回，__init__ 的异常回滚拿不到先前对象。
+                    self._zzmi_stub_object_names.append(obj_name)
+                    # 该 DrawCall 可能在 SubMeshModel 完成前就被用于生成 IB override。
+                    # 显式填入占位几何的导出计数，避免默认的 0 让占位段退化成
+                    # drawindexed = 0；SubMeshModel 后续仍会用真实 mesh 再校准一次。
+                    stub_draw_call = DrawCallModel(obj_name=obj_name)
+                    stub_draw_call.vertex_count = 3
+                    stub_draw_call.index_count = 3
+                    stub_draw_call.index_offset = 0
+                    stub_draw_call.zzmi_stub = True
+                    ordered.append(stub_draw_call)
+                    self._zzmi_stub_draw_calls.append(stub_draw_call)
                     created.append(obj_name)
                     print(
                         f"[ZZMI骨骼合并] 部件 {member} 没有对应对象，"
@@ -278,39 +329,70 @@ class ExportZZMI(ExportUnity):
         if not workspace_unique_str.upper().startswith("LOD"):
             workspace_unique_str = "LOD0." + workspace_unique_str
 
-        mesh = bpy.data.meshes.new(name="ZZMI_STUB_MESH_" + workspace_unique_str)
-        mesh.from_pydata(
-            [(0.0, 0.0, 0.0), (1e-6, 0.0, 0.0), (0.0, 1e-6, 0.0)],
-            [],
-            [(0, 1, 2)],
-        )
-        mesh.update()
-
-        obj = bpy.data.objects.new(name=workspace_unique_str, object_data=mesh)
-        obj["ZZMI_STUB"] = 1
-        obj["3DMigoto:WorkspaceUniqueStr"] = workspace_unique_str
-        vertex_group = obj.vertex_groups.new(name="0")
-        vertex_group.add([0, 1, 2], 1.0, 'REPLACE')
-
+        mesh = None
+        obj = None
         try:
-            bpy.context.collection.objects.link(obj)
+            mesh = bpy.data.meshes.new(name="ZZMI_STUB_MESH_" + workspace_unique_str)
+            mesh.from_pydata(
+                [(0.0, 0.0, 0.0), (1e-6, 0.0, 0.0), (0.0, 1e-6, 0.0)],
+                [],
+                [(0, 1, 2)],
+            )
+            mesh.update()
+
+            obj = bpy.data.objects.new(name=workspace_unique_str, object_data=mesh)
+            obj["ZZMI_STUB"] = 1
+            obj["3DMigoto:WorkspaceUniqueStr"] = workspace_unique_str
+            vertex_group = obj.vertex_groups.new(name="0")
+            vertex_group.add([0, 1, 2], 1.0, 'REPLACE')
+
+            try:
+                bpy.context.collection.objects.link(obj)
+            except Exception:
+                bpy.context.scene.collection.objects.link(obj)
+            return obj.name
         except Exception:
-            bpy.context.scene.collection.objects.link(obj)
-        return obj.name
+            if obj is not None and bpy.data.objects.get(obj.name) is not None:
+                self._remove_stub_object_data(obj)
+            elif mesh is not None and getattr(mesh, "users", 0) == 0:
+                try:
+                    bpy.data.meshes.remove(mesh)
+                except (AttributeError, RuntimeError):
+                    pass
+            raise
 
     def _cleanup_stub_objects(self):
-        """导出结束后移除占位对象（含 mesh 数据）。"""
-        for obj_name in self._zzmi_stub_object_names:
+        """导出结束后移除占位对象、mesh 数据和注入蓝图的 DrawCall。"""
+        tracked_draw_calls = list(getattr(self, "_zzmi_stub_draw_calls", []) or [])
+        object_names = set(getattr(self, "_zzmi_stub_object_names", []) or [])
+        object_names.update(
+            self._draw_call_object_name(draw_call)
+            for draw_call in tracked_draw_calls
+        )
+        object_names.discard("")
+        tracked_draw_call_ids = {id(draw_call) for draw_call in tracked_draw_calls}
+        ordered = getattr(
+            getattr(self, "blueprint_model", None),
+            "ordered_draw_obj_data_model_list",
+            None,
+        )
+        if ordered is not None:
+            ordered[:] = [
+                draw_call
+                for draw_call in ordered
+                if id(draw_call) not in tracked_draw_call_ids
+                and not getattr(draw_call, "zzmi_stub", False)
+            ]
+
+        for obj_name in sorted(object_names):
             obj = bpy.data.objects.get(obj_name)
             if obj is None:
                 continue
-            mesh = obj.data
-            bpy.data.objects.remove(obj, do_unlink=True)
-            if mesh is not None and mesh.users == 0:
-                bpy.data.meshes.remove(mesh)
-        if self._zzmi_stub_object_names:
-            print(f"[ZZMI骨骼合并] 已清理 {len(self._zzmi_stub_object_names)} 个占位小三角面对象")
+            self._remove_stub_object_data(obj)
+        if object_names:
+            print(f"[ZZMI骨骼合并] 已清理 {len(object_names)} 个占位小三角面对象")
         self._zzmi_stub_object_names = []
+        self._zzmi_stub_draw_calls = []
 
     def _collect_merged_skeleton_components(self):
         """收集 ZZMI 合并骨架组件信息（按 DrawIB 去重，骨架组+vg_offset 排序）。
@@ -964,26 +1046,28 @@ class ExportZZMI(ExportUnity):
     #   - 合并网格挂载的 DrawIB（carrier）的 deform override 退化为 stub draw
     #     （3 顶点，保留 copy palette + attach 写当帧骨骼）；
     #   - 组内最后一个 deform draw 的 DrawIB（target）的 deform override 追加
-    #     画合并网格（绑定 carrier 的 vb0/vb2），其 SO 按 [target 真实几何][
-    #     merged...] 拼接；
-    #   - carrier 的 render override 改挂 target 的 render draw（match_first_index
-    #     用 target 子网格的，base_vertex = target 真实几何 SO 偏移；纹理/IB 保留
-    #     carrier 的）；
-    #   - target 的 stub 子网格 render override 改 ib = null（不画，防多余三角）；
+    #     画合并网格（绑定 carrier 的 vb0/vb2），其 SO 按 [target 完整导出顶点
+    #     （含 stub）][merged...] 拼接；
+    #   - carrier 的 render override 保留 carrier 自己的 hash/first_index，并显式
+    #     绑定 target RedirectSO（base_vertex = target 完整导出顶点数）；
+    #   - target/缺失部件始终保留自己的 hash、IB 和极限小三角占位，不用 ib=null
+    #     静默跳过，避免不同物体共享 hash 时发生串扰；
     #   - VertexLimitRaise：carrier = 3，target = SO 总大小。
     # 对用户完全透明：任意 IB 挂载都正确，无需改名。
 
     def _submesh_is_stub(self, submesh_model) -> bool:
         """子网格是否只有占位小三角面对象（无真实几何）。"""
+        saw_confirmed_stub = False
         for draw_call in getattr(submesh_model, "drawcall_model_list", []) or []:
             try:
                 obj_name = draw_call.get_blender_obj_name()
             except Exception:
-                continue
-            obj = bpy.data.objects.get(obj_name) if obj_name else None
-            if obj is not None and not obj.get("ZZMI_STUB"):
                 return False
-        return True
+            obj = bpy.data.objects.get(obj_name) if obj_name else None
+            if obj is None or not obj.get("ZZMI_STUB"):
+                return False
+            saw_confirmed_stub = True
+        return saw_confirmed_stub
 
     def _submesh_exported_vertex_count(self, submesh_model) -> int:
         """子网格导出 buffer 顶点数（去重后；与 drawib_model.vertex_count 口径一致）。"""
@@ -1005,15 +1089,13 @@ class ExportZZMI(ExportUnity):
             return 0
         return int(len(position_buffer) / position_stride)
 
-    def _drawib_real_vertex_count(self, draw_ib: str) -> int:
-        """DrawIB 真实子网格（非 stub）的导出顶点数之和。"""
+    def _drawib_exported_vertex_count(self, draw_ib: str) -> int:
+        """DrawIB 完整导出顶点数之和，包含用于保持 IB 布局的 stub 顶点。"""
         total = 0
         for drawib_model in self.drawib_model_list:
             if drawib_model.draw_ib != draw_ib:
                 continue
             for submesh_model in drawib_model.submesh_model_list:
-                if self._submesh_is_stub(submesh_model):
-                    continue
                 total += self._submesh_exported_vertex_count(submesh_model)
         return total
 
@@ -1064,8 +1146,8 @@ class ExportZZMI(ExportUnity):
                                    "target_first_index": 重挂 render 用的 match_first_index,
                                    "vertex_count": 合并网格导出顶点数}
         - target_map: draw_ib -> {"deform_draws": [(vb0 资源名, vb2 资源名, 顶点数), ...],
-                                  "so_vertex_count": target SO 总大小（含自身真实几何）,
-                                  "target_own_vertices": target 自身真实几何顶点数}
+                                  "so_vertex_count": target SO 总大小（含自身 stub）,
+                                  "target_own_vertices": target 完整导出顶点数}
         - unredirected: draw_ib -> {"reason": str, "target": str|""}（无法自动重定向）
         """
         carrier_map: dict[str, dict] = {}
@@ -1104,8 +1186,10 @@ class ExportZZMI(ExportUnity):
 
             last = max(with_draw, key=lambda c: int(c.get("deform_draw", 0) or 0))
             target_ib = last["draw_ib"]
-            # target 自身真实几何的 SO 顶点数（无真实几何 = 0，stub 顶点不进 SO）
-            target_own_vertices = self._drawib_real_vertex_count(target_ib)
+            # target 的 SO 前缀必须与自身导出 VB/IB 使用同一完整顶点布局。
+            # stub 的 remapped IB 也引用这 3 个顶点；若将其排除，紧随其后的
+            # carrier 顶点会占据相同索引范围，target 占位 draw 将画出真实几何。
+            target_own_vertices = self._drawib_exported_vertex_count(target_ib)
             target_first_indices = self._drawib_first_match_first_index(target_ib)
             target_first_index = target_first_indices[0] if target_first_indices else 0
 
@@ -1145,7 +1229,7 @@ class ExportZZMI(ExportUnity):
             if not carriers:
                 continue
 
-            # target 的 SO 布局：[target 真实几何][carrier1 merged][carrier2 merged]...
+            # target 的 SO 布局：[target 完整导出顶点（含 stub）][carrier1 merged]...
             base_vertex = target_own_vertices
             deform_draws = []
             if target_own_vertices > 0:
@@ -1437,27 +1521,41 @@ class ExportZZMI(ExportUnity):
                 )
                 texture_override_ib_section.new_line()
 
-            # 合并网格自动重定向：carrier 的 render override 改挂 target 的
-            # render draw（match_first_index 用 target 子网格的）；target 的
-            # stub 子网格改 ib=null（不画，防止多余三角形读出合并几何）。
+            # 合并网格自动重定向：渲染身份必须仍归属于原始 DrawIB/物体。
+            #
+            # 变形阶段可以把 carrier 的几何写入 target 的 RedirectSO，但这不
+            # 等于渲染阶段也要把 carrier 的 TextureOverride 改挂到 target hash。
+            # 以前这里复用 target hash + target first_index，会让不同物体落到同
+            # 一个运行时匹配键下：纹理、透明、shader replace 和 mesh 备注互相
+            # 覆盖；target 的占位段还会用 ib=null 把对应物体整个跳过。
+            #
+            # 现在每个段始终使用自己的 hash/first_index。carrier 若需读取合并
+            # 后的 SO，显式绑定 RedirectSO；target/缺失部件的占位 IB 保持可见
+            # （几何尺寸为 1e-6），不再使用 ib=null 作为“跳过”手段。
             redirect_carrier_info = self._redirect_carrier_map.get(draw_ib)
-            target_stub_submesh = (
-                draw_ib in self._redirect_target_map
-                and self._submesh_is_stub(submesh_model)
-            )
-            override_hash = redirect_carrier_info["target"] if redirect_carrier_info else draw_ib
-            override_first_index = (
-                redirect_carrier_info["target_first_index"]
-                if redirect_carrier_info
-                else submesh_model.match_first_index
-            )
+            override_hash = draw_ib
+            override_first_index = submesh_model.match_first_index
 
             texture_override_ib_section.append("[TextureOverride_" + texture_override_name_suffix + "]")
             texture_override_ib_section.append("hash = " + override_hash)
             texture_override_ib_section.append("match_first_index = " + str(override_first_index))
 
+            if redirect_carrier_info is not None:
+                # carrier 的索引仍属于 carrier，但顶点来自 target 的合并 SO。
+                # 显式换绑 vb0 后，渲染匹配键仍保持 carrier hash，不会与 target
+                # 或同 DrawIB 的其它子网格串台。
+                texture_override_ib_section.append(
+                    "vb0 = ResourceZZRedirectSO_" + redirect_carrier_info["target"]
+                )
+
             ib_buf = drawib_model.submesh_ib_dict.get(submesh_model.unique_str, None)
-            if ib_buf is None or len(ib_buf) == 0 or target_stub_submesh:
+            if ib_buf is None or len(ib_buf) == 0:
+                if self.has_merged_skeleton:
+                    raise RuntimeError(
+                        f"[ZZMI骨骼合并] 子网格 {submesh_model.unique_str} 的索引缓冲为空；"
+                        "合并骨架导出禁止以 ib=null/IB skip 静默跳过，请重新导出以生成"
+                        "对应的物体或极限小三角占位"
+                    )
                 texture_override_ib_section.append("ib = null")
                 texture_override_ib_section.new_line()
                 continue
@@ -1586,7 +1684,8 @@ class ExportZZMI(ExportUnity):
 
         判定：DrawIBModel 元数据里的部件表（match_first_index_partname_dict）与本次导出
         实际拿到对象的子网格（submesh_model_list 的 match_first_index）比对。
-        缺失部件会输出空 IB（ib=null）并在游戏内整个消失——必须让用户看见。
+        合并骨架模式下缺失部件应已由初始化阶段注入占位；这里仅用于发现
+        占位注入之外的异常输入并提示用户，不负责用空 IB 静默隐藏部件。
         返回缺失清单 [{draw_ib, missing:[(first_index, part_name)], present:[...]}]。
         """
         missing_report = []
@@ -1620,15 +1719,22 @@ class ExportZZMI(ExportUnity):
                 f"缺失: {missing_names}"
             )
             print(
-                "[ZZMI导出] 这些部件将输出空 IB（ib=null）并在游戏内整个消失/报错。"
-                "常见原因：多个物体被合并成一个（只有幸存名字的部件有对象）、对象被删除或改名。"
-                "请为每个部件保留对应对象（合并物体编辑的功能正在规划），或确认你就是要隐藏它们。"
+                "[ZZMI导出] 合并骨架模式会为这些缺失部件注入极限小三角占位；"
+                "若仍出现在此处，说明占位注入未生效，导出的 hash/IB 映射可能不完整。"
+                "常见原因：对象被删除或改名，或工作区 DrawIB-Component/VGMap 缓存过期。"
             )
         return missing_report
 
     def export(self):
         try:
             self._export_impl()
+        finally:
+            self._cleanup_stub_objects()
+
+    def export_buffers_only(self):
+        """多轮导出的纯缓冲路径也必须闭合占位对象事务。"""
+        try:
+            return super().export_buffers_only()
         finally:
             self._cleanup_stub_objects()
 
@@ -1674,8 +1780,9 @@ class ExportZZMI(ExportUnity):
             # 无法自动重定向的合并网格（缺反查缓存/跨 IB）大声报警
             self._warn_merged_mesh_timing(unredirected)
 
-        # 部件缺失守卫：DrawIB 内若有部件没有任何对应对象（物体被合并/删除/改名），
-        # 该部件会输出空 IB（ib=null）并在游戏内整个消失——大声报警而非静默。
+        # 部件缺失守卫：正常的合并骨架流程已在 ExportZZMI 初始化阶段为缺失部件
+        # 注入极限小三角占位，因此这里仅报告仍未能匹配的异常输入；不会再主动
+        # 生成 ib=null 来静默跳过对应物体。
         self._warn_missing_drawib_parts()
 
         TimerUtils.start_stage("INI配置生成")
