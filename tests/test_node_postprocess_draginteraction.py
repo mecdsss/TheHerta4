@@ -1701,6 +1701,9 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("#define DETECT_OBJECT_SPAN  IniParams[28].z", shader)
         self.assertIn("#define DETECT_VERTEX_BASE", shader)
         self.assertIn("gIndexBuffer[indexBase + 0u] + DETECT_VERTEX_BASE", shader)
+        self.assertIn("uint vertexIndex = (uint)(meta.x + 0.5f);", shader)
+        self.assertIn("vertexIndex += DETECT_VERTEX_BASE;", shader)
+        self.assertIn("localPos = gVB0[vertexIndex].position;", shader)
         self.assertIn(
             "for (uint objectIndex = objectFirst; objectIndex < objectLast; objectIndex++)",
             shader)

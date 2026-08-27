@@ -207,10 +207,16 @@ bool ReadCalibSample(uint slot, uint vertexCount, out float3 localPos, out float
     if (meta.w < 0.5f || abs(meta.y - (float)slot) > 0.5f)
         return false;
 
+    // The calibration probe is issued with the same RedirectSO base vertex as
+    // the real draw.  The GS stores the raw carrier-local IB index, while the
+    // clip position in row 0 was produced from rawIndex + baseVertex.  Apply
+    // that prefix here too, otherwise the affine local->clip solve pairs a
+    // real clip position with one of the three stub vertices.
     uint vertexIndex = (uint)(meta.x + 0.5f);
 
-    if (vertexIndex >= vertexCount)
+    if (vertexIndex >= vertexCount || DETECT_VERTEX_BASE > vertexCount - vertexIndex)
         return false;
+    vertexIndex += DETECT_VERTEX_BASE;
 
     if (!all(abs(clip) < float4(1000000.0f, 1000000.0f, 1000000.0f, 1000000.0f)))
         return false;

@@ -1373,12 +1373,19 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         """BI4 的占位 target 即使依赖齐全，也不能执行 BI16 carrier 重放。"""
         exporter, models = self._group3_exporter()
         models[1].d3d11GameType.CategoryStrideDict["Blend"] = 4
-        _carrier_map, target_map, _unredirected = self._build_and_apply_plan(exporter)
+        _carrier_map, target_map, unredirected = self._build_and_apply_plan(exporter)
 
         target_component_id = exporter.merged_skeleton_component_id_dict["a23aa8a3"]
         carrier_component_id = exporter.merged_skeleton_component_id_dict["b20f90ea"]
         self.assertNotIn(target_component_id, target_map["a23aa8a3"]["compatible_component_ids"])
         self.assertIn(carrier_component_id, target_map["a23aa8a3"]["compatible_component_ids"])
+        self.assertEqual(
+            unredirected["b20f90ea"]["reason"],
+            "required-dependency-after-compatible-host",
+        )
+
+        warning = self._capture_stdout(lambda: exporter._warn_merged_mesh_timing(unredirected))
+        self.assertIn("必需骨骼依赖到达晚于所有兼容重放宿主", warning)
 
         builder_target = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder_target, models[1])
@@ -1391,6 +1398,17 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         text_carrier = "\n".join(builder_carrier.sections[0].SectionLineList)
         self.assertIn("ResourceZZRedirectSO_a23aa8a3 = ref so0", text_carrier)
         self.assertIn("draw = 18776, 0", text_carrier)
+
+    def test_redirect_render_is_gated_by_current_frame_ready_marker(self):
+        """重放失败时不能消费 RedirectSO 的上一帧/未初始化尾部。"""
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+
+        builder = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_ib_sections(builder, models[0])
+        text = "\n".join(builder.sections[0].SectionLineList)
+        self.assertIn("if $zz_ms_redirect_drawn_a23aa8a3 == 1", text)
+        self.assertIn("endif", text)
 
     def test_real_target_with_incompatible_blend_layout_is_not_redirected(self):
         """真实 target 与 carrier 的 Blend 布局不同，不能把整段重放伪装成兼容。"""

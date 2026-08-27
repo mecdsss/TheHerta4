@@ -576,6 +576,40 @@ class ExportZZMI(ExportUnity):
                     section.append("endif")
             section.append("")
 
+    def _append_ready_gated_render_draws(
+        self,
+        section,
+        drawcall_list,
+        draw_offset_dict,
+        target_ib: str,
+        base_vertex: int = 0,
+    ) -> None:
+        """Emit carrier render draws only after this frame's SO replay ran.
+
+        RedirectSO is persistent and its carrier hook always writes a small
+        stub prefix.  If a required palette arrives after every compatible
+        deform host, the replay guard cannot run; drawing the SO tail anyway
+        would consume the previous frame or uninitialised data.  Gate only the
+        carrier's render draw, leaving the normal texture/resource setup intact.
+        """
+        ready_var = f"$zz_ms_redirect_drawn_{target_ib}"
+        section.append(f"if {ready_var} == 1")
+        start = len(section.SectionLineList)
+        self._append_drawindexed_with_shader_replace(
+            section,
+            drawcall_list,
+            draw_offset_dict,
+            base_vertex=base_vertex,
+        )
+        # Keep nested generated conditions syntactically inside the readiness
+        # block.  M_IniSection stores raw lines, so indentation is the only
+        # required operation and does not alter the existing draw expressions.
+        for index in range(start, len(section.SectionLineList)):
+            line = section.SectionLineList[index]
+            if line:
+                section.SectionLineList[index] = "    " + line
+        section.append("endif")
+
     @staticmethod
     def _format_name_set(names) -> list[str]:
         return sorted(str(name) for name in (names or []))
@@ -1042,6 +1076,18 @@ class ExportZZMI(ExportUnity):
             )
         for skeleton_group, entries in by_group.items():
             for draw_ib, reason, target_ib in entries:
+                if reason == "required-dependency-after-compatible-host":
+                    print(
+                        f"[ZZMI骨骼合并] !!! 合并网格无法自动重定向: DrawIB {draw_ib}"
+                        f"（骨架组 G{skeleton_group}）有必需骨骼依赖到达晚于所有兼容重放宿主；"
+                        "本次帧不会消费旧 RedirectSO 数据。"
+                    )
+                    print(
+                        "[ZZMI骨骼合并] 请把合并几何拆回相同 Blend 输入布局的部件，"
+                        "或重新导入后统一参与重放部件的 Blend 布局；当前 BI4/BI16 混合顺序"
+                        "无法安全自动重放。"
+                    )
+                    continue
                 if reason == "incompatible-blend-layout":
                     print(
                         f"[ZZMI骨骼合并] !!! 合并网格无法自动重定向: DrawIB {draw_ib}"
@@ -1454,6 +1500,41 @@ class ExportZZMI(ExportUnity):
                 # 元数据不完整时保持旧行为，避免历史工作空间因为缺少布局对象
                 # 而突然失去自动重定向；真实模型会在上面的完整签名分支收紧。
                 compatible_component_ids = sorted(required_component_ids)
+
+            # A required palette may belong to a later deform pass whose input
+            # layout cannot host the replay (for example, a BI4 rigid
+            # component arriving after all BI16 hosts).  Then every compatible
+            # host has already run before the last dependency arrives, so the
+            # emitted guard can never become true in this frame.  Keep the
+            # carrier stub/ready gate so stale RedirectSO data is not rendered,
+            # but publish an explicit diagnostic instead of silently producing
+            # a flickering mesh.
+            if required_component_ids:
+                required_draws = [
+                    int(
+                        self.merged_skeleton_components[component_id].get(
+                            "deform_draw", 0
+                        )
+                        or 0
+                    )
+                    for component_id in required_component_ids
+                ]
+                compatible_draws = [
+                    int(
+                        self.merged_skeleton_components[component_id].get(
+                            "deform_draw", 0
+                        )
+                        or 0
+                    )
+                    for component_id in compatible_component_ids
+                ]
+                if not compatible_draws or max(required_draws) > max(compatible_draws):
+                    for carrier in carriers:
+                        unredirected[carrier["draw_ib"]] = {
+                            "reason": "required-dependency-after-compatible-host",
+                            "target": last.get("unique_str") or "",
+                        }
+
             target_map[target_ib] = {
                 "target_ib": target_ib,
                 "deform_draws": deform_draws,
@@ -1918,10 +1999,11 @@ class ExportZZMI(ExportUnity):
                     # 合并网格重定向：drawindexed 带 base_vertex——从 target 的 SO
                     # 中读本合并网格的区段（offset 保持本 submesh 的索引偏移）
                     base_vertex = redirect_carrier_info["base_vertex"]
-                    self._append_drawindexed_with_shader_replace(
+                    self._append_ready_gated_render_draws(
                         texture_override_ib_section,
                         submesh_model.drawcall_model_list,
                         drawib_model.obj_name_draw_offset,
+                        redirect_carrier_info["target"],
                         base_vertex=base_vertex,
                     )
                 else:
