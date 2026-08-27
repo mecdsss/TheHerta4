@@ -177,7 +177,7 @@ class GlobalProterties(bpy.types.PropertyGroup):
 
     efmi_lod_group_projection: bpy.props.BoolProperty(
         name="EFMI LOD 分组投影",
-        description="EFMI 多 LOD 时先按部件点云建立对应，再将 LOD0 去重分组投影到 LOD1；关闭后 LOD0/LOD1 各自独立进行顶点组去重",
+        description="EFMI 多 LOD 时，以 LOD0 的去重分组关系约束 LOD1：LOD0 已合并的对应组在 LOD1 也合并、未合并的组不互并；两侧仍使用互不重叠的独立槽位段。开启时还会过滤几何未匹配的 LOD1 物体并自动创建匹配链；关闭后双侧完全独立去重、不过滤、不建链",
         default=True,
     ) # type: ignore
 

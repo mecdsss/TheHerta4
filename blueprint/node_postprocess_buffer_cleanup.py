@@ -9,7 +9,7 @@ from .node_postprocess_base import SSMTNode_PostProcess_Base
 class SSMTNode_PostProcess_BufferCleanup(SSMTNode_PostProcess_Base):
     bl_idname = 'SSMTNode_PostProcess_BufferCleanup'
     bl_label = '缓冲区清理'
-    bl_description = '扫描并删除配置表路径下所有未被任何INI文件引用的.buf文件'
+    bl_description = '递归扫描INI引用并删除配置表路径下未被引用的.buf缓冲区文件'
 
     def draw_buttons(self, context, layout):
         layout.label(text="此操作将永久删除未引用的.buf文件", icon='ERROR')
@@ -18,17 +18,32 @@ class SSMTNode_PostProcess_BufferCleanup(SSMTNode_PostProcess_Base):
     def _find_unused_buffers(self, config_path):
         referenced_files = set()
         filename_pattern = re.compile(r'^\s*filename\s*=\s*(.+)', re.IGNORECASE)
-        for ini_file in glob.glob(os.path.join(config_path, "*.ini")):
+        for ini_file in glob.glob(os.path.join(config_path, '**', '*.ini'), recursive=True):
             try:
                 with open(ini_file, 'r', encoding='utf-8') as f:
                     for line in f:
                         match = filename_pattern.match(line)
                         if match:
-                            referenced_files.add(os.path.normpath(os.path.join(config_path, match.group(1).strip().replace('/', os.sep))))
+                            filename = match.group(1).strip()
+                            if os.path.splitext(filename)[1].lower() != '.buf':
+                                continue
+                            referenced_files.add(
+                                os.path.normcase(
+                                    os.path.abspath(
+                                        os.path.normpath(
+                                            os.path.join(config_path, filename.replace('/', os.sep))
+                                        )
+                                    )
+                                )
+                            )
             except Exception as e:
                 print(f"读取INI文件失败 {ini_file}: {e}")
         disk_buf_files = glob.glob(os.path.join(config_path, '**', '*.buf'), recursive=True)
-        return [abs_path for buf_file in disk_buf_files if (abs_path := os.path.normpath(buf_file)) not in referenced_files]
+        return [
+            buf_file
+            for buf_file in disk_buf_files
+            if os.path.normcase(os.path.abspath(os.path.normpath(buf_file))) not in referenced_files
+        ]
 
     def execute_postprocess(self, mod_export_path):
         print(f"缓冲区清理后处理节点开始执行，Mod导出路径: {mod_export_path}")

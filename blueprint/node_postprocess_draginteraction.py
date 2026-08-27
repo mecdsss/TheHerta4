@@ -140,10 +140,12 @@ DEFAULT_VERTEX_STRUCT = (
 
 DRAG_TAIL_MARKER = "; --- AUTO-APPENDED DRAG INTERACTION MODULE ---"
 MESH_COMMENT_RE = re.compile(r"^;\s*\[mesh:(?P<object_name>[^\]]+)\]", re.IGNORECASE)
-# TTL 二次绘制的区间参数：$\TTL\_1 = 索引数，$\TTL\_2 = 起始索引；
-# run 目标形如 CommandListSSMTTTLDraw_<token>（TTL 库 drawindexedinstanced 读取 $_1/$_2）。
+# TTL 二次绘制的区间参数：$\TTL\_1 = 索引数，$\TTL\_2 = 起始索引，
+# $\TTL\_3 = 起始顶点/base vertex；run 目标形如
+# CommandListSSMTTTLDraw_<token>（TTL 库 drawindexedinstanced 读取 $_1/$_2/$_3）。
 TTL_ARG1_RE = re.compile(r'^\$\\TTL\\_1\s*=\s*(\d+)', re.IGNORECASE)
 TTL_ARG2_RE = re.compile(r'^\$\\TTL\\_2\s*=\s*(\d+)', re.IGNORECASE)
+TTL_ARG3_RE = re.compile(r'^\$\\TTL\\_3\s*=\s*(\d+)', re.IGNORECASE)
 TTL_DRAW_RUN_RE = re.compile(r'^run\s*=\s*CommandListSSMTTTLDraw_', re.IGNORECASE)
 # 物体显隐 flag 行（注入绘制分支内；material 的 TTL 块重建必须保留）
 DRAG_OBJVIS_LINE_RE = re.compile(r'^\s*\$ssmtdrag_objvis_[\w]*\s*=\s*1\s*$')
@@ -1428,6 +1430,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             base_name = self._resolve_position_stem(sections, hash_value) or parts[0]["base_name"]
             vertex_count = self._get_vertex_count(sections, hash_value)
             base_resource = self._find_existing_base_resource_name(sections, hash_value, base_name)
+            vertex_bases = {
+                int(part.get("vertex_base", 0) or 0)
+                for part in parts
+            }
+            if len(vertex_bases) > 1:
+                print(
+                    f"[DragInteraction][WARNING] hash {hash_value} 的绘制段使用多个 "
+                    f"base vertex {sorted(vertex_bases)}；逐顶点资源暂按最小值对齐"
+                )
+            vertex_base = min(vertex_bases) if vertex_bases else 0
             # 物体显隐：按记录稳定分配全局物体编号（mesh 注释名 → id；跨组件连续），
             # 供 flag 变量注入与 TriangleObjectIDs 烘焙共用同一编号空间。
             name_to_id = {}
@@ -1442,6 +1454,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "base_name": base_name,
                 "comp_name": self._comp_name(base_name),
                 "vertex_count": vertex_count or 0,
+                "vertex_base": vertex_base,
                 "base_resource": base_resource,
                 "parts": parts,
                 "object_id_map": name_to_id,
@@ -1517,10 +1530,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 try:
                     draw_count = int(nums[0])
                     draw_offset = int(nums[1]) if len(nums) > 1 else 0
+                    vertex_base = int(nums[2]) if len(nums) > 2 else 0
                 except (ValueError, IndexError):
                     continue
                 if draw_count > 0 and draw_offset >= 0:
-                    draw_ranges.append((draw_offset, draw_count))
+                    draw_ranges.append((draw_offset, draw_count, vertex_base))
             elif normalized.startswith("run ="):
                 nested_name = stripped.split("=", 1)[1].strip()
                 draw_ranges.extend(cls._collect_referenced_draw_ranges(
@@ -1564,6 +1578,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             draw_records = []
             pending_ttl_1 = None
             pending_ttl_2 = None
+            pending_ttl_3 = None
 
             for line_idx, line in enumerate(lines):
                 s = line.strip()
@@ -1575,6 +1590,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 ttl_arg2 = TTL_ARG2_RE.match(s)
                 if ttl_arg2:
                     pending_ttl_2 = int(ttl_arg2.group(1))
+                    continue
+                ttl_arg3 = TTL_ARG3_RE.match(s)
+                if ttl_arg3:
+                    pending_ttl_3 = int(ttl_arg3.group(1))
                     continue
                 if normalized.startswith("ib ="):
                     val = s.split("=", 1)[1].strip()
@@ -1617,6 +1636,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                             "ib_resource": active_ib_resource,
                             "draw_offset": pending_ttl_2,
                             "draw_count": pending_ttl_1,
+                            "vertex_base": pending_ttl_3 or 0,
                             "mesh_first_index": pending_mesh_first_index,
                             "hook_anchor_comment": pending_mesh_comment,
                             "hook_anchor_occurrence": pending_mesh_comment_occurrence,
@@ -1625,6 +1645,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                         draw_ordinal += 1
                     pending_ttl_1 = None
                     pending_ttl_2 = None
+                    pending_ttl_3 = None
                     pending_mesh_owner = None
                     pending_mesh_first_index = None
                     pending_mesh_comment = None
@@ -1636,13 +1657,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     referenced_ranges = self._collect_referenced_draw_ranges(sections, command_name)
                     if referenced_ranges:
                         draw_owner = pending_mesh_owner or section_hash
-                        for draw_offset, draw_count in referenced_ranges:
+                        for draw_offset, draw_count, vertex_base in referenced_ranges:
                             if draw_owner and draw_owner.casefold() == normalized_hash and active_ib_resource:
                                 draw_records.append({
                                     "ordinal": draw_ordinal,
                                     "ib_resource": active_ib_resource,
                                     "draw_offset": draw_offset,
                                     "draw_count": draw_count,
+                                    "vertex_base": vertex_base,
                                     "mesh_first_index": pending_mesh_first_index,
                                     "hook_anchor_comment": pending_mesh_comment,
                                     "hook_anchor_occurrence": pending_mesh_comment_occurrence,
@@ -1660,6 +1682,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     try:
                         draw_count = int(nums[0])
                         draw_offset = int(nums[1]) if len(nums) > 1 else 0
+                        vertex_base = int(nums[2]) if len(nums) > 2 else 0
                     except (ValueError, IndexError):
                         draw_ordinal += 1
                         continue
@@ -1677,6 +1700,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                             "ib_resource": active_ib_resource,
                             "draw_offset": draw_offset,
                             "draw_count": draw_count,
+                            "vertex_base": vertex_base,
                             "mesh_first_index": pending_mesh_first_index,
                             "hook_anchor_comment": pending_mesh_comment,
                             "hook_anchor_occurrence": pending_mesh_comment_occurrence,
@@ -1752,6 +1776,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "hook_anchor_occurrence": representative["hook_anchor_occurrence"],
                 "name_ranges": name_ranges,
                 "draw_records": records,
+                "vertex_base": int(representative.get("vertex_base", 0) or 0),
             })
         return parts
 
@@ -1953,11 +1978,35 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 无区域 → zone0 全 1
         if not zones or not GB_CORE_AVAILABLE:
             fallback_zone_id = entries[0][0] if entries else 0
-            self._write_masks_fallback(mod_export_path, sections, comp, vertex_count, fallback_zone_id)
+            self._write_masks_fallback(
+                mod_export_path,
+                sections,
+                comp,
+                vertex_count,
+                fallback_zone_id,
+                vertex_base=int(comp.get("vertex_base", 0) or 0),
+            )
             return True
 
         # radius 参数与球尺度失配检查（防“整块刚体动”失配，原版实测 ratio 0.3~2.2）
         self._check_zone_radius_scale(zones)
+
+        # 读取 Position.buf 顶点坐标。VLR 可能是 ZZMI RedirectSO 的运行时容量，
+        # 比基础 Position.buf 多一个 base-vertex 前缀（当前为 3 个 stub 顶点）。
+        # 权重先在基础缓冲的局部索引空间烘焙，写文件前再补齐运行时前缀。
+        positions = self._read_position_buf(mod_export_path, sections, comp, vertex_count)
+        if positions is None:
+            self._write_masks_fallback(
+                mod_export_path,
+                sections,
+                comp,
+                vertex_count,
+                entries[0][0],
+                vertex_base=int(comp.get("vertex_base", 0) or 0),
+            )
+            return True
+        source_vertex_count = len(positions)
+        vertex_base, vertex_count = self._runtime_vertex_layout(comp, source_vertex_count)
 
         # 拓扑读取：任一启用区域开了球级沿表面扩散，或任一权重球配置了包含物体列表时读一次
         # IB 三角形 → 去重边（沿表面扩散用）；同时得到逐三角形部件名供包含列表过滤。
@@ -1971,19 +2020,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             for _, empty in entries
         )
         if needs_component_topology:
-            result = self._read_component_triangles(mod_export_path, sections, comp, vertex_count)
+            result = self._read_component_triangles(
+                mod_export_path, sections, comp, source_vertex_count
+            )
             if result is not None:
                 triangles, tri_part_names = result
                 if any(_zone_propagate(empty.ssmt_drag_zone, self) for _, empty in entries):
                     edge_verts = gb_core.edges_from_triangles(triangles)
             else:
                 print(f"[DragInteraction][WARNING] {comp['comp_name']} 无法读取 IB 拓扑，沿表面传播回退体积球")
-
-        # 读取 Position.buf 顶点坐标
-        positions = self._read_position_buf(mod_export_path, sections, comp, vertex_count)
-        if positions is None:
-            self._write_masks_fallback(mod_export_path, sections, comp, vertex_count, entries[0][0])
-            return True
 
         # 烘焙参考物体世界矩阵的逆（坐标系换算）
         ref_matrix_inv = self._get_reference_matrix_inv(comp)
@@ -1993,10 +2038,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 朝向）同空间，否则掩码左右颠倒（用户报告）。预览不受影响（所见即所得）。
         mirror = self._get_non_mirror_mirror()
 
-        zone_ids = np.full((vertex_count, SPARSE_ZONE_SLOTS), INVALID_ZONE_ID, dtype=np.uint32)
-        zone_weights = np.zeros((vertex_count, SPARSE_ZONE_SLOTS), dtype=np.float32)
-        overlap_counts = np.zeros(vertex_count, dtype=np.uint16)
-        row_indices = np.arange(vertex_count)
+        zone_ids = np.full(
+            (source_vertex_count, SPARSE_ZONE_SLOTS),
+            INVALID_ZONE_ID,
+            dtype=np.uint32,
+        )
+        zone_weights = np.zeros(
+            (source_vertex_count, SPARSE_ZONE_SLOTS), dtype=np.float32
+        )
+        overlap_counts = np.zeros(source_vertex_count, dtype=np.uint16)
+        row_indices = np.arange(source_vertex_count)
         for zone_id, empty in entries:
             settings = empty.ssmt_drag_zone
             allowed_mask = _zone_allowed_vertex_mask(
@@ -2045,6 +2096,23 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             self._remove_mask_files(mod_export_path, sections, comp)
             return False
 
+        # 从基础 Position/IB 的局部索引空间映射到运行时 VB0。RedirectSO 的
+        # carrier 由 base_vertex=3 开始，因此前三行保持无效/零权重。
+        if vertex_base or vertex_count != source_vertex_count:
+            runtime_zone_ids = np.full(
+                (vertex_count, SPARSE_ZONE_SLOTS),
+                INVALID_ZONE_ID,
+                dtype=np.uint32,
+            )
+            runtime_zone_weights = np.zeros(
+                (vertex_count, SPARSE_ZONE_SLOTS), dtype=np.float32
+            )
+            copy_end = vertex_base + source_vertex_count
+            runtime_zone_ids[vertex_base:copy_end] = zone_ids
+            runtime_zone_weights[vertex_base:copy_end] = zone_weights
+            zone_ids = runtime_zone_ids
+            zone_weights = runtime_zone_weights
+
         out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
         os.makedirs(out_dir, exist_ok=True)
         zone_ids.tofile(os.path.join(out_dir, f"{comp['base_name']}JiggleZoneIDs.buf"))
@@ -2063,6 +2131,29 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         )
         return True
 
+    @staticmethod
+    def _runtime_vertex_layout(comp, source_vertex_count):
+        """返回 ``(base_vertex, runtime_vertex_count)`` 并校验缓冲跨度。
+
+        ``source_vertex_count`` 来自磁盘 Position.buf；``vertex_count`` 来自
+        VertexLimitRaise/运行时 VB0 容量。ZZMI 合并重定向会在 carrier 前放置
+        stub 前缀，所以二者不能直接混作同一个数组维度。
+        """
+        source_vertex_count = max(0, int(source_vertex_count or 0))
+        vertex_base = max(0, int(comp.get("vertex_base", 0) or 0))
+        runtime_vertex_count = max(0, int(comp.get("vertex_count", 0) or 0))
+        required_count = vertex_base + source_vertex_count
+        if runtime_vertex_count == 0:
+            runtime_vertex_count = required_count
+            comp["vertex_count"] = runtime_vertex_count
+        if runtime_vertex_count < required_count:
+            raise ValueError(
+                f"{comp.get('comp_name', 'component')} 的运行时顶点容量 "
+                f"{runtime_vertex_count} 小于 base_vertex {vertex_base} + "
+                f"Position 顶点数 {source_vertex_count}"
+            )
+        return vertex_base, runtime_vertex_count
+
     def _remove_mask_files(self, mod_export_path, sections, comp):
         """组件被跳过时清掉可能残留的掩码文件（含旧命名），避免陈旧缓冲被打包。"""
         out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
@@ -2072,11 +2163,20 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 os.remove(path)
         self._remove_legacy_mask_files(out_dir, comp["base_name"])
 
-    def _write_masks_fallback(self, mod_export_path, sections, comp, vertex_count, fallback_zone_id=0):
+    def _write_masks_fallback(
+        self,
+        mod_export_path,
+        sections,
+        comp,
+        vertex_count,
+        fallback_zone_id=0,
+        vertex_base=0,
+    ):
         zone_ids = np.full((vertex_count, SPARSE_ZONE_SLOTS), INVALID_ZONE_ID, dtype=np.uint32)
         zone_weights = np.zeros((vertex_count, SPARSE_ZONE_SLOTS), dtype=np.float32)
-        zone_ids[:, 0] = np.uint32(fallback_zone_id)
-        zone_weights[:, 0] = 1.0
+        vertex_base = max(0, min(int(vertex_base or 0), int(vertex_count)))
+        zone_ids[vertex_base:, 0] = np.uint32(fallback_zone_id)
+        zone_weights[vertex_base:, 0] = 1.0
         out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
         os.makedirs(out_dir, exist_ok=True)
         zone_ids.tofile(os.path.join(out_dir, f"{comp['base_name']}JiggleZoneIDs.buf"))
@@ -2310,16 +2410,27 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if positions is None:
             print(f"[DragInteraction][WARNING] 碰撞烘焙：{comp['comp_name']} 无法读取 Position.buf，跳过")
             return False
+        source_vertex_count = len(positions)
+        vertex_base, vertex_count = self._runtime_vertex_layout(
+            comp, source_vertex_count
+        )
 
-        result = self._read_component_triangles(mod_export_path, sections, comp, vertex_count)
+        result = self._read_component_triangles(
+            mod_export_path, sections, comp, source_vertex_count
+        )
         if result is None:
             print(f"[DragInteraction][WARNING] 碰撞烘焙：{comp['comp_name']} 无法读取 IB 拓扑，跳过")
             return False
         triangles, tri_part_names = result
 
-        collider_mask = np.zeros(int(vertex_count), dtype=bool)
+        collider_mask = np.zeros(source_vertex_count, dtype=bool)
         for _, empty in self._collect_enabled_zone_entries():
-            m = _collider_vertex_mask(empty.ssmt_drag_zone, vertex_count, triangles, tri_part_names)
+            m = _collider_vertex_mask(
+                empty.ssmt_drag_zone,
+                source_vertex_count,
+                triangles,
+                tri_part_names,
+            )
             if m is not None:
                 collider_mask |= m
         if not np.any(collider_mask):
@@ -2329,7 +2440,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             )
             return False
 
-        normals = self._collider_vertex_normals(positions, triangles, collider_mask, vertex_count)
+        normals = self._collider_vertex_normals(
+            positions, triangles, collider_mask, source_vertex_count
+        )
         collider_idx = np.flatnonzero(collider_mask)
         points = np.asarray(positions, dtype=np.float32)[collider_idx]
         point_normals = normals[collider_idx]
@@ -2343,11 +2456,25 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         grid = self._build_collider_grid(points, cell_size, margin)
 
         masked = self._collider_l0_mask(mod_export_path, sections, comp)
+        if masked is not None and len(masked) == vertex_count:
+            masked = masked[vertex_base:vertex_base + source_vertex_count]
+        elif masked is not None and len(masked) != source_vertex_count:
+            print(
+                f"[DragInteraction][WARNING] {comp['comp_name']} 的 JiggleZoneWeights "
+                f"长度 {len(masked)} 无法与 Position {source_vertex_count} / 运行时 "
+                f"{vertex_count} 对齐，碰撞 L0 将按全部基础顶点烘焙"
+            )
+            masked = None
         # 点云交错布局：每点 2×float4（位置 + 单位法线），法线按网格 count-sort 同一 order 重排
         reordered_normals = np.asarray(point_normals, dtype=np.float32)[grid["order"]]
         l0 = self._bake_collider_l0(
             positions, grid["sorted_points"], masked, normals=reordered_normals
         )
+        if vertex_base or vertex_count != source_vertex_count:
+            runtime_l0 = np.zeros((vertex_count * 2, 4), dtype=np.float32)
+            start = vertex_base * 2
+            runtime_l0[start:start + len(l0)] = l0
+            l0 = runtime_l0
 
         out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
         os.makedirs(out_dir, exist_ok=True)
@@ -3212,6 +3339,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     def _detect_section_lines(self, comp, ns, part_index):
         cn = comp["comp_name"]
+        vertex_base = int(comp.get("vertex_base", 0) or 0)
+        if part_index is not None and part_index < len(comp.get("parts") or []):
+            vertex_base = int(comp["parts"][part_index].get("vertex_base", vertex_base) or 0)
         lines = [
             f"cs = {RES_SHADER_DIR}/rzm_object_detect.hlsl",
             "x28 = 0",
@@ -3239,7 +3369,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"cs-u2 = ResourceDragDebugDetect_{cn}_{ns}",
             "x24 = $cursorX", "y24 = $cursorY", "z24 = $screenW", "w24 = $screenH",
             "x25 = $isMouseButtonDown",
-            "x26 = 48", "w26 = 8.0",
+            "x26 = 48", f"z26 = {vertex_base}", "w26 = 8.0",
             "x27 = $cursorX", "y27 = $cursorY", "z27 = res_width", "w27 = res_height",
             "x85 = 0", "y85 = 0", "z85 = 1", "w85 = 1",  # 视口恒等（offset=0,0 scale=1,1）
             # VIEWPORT_VALID 必须为 1：shader 检测主循环被 ValidViewportCursor 门控。
@@ -3275,6 +3405,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"clear = ResourceDragBakeRT_{ns} 0.0",
             ]
             ib_res = part["ib_resource"]
+            vertex_base = int(
+                part.get("vertex_base", comp.get("vertex_base", 0)) or 0
+            )
             step = part["index_count"] // 8
             ib_first_index = part["ib_first_index"]
             for i in range(8):
@@ -3289,7 +3422,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     f"o0 = set_viewport no_view_cache ResourceDragBakeRT_{ns}",
                     f"x26 = {i}",
                     f"y26 = {offset}",
-                    f"drawindexed = 1, {offset}, 0",
+                    f"drawindexed = 1, {offset}, {vertex_base}",
                 ]
             sections[bake_sec] = lines
 

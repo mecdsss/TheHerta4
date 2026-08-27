@@ -22,7 +22,7 @@ DDS_DEFAULT_RULES = [
     {
         "texture_type": "LightMap",
         "pattern": r"(?i)(?:^|[_\-. ])LightMap(?:[_\-. ]|$)",
-        "format": "bc7_unorm_srgb",
+        "format": "bc7_unorm",
     },
     {
         "texture_type": "MaterialMap",
@@ -130,11 +130,20 @@ def _format_is_srgb(dds_format: str) -> bool:
     return "_srgb" in str(dds_format or "").strip().lower()
 
 
-def _texconv_colorspace_flags() -> list[str]:
-    """输入贴图一律按原始数值读取（--ignore-srgb）：渲染器/导出流程写出的
-    PNG 装的就是最终值，转换只更换容器格式、不改变数值，保证转换前后颜色一致。
-    （实测验证：渲染器输出的 PNG 为原始值直出，并非 sRGB 编码；用 --srgb-in
-    会被误做一次 sRGB->线性解码，导致整体变暗。）"""
+def _texconv_colorspace_flags(dds_format: str) -> list[str]:
+    """按输出 DXGI 格式决定 texconv 的色彩空间标志，保证「数值不变、颜色不变」。
+
+    - _srgb 输出（如 bc7_unorm_srgb）：texconv 会把输入默认当作线性并再 encode 到
+      sRGB，导致颜色整体变亮（实测参考图 0.845 -> 0.926）。必须用 --srgb-in 让
+      texconv 先把输入按 sRGB 解码、再 encode 回 sRGB，净效果为恒等，存进去的就是
+      输入本身的数值（0.845 仍旧是 0.845）。
+    - 非 sRGB / 线性 UNORM 输出（bc7_unorm、r8g8b8a8_unorm 等）：按原始数值直接读取
+      （--ignore-srgb），不做任何色彩空间变换，直接存入原值。
+
+    因此不能用固定标志：--srgb-in 对线性输出会误做一次 sRGB->线性解码（变暗），
+    --ignore-srgb 对 sRGB 输出会漏掉解码导致二次 encode（变亮）。"""
+    if _format_is_srgb(dds_format):
+        return ["--srgb-in"]
     return ["--ignore-srgb"]
 
 
@@ -188,7 +197,7 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
 class TT_OT_convert_to_dds(bpy.types.Operator):
     bl_idname = "toolkit.tt_convert_to_dds"
     bl_label = "批量转换为 .dds"
-    bl_description = "使用 texconv.exe 将输出目录中的贴图转换或重编码为目标 DDS 格式，并更新图片引用。按原始数值直接转换（--ignore-srgb），不做色彩空间变换，保证颜色不变"
+    bl_description = "使用 texconv.exe 将输出目录中的贴图转换或重编码为目标 DDS 格式，并更新图片引用。按输出格式选择正确色彩空间标志（sRGB 输出用 --srgb-in、线性输出用 --ignore-srgb），保证转换前后数值/颜色不变"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -250,7 +259,7 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
                     dds_format = "bc7_unorm"
 
                 command = [texconv_executable, "-f", dds_format]
-                command.extend(_texconv_colorspace_flags())
+                command.extend(_texconv_colorspace_flags(dds_format))
                 command.extend(["-o", root, "-y", old_path])
 
                 try:

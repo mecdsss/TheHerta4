@@ -392,9 +392,26 @@ class ObjBufferHelper:
             d3d11_element.ByteWidth / numpy.dtype(FormatUtils.get_nptype_from_format(d3d11_element.Format)).itemsize
         )
         blendindices = FormatUtils.fit_component_width(blendindices, component_count)
-        if d3d11_element.Format == "R32G32B32A32_SINT":
-            return blendindices
-        elif d3d11_element.Format == "R16G16B16A16_UINT":
+        r16_integer_dtypes = {
+            "R16_UINT": numpy.uint16,
+            "R16G16_UINT": numpy.uint16,
+            "R16G16B16A16_UINT": numpy.uint16,
+            "R16_SINT": numpy.int16,
+            "R16G16_SINT": numpy.int16,
+            "R16G16B16A16_SINT": numpy.int16,
+        }
+        if d3d11_element.Format in r16_integer_dtypes:
+            target_dtype = numpy.dtype(r16_integer_dtypes[d3d11_element.Format])
+            limits = numpy.iinfo(target_dtype)
+            min_index = int(numpy.min(blendindices, initial=0))
+            max_index = int(numpy.max(blendindices, initial=0))
+            if min_index < int(limits.min) or max_index > int(limits.max):
+                SSMTErrorUtils.raise_fatal(
+                    f"BLENDINDICES 超出 {d3d11_element.Format} 可承载范围: "
+                    f"min={min_index}, max={max_index}"
+                )
+            return blendindices.astype(target_dtype)
+        elif d3d11_element.Format == "R32G32B32A32_SINT":
             return blendindices
         elif d3d11_element.Format == "R32G32B32A32_UINT":
             return blendindices
@@ -411,37 +428,43 @@ class ObjBufferHelper:
         elif d3d11_element.Format == 'R8G8B8A8_UNORM':
             return FormatUtils.convert_4x_float32_to_r8g8b8a8_unorm(blendindices)
         elif d3d11_element.Format == 'R8G8B8A8_UINT':
+            min_index = int(numpy.min(blendindices, initial=0))
             max_index = int(numpy.max(blendindices, initial=0))
-            if max_index > 255:
+            if min_index < 0 or max_index > 255:
                 if ObjBufferHelper._allow_wide_blendindices_for_remap():
+                    if min_index < 0 or max_index > 65535:
+                        raise Fatal(
+                            "BLENDINDICES cannot be losslessly widened to uint16 "
+                            f"(min={min_index}, max={max_index})."
+                        )
                     return blendindices.astype(numpy.uint16)
                 raise Fatal(
-                    "BLENDINDICES contains values larger than 255 (max="
-                    + str(max_index)
-                    + ") and cannot be exported as R8G8B8A8_UINT."
+                    "BLENDINDICES is outside the R8G8B8A8_UINT range "
+                    f"(min={min_index}, max={max_index})."
                 )
             blendindices = blendindices.astype(numpy.uint8)
             return blendindices
             # print(original_elementname_data_dict[d3d11_element_name].dtype)
         elif d3d11_element.Format == "R8_UINT":
+            min_index = int(numpy.min(blendindices, initial=0))
             max_index = int(numpy.max(blendindices, initial=0))
-            if max_index > 255:
+            if min_index < 0 or max_index > 255:
                 if ObjBufferHelper._allow_wide_blendindices_for_remap():
+                    if min_index < 0 or max_index > 65535:
+                        raise Fatal(
+                            "BLENDINDICES cannot be losslessly widened to uint16 "
+                            f"(min={min_index}, max={max_index})."
+                        )
                     return blendindices.astype(numpy.uint16)
                 raise Fatal(
-                    "BLENDINDICES contains values larger than 255 (max="
-                    + str(max_index)
-                    + ") and cannot be exported as R8_UINT."
+                    "BLENDINDICES is outside the R8_UINT range "
+                    f"(min={min_index}, max={max_index})."
                 )
             blendindices = blendindices.astype(numpy.uint8)
 
             return blendindices
             # print(original_elementname_data_dict[d3d11_element_name].dtype)
             # print("WWMI R8_UINT特殊处理")
-        elif d3d11_element.Format == "R16_UINT":
-            blendindices = blendindices.astype(numpy.uint16)
-            return blendindices
-            # print("WWMI R16_UINT特殊处理")
         else:
             # print(blendindices.shape)
             SSMTErrorUtils.raise_fatal("未知的BLENDINDICES格式")
@@ -645,6 +668,23 @@ class ObjBufferHelper:
                 and isinstance(data, numpy.ndarray)
                 and data.size != 0
             ):
+                # 合并模式（EFMI import_merged_vgmap / WWMI/NTEMI remap）下
+                # BLENDINDICES 必须是 R16 全局骨骼 id；仍为 uint8 = widen 未生效
+                # 的静默截断路径（全局 id > 255 被截断、运行时按 16 位读取错位
+                # → 权重爆炸）。这里大声失败，禁止输出坏 mod。
+                if (
+                    GlobalConfig.logic_name == LogicName.EFMI
+                    and GlobalProterties.import_merged_vgmap()
+                    and bool(getattr(d3d11_game_type, "GPU_PreSkinning", False))
+                ) or (
+                    GlobalConfig.logic_name in (LogicName.WWMI, LogicName.NTEMI)
+                    and GlobalProterties.import_merged_vgmap()
+                ):
+                    SSMTErrorUtils.raise_fatal(
+                        "BLENDINDICES 仍以 uint8 打包（合并模式必须 R16 全局骨骼 id）："
+                        f"max_index={int(numpy.max(data, initial=0))}。请检查 "
+                        "widen_blendindices 是否在导出前生效（重新导入或重新执行合并骨骼预处理）。"
+                    )
                 max_index = int(numpy.max(data, initial=0))
                 if max_index > 255:
                     SSMTErrorUtils.raise_fatal(

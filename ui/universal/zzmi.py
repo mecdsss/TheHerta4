@@ -790,11 +790,23 @@ class ExportZZMI(ExportUnity):
                     )
                 redirect_target_plan = self._redirect_target_map.get(draw_ib)
                 if redirect_target_plan is not None:
-                    # target 先到时保存其真实 SO 输出资源；后到的依赖挂点会把
-                    # 合并 deform draw 明确回写到这块 target SO，而非 carrier SO。
-                    texture_override_vb_section.append(
-                        f"ResourceZZRedirectSO_{draw_ib} = ref so0"
-                    )
+                    # 有真实几何的 target 仍由自身捕获 SO；纯占位 target 则由
+                    # 兼容的 carrier 捕获，避免 target 晚到时把有效 carrier SO
+                    # 覆盖为空或以 BI4 布局执行 BI16 重放。
+                    if redirect_target_plan.get("target_has_real_geometry", True):
+                        texture_override_vb_section.append(
+                            f"ResourceZZRedirectSO_{draw_ib} = ref so0"
+                        )
+                # 纯占位 target 的 SO owner 是第一个 carrier。该赋值必须只在
+                # owner 挂点出现；若 target 晚到，不能再次覆盖已写入的有效 SO。
+                for owner_target_ib, owner_plan in self._redirect_target_map.items():
+                    if (
+                        owner_plan.get("so_owner_ib") == draw_ib
+                        and not owner_plan.get("target_has_real_geometry", True)
+                    ):
+                        texture_override_vb_section.append(
+                            f"ResourceZZRedirectSO_{owner_target_ib} = ref so0"
+                        )
                 texture_override_vb_section.append("handling = skip")
 
                 # 合并网格自动重定向：carrier 的 deform 退化为 3 顶点 stub draw
@@ -821,6 +833,12 @@ class ExportZZMI(ExportUnity):
                     and int(merged_component) in plan.get("required_component_ids", [])
                 ]
                 for deferred_target_ib, deferred_plan in deferred_plans:
+                    compatible_ids = deferred_plan.get("compatible_component_ids")
+                    if (
+                        compatible_ids is not None
+                        and int(merged_component) not in compatible_ids
+                    ):
+                        continue
                     required_ids = deferred_plan.get("required_component_ids", [])
                     all_seen = " && ".join(
                         f"$zz_ms_seen_c{cid} == 1" for cid in required_ids
@@ -879,11 +897,19 @@ class ExportZZMI(ExportUnity):
             )
             return
 
-        vertex_count = (
-            3
-            if redirect_carrier is not None
-            else redirect_target["so_vertex_count"]
-        )
+        if redirect_carrier is not None:
+            carrier_target_plan = self._redirect_target_map.get(
+                redirect_carrier.get("target"), {}
+            )
+            if (
+                not carrier_target_plan.get("target_has_real_geometry", True)
+                and carrier_target_plan.get("so_owner_ib") == draw_ib
+            ):
+                vertex_count = carrier_target_plan["so_vertex_count"]
+            else:
+                vertex_count = 3
+        else:
+            vertex_count = redirect_target["so_vertex_count"]
         vertexlimit_section = M_IniSection(M_SectionType.TextureOverrideVertexLimitRaise)
         vertexlimit_section.append(
             "[TextureOverride_" + draw_ib + "_" + drawib_model.draw_ib_alias
@@ -1016,6 +1042,28 @@ class ExportZZMI(ExportUnity):
             )
         for skeleton_group, entries in by_group.items():
             for draw_ib, reason, target_ib in entries:
+                if reason == "incompatible-blend-layout":
+                    print(
+                        f"[ZZMI骨骼合并] !!! 合并网格无法自动重定向: DrawIB {draw_ib}"
+                        f"（骨架组 G{skeleton_group}）与目标挂点的 Blend 输入布局不兼容；"
+                        "强行重放会按错误的 BLENDINDICES/BLENDWEIGHT 格式读取并导致爆炸。"
+                    )
+                    print(
+                        "[ZZMI骨骼合并] 请让合并网格挂在组内最后一个 deform draw，"
+                        "或重新导入并统一参与重放部件的 Blend 布局后再导出。"
+                    )
+                    continue
+                if reason == "missing-blend-layout":
+                    print(
+                        f"[ZZMI骨骼合并] !!! 合并网格无法自动重定向: DrawIB {draw_ib}"
+                        f"（骨架组 G{skeleton_group}）缺少可验证的 Blend 输入布局；"
+                        "为避免按错误的 BLENDINDICES/BLENDWEIGHT 格式重放，已停止该重定向。"
+                    )
+                    print(
+                        "[ZZMI骨骼合并] 请重新导入该角色的全部参与部件，"
+                        "确保 GameType 包含有效的 Blend 元素或正数 stride 后再导出。"
+                    )
+                    continue
                 print(
                     f"[ZZMI骨骼合并] !!! 合并网格时序无法自动修复: DrawIB {draw_ib}"
                     f"（骨架组 G{skeleton_group}）引用了其它部件的骨骼，但其 deform "
@@ -1099,6 +1147,66 @@ class ExportZZMI(ExportUnity):
                 total += self._submesh_exported_vertex_count(submesh_model)
         return total
 
+    def _drawib_has_real_geometry(self, draw_ib: str) -> bool:
+        """判断 DrawIB 是否包含真实几何（而非全部为 ZZMI 占位子网格）。"""
+        for drawib_model in self.drawib_model_list:
+            if drawib_model.draw_ib != draw_ib:
+                continue
+            for submesh_model in drawib_model.submesh_model_list:
+                if not self._submesh_is_stub(submesh_model):
+                    return True
+        return False
+
+    def _drawib_blend_layout_signature(self, draw_ib: str):
+        """返回用于 deform 重放的 Blend 输入布局签名。
+
+        自动重定向会在另一个 DrawIB 的 IA 状态下执行 draw；Blend 槽的
+        stride/元素布局不兼容时，BLENDINDICES 会被按错误格式解释，结果通常
+        是流输出全零。优先比较完整元素，测试桩或旧模型则退化为 stride。
+        """
+        for drawib_model in self.drawib_model_list:
+            if drawib_model.draw_ib != draw_ib:
+                continue
+            game_type = getattr(drawib_model, "d3d11GameType", None)
+            elements = getattr(game_type, "D3D11ElementList", None)
+            if elements:
+                signature = []
+                for element in elements:
+                    if str(getattr(element, "Category", "") or "") != "Blend":
+                        continue
+                    semantic_name = str(
+                        getattr(element, "SemanticName", "") or ""
+                    ).upper()
+                    element_format = str(
+                        getattr(element, "Format", "") or ""
+                    ).upper()
+                    # 不同捕获路径可能把同一组 32 位骨骼索引记录成
+                    # UINT/SINT；对非负骨骼编号而言二者的位宽和读取步长相同，
+                    # 不应因此把本来兼容的 BI16 挂点拆开。
+                    if semantic_name == "BLENDINDICES":
+                        element_format = element_format.replace("_UINT", "_INT")
+                        element_format = element_format.replace("_SINT", "_INT")
+                    signature.append(
+                        (
+                            semantic_name,
+                            int(getattr(element, "SemanticIndex", 0) or 0),
+                            element_format,
+                            int(getattr(element, "ByteWidth", 0) or 0),
+                            str(getattr(element, "ExtractSlot", "") or ""),
+                        )
+                    )
+                if signature:
+                    return ("elements", tuple(signature))
+            stride_dict = getattr(game_type, "CategoryStrideDict", {}) or {}
+            try:
+                blend_stride = int(stride_dict.get("Blend", 0) or 0)
+            except (TypeError, ValueError):
+                blend_stride = 0
+            if blend_stride > 0:
+                return ("stride", blend_stride)
+            return None
+        return None
+
     def _drawib_stub_submeshes(self, draw_ib: str) -> list:
         """DrawIB 的 stub 子网格列表（占位对象，无真实几何）。"""
         result = []
@@ -1147,7 +1255,9 @@ class ExportZZMI(ExportUnity):
                                    "vertex_count": 合并网格导出顶点数}
         - target_map: draw_ib -> {"deform_draws": [(vb0 资源名, vb2 资源名, 顶点数), ...],
                                   "so_vertex_count": target SO 总大小（含自身 stub）,
-                                  "target_own_vertices": target 完整导出顶点数}
+                                  "target_own_vertices": target 完整导出顶点数,
+                                  "so_owner_ib": 实际持有 SO 的 DrawIB,
+                                  "compatible_component_ids": 可安全执行重放的组件 id}
         - unredirected: draw_ib -> {"reason": str, "target": str|""}（无法自动重定向）
         """
         carrier_map: dict[str, dict] = {}
@@ -1190,6 +1300,7 @@ class ExportZZMI(ExportUnity):
             # stub 的 remapped IB 也引用这 3 个顶点；若将其排除，紧随其后的
             # carrier 顶点会占据相同索引范围，target 占位 draw 将画出真实几何。
             target_own_vertices = self._drawib_exported_vertex_count(target_ib)
+            target_has_real_geometry = self._drawib_has_real_geometry(target_ib)
             target_first_indices = self._drawib_first_match_first_index(target_ib)
             target_first_index = target_first_indices[0] if target_first_indices else 0
 
@@ -1229,10 +1340,41 @@ class ExportZZMI(ExportUnity):
             if not carriers:
                 continue
 
+            # 一段 deferred deform draw 只能在同一种已知 Blend 输入布局下执行。
+            # 元数据缺失也不能按“兼容”回退，否则换角色或旧工作空间恰好混入
+            # R16/R32、BI4/BI16 时，仍会在运行时静默错读权重。
+            replay_draw_ibs = [
+                target_ib if target_has_real_geometry else None,
+                *(carrier["draw_ib"] for carrier in carriers),
+            ]
+            replay_layouts = {
+                self._drawib_blend_layout_signature(draw_ib)
+                for draw_ib in replay_draw_ibs
+                if draw_ib
+            }
+            if None in replay_layouts:
+                for carrier in carriers:
+                    unredirected[carrier["draw_ib"]] = {
+                        "reason": "missing-blend-layout",
+                        "target": last.get("unique_str") or "",
+                    }
+                continue
+            known_replay_layouts = {layout for layout in replay_layouts if layout is not None}
+            if len(known_replay_layouts) > 1:
+                for carrier in carriers:
+                    unredirected[carrier["draw_ib"]] = {
+                        "reason": "incompatible-blend-layout",
+                        "target": last.get("unique_str") or "",
+                    }
+                continue
+
             # target 的 SO 布局：[target 完整导出顶点（含 stub）][carrier1 merged]...
             base_vertex = target_own_vertices
             deform_draws = []
-            if target_own_vertices > 0:
+            # 纯占位 target 只需要保留 SO 前缀，不能把它的 BI4/BI8 等输入布局
+            # 带进后续 carrier 的实际重放；carrier 的 3 顶点 stub draw 会占住
+            # 前缀，真实 carrier 几何仍从 base_vertex=3 开始，因此无需 target draw。
+            if target_has_real_geometry and target_own_vertices > 0:
                 deform_draws.append((
                     f"Resource{target_ib}Position",
                     f"Resource{target_ib}Blend",
@@ -1253,7 +1395,7 @@ class ExportZZMI(ExportUnity):
                     slot_owner.setdefault(bone_id, component_id)
             required_component_ids: set[int] = set()
             target_component_id = component_id_by_draw_ib.get(target_ib)
-            if target_component_id is not None:
+            if target_component_id is not None and target_has_real_geometry:
                 # target 的 deform 段负责捕获 ResourceZZRedirectSO_<target>；
                 # 没有它就绪，carrier 即使其它 palette 都到齐也不能回放。
                 required_component_ids.add(target_component_id)
@@ -1278,11 +1420,49 @@ class ExportZZMI(ExportUnity):
                 }
                 base_vertex += carrier["vertex_count"]
                 so_total += carrier["vertex_count"]
+
+            # target 只有占位几何时，合并 SO 必须由一个真实 carrier 挂点拥有。
+            # 这样 target 晚到也不会把空的/BI4 的 SO 覆盖掉，carrier 自己的
+            # BI16（或同类）输入布局可以在任意兼容挂点完成实际流输出。
+            so_owner_ib = target_ib
+            if not target_has_real_geometry and carriers:
+                so_owner_ib = carriers[0]["draw_ib"]
+                owner_component_id = component_id_by_draw_ib.get(so_owner_ib)
+                if owner_component_id is not None:
+                    required_component_ids.add(owner_component_id)
+
+            # 只有 Blend 输入布局兼容的挂点才允许执行整段 deferred draw。
+            # 位置/UV 槽可以不同，但 BI4 与 BW16_BI16 不能混用；后者会把
+            # float 权重按单索引解释，D3D11 流输出通常直接变成全零。
+            deform_draw_ibs = [
+                target_ib if target_has_real_geometry else None,
+                *(carrier["draw_ib"] for carrier in carriers),
+            ]
+            deform_draw_ibs = [draw_ib for draw_ib in deform_draw_ibs if draw_ib]
+            deform_layouts = {
+                self._drawib_blend_layout_signature(draw_ib)
+                for draw_ib in deform_draw_ibs
+            }
+            compatible_component_ids = []
+            if deform_layouts and None not in deform_layouts and len(deform_layouts) == 1:
+                common_layout = next(iter(deform_layouts))
+                for component_id in sorted(required_component_ids):
+                    component_draw_ib = self.merged_skeleton_components[component_id]["draw_ib"]
+                    if self._drawib_blend_layout_signature(component_draw_ib) == common_layout:
+                        compatible_component_ids.append(component_id)
+            else:
+                # 元数据不完整时保持旧行为，避免历史工作空间因为缺少布局对象
+                # 而突然失去自动重定向；真实模型会在上面的完整签名分支收紧。
+                compatible_component_ids = sorted(required_component_ids)
             target_map[target_ib] = {
+                "target_ib": target_ib,
                 "deform_draws": deform_draws,
                 "so_vertex_count": so_total,
                 "target_own_vertices": target_own_vertices,
+                "target_has_real_geometry": target_has_real_geometry,
+                "so_owner_ib": so_owner_ib,
                 "required_component_ids": sorted(required_component_ids),
+                "compatible_component_ids": compatible_component_ids,
                 "so_stride": next(
                     (
                         int(
@@ -1306,6 +1486,92 @@ class ExportZZMI(ExportUnity):
 
         return carrier_map, target_map, unredirected
 
+    @staticmethod
+    def _redirect_texcoord_resource_name(target_ib: str, carrier_ib: str, base_vertex: int) -> str:
+        """返回合并网格 carrier 专用的、已按 base_vertex 对齐的 Texcoord 资源名。"""
+        return (
+            f"ResourceZZRedirectTexcoord_{target_ib}_{carrier_ib}_{int(base_vertex)}"
+        )
+
+    @staticmethod
+    def _redirect_texcoord_filename(target_ib: str, carrier_ib: str, base_vertex: int) -> str:
+        return f"zz_redirect_texcoord_{target_ib}_{carrier_ib}_{int(base_vertex)}.buf"
+
+    def _build_redirect_texcoord_payload(self, carrier_ib: str, carrier_info: dict) -> tuple[bytes, int]:
+        """为 carrier 的 vb1 生成与 RedirectSO 相同顶点偏移的缓冲。
+
+        D3D11 的 ``base_vertex`` 会同时作用于所有顶点输入槽。合并重定向只把
+        ``vb0`` 换成 target 的 RedirectSO，而 carrier 原本的 vb1 从第 0 行开始，
+        因而会在每个索引上错读 ``base_vertex`` 行。这里在 Texcoord 前补齐同样
+        数量的空行，使 ``vb1[index + base_vertex]`` 仍命中 carrier 的 UV 行。
+        """
+        drawib_model = next(
+            (
+                model
+                for model in self.drawib_model_list
+                if model.draw_ib == carrier_ib
+            ),
+            None,
+        )
+        if drawib_model is None:
+            raise RuntimeError(
+                f"[ZZMI骨骼合并] 找不到重定向 carrier DrawIB {carrier_ib}，无法生成 Texcoord 对齐缓冲"
+            )
+
+        game_type = getattr(drawib_model, "d3d11GameType", None)
+        stride = int(
+            (getattr(game_type, "CategoryStrideDict", {}) or {}).get("Texcoord", 0)
+            or 0
+        )
+        if stride <= 0:
+            # 没有 Texcoord 输入槽时不需要绑定 vb1；调用方会据此跳过资源。
+            return b"", 0
+
+        category_buffer = (getattr(drawib_model, "category_buffer_dict", {}) or {}).get(
+            "Texcoord"
+        )
+        if category_buffer is None:
+            raise RuntimeError(
+                f"[ZZMI骨骼合并] carrier {carrier_ib} 缺少 Texcoord 缓冲，"
+                "不能生成与 RedirectSO 对齐的 vb1"
+            )
+        if hasattr(category_buffer, "tobytes"):
+            category_bytes = category_buffer.tobytes()
+        else:
+            category_bytes = bytes(category_buffer)
+
+        vertex_count = int(carrier_info.get("vertex_count", 0) or 0)
+        if vertex_count < 0 or len(category_bytes) != vertex_count * stride:
+            raise RuntimeError(
+                f"[ZZMI骨骼合并] carrier {carrier_ib} 的 Texcoord 长度不匹配："
+                f"实际 {len(category_bytes)} 字节，期望 {vertex_count}*{stride}"
+            )
+
+        base_vertex = int(carrier_info.get("base_vertex", 0) or 0)
+        if base_vertex < 0:
+            raise RuntimeError(
+                f"[ZZMI骨骼合并] carrier {carrier_ib} 的 base_vertex 不能为负数: {base_vertex}"
+            )
+        return (b"\x00" * (base_vertex * stride)) + category_bytes, stride
+
+    def _write_redirect_texcoord_resources(self) -> list[tuple[str, int, str]]:
+        """写出所有 carrier 的对齐 Texcoord，并返回 INI 资源定义。"""
+        resource_definitions = []
+        mod_meshes_dir = os.path.join(GlobalConfig.path_generate_mod_folder(), "Meshes")
+        for carrier_ib, carrier_info in sorted((self._redirect_carrier_map or {}).items()):
+            payload, stride = self._build_redirect_texcoord_payload(carrier_ib, carrier_info)
+            if stride <= 0:
+                continue
+            target_ib = carrier_info["target"]
+            base_vertex = int(carrier_info.get("base_vertex", 0) or 0)
+            resource_name = self._redirect_texcoord_resource_name(
+                target_ib, carrier_ib, base_vertex
+            )
+            filename = self._redirect_texcoord_filename(target_ib, carrier_ib, base_vertex)
+            self._atomic_write_binary(os.path.join(mod_meshes_dir, filename), payload)
+            resource_definitions.append((resource_name, stride, filename))
+        return resource_definitions
+
     def add_merged_skeleton_sections(self, ini_builder: M_IniBuilder):
         """生成 ZZMI 合并骨架段（组内统一骨架版：全局骨骼编号 + 逐 pass attach）。
 
@@ -1325,13 +1591,14 @@ class ExportZZMI(ExportUnity):
         - 未生成组件无需任何延迟机制，继续走游戏原渲染（当帧 palette）。
         """
         section = M_IniSection(M_SectionType.MergedSkeleton)
-        section.append("[Constants]")
+        constants_section = M_IniSection(M_SectionType.Constants)
+        constants_section.SectionName = "Constants"
         groups = self._merged_skeleton_groups()
         for component_id in range(len(self.merged_skeleton_components)):
-            section.append(f"global $zz_ms_seen_c{component_id} = 0")
+            constants_section.append(f"global $zz_ms_seen_c{component_id} = 0")
         for target_ib in sorted(self._redirect_target_map):
-            section.append(f"global $zz_ms_redirect_drawn_{target_ib} = 0")
-        section.new_line()
+            constants_section.append(f"global $zz_ms_redirect_drawn_{target_ib} = 0")
+        constants_section.new_line()
 
         # 全宽口径：全局骨骼编号空间的大小 = 全部组件 max(vg_offset+vg_count)
         # （导出子集时 vg_offset 是工作空间全局槽位，可能远超导出内 sum——
@@ -1386,6 +1653,11 @@ class ExportZZMI(ExportUnity):
             section.append(f"stride = {int(plan.get('so_stride', 40))}")
             section.new_line()
 
+        # RedirectSO 使用 DrawIndexed 的 base_vertex 读取合并 Position；D3D11 会
+        # 将这个偏移同时应用到 vb1，因此必须给每个 carrier 的 Texcoord 前面补
+        # 同样数量的顶点行。否则位置与 UV 会错位，表现为 UV 整体乱跳/串块。
+        redirect_texcoord_resources = self._write_redirect_texcoord_resources()
+
         # 每组一套合并骨架（组内统一：只直拷本组骨骼，跨组别禁止合并）。
         for skeleton_group in groups:
             section.append(f"[ResourceZZMergedSkeleton_G{skeleton_group}]")
@@ -1419,14 +1691,27 @@ class ExportZZMI(ExportUnity):
             section.new_line()
 
         # [Present] 只清理本帧到达/绘制标记，不再重放可能跨帧/跨对象的 palette 副本。
-        section.append("[Present]")
+        present_section = M_IniSection(M_SectionType.Present)
+        present_section.SectionName = "Present"
         for component_id in range(len(self.merged_skeleton_components)):
-            section.append(f"$zz_ms_seen_c{component_id} = 0")
+            present_section.append(f"$zz_ms_seen_c{component_id} = 0")
         for target_ib in sorted(self._redirect_target_map):
-            section.append(f"$zz_ms_redirect_drawn_{target_ib} = 0")
-        section.new_line()
+            present_section.append(f"$zz_ms_redirect_drawn_{target_ib} = 0")
+        present_section.new_line()
 
         ini_builder.append_section(section)
+        ini_builder.append_section(constants_section)
+        ini_builder.append_section(present_section)
+
+        if redirect_texcoord_resources:
+            resource_section = M_IniSection(M_SectionType.ResourceBuffer)
+            for resource_name, stride, filename in redirect_texcoord_resources:
+                resource_section.append(f"[{resource_name}]")
+                resource_section.append("type = Buffer")
+                resource_section.append(f"stride = {stride}")
+                resource_section.append(f"filename = Meshes/{filename}")
+                resource_section.new_line()
+            ini_builder.append_section(resource_section)
 
     def _copy_merged_skeleton_shader_to_mod(self):
         """把 attach CS 着色器（组内直拷版）复制到生成 Mod 的 res/ 目录。"""
@@ -1567,7 +1852,21 @@ class ExportZZMI(ExportUnity):
             # 的 Texcoord buffer——游戏原 vb1 只覆盖原部件顶点数，合并网格的
             # 索引会越界读（D3D11 OOB 返回 0，UV 全糊到 (0,0) 角落）。
             # 数量不超时保持游戏原绑定（数据同源，零行为变化）。
-            if (
+            if redirect_carrier_info is not None:
+                # DrawIndexed 的 base_vertex 会作用于 vb0/vb1 的所有输入槽；
+                # 使用导出阶段补齐前缀的 carrier Texcoord，保证与 RedirectSO
+                # 中的 Position 行保持同一顶点索引。
+                texcoord_stride = int(
+                    drawib_model.d3d11GameType.CategoryStrideDict.get("Texcoord", 0)
+                    or 0
+                )
+                if texcoord_stride > 0:
+                    base_vertex = int(redirect_carrier_info.get("base_vertex", 0) or 0)
+                    texcoord_resource_name = self._redirect_texcoord_resource_name(
+                        redirect_carrier_info["target"], draw_ib, base_vertex
+                    )
+                    texture_override_ib_section.append(f"vb1 = {texcoord_resource_name}")
+            elif (
                 int(getattr(submesh_model, "vertex_count", 0) or 0)
                 > int(getattr(submesh_model, "original_vertex_count", 0) or 0)
                 and int(getattr(submesh_model, "original_vertex_count", 0) or 0) > 0

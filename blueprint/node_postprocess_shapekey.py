@@ -2355,7 +2355,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     if f"post {res_name} = copy_desc" not in constants_content:
                         constants_lines.append(f"post {res_name} = copy_desc {res_name}_0")
                 if len(base_resources) > 1:
-                    vars_to_define.add("$swapkey100")
+                    # ShapeKey 的内部基础网格选择器必须与 MultiFile 对用户公开的
+                    # animation_swapkey（历史默认 $swapkey100）隔离。
+                    vars_to_define.add("$ssmt_sk_base_mesh")
                 if f"post run = CustomShader_{h}_Anim" not in constants_content:
                     constants_lines.append(f"post run = CustomShader_{h}_Anim")
 
@@ -2469,7 +2471,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                                 "_0",
                                 source_candidates=[res_name],
                             )
-                            block_lines.extend([f"    if $swapkey100 == {i}", f"        cs-u5 = copy {res_name}_0", f"        {res_name} = ref cs-u5", "    endif"])
+                            block_lines.extend([f"    if $ssmt_sk_base_mesh == {i}", f"        cs-u5 = copy {res_name}_0", f"        {res_name} = ref cs-u5", "    endif"])
                     else:
                         res_name = res_to_bind[0]
                         ensure_resource_alias_section(

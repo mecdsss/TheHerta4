@@ -26,11 +26,20 @@ EFMI（明日方舟：终末地）骨骼合并支持模块
 
 多 LOD：LOD0 / LOD1 用**自己**的 FrameAnalysis dump 提取目录（Config/WorkPageTabs.json
 的 tab 名即 LOD 名，每个 tab 的 Config/Tabs/<tabid>.json 记录自己的路径）读取原始
-候选；先用部件加权点云一对一配对，再在部件内部按局部权重中心建立对应。默认只在
-LOD0 执行权重扩散去重，LOD1 将该分区投影到自己的原始槽位；关闭分组投影选项时，
-两侧都保留同一份部件对应账本但各自独立去重。LOD0 是基准；LOD1 的有效对应组数
-不得少于 LOD0，额外细分允许存在。导出端仍按 LOD 生成多套独立合并骨架配置，JSON
-另写入 EFMILODCorrespondence 账本供复核。
+候选。v10：每 LOD 用**自己的 dump** 独立执行权重扩散去重
+（槽位从 0 起），随后非基准 LOD 的整个编号空间**平移到基准 LOD 段之后**
+（LOD0: 0..max0，LOD1: base 起）——两域不相交、全局唯一，跨 LOD **零共享零串扰**。
+v9 投影（LOD1 顶点组引用 LOD0 基准槽位 + 运行时 full→lod BlendRemap 共享槽位）
+实测爆炸：同帧 LOD0/LOD1 绘制对同一 component 只导入一次骨骼、仅允许更优 LOD
+覆盖，LOD1 网格混用 LOD0 矩阵。跨 LOD 对应账本（build_cross_lod_correspondence）
+仍写入 json（EFMILODCorrespondence / EFMILODReference / EFMILODGroupCount 等）
+但不让 LOD1 直接借用 LOD0 槽位：开关开启时，它用于把 LOD0 最终去重分区镜像
+约束到 LOD1 自己的槽位段，并在导入后为实际 Blender 物体配对、生成并执行
+LOD0→LOD1 顶点组匹配节点；账本本身不充当物体顶点组映射表。
+几何匹配不成功的 LOD1 部件（未进入部件配对或配对得分超
+_CROSS_LOD_PART_IMPORT_SCORE_LIMIT）不生成 VGMap、json 写入
+EFMILODProjectionSkipped=True，导入侧据此排除。约束、过滤和自动匹配链均由
+lod_group_projection 开关统一控制；关闭后两侧只按各自 dump 独立去重。
 """
 
 # 注解延迟求值（PEP 563）：避免类定义期解析 numpy.ndarray 等注解，
@@ -62,7 +71,42 @@ _MATRIX_AMBIGUITY_FLOOR = 1e-6
 # 对应评分而不误把旧的运行时槽位当成新布局。
 # v5: cross-LOD local correspondence is geometry-led; matrix is no longer a
 # hard acceptance gate and is only a bounded secondary score term.
-_CROSS_LOD_LAYOUT_VERSION = 5
+# v7: 目标侧 VGMap 编号空间修正——不再沿用参考侧组 id（跨 LOD 串扰根因：参考号
+# 在目标池中命中错误骨骼段/空洞）。
+# v8: 完全独立 + 分段平移（2026-08-27 用户拍板）：每 LOD 用自身 dump 独立去重，
+# 非基准 LOD 的整个编号空间平移到基准 LOD 段之后（LOD0: 0..max0，LOD1: base 起），
+# 两域不相交；build_lod_maps_from_reference 已移除，跨 LOD 对应仅存诊断账本。
+# v9（2026-08-28 用户拍板：恢复投影）：非基准 LOD 的 VGMap **投影到基准分区**——
+# 匹配局部映射到 LOD0 分区的全局槽位（LOD0 中已合并的两个组，其 LOD1 对应组
+# 也落在同一槽位 = 继承合并）；未匹配局部按恒等暗影槽位（part_offset + local），
+# 对应参考插件 remap 的 get(i,i) 回退。跨 LOD 顶点组编号统一（单池单编号空间），
+# LOD 骨骼布局差异由 full→lod remap 在运行时消化。
+# v10（**撤销 v9 共享槽位投影**）：实测 LOD1 模型爆炸根因 = LOD1 的
+# 顶点组编号与 LOD0 共用同一批槽位，而运行时 MergedSkeleton_Apply 对同一
+# component 每帧只导入一次骨骼（Instance_UpdateFrame 门控 + 仅允许更优
+# $lod_level 覆盖）：同帧先 LOD0 后 LOD1 时，LOD1 网格读取的是 LOD0 已导入的
+# 矩阵（L0/L1 两侧矩阵数据不同）→ 爆炸。恢复 v8 语义：每 LOD 独立去重（自身
+# 槽位从 0 起），非基准 LOD 编号空间整体平移到基准段之后（LOD0 0..370、
+# LOD1 371 起），两域不相交、全局唯一；每个 LOD 绘制入口挂**自己的** component
+# 槽位段，运行时把**当前 LOD 自己的矩阵**写入自己的槽位（无跨 LOD remap 共享）。
+# v11（修复 v10 两点缺陷）：两边去重不一致（L0 5/6 合并，
+# L1 对应 11..17 却各占槽位）——以 L0 最终合并组为标签约束 L1 去重（不同标签
+# 断边）+ 强制同标签共用最小槽位，L0 合并 ⇒ L1 对应必合并；L1 可多于 L0
+# （无对应组保持独立槽位）。
+# v12（暂存）：曾把两侧值域压缩重排（L0 [0,k0)、L1 从 k0 起）——实测游戏内
+# 直接乱掉（L1 值域侵入 L0 声明段区域）。v13 撤销：**两侧都不做值域重排**，
+# 恢复 v10 平移口径（值域 = 去重原生槽位 + 整段平移，跨 LOD 零共享），
+# 仅保留 v11 镜像约束。
+_CROSS_LOD_LAYOUT_VERSION = 13
+
+# 跨 LOD 部件配对得分上限：部件双方已进入一对一配对（中心距通过 0.75 硬门控）
+# 但得分仍超过该值时视作“几何匹配不成立”——用于分组投影模式的导入过滤，
+# 该部件同样不导入。不参与部件内部 VG 级对应/去重的判定。
+# 得分构成：0.5*(对称最近邻点云中位距离) + bbox 间隙*0.25 + 中心距*0.10
+#   + 尺寸误差*0.05 + 部件数对数项(<=0.20)。
+# 真实同部件跨 LOD 的表面间距通常 <=0.05（简化 LOD 亦在 ~0.1 内）；
+# 错配且中心恰好相近（如贴身衣物/邻近附件）的部件往往 >=0.3。
+_CROSS_LOD_PART_IMPORT_SCORE_LIMIT = 0.30
 # LOD0/LOD1 may be captured in different poses or after mesh simplification;
 # this is the scale used for the secondary matrix score. Same-LOD deduplication
 # continues to use its independent 1e-3 hard gate.
@@ -371,11 +415,11 @@ class EFMIBoneMapBuilder:
         位（0xFFFFFFFF），因此 i4 与 u4 共用同一哨兵。
         """
         np_type = str(np_type or "").strip().lower()
-        if np_type == "u1":
+        if np_type in {"u1", "i1"}:
             return 0xFF
-        if np_type == "u2":
+        if np_type in {"u2", "i2"}:
             return 0xFFFF
-        return 0xFFFFFFFF  # u4 / i4
+        return 0xFFFFFFFF  # u4 / i4；有符号类型的全部负值由 valid_blend_channels 过滤
 
     @staticmethod
     def parse_blend_layout(submesh_json_dict: dict) -> dict | None:
@@ -384,7 +428,7 @@ class EFMIBoneMapBuilder:
         返回 {
             "stride": 顶点行总字节数,
             "bi_offset": BLENDINDICES 字节偏移,
-            "bi_np": numpy dtype 字符串（'u1'/'u2'/'u4'/'i4'）,
+            "bi_np": numpy dtype 字符串（'u1'/'u2'/'u4'/'i1'/'i2'/'i4'）,
             "bi_channels": 索引通道数,
             "bw_offset": BLENDWEIGHTS 字节偏移（无权重元素时为 None）,
             "bw_np": 权重 dtype（无权重元素时为 None）,
@@ -445,10 +489,17 @@ class EFMIBoneMapBuilder:
     def _blend_index_layout_entry(fmt: str) -> tuple[str, int] | None:
         layout = {
             "R8G8B8A8_UINT": ("u1", 4),
+            "R8G8_UINT": ("u1", 2),
             "R8_UINT": ("u1", 1),
+            "R8G8B8A8_SINT": ("i1", 4),
+            "R8G8_SINT": ("i1", 2),
+            "R8_SINT": ("i1", 1),
             "R16G16B16A16_UINT": ("u2", 4),
             "R16G16_UINT": ("u2", 2),
             "R16_UINT": ("u2", 1),
+            "R16G16B16A16_SINT": ("i2", 4),
+            "R16G16_SINT": ("i2", 2),
+            "R16_SINT": ("i2", 1),
             "R32G32B32A32_UINT": ("u4", 4),
             "R32G32_UINT": ("u4", 2),
             "R32_UINT": ("u4", 1),
@@ -545,7 +596,7 @@ class EFMIBoneMapBuilder:
         for channel in range(indices.shape[1]):
             weight_col = weights[:, channel] if channel < weights.shape[1] else weights[:, 0]
             column = indices[:, channel]
-            if np_type == "i4":
+            if np_type.startswith("i"):
                 # SINT 经 uint32 转换后，任何负值都落在高位；-1 只是其中一种
                 # 无效标记，这里把全部负数回绕值一并过滤。
                 index_valid = column < 0x80000000
@@ -1813,81 +1864,171 @@ class EFMIBoneMapBuilder:
         return vg_maps, vg_offsets
 
     @staticmethod
-    def build_lod_maps_from_reference(
-        reference_submesh_skeletons: dict[str, tuple],
-        reference_vg_maps: dict[str, dict],
-        target_submesh_skeletons: dict[str, tuple],
+    def project_non_reference_partitions(
+        collected_by_lod: dict[str, dict[str, tuple]],
         correspondence: dict,
-        reference_lod: str | None = None,
-        target_lod: str | None = None,
-    ) -> tuple[dict[str, dict], dict[str, int]]:
-        """按参考 LOD 的去重分区生成目标 LOD 映射。
+        reference_lod: str,
+        projection_skip_by_lod: dict[str, set[str]] | None = None,
+    ) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, int]], int]:
+        """[已废弃 v9 投影语义] 遗留入口，见 build_independent_lod_maps。
 
-        目标侧只建立原始槽位的恒等映射，然后把已有的一对一原始候选对应
-        投影到参考侧 global group。这样 LOD1 不再独立运行权重扩散/并查集，
-        但仍使用自己的槽位编号和自己的骨骼矩阵池；未被对应覆盖的额外 LOD1
-        候选保留恒等槽位，不伪造参考侧缺失的顶点组。
+        v9 曾把非基准 LOD 的槽位投影到基准分区，实测 LOD1 爆炸
+        （同帧共用槽位 + 运行时每 component 每帧只导入一次骨骼 → LOD1 网格读到
+        LOD0 矩阵）。该方案已经撤销，此函数保留仅作历史参考与兼容旧
+        测试桩；新代码一律使用 build_independent_lod_maps。
         """
-        target_maps, target_offsets = EFMIBoneMapBuilder.build_vg_maps(
-            target_submesh_skeletons,
-            deduplicate=False,
+        raise RuntimeError(
+            "project_non_reference_partitions（v9 投影）已废弃；"
+            "请使用 EFMIBoneMapBuilder.build_independent_lod_maps（v10 独立+分段平移）。"
         )
-        if not target_maps or not reference_vg_maps:
-            return target_maps, target_offsets
 
-        reference_lod = str(
-            reference_lod or correspondence.get("reference_lod", "") or ""
-        ).strip()
-        if target_lod is None:
-            lod_names = {
-                str(row.get("target_lod", "") or "").strip()
-                for row in correspondence.get("matches", []) or []
+    @staticmethod
+    def build_independent_lod_maps(
+        collected_by_lod: dict[str, dict[str, tuple]],
+        reference_lod: str,
+        projection_skip_by_lod: dict[str, set[str]] | None = None,
+        correspondence: dict | None = None,
+    ) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, int]], int]:
+        """把各 LOD 的槽位编号建成**相互独立、分段平移**的全局空间（v10/v11/v13）。
+
+        v10（撤销 v9 共享槽位投影）：每个 LOD 都用**自己的 dump**
+        独立执行权重扩散去重（build_vg_maps，槽位从 0 起、组内自洽），再把非基准
+        LOD 的整个编号空间**平移到基准 LOD 段之后**：
+
+        - 基准 LOD0：0..max0（唯一去重，不做任何平移）；
+        - 非基准 LOD1：base 起（base = 基准段大小 = 基准组全部候选槽位数，
+          即 0..370 之后从 371 起）——两域不相交、全局唯一，跨 LOD 零共享。
+
+        v11（修复 v10 两点缺陷；v13 撤销“值域压缩”部分）：
+        1. ~~值域空洞~~（v13 撤销）：曾把每个 LOD 的值域压缩为密集段（基准段
+           [0,k0)、非基准段从上一段压缩后段尾起）——实测游戏内直接乱掉（L1
+           值域侵入 L0 声明段区域，运行时按全局槽位/声明段混合索引时串扰）。
+           撤销后恢复 v10 平移口径：值域 = 各 LOD 去重原生槽位 + 整体平移，
+           非基准 LOD 值域 ⊆ [baseline_size, 其声明段尾)，跨 LOD 零共享。
+        2. **两边去重不一致**：LOD1 自己的矩阵/扩散判据可能把 L0 同一合并组的
+           多个对应组拆成多个槽位（L0 的 5/6 合并了，L1 对应的 11..17 却各自为政）。
+           修复：传入跨 LOD 对应（``correspondence``），先给 LOD1 候选打上
+           “所属 L0 合并组”标签（_build_cross_lod_constraint_labels，不同标签
+           断边），再强制同标签候选共用同一槽位（_enforce_same_reference_group_
+           single_slot，取组内最小槽、不改编号空间）——L0 合并 ⇒ L1 对应组
+           必合并，L0 未合并 ⇒ L1 对应组也绝不合。L1 总体可多于 L0（无对应的
+           L1-only 组保持独立槽位）。
+
+        v9 投影让 LOD1 顶点组引用 LOD0 的槽位，运行时（MergedSkeleton.ini：
+        每 component 每帧只导入一次骨骼，且仅允许更优 $lod_level 覆盖）同帧
+        先 LOD0 后 LOD1 时，LOD1 网格读取的是 LOD0 已导入的矩阵（两侧矩阵
+        数据不同）→ 模型爆炸。分段平移后每个 LOD 绘制入口挂自己的槽位段，
+        运行时把**当前 LOD 自己的矩阵**写入自己的槽位，无跨 LOD 共享。
+
+        参数与返回同 v9 约定：``collected_by_lod[lod][unique_str] =
+        (skeleton_buffer, vg_count, weighted_counts, signatures)``；返回
+        (maps_by_lod, offsets_by_lod, base_slot)。base_slot 为基准段大小
+        （非基准 LOD 的起始基址），用于统计数据与后续 LOD2+ 的继续平移。
+        ``correspondence`` 为 build_cross_lod_correspondence 的返回值，缺省
+        None 时退化为纯 v10 行为（各自去重 + 平移，无镜像约束）。
+        """
+        projection_skip_by_lod = projection_skip_by_lod or {}
+        reference_lod = str(reference_lod or "").strip()
+        if not reference_lod:
+            reference_lod = "LOD0" if "LOD0" in collected_by_lod else (
+                sorted(collected_by_lod.keys())[0] if collected_by_lod else ""
+            )
+
+        reference_retained = {
+            unique_str: entry
+            for unique_str, entry in (collected_by_lod.get(reference_lod, {}) or {}).items()
+            if unique_str not in projection_skip_by_lod.get(reference_lod, ())
+        }
+        if reference_retained:
+            baseline_maps, baseline_offsets = EFMIBoneMapBuilder.build_vg_maps(
+                reference_retained
+            )
+        else:
+            baseline_maps, baseline_offsets = {}, {}
+
+        maps_by_lod: dict[str, dict[str, dict]] = {
+            reference_lod: baseline_maps,
+        }
+        offsets_by_lod: dict[str, dict[str, int]] = {
+            reference_lod: baseline_offsets,
+        }
+
+        # 基准段大小：基准组全部候选槽位（offset 按 vg_count 连续累加，
+        # max(offset+count) 即基准池总槽位，也是非基准 LOD 的平移基址）。
+        baseline_size = 0
+        for unique_str, ref_offset in baseline_offsets.items():
+            entry = reference_retained.get(unique_str)
+            if entry is None:
+                continue
+            vg_count = int(entry[1] or 0)
+            baseline_size = max(baseline_size, ref_offset + vg_count)
+
+        # 非基准 LOD 按名称排序逐个处理（LOD1、LOD2…），保证平移确定性；
+        # 每个 LOD 独立去重后整体平移，并把自身段大小累加到下一个基址
+        # （LOD2 起继续落在上一段之后；LOD1 只关心与基准不相交）。
+        # v13：**两侧都不做值域压缩重排**——重排使
+        # L0 值域压成 [0,k0) 后 L1 值域被迫从 k0 起，侵入 L0 的声明段区域
+        # [0, baseline_size)，实测游戏内直接乱掉。恢复 v10 平移口径：
+        # 值域 = 各 LOD 去重后的原生槽位（canonical 借位可能留下未引用空洞），
+        # 非基准 LOD 整体平移到基准声明段之后（值域 ⊆ 自身声明段 ∪ 段内借位，
+        # 即 ⊂ [baseline_size, 基准声明尾 + 本段声明尾)），跨 LOD 零共享。
+        # 镜像约束（同 L0 合并组强制同槽、不同 L0 组断边）**保留**——
+        # 它是"拿 L0 约束 L1 去重"，不改变编号语义。
+        shift_base = baseline_size
+        for lod_name in sorted(collected_by_lod.keys()):
+            if lod_name == reference_lod:
+                continue
+            retained = {
+                unique_str: entry
+                for unique_str, entry in (collected_by_lod.get(lod_name, {}) or {}).items()
+                if unique_str not in projection_skip_by_lod.get(lod_name, ())
             }
-            target_lod = next(iter(sorted(lod_names)), "")
-        target_lod = str(target_lod or "").strip()
+            if not retained:
+                maps_by_lod[lod_name] = {}
+                offsets_by_lod[lod_name] = {}
+                continue
+            # v11 镜像约束：从跨 LOD 对应生成本 LOD 候选的“所属 L0 合并组”标签。
+            # 有对应时不同标签断边（不能跨 L0 组合并），无对应时退化为 v10 语义。
+            constraint_labels = (
+                EFMIBoneMapBuilder._build_cross_lod_constraint_labels(
+                    correspondence, lod_name, baseline_maps
+                )
+                if correspondence
+                else {}
+            )
+            lod_maps, lod_offsets = EFMIBoneMapBuilder.build_vg_maps(
+                retained,
+                constraint_labels=constraint_labels,
+            )
+            # v11 镜像强制：同一 L0 合并组的全部目标候选强制共用最小槽位
+            # （build_vg_maps 的标签只断不同组，不并同组）。只重定目标侧
+            # 槽位（取组内最小值），不做任何全局重排。
+            EFMIBoneMapBuilder._enforce_same_reference_group_single_slot(
+                lod_maps, constraint_labels
+            )
+            shifted_maps = {
+                unique_str: {
+                    int(local_id): int(global_id) + shift_base
+                    for local_id, global_id in sorted(part_map.items())
+                }
+                for unique_str, part_map in lod_maps.items()
+            }
+            shifted_offsets = {
+                unique_str: int(offset) + shift_base
+                for unique_str, offset in lod_offsets.items()
+            }
+            maps_by_lod[lod_name] = shifted_maps
+            offsets_by_lod[lod_name] = shifted_offsets
+            # 本 LOD 段大小（供 LOD2+ 继续平移）。
+            segment_end = shift_base
+            for unique_str, shifted_offset in shifted_offsets.items():
+                entry = retained.get(unique_str)
+                if entry is None:
+                    continue
+                segment_end = max(segment_end, shifted_offset + int(entry[1] or 0))
+            shift_base = segment_end
 
-        # 先为每个参考 global group 选一个确定性的目标槽位。primary
-        # correspondence 已保证一个目标原始候选只对应一个参考候选；同一参考组
-        # 的多个目标候选表示 LOD1 额外细分，全部投到该组的第一个目标槽位。
-        target_slot_by_reference_group: dict[int, int] = {}
-        projected_rows = []
-        for row in correspondence.get("matches", []) or []:
-            if reference_lod and str(row.get("reference_lod", "") or "") != reference_lod:
-                continue
-            if target_lod and str(row.get("target_lod", "") or "") != target_lod:
-                continue
-            reference_unique = str(row.get("reference_unique_str", "") or "")
-            target_unique = str(row.get("target_unique_str", "") or "")
-            if reference_unique not in reference_submesh_skeletons:
-                continue
-            try:
-                reference_local = int(row.get("reference_local_vg_id", 0) or 0)
-                target_local = int(row.get("target_local_vg_id", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            reference_group = reference_vg_maps.get(reference_unique, {}).get(reference_local)
-            target_slot = target_maps.get(target_unique, {}).get(target_local)
-            if reference_group is None or target_slot is None:
-                continue
-            reference_group = int(reference_group)
-            target_slot = int(target_slot)
-            projected_rows.append((
-                reference_group,
-                target_slot,
-                target_unique,
-                target_local,
-            ))
-            previous = target_slot_by_reference_group.get(reference_group)
-            if previous is None or target_slot < previous:
-                target_slot_by_reference_group[reference_group] = target_slot
-
-        for reference_group, _target_slot, target_unique, target_local in projected_rows:
-            canonical_target = target_slot_by_reference_group.get(reference_group)
-            if canonical_target is None:
-                continue
-            if target_local in target_maps.get(target_unique, {}):
-                target_maps[target_unique][target_local] = canonical_target
-        return target_maps, target_offsets
+        return maps_by_lod, offsets_by_lod, baseline_size
 
     @staticmethod
     def build_cross_lod_correspondence(
@@ -2572,6 +2713,67 @@ class EFMIBoneMapBuilder:
             labels[(str(unique_str), local_id)] = (str(other_lod), int(other_group))
         return labels
 
+    @staticmethod
+    def _enforce_same_reference_group_single_slot(
+        vg_maps: dict[str, dict],
+        constraint_labels: dict[tuple[str, int], object],
+    ) -> dict[str, dict]:
+        """强制：同一参考合并组（同 label）的所有目标候选落到同一个槽位（v11）。
+
+        build_vg_maps 的 constraint_labels 只保证“不同参考组不合并”，不保证
+        “同一参考组必须合并”——目标 LOD 自己的矩阵硬门控/权重扩散可能把同一
+        参考组的多个候选拆到多个槽位（L1 细分：L0 一个合并组对应 L1 多个组，
+        用户用例：L0 的 5/6 合并后，L1 对应的 11..17 也必须合并）。本步是跨 LOD
+        镜像的**强制**语义：把同 label 的全部候选统一到该组目标侧最小槽位
+        （确定性，不依赖遍历先后）；未带 label 的候选（L0 无对应）保持自身
+        槽位不动。不同 label 的组在 build_vg_maps 阶段已被断边，槽位集天然
+        不相交，因此本步不会产生跨参考组串扰。
+        """
+        if not constraint_labels:
+            return vg_maps
+        label_candidates: dict[object, list[tuple[str, int]]] = {}
+        for key, label in constraint_labels.items():
+            unique_str, local_id = key
+            if vg_maps.get(unique_str) is None or local_id not in vg_maps[unique_str]:
+                continue
+            label_candidates.setdefault(label, []).append((unique_str, local_id))
+        for members in label_candidates.values():
+            if len(members) <= 1:
+                continue
+            rep_slot = min(int(vg_maps[unique][local_id]) for unique, local_id in members)
+            for unique, local_id in members:
+                vg_maps[unique][local_id] = rep_slot
+        return vg_maps
+
+    @staticmethod
+    def _renumber_lod_maps_for_segment(
+        vg_maps: dict[str, dict],
+        base: int,
+    ) -> tuple[dict[str, dict], int]:
+        """把本 LOD 的槽位**值域**按（子网格, 局部）首次出现顺序压到 [base, base+k)。
+
+        用户实测 v10 输出：LOD0 域 [0,370]、LOD1 域 [372,739]——中间的 371
+        不见了。根因：LOD1 首个子网格的 local 0 在去重时并入了其它子网格的
+        canonical 槽位（如 596），其自身声明段起始槽位 371 没有任何候选引用，
+        值域出现空洞。本步把该 LOD 的全部现存槽位重新编号为 base 起、无洞、
+        密集（槽位语义不变，只是压缩编号），并返回段尾（base+去重后组数）供
+        下一 LOD 平移。子网格各自的 VGOffset（声明段，按 vg_count 连续累加）
+        保持不变——声明段只用于“互不相交”的布局检查，实际读槽位以 VGMap
+        值域为准。
+        """
+        order: dict[int, int] = {}
+        next_slot = int(base)
+        for unique_str in sorted(vg_maps.keys()):
+            for local_id in sorted(vg_maps[unique_str], key=lambda k: int(k)):
+                old_slot = int(vg_maps[unique_str][local_id])
+                if old_slot not in order:
+                    order[old_slot] = next_slot
+                    next_slot += 1
+        for unique_str, local_map in vg_maps.items():
+            for local_id in list(local_map.keys()):
+                local_map[local_id] = order[int(local_map[local_id])]
+        return vg_maps, next_slot
+
 
 class EFMISkeletonMergeHelper:
     """EFMI 骨骼合并总流程：定位 FrameAnalysis -> 解析 log -> 构建映射 -> 写回工作空间。"""
@@ -2930,10 +3132,17 @@ class EFMISkeletonMergeHelper:
         """BLENDINDICES 格式 -> (numpy dtype, 通道数)。"""
         layout = {
             "R8G8B8A8_UINT": ("u1", 4),
+            "R8G8_UINT": ("u1", 2),
             "R8_UINT": ("u1", 1),
+            "R8G8B8A8_SINT": ("i1", 4),
+            "R8G8_SINT": ("i1", 2),
+            "R8_SINT": ("i1", 1),
             "R16G16B16A16_UINT": ("u2", 4),
             "R16G16_UINT": ("u2", 2),
             "R16_UINT": ("u2", 1),
+            "R16G16B16A16_SINT": ("i2", 4),
+            "R16G16_SINT": ("i2", 2),
+            "R16_SINT": ("i2", 1),
             "R32G32B32A32_UINT": ("u4", 4),
             "R32G32_UINT": ("u4", 2),
             "R32_UINT": ("u4", 1),
@@ -3035,15 +3244,29 @@ class EFMISkeletonMergeHelper:
     ) -> tuple[bool, str]:
         """为 EFMI 工作空间的子网格生成并写回骨骼合并数据（幂等）。
 
-        多 LOD 语义：unique_str_list 按 LOD 前缀分组，每组优先用**自己的 dump**
-        解析原始骨骼候选；dump 不可用时改用该 LOD 子网格中已复制的工作空间
-        原始文件缓存。先按部件点云建立原始候选对应。lod_group_projection=True
-        时只对 LOD0 执行一次权重扩散去重，再将分区投影到 LOD1；为 False 时
-        两边各自独立执行去重。只有 LOD0 时直接独立计算，不要求 LOD1 存在；
-        明确标记为 GPU-PreSkinning=false 的 CPU 子网格不参与骨骼合并，也不会
-        因此使 GPU 子网格整批回退。没有对应的额外 LOD1 候选保留恒等槽位。
-        运行时槽位仍按 LOD 独立从 0 起，避免把不同 dump 的骨骼池混写；对应事实
-        写入 EFMILODCorrespondence/EFMILOD* 字段，供导出和问题复核。
+        多 LOD 语义（v10/v11/v13：独立分段 + 镜像分区约束）：
+        unique_str_list 按 LOD 前缀分组，每组优先用**自己的 dump** 解析原始骨骼
+        候选；dump 不可用时改用该 LOD 子网格中已复制的工作空间原始文件缓存。
+        每 LOD 用自身 dump 独立执行权重扩散去重，随后非基准 LOD 的编号空间整体
+        **平移**到基准 LOD 段之后（LOD0: 0..max0，LOD1: base 起）——两域不相交、
+        全局唯一，跨 LOD 零共享零串扰。v11 追加镜像约束（跨 LOD 对应作为标签：
+        L0 合并组 ⇒ L1 对应组必合并、不同 L0 组合并断边）；v13 撤销 v12 的
+        值域压缩，保留每个 component 的原生连续声明段。v9 投影
+        （LOD1 顶点组映射到 LOD0 槽位 + 运行时 full→lod BlendRemap）实测 LOD1
+        爆炸：运行时对同一 component 每帧只导入一次骨骼、仅允许更优 $lod_level
+        覆盖，同帧先 LOD0 后 LOD1 时 LOD1 网格读到的是 LOD0 已导入的矩阵
+        （L0/L1 两侧矩阵数据不同）。
+        ``lod_group_projection`` 控制跨 LOD 约束功能，但不改变独立分段编号：
+        True 时用 LOD0 的去重结果镜像约束 LOD1（L0 同组 ⇒ L1 对应组同组，
+        L0 不同组 ⇒ L1 对应组断边），并过滤几何未匹配的 LOD1 部件（不生成
+        VGMap，json 写 EFMILODProjectionSkipped=True）；False 时不传镜像约束、
+        不过滤，LOD0/LOD1 完全按各自 dump 独立去重。两种模式的 LOD 槽位段
+        始终互不重叠，绝不会让 LOD1 直接引用 LOD0 槽位。
+        只有 LOD0 时直接独立计算，不要求 LOD1 存在；明确标记为
+        GPU-PreSkinning=false 的 CPU 子网格不参与骨骼合并，也不会因此使 GPU
+        子网格整批回退。对应成功的部件写入 EFMILODCorrespondence/EFMILOD*
+        诊断账本；开关开启时，该账本还用于构造 LOD1 去重约束标签，但不共享
+        或重排 LOD0 的实际槽位编号。
 
         返回 (是否成功, 描述)。
         """
@@ -3125,14 +3348,17 @@ class EFMISkeletonMergeHelper:
 
         # 多 LOD 先收集原始候选，再建立跨 LOD 对应。单独只有一个 LOD（包括
         # 关闭分组投影时只有 LOD0）必须直接走下面的单组路径，不能把 LOD1
-        # 当成合并计算的前置条件。分组投影模式下 LOD0 是唯一
-        # 执行权重扩散去重的基准侧；LOD1 只把该分区投影到自己的原始槽位，避免
-        # 两侧各自计算后出现“同一对应关系被拆成两套 global group”的回退。独立
-        # 模式仍使用同一份部件对应账本，但两侧分别调用 build_vg_maps。
+        # 当成合并计算的前置条件。全独立 + 分段平移（2026-08-27 用户拍板）：
+        # 每 LOD 用**自己的 dump** 独立执行权重扩散去重（槽位自洽），随后
+        # 非基准 LOD 的编号空间整体**平移**到基准段之后（LOD0: 0..max0，
+        # LOD1: base 起），两域不相交、全局唯一——跨 LOD 零共享、零串扰
+        # （此前“把 LOD1 投影到参考侧组 id”实为串扰根因：参考号在 LOD1 池
+        # 命中错误骨骼段/空洞）。LOD1 独立槽位从自身 0 起步再由平移归位。
         # 已有完整联合缓存时保持幂等，不重复读取大型 Position/Blend 缓冲。
         has_multiple_lods = len(groups) > 1
         if has_multiple_lods:
             joint_cache_ready = True
+            projection_skipped_in_joint: set[str] = set()
             for lod_name, group_list in groups.items():
                 parser = _parser_for_lod(lod_name)
                 for unique_str in group_list:
@@ -3151,6 +3377,11 @@ class EFMISkeletonMergeHelper:
                     if not isinstance(payload, dict):
                         joint_cache_ready = False
                         break
+                    if cls._is_projection_skipped(payload, lod_group_projection):
+                        # 分组投影裁决的“有意排除”：该目标不生成 VGMap 是设计结果，
+                        # 不能当作缓存缺失，否则每次导入都重算整个联合缓存。
+                        projection_skipped_in_joint.add(unique_str)
+                        continue
                     if not cls._efmi_cache_intact(payload, json_path, unique_str):
                         joint_cache_ready = False
                         break
@@ -3179,6 +3410,11 @@ class EFMISkeletonMergeHelper:
                 if not joint_cache_ready:
                     break
             if joint_cache_ready and not force:
+                if projection_skipped_in_joint:
+                    return True, (
+                        "全部子网格已有跨 LOD 骨骼合并缓存（VGMap）；其中 "
+                        f"{len(projection_skipped_in_joint)} 个为投影未匹配裁决跳过，无需重新生成。"
+                    )
                 return True, "全部子网格已有跨 LOD 骨骼合并缓存（VGMap），无需重新生成。"
 
             collected_by_lod = {}
@@ -3198,44 +3434,66 @@ class EFMISkeletonMergeHelper:
                 collected_by_lod,
                 reference_lod="LOD0",
             )
-            maps_by_lod = {}
-            offsets_by_lod = {}
             reference_lod = correspondence.get("reference_lod", "")
-            reference_skeletons = collected_by_lod.get(reference_lod, {})
+
+            # 分组投影导入过滤裁决（先于编号计算）：非基准 LOD 的部件若未进入
+            # 部件一对一配对（unmatched_target_parts）、配对得分超过
+            # _CROSS_LOD_PART_IMPORT_SCORE_LIMIT（弱匹配），或**未能收集到原始
+            # 候选**（dump/工作空间均无骨骼来源、Blend 无 BLENDINDICES 等——
+            # 正是 LOD1 中与 LOD0 无对应的“未知物体”），一律视为“几何匹配不
+            # 成功”：不生成 VGMap、导入时排除。
+            # **关键**：被排除部件必须**参与编号之前**就剔除——统一顶点组编号
+            # 只针对“会被导入的匹配部件”这一整块计算（LOD0 全 + LOD1 保留集），
+            # 被排除的 90 多个不能占用任何槽位（否则匹配部件 offset 落点被撑高，
+            # 顶点组数量虚涨到两三千，且运行时池出现大段空洞）。
+            projection_skip_by_lod: dict[str, set[str]] = {}
             if lod_group_projection:
-                reference_maps, reference_offsets = EFMIBoneMapBuilder.build_vg_maps(
-                    reference_skeletons,
-                ) if reference_skeletons else ({}, {})
-                maps_by_lod[reference_lod] = reference_maps
-                offsets_by_lod[reference_lod] = reference_offsets
-                for lod_name, skeletons in collected_by_lod.items():
+                score_limit = float(_CROSS_LOD_PART_IMPORT_SCORE_LIMIT)
+                for lod_name in sorted(groups.keys()):
                     if lod_name == reference_lod:
                         continue
-                    if not skeletons:
-                        maps_by_lod[lod_name] = {}
-                        offsets_by_lod[lod_name] = {}
-                        continue
-                    maps_by_lod[lod_name], offsets_by_lod[lod_name] = (
-                        EFMIBoneMapBuilder.build_lod_maps_from_reference(
-                            reference_skeletons,
-                            reference_maps,
-                            skeletons,
-                            correspondence,
-                            reference_lod=reference_lod,
-                            target_lod=lod_name,
-                        )
+                    group_list = groups[lod_name]
+                    skipped_parts: set[str] = set()
+                    for part in (
+                        correspondence.get("unmatched_target_parts", {}).get(lod_name, []) or []
+                    ):
+                        skipped_parts.add(str(part))
+                    for row in correspondence.get("part_matches", []) or []:
+                        if str(row.get("target_lod", "") or "") != lod_name:
+                            continue
+                        try:
+                            part_score = float(row.get("score", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            part_score = 0.0
+                        if part_score > score_limit:
+                            skipped_parts.add(str(row.get("target_unique_str", "") or ""))
+                    # 未收集目标 = 该 LOD 请求集合中未进入 collected_by_lod 的目标；
+                    # 它们是 dump/工作空间里拿不到骨骼原始候选的未知部件，几何上
+                    # 无从对应，按“匹配不成功”跳过导入。
+                    uncollected = set(group_list) - set(
+                        collected_by_lod.get(lod_name, {}) or {}
                     )
-            else:
-                # 诊断/兼容模式：保留跨部件点云对应账本，但两侧不共享分区，
-                # 各自使用原有权重扩散判定独立生成 VGMap。
-                for lod_name, skeletons in collected_by_lod.items():
-                    if not skeletons:
-                        maps_by_lod[lod_name] = {}
-                        offsets_by_lod[lod_name] = {}
-                        continue
-                    maps_by_lod[lod_name], offsets_by_lod[lod_name] = (
-                        EFMIBoneMapBuilder.build_vg_maps(skeletons)
-                    )
+                    skipped_parts |= uncollected
+                    skipped_parts.discard("")
+                    projection_skip_by_lod[lod_name] = skipped_parts
+
+            maps_by_lod = {}
+            offsets_by_lod = {}
+            reference_skeletons = collected_by_lod.get(reference_lod, {})
+            # v10/v11/v13 语义：
+            # 每 LOD 用**自己的 dump** 独立执行权重扩散去重（槽位从 0 起），随后
+            # 非基准 LOD 的编号空间整体平移到基准 LOD 段之后（LOD0: 0..max0，
+            # LOD1: base 起）——两域不相交、全局唯一，跨 LOD 零共享零串扰。
+            # 开启分组投影时，跨 LOD 对应作为 L1 去重的镜像约束（L0 合并组 ⇒
+            # L1 对应组必合并）；关闭时传 None，恢复纯 v10 双侧独立去重。
+            maps_by_lod, offsets_by_lod, _base_slot = (
+                EFMIBoneMapBuilder.build_independent_lod_maps(
+                    collected_by_lod,
+                    reference_lod,
+                    projection_skip_by_lod,
+                    correspondence=correspondence if lod_group_projection else None,
+                )
+            )
 
             provisional_counts = {
                 lod_name: len({
@@ -3266,6 +3524,10 @@ class EFMISkeletonMergeHelper:
                     vg_maps_override=maps_by_lod.get(lod_name),
                     vg_offsets_override=offsets_by_lod.get(lod_name),
                     cross_lod_info=correspondence,
+                    projection_skip_parts=(
+                        projection_skip_by_lod.get(lod_name, set())
+                        if lod_group_projection else None
+                    ),
                 )
                 total_written += written
                 total_skipped += skipped
@@ -3330,8 +3592,14 @@ class EFMISkeletonMergeHelper:
         vg_offsets_override: dict[str, int] | None = None,
         collect_only: bool = False,
         cross_lod_info: dict | None = None,
+        projection_skip_parts: set[str] | None = None,
     ) -> tuple[int, int, str] | tuple[dict[str, tuple], dict[str, dict], int]:
         """为单个 LOD 组的子网格生成并写回骨骼合并数据（幂等）。
+
+        projection_skip_parts：分组投影裁决为“几何匹配不成功”的部件集合。
+        命中者不写 VGMap/VGOffset/VGCount，只写 EFMILODProjectionSkipped 标记
+        与骨骼来源缓存，供导入侧过滤排除；计入返回的 skipped 使外层对账把
+        它们视为“已处理”（既不重复生成，也不误报未完整生成）。
 
         返回 (written, skipped, 描述消息)；vg_offsets 在该组内从 0 起分配，
         与其它 LOD 组完全独立。collect_only=True 时只返回原始候选和元数据，
@@ -3571,6 +3839,7 @@ class EFMISkeletonMergeHelper:
         # 写回工作空间 json + 复制骨骼池缓存
         written = 0
         written_targets: set[str] = set()
+        projection_skipped_targets: set[str] = set()
         for unique_str, entry in submesh_skeletons.items():
             skeleton_buffer = entry[0]
             vg_count = entry[1]
@@ -3580,9 +3849,37 @@ class EFMISkeletonMergeHelper:
             if not isinstance(submesh_json, dict):
                 continue
 
+            if projection_skip_parts and unique_str in projection_skip_parts:
+                # 分组投影裁决：几何匹配不成功 -> 不导入。JSON 不写任何 VGMap/
+                # VGOffset/VGCount（导入侧据此排除对象、导出侧自然不含该部件），
+                # 但仍写“投影未匹配”标记与骨骼来源缓存（保留日后清缓存/取消
+                # 过滤后凭工作空间原文件重建的能力），并发布 BoneMatrix/
+                # InstanceConfig 两份缓存。
+                try:
+                    # 历史缓存键必须清空：旧版可能留有 VGCount=0/VGOffset=0 等
+                    # 半成品，残留会让导入/幂等判定产生歧义。
+                    for stale_key in (
+                        "VGMap", "VGOffset", "VGCount", "VGMapAlgorithmVersion",
+                        "VGMapDedupEnabled",
+                    ):
+                        submesh_json.pop(stale_key, None)
+                    cls._mark_projection_skipped(submesh_json, cross_lod_info)
+                    cls._publish_skeleton_source_cache(meta, submesh_json, vg_count)
+                except Exception as e:
+                    print(
+                        f"[EFMI骨骼合并] 提交投影未匹配标记/来源缓存事务失败 {unique_str}: {e}"
+                    )
+                    continue
+                projection_skipped_targets.add(unique_str)
+                continue
+
             vg_map = vg_maps.get(unique_str, {})
             if not vg_map:
                 continue
+
+            # 只要本次写回 VGMap，就撤销任何历史“投影未匹配”标记（策略变更/
+            # 取消过滤后该部件回归导入，标记不得残留造成导入侧误排除）。
+            submesh_json.pop("EFMILODProjectionSkipped", None)
 
             # VGOffset = 该子网格在组内全局骨架中的起始（取去重时分配的槽位，保证与 vg_map 一致）
             vg_offset = vg_offsets.get(unique_str, 0)
@@ -3657,36 +3954,7 @@ class EFMISkeletonMergeHelper:
             # 双来源缓存与 JSON 作为同一可回滚文件事务提交；任一准备/替换失败
             # 都不能留下“新 BoneMatrix + 旧 InstanceConfig/JSON”的混合状态。
             try:
-                runtime_dir = os.path.join(meta["submesh_dir"], "ModImpRuntime")
-                dest_name = f"{meta['bare_name']}-BoneMatrix.buf"
-                dest_path = os.path.join(runtime_dir, dest_name)
-                submesh_json["BoneMatrixFileName"] = dest_name
-
-                instance_dest_name = f"{meta['bare_name']}-InstanceConfig.buf"
-                instance_dest_path = os.path.join(runtime_dir, instance_dest_name)
-                first_constant = int(meta["instance_config_first_constant"])
-                submesh_json["InstanceConfigFileName"] = instance_dest_name
-                submesh_json["InstanceConfigFirstConstant"] = first_constant
-                if meta.get("draw_index"):
-                    submesh_json["SkeletonSourceDrawIndex"] = str(meta["draw_index"])
-                cls._atomic_publish_skeleton_transaction(
-                    [
-                        {
-                            "source_path": meta["pool_path"],
-                            "dest_path": dest_path,
-                            "vg_count": vg_count,
-                            "min_size": 4,
-                        },
-                        {
-                            "source_path": meta["instance_config_path"],
-                            "dest_path": instance_dest_path,
-                            "vg_count": 0,
-                            "min_size": (first_constant + 16) * 16,
-                        },
-                    ],
-                    submesh_json,
-                    json_path,
-                )
+                cls._publish_skeleton_source_cache(meta, submesh_json, vg_count)
             except Exception as e:
                 print(f"[EFMI骨骼合并] 提交骨骼来源/JSON 事务失败 {unique_str}: {e}")
                 continue
@@ -3694,13 +3962,52 @@ class EFMISkeletonMergeHelper:
             written += 1
             written_targets.add(unique_str)
 
+        # 分组投影跳过但**未收集**的目标（dump/工作空间无骨骼原始候选、Blend 无
+        # BLENDINDICES 等）：它们不在 submesh_skeletons 里，主循环写不到，这里
+        # 单独打“投影未匹配”标记（无来源缓存可发布，只提交 JSON）。json 也读
+        # 不出来的目标保持未处理状态，由外层按失败处理（不静默丢弃）。
+        for unique_str in sorted(set(unique_str_list)):
+            if unique_str in submesh_skeletons or unique_str in projection_skipped_targets:
+                continue
+            if not (projection_skip_parts and unique_str in projection_skip_parts):
+                continue
+            json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+            if not json_path:
+                continue
+            try:
+                submesh_json = JsonUtils.LoadFromFile(json_path)
+                if not isinstance(submesh_json, dict):
+                    continue
+                for stale_key in (
+                    "VGMap", "VGOffset", "VGCount", "VGMapAlgorithmVersion",
+                    "VGMapDedupEnabled",
+                ):
+                    submesh_json.pop(stale_key, None)
+                cls._mark_projection_skipped(submesh_json, cross_lod_info)
+                cls._atomic_publish_skeleton_transaction([], submesh_json, json_path)
+            except Exception as e:
+                print(
+                    f"[EFMI骨骼合并] 写入投影未匹配标记失败 {unique_str}: {e}"
+                )
+                continue
+            projection_skipped_targets.add(unique_str)
+
         # 完整性：written + skipped 必须覆盖全部请求目标；重建过程中任何
         # 读取失败/生成失败的目标都会让 unprocessed > 0，由外层据此判定失败。
-        unprocessed_targets = sorted(set(unique_str_list) - written_targets)
+        unprocessed_targets = sorted(
+            set(unique_str_list) - written_targets - projection_skipped_targets
+        )
         unprocessed_count = len(unprocessed_targets)
         message = f"已为 {written} 个子网格生成骨骼合并数据"
         if skipped:
             message += f"（跳过已缓存 {skipped} 个）"
+        if projection_skipped_targets:
+            shown = sorted(projection_skipped_targets)[:5]
+            suffix = "…" if len(projection_skipped_targets) > 5 else ""
+            message += (
+                f"；按跨 LOD 投影未匹配跳过 {len(projection_skipped_targets)} 个: "
+                f"{'、'.join(shown)}{suffix}"
+            )
         if unprocessed_count > 0:
             shown = unprocessed_targets[:5]
             suffix = "…" if len(unprocessed_targets) > 5 else ""
@@ -3708,7 +4015,67 @@ class EFMISkeletonMergeHelper:
                 f"；{unprocessed_count} 个目标未生成骨骼数据: "
                 f"{'、'.join(shown)}{suffix}"
             )
+        # 投影未匹配的目标按“已处理”口径计入 skipped，使外层 processed 对账通过
+        skipped += len(projection_skipped_targets)
         return written, skipped, message
+
+    @staticmethod
+    def _mark_projection_skipped(submesh_json: dict, cross_lod_info: dict | None) -> None:
+        """给子网格 json 写入“跨 LOD 投影未匹配”裁决标记。
+
+        写 EFMILODProjectionSkipped=True + 布局版本/基准 LOD/投影开关三件套，
+        供幂等门控与导入侧过滤读取；不写任何 VGMap 系列字段。
+        """
+        submesh_json["EFMILODLayoutVersion"] = _CROSS_LOD_LAYOUT_VERSION
+        submesh_json["EFMILODReference"] = (
+            str(cross_lod_info.get("reference_lod", "") or "")
+            if cross_lod_info else ""
+        )
+        submesh_json["EFMILODProjection"] = True
+        submesh_json["EFMILODProjectionSkipped"] = True
+
+    @classmethod
+    def _publish_skeleton_source_cache(
+        cls,
+        meta: dict,
+        submesh_json: dict,
+        vg_count: int,
+    ) -> None:
+        """写骨骼来源缓存字段并按可回滚文件事务发布 BoneMatrix/InstanceConfig。
+
+        同时服务常规写回（配合 VGMap）与投影未匹配标记写回（不写 VGMap，
+        但保留日后凭工作空间原文件重建的能力）；任何失败向上抛出。
+        """
+        runtime_dir = os.path.join(meta["submesh_dir"], "ModImpRuntime")
+        dest_name = f"{meta['bare_name']}-BoneMatrix.buf"
+        dest_path = os.path.join(runtime_dir, dest_name)
+        submesh_json["BoneMatrixFileName"] = dest_name
+
+        instance_dest_name = f"{meta['bare_name']}-InstanceConfig.buf"
+        instance_dest_path = os.path.join(runtime_dir, instance_dest_name)
+        first_constant = int(meta["instance_config_first_constant"])
+        submesh_json["InstanceConfigFileName"] = instance_dest_name
+        submesh_json["InstanceConfigFirstConstant"] = first_constant
+        if meta.get("draw_index"):
+            submesh_json["SkeletonSourceDrawIndex"] = str(meta["draw_index"])
+        cls._atomic_publish_skeleton_transaction(
+            [
+                {
+                    "source_path": meta["pool_path"],
+                    "dest_path": dest_path,
+                    "vg_count": vg_count,
+                    "min_size": 4,
+                },
+                {
+                    "source_path": meta["instance_config_path"],
+                    "dest_path": instance_dest_path,
+                    "vg_count": 0,
+                    "min_size": (first_constant + 16) * 16,
+                },
+            ],
+            submesh_json,
+            meta["json_path"],
+        )
 
     @staticmethod
     def _runtime_cache_path(submesh_json: dict, json_path: str, unique_str: str) -> str:
@@ -3846,6 +4213,112 @@ class EFMISkeletonMergeHelper:
             return False
         return True
 
+    @staticmethod
+    def _is_projection_skipped(payload: dict, projection_enabled: bool) -> bool:
+        """判定 json 是否携带“跨 LOD 投影未匹配”裁决且与当前投影开关一致。
+
+        只有标记、布局版本与投影开关三者同时匹配时才算有效裁决；任何一项
+        不一致都视为需要重新评估（旧缓存/切换开关/半成品），按缓存失效处理。
+        """
+        if not isinstance(payload, dict) or payload.get("EFMILODProjectionSkipped") is not True:
+            return False
+        try:
+            layout_version = int(payload.get("EFMILODLayoutVersion", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return (
+            layout_version == _CROSS_LOD_LAYOUT_VERSION
+            and bool(payload.get("EFMILODProjection", False)) == bool(projection_enabled)
+        )
+
+    @classmethod
+    def load_projection_skipped_targets(
+        cls,
+        workspace_root: str,
+        unique_str_list: list[str],
+    ) -> set[str]:
+        """读取“跨 LOD 投影未匹配”目标集合（供导入侧过滤）。
+
+        json 中 EFMILODProjectionSkipped=True 且布局版本/投影开关均一致时，
+        该目标在分组投影模式下被裁决为几何匹配不成功，导入时必须排除。
+        """
+        skipped: set[str] = set()
+        for unique_str in unique_str_list:
+            json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+            if not json_path:
+                continue
+            try:
+                payload = JsonUtils.LoadFromFile(json_path)
+            except Exception:
+                continue
+            if cls._is_projection_skipped(payload, True):
+                skipped.add(unique_str)
+        return skipped
+
+    @classmethod
+    def load_lod_match_pairs(
+        cls,
+        workspace_root: str,
+        import_keys: list[str],
+    ) -> list[dict]:
+        """读取跨 LOD 自动匹配节点所需的物体配对。
+
+        每对来自**目标侧**（非基准 LOD）子网格 json 的 EFMILODCorrespondence 账本：
+        非空即表示该部件与基准侧存在几何对应。基准侧 json 也写对应账本，但其中
+        ``unique_str`` 指向目标侧；以 EFMILODReference 区分后只收集目标侧，保证
+        每对只出现一次。
+
+        单对返回：target_key（目标侧 import_key）/ reference_key（基准侧 import_key）/
+        target_lod / reference_lod。这里的账本只负责确认“哪个实际导入物体和哪个
+        实际导入物体匹配”，不能作为顶点组重命名表：导入器随后必须让自动生成的
+        ``SSMTNode_VertexGroupMatch`` 读取 Blender 中两边的真实顶点组并重新匹配。
+        因此本方法刻意不读取 ``VGMap``，也不会把 local 对应换算成全局组映射。
+        """
+        pairs: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+
+        for unique_str in import_keys:
+            lod_name = cls._parse_lod_name(unique_str)
+            if not lod_name:
+                continue
+            json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+            if not json_path:
+                continue
+            try:
+                payload = JsonUtils.LoadFromFile(json_path)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            reference_lod = str(payload.get("EFMILODReference", "") or "").strip()
+            correspondence = payload.get("EFMILODCorrespondence")
+            if not isinstance(correspondence, dict) or not correspondence:
+                continue
+
+            reference_keys: set[str] = set()
+            for row in correspondence.values():
+                if not isinstance(row, dict):
+                    continue
+                candidate = str(row.get("unique_str", "") or "")
+                if candidate and cls._parse_lod_name(candidate) == reference_lod:
+                    reference_keys.add(candidate)
+            if not reference_keys:
+                continue
+
+            for reference_key in sorted(reference_keys, key=str.casefold):
+                key = (str(unique_str), reference_key)
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append({
+                    "target_key": str(unique_str),
+                    "reference_key": reference_key,
+                    "target_lod": lod_name,
+                    "reference_lod": cls._parse_lod_name(reference_key),
+                })
+        pairs.sort(key=lambda item: (item["target_lod"], item["target_key"]))
+        return pairs
+
     @classmethod
     def clear_vgmap_cache(cls, workspace_root: str) -> tuple[int, int]:
         """删除工作空间内所有子网格 json 的 VGMap/VGOffset/VGCount/SkeletonGroup 缓存键。
@@ -3884,7 +4357,7 @@ class EFMISkeletonMergeHelper:
                     "VGMapDedupEnabled", "SkeletonGroup", "EFMILODLayoutVersion",
                     "EFMILODReference", "EFMILODProjection", "EFMILODBaselineGroupCount", "EFMILODGroupCount",
                     "EFMILODActualGroupCount", "EFMILODMissingBaselineCount",
-                    "EFMILODCorrespondence"
+                    "EFMILODCorrespondence", "EFMILODProjectionSkipped"
                 ):
                     payload.pop(key, None)
                 try:

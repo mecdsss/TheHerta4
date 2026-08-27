@@ -124,6 +124,7 @@ Texture1D<float4> IniParams : register(t120);
 #define CURSOR_PARAMS IniParams[24]
 #define CLICK_PARAMS  IniParams[25]
 #define DETECT_PARAMS IniParams[26]
+#define DETECT_VERTEX_BASE ((uint)max(DETECT_PARAMS.z, 0.0f))
 #define ALT_CURSOR_PARAMS IniParams[27]
 #define COMPONENT_TOKEN   IniParams[28].x
 // Optional ObjectMap sub-range for this dispatch: .y = first entry index,
@@ -629,14 +630,22 @@ void TestTriangleRange(
     inout HitPayload anchorPayload)
 {
     uint triangleCount = indexCount / 3u;
+    uint vbCount, vbStride;
+    gVB0.GetDimensions(vbCount, vbStride);
 
     [loop]
     for (uint tri = tid; tri < triangleCount; tri += THREADS_PER_GROUP)
     {
         uint indexBase = firstIndex + tri * 3u;
-        uint i0 = gIndexBuffer[indexBase + 0u];
-        uint i1 = gIndexBuffer[indexBase + 1u];
-        uint i2 = gIndexBuffer[indexBase + 2u];
+        // IB 中保存的是 carrier 的局部索引；ZZMI RedirectSO 会在 carrier
+        // 前放置 stub 顶点，并通过 drawindexed 的 base vertex 偏移到正文。
+        // CS 直接读取 VB/SRV 时不会自动应用该偏移，必须显式补上。
+        uint i0 = gIndexBuffer[indexBase + 0u] + DETECT_VERTEX_BASE;
+        uint i1 = gIndexBuffer[indexBase + 1u] + DETECT_VERTEX_BASE;
+        uint i2 = gIndexBuffer[indexBase + 2u] + DETECT_VERTEX_BASE;
+
+        if (i0 >= vbCount || i1 >= vbCount || i2 >= vbCount)
+            continue;
 
         float3 p0 = gVB0[i0].position;
         float3 p1 = gVB0[i1].position;

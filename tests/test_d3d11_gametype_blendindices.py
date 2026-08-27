@@ -72,7 +72,7 @@ class D3D11GameTypeBlendIndicesTests(unittest.TestCase):
         )
         self.assertEqual(game_type.CategoryStrideDict["Blend"], 16)
 
-    def test_preserves_r32_layout_while_widening_other_semantics(self):
+    def test_downcasts_r32_blendindices_to_r16_while_widening_other_semantics(self):
         game_type = self._make([
             _element("BLENDINDICES", 0, "R32G32B32A32_UINT", 16),
             _element("BLENDINDICES", 1, "R8G8B8A8_UINT", 4),
@@ -80,9 +80,50 @@ class D3D11GameTypeBlendIndicesTests(unittest.TestCase):
         self.assertTrue(game_type.widen_blendindices())
         layouts = game_type.get_blendindices_layouts()
         self.assertEqual(layouts, [
-            (0, "R32G32B32A32_UINT", "vb2"),
+            (0, "R16G16B16A16_UINT", "vb2"),
             (1, "R16G16B16A16_UINT", "vb2"),
         ])
+        self.assertEqual(game_type.CategoryStrideDict["Blend"], 16)
+
+    def test_downcasts_single_channel_r32_uint(self):
+        game_type = self._make([
+            _element("BLENDINDICES", 0, "R32_UINT", 4),
+        ])
+        self.assertTrue(game_type.widen_blendindices())
+        self.assertEqual(game_type.get_blendindices_layouts(), [
+            (0, "R16_UINT", "vb2"),
+        ])
+        self.assertEqual(game_type.CategoryStrideDict["Blend"], 2)
+
+    def test_downcasts_r32_sint_preserving_signedness(self):
+        game_type = self._make([
+            _element("BLENDINDICES", 0, "R32G32B32A32_SINT", 16),
+        ])
+        self.assertTrue(game_type.widen_blendindices())
+        self.assertEqual(game_type.get_blendindices_layouts(), [
+            (0, "R16G16B16A16_SINT", "vb2"),
+        ])
+        self.assertEqual(game_type.CategoryStrideDict["Blend"], 8)
+
+    def test_unifies_r16_and_r32_layouts_for_same_lod(self):
+        """回归：同一 LOD 混用 R16/R32 BLENDINDICES（旧"布局不一致"直出失败场景）——
+        两侧经 widen 归一化后布局完全一致，EFMI 合并骨架校验可通过。"""
+        r16_type = self._make([
+            _element("BLENDINDICES", 0, "R16G16B16A16_UINT", 8),
+        ])
+        r32_type = self._make([
+            _element("BLENDINDICES", 0, "R32G32B32A32_UINT", 16),
+        ])
+        self.assertFalse(r16_type.widen_blendindices())  # R16 已是最终布局
+        self.assertTrue(r32_type.widen_blendindices())   # R32 降宽到 R16
+        self.assertEqual(
+            r16_type.get_blendindices_layouts(),
+            r32_type.get_blendindices_layouts(),
+        )
+        self.assertEqual(
+            r16_type.CategoryStrideDict["Blend"],
+            r32_type.CategoryStrideDict["Blend"],
+        )
 
     def test_preserves_channel_count_and_existing_r16_layout(self):
         game_type = self._make([
@@ -95,6 +136,13 @@ class D3D11GameTypeBlendIndicesTests(unittest.TestCase):
             (1, "R16G16_UINT", "vb2"),
         ])
         self.assertEqual(game_type.CategoryStrideDict["Blend"], 6)
+
+    def test_rejects_three_channel_r32_downcast_without_valid_dxgi_target(self):
+        game_type = self._make([
+            _element("BLENDINDICES", 0, "R32G32B32_UINT", 12),
+        ])
+        with self.assertRaisesRegex(ValueError, "三通道.*无法归一化"):
+            game_type.widen_blendindices()
 
 
 if __name__ == "__main__":

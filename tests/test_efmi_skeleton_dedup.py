@@ -98,6 +98,38 @@ def _entry(bones, sigs=None, weighted=None):
     return (arr, n, weighted, sigs or {})
 
 
+class BlendIndicesSignedLayoutTests(unittest.TestCase):
+    def test_import_layout_accepts_signed_r8_and_r16(self):
+        self.assertEqual(
+            EFMIBoneMapBuilder._blend_index_layout_entry("R8G8_UINT"),
+            ("u1", 2),
+        )
+        self.assertEqual(
+            EFMIBoneMapBuilder._blend_index_layout_entry("R8G8B8A8_SINT"),
+            ("i1", 4),
+        )
+        self.assertEqual(
+            EFMIBoneMapBuilder._blend_index_layout_entry("R16G16B16A16_SINT"),
+            ("i2", 4),
+        )
+        self.assertEqual(
+            _efmi.EFMISkeletonMergeHelper._blend_indices_layout("R16_SINT"),
+            ("i2", 1),
+        )
+
+    def test_all_negative_signed_indices_are_invalid_channels(self):
+        indices = numpy.array(
+            [[0, 1, 0xFFFFFFFF, 0xFFFFFFFE]], dtype=numpy.uint32
+        )
+        weights = numpy.ones((1, 4), dtype=numpy.float32)
+        mask = EFMIBoneMapBuilder.valid_blend_channels(
+            indices,
+            {"np_type": "i2"},
+            weights,
+        )
+        self.assertEqual(mask.tolist(), [[True, True, False, False]])
+
+
 class DedupGateTests(unittest.TestCase):
     def setUp(self):
         # 显式打开开关，锚定算法行为本身（关闭路径另有回归用例）。
@@ -238,11 +270,15 @@ class DedupGateTests(unittest.TestCase):
         self.assertEqual(row["target_local_vg_id"], 0)
         self.assertAlmostEqual(row["matrix_diff"], 1.60, places=6)
 
-    def test_cross_lod_projection_merges_reference_group_at_matrix_diff_160(self):
-        """高姿态差异的两条对应仍须把 LOD0 合并组投影到 LOD1。"""
+    def test_each_lod_dedups_independently_into_own_slot_space(self):
+        """完全独立编号（用户拍板）：每 LOD 用自己的 dump 独立去重，槽位空间互不相交。
+
+        LOD1 不再借用 LOD0 的参考组 id（串扰根因：参考号在 LOD1 池中命中别的
+        部件段/空洞），因此即便矩阵姿态差异很大的对应，两侧各自去重、各自编号。
+        """
         reference_bone = _bone(0.0)
         target_bone = list(reference_bone)
-        target_bone[0] = -0.60  # max(abs(diff)) == 1.60
+        target_bone[0] = -0.60  # max(abs(diff)) == 1.60（跨 LOD 对应允许但不再影响编号）
         lod0 = {
             "LOD0.a": _entry(
                 [reference_bone],
@@ -263,21 +299,21 @@ class DedupGateTests(unittest.TestCase):
                 {0: _sig((0.014, 0.0, 0.0))},
             ),
         }
-        reference_maps, _ = EFMIBoneMapBuilder.build_vg_maps(lod0)
-        correspondence = EFMIBoneMapBuilder.build_cross_lod_correspondence(
-            {"LOD0": lod0, "LOD1": lod1},
-        )
-        target_maps, _ = EFMIBoneMapBuilder.build_lod_maps_from_reference(
-            lod0,
-            reference_maps,
-            lod1,
-            correspondence,
-        )
-        self.assertEqual(len(correspondence["matches"]), 2)
-        self.assertEqual(target_maps["LOD1.x"][0], target_maps["LOD1.y"][0])
+        # 每 LOD 独立 build_vg_maps（LOD1 不再投影到参考编号）
+        maps0, offsets0 = EFMIBoneMapBuilder.build_vg_maps(lod0)
+        maps1, offsets1 = EFMIBoneMapBuilder.build_vg_maps(lod1)
+        # LOD0: a、b 骨骼 bitwise 相同 -> 合并组 0
+        self.assertEqual(maps0["LOD0.a"][0], maps0["LOD0.b"][0])
+        self.assertEqual(maps0["LOD0.a"][0], 0)
+        # LOD1: x、y 骨骼 bitwise 相同 -> 合并组 0（独立编号，不与 LOD0 共享）
+        self.assertEqual(maps1["LOD1.x"][0], maps1["LOD1.y"][0])
+        self.assertEqual(maps1["LOD1.x"][0], 0)
+        # 两 LOD 的编号空间各自从 0 起步 —— 由调用方分段平移保证全局唯一
+        self.assertEqual(offsets0, {"LOD0.a": 0, "LOD0.b": 1})
+        self.assertEqual(offsets1, {"LOD1.x": 0, "LOD1.y": 1})
 
-    def test_lod1_sync_reuses_lod0_partition_without_rededup(self):
-        """LOD1 只复用 LOD0 的语义分组，不能再次按自身点云重算出另一套分组。"""
+    def test_lod1_keeps_own_partition_even_with_matching_geometry(self):
+        """LOD1 即使几何与 LOD0 完全一致，也只用自身点云去重，不复用 LOD0 分组。"""
         same = _bone(0.0)
         near = _bone(0.0)
         near[0] += 1e-5
@@ -289,19 +325,13 @@ class DedupGateTests(unittest.TestCase):
             "LOD1.x": _entry([near], {0: _sig((0.0, 0.0, 0.0))}),
             "LOD1.y": _entry([near], {0: _sig((0.01, 0.0, 0.0))}),
         }
-        reference_maps, _ = EFMIBoneMapBuilder.build_vg_maps(lod0)
-        correspondence = EFMIBoneMapBuilder.build_cross_lod_correspondence(
-            {"LOD0": lod0, "LOD1": lod1},
-        )
-        target_maps, target_offsets = EFMIBoneMapBuilder.build_lod_maps_from_reference(
-            lod0,
-            reference_maps,
-            lod1,
-            correspondence,
-        )
-        self.assertEqual(target_offsets, {"LOD1.x": 0, "LOD1.y": 1})
-        self.assertEqual(target_maps["LOD1.x"][0], target_maps["LOD1.y"][0])
-        self.assertEqual(target_maps["LOD1.x"][0], 0)
+        maps0, offsets0 = EFMIBoneMapBuilder.build_vg_maps(lod0)
+        maps1, offsets1 = EFMIBoneMapBuilder.build_vg_maps(lod1)
+        self.assertEqual(maps0["LOD0.a"][0], maps0["LOD0.b"][0])
+        self.assertEqual(maps1["LOD1.x"][0], maps1["LOD1.y"][0])
+        self.assertEqual(maps1["LOD1.x"][0], 0)
+        self.assertEqual(offsets0, {"LOD0.a": 0, "LOD0.b": 1})
+        self.assertEqual(offsets1, {"LOD1.x": 0, "LOD1.y": 1})
 
     def test_matrix_mismatch_never_merges_despite_geometry(self):
         """回归（误并核心）：矩阵完全不同（diff=0.2）+ 几何三维度全贴近 -> 绝不合并。
@@ -844,6 +874,280 @@ class DedupGateTests(unittest.TestCase):
         self.assertEqual(vg_offsets, {"aa_part": 0, "bb_part": 2})
         self.assertEqual(vg_maps["aa_part"], {0: 0, 1: 1})
         self.assertEqual(vg_maps["bb_part"], {0: 2, 1: 3})
+
+
+class LodProjectionTests(unittest.TestCase):
+    """v10（撤销 v9 共享槽位投影）——每 LOD 完全独立 + 分段平移。
+
+    核心保证：非基准 LOD 槽位段与基准 LOD 段**不相交**（LOD0: 0..max0，
+    LOD1: base 起），跨 LOD 零共享；v9 投影（LOD1 顶点组映射到 LOD0 槽位 +
+    运行时 full→lod BlendRemap）实测爆炸（同帧共用槽位 + 每 component 每帧
+    只导入一次骨骼 → LOD1 网格读到 LOD0 矩阵）。
+    """
+
+    def test_each_lod_dedups_independently_and_segments_do_not_overlap(self):
+        """LOD0 合并（aa.0/bb.0 同槽）；LOD1 用自己的 dump 独立去重 + 整段平移。"""
+        shared = _bone(0.0)
+        lod0 = {
+            "LOD0.aa": _entry([shared, _bone(1.0)], {0: _sig((0.0, 0.0, 0.0))}),
+            "LOD0.bb": _entry([shared, _bone(2.0)], {0: _sig((0.01, 0.0, 0.0))}),
+        }
+        lod1 = {
+            "LOD1.xx": _entry([_bone(3.0), _bone(3.1)], {0: _sig((0.0, 0.0, 0.0))}),
+        }
+        maps, offsets, base = EFMIBoneMapBuilder.build_independent_lod_maps(
+            {"LOD0": lod0, "LOD1": lod1}, "LOD0", {}
+        )
+        # LOD0 分区：aa.0 与 bb.0 同槽（0）；aa.1 -> 1；bb.1 -> 3（自身独立去重不变）
+        self.assertEqual(maps["LOD0"]["LOD0.aa"][0], maps["LOD0"]["LOD0.bb"][0])
+        self.assertEqual(maps["LOD0"]["LOD0.aa"], {0: 0, 1: 1})
+        # 基准段大小 = aa(2) + bb(2) = 4（LOD0 用例槽位 0..3）；不做值域重排。
+        self.assertEqual(base, 4)
+        # LOD1 用自己 dump 独立去重（3.0/3.1 互不相同 -> 各自槽位），再整体平移 +4：
+        # LOD1 全部槽位 ∈ [4, 6)，与 LOD0 段 [0,4) 不相交。
+        self.assertEqual(maps["LOD1"]["LOD1.xx"], {0: 4, 1: 5})
+        self.assertEqual(offsets["LOD1"]["LOD1.xx"], 4)
+        # 两域不相交
+        lod0_slots = {v for m in maps["LOD0"].values() for v in m.values()}
+        lod1_slots = {v for m in maps["LOD1"].values() for v in m.values()}
+        self.assertTrue(lod0_slots.isdisjoint(lod1_slots))
+
+    def test_unmatched_target_local_identity_not_borrowing_baseline(self):
+        """LOD1 独有组也是自己槽位段内的恒等映射，绝不借用 LOD0 的编号。"""
+        lod0 = {
+            "LOD0.aa": _entry([_bone(0.0), _bone(1.0)], {0: _sig((0.0, 0.0, 0.0))}),
+        }
+        lod1 = {
+            "LOD1.xx": _entry([_bone(3.0), _bone(3.1), _bone(3.2)], {}),
+        }
+        maps, offsets, _base = EFMIBoneMapBuilder.build_independent_lod_maps(
+            {"LOD0": lod0, "LOD1": lod1}, "LOD0", {}
+        )
+        # LOD0 槽位 0..1；LOD1 三个组独立 -> 2,3,4（本 LOD 段内恒等）
+        self.assertEqual(maps["LOD0"]["LOD0.aa"], {0: 0, 1: 1})
+        self.assertEqual(maps["LOD1"]["LOD1.xx"], {0: 2, 1: 3, 2: 4})
+        self.assertEqual(offsets["LOD1"]["LOD1.xx"], 2)
+
+    def test_unmatched_part_gets_own_segment_after_baseline(self):
+        """整体未匹配的 LOD1 部件也使用自己段内的恒等映射（base 起）。"""
+        lod0 = {
+            "LOD0.aa": _entry([_bone(0.0), _bone(1.0)], {}),
+        }
+        lod1 = {
+            "LOD1.zz": _entry([_bone(5.0), _bone(6.0)], {}),
+        }
+        maps, offsets, base = EFMIBoneMapBuilder.build_independent_lod_maps(
+            {"LOD0": lod0, "LOD1": lod1}, "LOD0", {}
+        )
+        self.assertEqual(base, 2)
+        self.assertEqual(offsets["LOD1"]["LOD1.zz"], 2)
+        self.assertEqual(maps["LOD1"]["LOD1.zz"], {0: 2, 1: 3})
+
+    # ------------------------------------------------------------------
+    # v11（修复 v10 缺陷）：L0 约束 L1 去重（镜像强制 + 标签断边）；
+    # v13 撤销值域压缩重排（v12 实测游戏内乱掉）——两侧只做平移，不做重排
+    # ------------------------------------------------------------------
+
+    def test_constrained_merge_mirrors_reference_groups(self):
+        """v11 镜像强制：L0 合并组 ⇒ L1 对应组必合并（即便 L1 自己的矩阵互不相同）。
+
+        LOD0 的 aa.0/bb.0 矩阵相同 → 合并到槽位 0；四个 L1 候选一一对应这个
+        L0 合并组（L1 细分：一个 L0 组 → 七个目标组的同构场景），L1 自己的
+        矩阵硬门控会把它们拆成 4 个槽位（v10 缺陷：两边去重不一致）。v11 以
+        L0 最终合并组为标签，强制全部落到该组目标侧最小槽位，值域从 base 起。
+        """
+        lod0 = {
+            "LOD0.aa": _entry(
+                [_bone(0.0), _bone(1.0)],
+                {0: _sig((0.0, 0.0, 0.0))},
+                weighted=numpy.array([5, 1]),
+            ),
+            "LOD0.bb": _entry(
+                [_bone(0.0), _bone(2.0)],
+                {0: _sig((0.01, 0.0, 0.0))},
+                weighted=numpy.array([3, 1]),
+            ),
+        }
+        lod1 = {
+            "LOD1.xx": _entry(
+                [_bone(3.0), _bone(3.05)],
+                {0: _sig((0.0, 0.0, 0.0))},
+            ),
+            "LOD1.yy": _entry(
+                [_bone(4.0), _bone(4.01)],
+                {0: _sig((0.01, 0.0, 0.0))},
+            ),
+        }
+        correspondence = {
+            "reference_lod": "LOD0",
+            "matches": [
+                {  # L1 细分：两个候选对应 L0 的 aa.0（同一合并组）
+                    "reference_lod": "LOD0", "target_lod": "LOD1",
+                    "reference_unique_str": "LOD0.aa", "reference_local_vg_id": 0,
+                    "target_unique_str": "LOD1.xx", "target_local_vg_id": 0,
+                },
+                {
+                    "reference_lod": "LOD0", "target_lod": "LOD1",
+                    "reference_unique_str": "LOD0.aa", "reference_local_vg_id": 0,
+                    "target_unique_str": "LOD1.xx", "target_local_vg_id": 1,
+                },
+                {
+                    "reference_lod": "LOD0", "target_lod": "LOD1",
+                    "reference_unique_str": "LOD0.bb", "reference_local_vg_id": 0,
+                    "target_unique_str": "LOD1.yy", "target_local_vg_id": 0,
+                },
+                {
+                    "reference_lod": "LOD0", "target_lod": "LOD1",
+                    "reference_unique_str": "LOD0.bb", "reference_local_vg_id": 0,
+                    "target_unique_str": "LOD1.yy", "target_local_vg_id": 1,
+                },
+            ],
+        }
+        maps, offsets, base = EFMIBoneMapBuilder.build_independent_lod_maps(
+            {"LOD0": lod0, "LOD1": lod1}, "LOD0", {},
+            correspondence=correspondence,
+        )
+        # L0：aa.0/bb.0 同槽 0（canonical = 加权数更大的 aa.0）；aa.1 -> 1；bb.1 -> 3
+        self.assertEqual(maps["LOD0"]["LOD0.aa"][0], maps["LOD0"]["LOD0.bb"][0])
+        self.assertEqual(base, 4)
+        # L1：四个候选（3.0/3.05/4.0/4.01 互不相同，仅凭 L1 自己绝不合并）
+        # 被镜像强制到同一槽位（组内最小槽 0），平移 +4 后 = 4。
+        self.assertEqual(maps["LOD1"]["LOD1.xx"], {0: 4, 1: 4})
+        self.assertEqual(maps["LOD1"]["LOD1.yy"], {0: 4, 1: 4})
+        slots1 = {v for m in maps["LOD1"].values() for v in m.values()}
+        self.assertEqual(slots1, {4}, "L1 镜像组应为单个槽位 4（段内最小槽平移，不做重排）")
+        lod0_slots = {v for m in maps["LOD0"].values() for v in m.values()}
+        self.assertTrue(lod0_slots.isdisjoint(slots1))
+
+    def test_constrained_labels_block_cross_reference_group_merge(self):
+        """v11 标签断边：L1 候选对应**不同** L0 组时，即使矩阵完全相同也不合并。
+
+        这里两个 L1 子网格的骨骼矩阵 bitwise 相同（无扩散签名时 v10 会直接
+        合并），但它们分别对应 L0 的 aa.0 / bb.0——L0 没合并，L1 绝不能合并。
+        """
+        lod0 = {
+            "LOD0.aa": _entry([_bone(0.0)], {}),
+            "LOD0.bb": _entry([_bone(5.0)], {}),
+        }
+        lod1 = {
+            "LOD1.xx": _entry([_bone(2.0)], {}),
+            "LOD1.yy": _entry([_bone(2.0)], {}),
+        }
+        correspondence = {
+            "reference_lod": "LOD0",
+            "matches": [
+                {
+                    "reference_lod": "LOD0", "target_lod": "LOD1",
+                    "reference_unique_str": "LOD0.aa", "reference_local_vg_id": 0,
+                    "target_unique_str": "LOD1.xx", "target_local_vg_id": 0,
+                },
+                {
+                    "reference_lod": "LOD0", "target_lod": "LOD1",
+                    "reference_unique_str": "LOD0.bb", "reference_local_vg_id": 0,
+                    "target_unique_str": "LOD1.yy", "target_local_vg_id": 0,
+                },
+            ],
+        }
+        maps, offsets, base = EFMIBoneMapBuilder.build_independent_lod_maps(
+            {"LOD0": lod0, "LOD1": lod1}, "LOD0", {},
+            correspondence=correspondence,
+        )
+        self.assertEqual(base, 2)
+        # 无标签时这两组会合并；有标签后必须分属两个槽位（L0 未合并 ⇒ L1 不合并）。
+        self.assertNotEqual(
+            maps["LOD1"]["LOD1.xx"][0], maps["LOD1"]["LOD1.yy"][0],
+            "不同 L0 组的 L1 候选不得合并（标签断边）",
+        )
+        self.assertEqual(maps["LOD1"]["LOD1.xx"], {0: 2})
+        self.assertEqual(maps["LOD1"]["LOD1.yy"], {0: 3})
+
+    def test_merged_away_first_local_keeps_canonical_slot_no_renumber(self):
+        """v13 撤销值域重排：L1 首个子网格 local 0 并入他人 canonical 后**不再压缩**。
+
+        v12 曾把该情形重排为 base 起密集（无洞）——实测游戏内乱掉。撤销后：
+        canonical 槽位（权重数更大者）保持不变，值 = canonical 槽位置 + 平移；
+        段内可能留下未引用槽位（空洞），但值域始终 ⊆ 本 LOD 声明段空间，
+        与 LOD0 域 [0, base) 不相交。
+        """
+        lod0 = {
+            "LOD0.aa": _entry([_bone(1.0), _bone(2.0)], {}),
+        }
+        lod1 = {
+            "LOD1.xx": _entry([_bone(3.0)], {}, weighted=numpy.array([1])),
+            "LOD1.yy": _entry([_bone(3.0)], {}, weighted=numpy.array([9])),
+        }
+        maps, offsets, base = EFMIBoneMapBuilder.build_independent_lod_maps(
+            {"LOD0": lod0, "LOD1": lod1}, "LOD0", {}
+        )
+        self.assertEqual(base, 2)
+        # xx.0 与 yy.0 矩阵相同 → 合并；canonical = 加权数更大的 yy.0
+        # （去重前 global_id = 1），平移 +2 后 = 3（不做重排，0 号槽位成空洞但
+        # 值域 [3,4) ⊂ [2,4) 声明段空间内，与 LOD0 值域 [0,2) 不相交）。
+        self.assertEqual(maps["LOD1"]["LOD1.xx"], {0: 3})
+        self.assertEqual(maps["LOD1"]["LOD1.yy"], {0: 3})
+        self.assertEqual(offsets["LOD1"]["LOD1.xx"], 2)
+        self.assertEqual(offsets["LOD1"]["LOD1.yy"], 3)
+
+    def test_unmatched_target_local_keeps_own_slot_after_baseline(self):
+        """v11：L0 无对应的 L1 候选不打标签——镜像强制只作用于有对应的候选。
+
+        LOD1.xx 两个候选对应同一 L0 合并组（强制同槽）；LOD1.yy 两个候选
+        无对应，保持自身去重槽位，绝不借用镜像组槽位；值域仍从 base 起密集。
+        """
+        lod0 = {
+            "LOD0.aa": _entry(
+                [_bone(0.0), _bone(1.0)],
+                {0: _sig((0.0, 0.0, 0.0))},
+                weighted=numpy.array([5, 1]),
+            ),
+            "LOD0.bb": _entry(
+                [_bone(0.0), _bone(2.0)],
+                {0: _sig((0.01, 0.0, 0.0))},
+                weighted=numpy.array([3, 1]),
+            ),
+        }
+        lod1 = {
+            "LOD1.xx": _entry(
+                [_bone(3.0), _bone(3.05)],
+                {0: _sig((0.0, 0.0, 0.0))},
+            ),
+            "LOD1.yy": _entry(
+                [_bone(4.0), _bone(4.01)],
+                {0: _sig((0.01, 0.0, 0.0))},
+            ),
+        }
+        correspondence = {
+            "reference_lod": "LOD0",
+            "matches": [
+                {  # 只有 xx.0/xx.1 有对应（同一个 L0 合并组）；yy 全是无对应
+                    "reference_lod": "LOD0", "target_lod": "LOD1",
+                    "reference_unique_str": "LOD0.aa", "reference_local_vg_id": 0,
+                    "target_unique_str": "LOD1.xx", "target_local_vg_id": 0,
+                },
+                {
+                    "reference_lod": "LOD0", "target_lod": "LOD1",
+                    "reference_unique_str": "LOD0.bb", "reference_local_vg_id": 0,
+                    "target_unique_str": "LOD1.xx", "target_local_vg_id": 1,
+                },
+            ],
+        }
+        maps, offsets, base = EFMIBoneMapBuilder.build_independent_lod_maps(
+            {"LOD0": lod0, "LOD1": lod1}, "LOD0", {},
+            correspondence=correspondence,
+        )
+        self.assertEqual(base, 4)
+        # xx 两个候选对应同一 L0 合并组 → 强制同槽（组内最小槽 0，平移 +4 = 4）；
+        # yy 无标签 → 各自槽位（+4 后 6/7）。**不做值域重排**（v13）：槽位 5
+        # 无候选引用（空洞由 canonical 借位产生，属正常；值域 ⊆ L1 声明段空间）。
+        self.assertEqual(maps["LOD1"]["LOD1.xx"], {0: 4, 1: 4})
+        self.assertNotEqual(
+            maps["LOD1"]["LOD1.yy"][0], maps["LOD1"]["LOD1.yy"][1],
+            "无标签候选保持自身去重槽位，不并入镜像组",
+        )
+        slots1 = {v for m in maps["LOD1"].values() for v in m.values()}
+        self.assertEqual(slots1, {4, 6, 7}, "L1 值域 = 镜像槽 4 + 无标签槽 6/7（不重排，保留空洞）")
+        lod0_slots = {v for m in maps["LOD0"].values() for v in m.values()}
+        self.assertTrue(lod0_slots.isdisjoint(slots1))
 
 
 if __name__ == "__main__":

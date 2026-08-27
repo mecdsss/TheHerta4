@@ -578,7 +578,7 @@ class M_IniHelper:
 
         # [Constants]
         constants_section = M_IniSection(M_SectionType.Constants)
-        constants_section.append("[Constants]")
+        constants_section.SectionName = "Constants"
         constants_section.append("global persist $shapekey_first_run = 1")
 
         for shapekey_name, m_key in shapekeyname_mkey_dict.items():
@@ -590,7 +590,7 @@ class M_IniHelper:
 
         # [Present]
         present_section = M_IniSection(M_SectionType.Present)
-        present_section.append("[Present]")
+        present_section.SectionName = "Present"
         present_section.append("if $shapekey_first_run")
 
         ib_number = 1

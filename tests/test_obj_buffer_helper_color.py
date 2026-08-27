@@ -199,5 +199,52 @@ class ObjBufferHelperColorTests(unittest.TestCase):
         np.testing.assert_array_equal(result, expected)
 
 
+class ObjBufferHelperBlendIndicesTests(unittest.TestCase):
+    @staticmethod
+    def _element(fmt, byte_width):
+        return types.SimpleNamespace(
+            SemanticIndex=0,
+            Format=fmt,
+            ByteWidth=byte_width,
+        )
+
+    def test_parse_r16g16_uint_after_r32_downcast(self):
+        source = np.array([[12, 513, 999, 1000]], dtype=np.uint32)
+        result = ObjBufferHelper._parse_blendindices(
+            {0: source}, self._element("R16G16_UINT", 4)
+        )
+        self.assertEqual(result.dtype, np.dtype(np.uint16))
+        self.assertEqual(result.tolist(), [[12, 513]])
+
+    def test_parse_r16g16b16a16_sint_preserves_signed_dtype(self):
+        source = np.array([[12, 513, 1024, 2048]], dtype=np.uint32)
+        result = ObjBufferHelper._parse_blendindices(
+            {0: source}, self._element("R16G16B16A16_SINT", 8)
+        )
+        self.assertEqual(result.dtype, np.dtype(np.int16))
+        self.assertEqual(result.tolist(), [[12, 513, 1024, 2048]])
+
+    def test_parse_r16_uint_rejects_overflow_before_cast(self):
+        source = np.array([[65536]], dtype=np.uint32)
+        with self.assertRaisesRegex(RuntimeError, "R16_UINT.*max=65536"):
+            ObjBufferHelper._parse_blendindices(
+                {0: source}, self._element("R16_UINT", 2)
+            )
+
+    def test_parse_r16_sint_rejects_unsigned_bone_id_above_signed_limit(self):
+        source = np.array([[32768]], dtype=np.uint32)
+        with self.assertRaisesRegex(RuntimeError, "R16_SINT.*max=32768"):
+            ObjBufferHelper._parse_blendindices(
+                {0: source}, self._element("R16_SINT", 2)
+            )
+
+    def test_parse_r8_uint_rejects_negative_index_before_cast(self):
+        source = np.array([[-1]], dtype=np.int32)
+        with self.assertRaisesRegex(RuntimeError, "R8_UINT.*min=-1"):
+            ObjBufferHelper._parse_blendindices(
+                {0: source}, self._element("R8_UINT", 1)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

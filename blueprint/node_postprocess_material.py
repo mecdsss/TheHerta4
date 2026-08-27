@@ -1575,7 +1575,11 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             re.IGNORECASE,
         )
         if match:
-            return int(match.group(1)), int(match.group(2))
+            # TTLib 的调用约定与 drawindexed 一致：
+            # _1=index count，_2=first index，_3=first vertex/base vertex。
+            # ZZMI RedirectSO 会在正文前保留 3 个 stub 顶点，因此第三项
+            # 不能丢弃，否则 TTL 二次绘制会从 base_vertex=0 错读 SO。
+            return int(match.group(1)), int(match.group(2)), int(match.group(3))
         return None
 
     def _ttl_first_drawindexed(self, block_lines):
@@ -1736,6 +1740,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                             ttl_lines.append(bl)
                     ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw1[0]))
                     ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw1[1]))
+                    ttl_lines.append("    ${}TTL{}_3 = {}".format(chr(92), chr(92), draw1[2]))
                     ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
                 if else_index != -1:
                     ttl_lines.append(block_lines[else_index])
@@ -1745,6 +1750,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                                 ttl_lines.append(bl)
                         ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw2[0]))
                         ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw2[1]))
+                        ttl_lines.append("    ${}TTL{}_3 = {}".format(chr(92), chr(92), draw2[2]))
                         ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
                 ttl_lines.append(tail)
                 i = j + 1
@@ -1756,6 +1762,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     pending_flags = []
                     ttl_lines.append("${}TTL{}_1 = {}".format(chr(92), chr(92), draw[0]))
                     ttl_lines.append("${}TTL{}_2 = {}".format(chr(92), chr(92), draw[1]))
+                    ttl_lines.append("${}TTL{}_3 = {}".format(chr(92), chr(92), draw[2]))
                     ttl_lines.append("run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
                 i += 1
         return ttl_lines, found

@@ -295,6 +295,68 @@ class EFMICacheSchemaTests(unittest.TestCase):
         ))
 
 
+def _make_dump_multi(dump_dir, draw_specs):
+    """同 _make_dump 但支持多个 drawcall（每个 (draw_index, cb_hash, t0_hash, bone_tx)）。"""
+    dump_dir = Path(dump_dir)
+    (dump_dir / "deduped").mkdir(parents=True, exist_ok=True)
+    log_lines = []
+    for draw_index, cb_hash, t0_hash, bone_tx in draw_specs:
+        cb = numpy.zeros((16, 4), dtype=numpy.float32)
+        cb_uint = cb.view(numpy.uint32)
+        cb_uint[5, 0] = 0
+        cb_uint[5, 1] = 4  # 骨骼段偏移（float4 单位）-> data_offset = 4 + 3 = 7
+        (dump_dir / "deduped" / f"{draw_index}-vs-cb2={cb_hash}.buf").write_bytes(cb.tobytes())
+
+        pool = numpy.zeros((800, 4), dtype=numpy.float32)
+        mat = numpy.array([1, 0, 0, 0, 1, 0, 0, 0, 1, bone_tx, 0, 0], dtype=numpy.float32)
+        pool[7:10] = mat.reshape(3, 4)
+        (dump_dir / "deduped" / f"{draw_index}-vs-t0={t0_hash}.buf").write_bytes(pool.tobytes())
+
+        deduped_abs = (dump_dir / "deduped").resolve()
+        cb_name = f"{draw_index}-vs-cb2={cb_hash}.buf"
+        t0_name = f"{draw_index}-vs-t0={t0_hash}.buf"
+        log_lines += [
+            f"{draw_index} VSSetConstantBuffers1(StartSlot:2,",
+            f"2: resource=0x00000000 hash={cb_hash} first_constant=0 num_constants=4096",
+            f"{draw_index} VSSetShaderResources(StartSlot:0,",
+            f"0: view=0x00000000 resource=0x00000000 hash={t0_hash}",
+            f"{draw_index} DrawIndexedInstanced(IndexCountPerInstance:100, InstanceCount:1, "
+            f"StartIndexLocation:0, BaseVertexLocation:0, StartInstanceLocation:0)",
+            f"{draw_index} 3DMigoto Dumping Buffer {draw_index}-vs-cb2={cb_hash} -> {deduped_abs / cb_name}",
+            f"{draw_index} 3DMigoto Dumping Buffer {draw_index}-vs-t0={t0_hash} -> {deduped_abs / t0_name}",
+        ]
+    (dump_dir / "log.txt").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+    return dump_dir
+
+
+def _make_submesh_geo(workspace, lod, bare, positions):
+    """构造带 Position 数据的子网格（json 含 Position + Blend 类别）。
+
+    positions: [(x, y, z), ...]（绑定姿态坐标），2 个以上顶点；
+    BLENDINDICES R8G8B8A8_UINT 全 0 -> vg_count = 1。
+    有 Position 数据后 compute_driven_signatures 才能给出质心/扩散点，
+    跨 LOD 部件配对才能按几何判定而不是盲目配对。
+    """
+    type_dir = workspace / lod / bare / ("TYPE_" + GAMETYPE)
+    type_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(type_dir / f"{bare}.json", {
+        "CategoryBufferList": [
+            {"D3D11ElementList": [
+                {"Category": "Position", "SemanticName": "POSITION", "ByteWidth": 12},
+            ]},
+            {"D3D11ElementList": [
+                {"Category": "Blend", "SemanticName": "BLENDINDICES",
+                 "Format": "R8G8B8A8_UINT", "ByteWidth": 4},
+            ]},
+        ],
+    })
+    position_array = numpy.asarray(positions, dtype=numpy.float32)
+    position_array.tofile(type_dir / f"{bare}-Position.buf")
+    blend = numpy.zeros((len(position_array), 4), dtype=numpy.uint8)
+    (type_dir / f"{bare}-Blend.buf").write_bytes(blend.tobytes())
+    return f"{lod}.{bare}"
+
+
 class MultiLodBuildTests(unittest.TestCase):
     """构建端 e2e：两个 LOD 各自用自己的 dump，LOD1 复用 LOD0 分区。"""
 
@@ -385,10 +447,15 @@ class MultiLodBuildTests(unittest.TestCase):
         json1 = self._read_submesh_json("LOD1", "ccccdddd-200-0")
         # 两个 LOD 都成功生成（各自在自己的 dump 里找到了骨骼数据）
         self.assertEqual(json0.get("VGMap"), {"0": 0}, "LOD0 应生成 VGMap")
-        self.assertEqual(json1.get("VGMap"), {"0": 0}, "LOD1 应生成 VGMap")
-        # 各自槽位从 0 起：LOD1 的 VGOffset 绝不能接在 LOD0 后面
+        # 全独立 + 分段平移（2026-08-27 用户拍板）：LOD1 用自己的 dump 独立去重
+        # （自身槽位从 0 起），再把整个编号空间平移到基准 LOD 段之后——
+        # LOD0 池大小 = 1 → LOD1 全部槽位 +1，两域不相交、全局唯一。
+        # 这样 LOD1 顶点引用的是 LOD1 自己的槽位（含自身 LOD 内的跨部件共享，
+        # 矩阵一致性由 LOD1 自己 dump 的去重保证），绝不触碰 LOD0 的编号域。
+        self.assertEqual(json1.get("VGMap"), {"0": 1}, "LOD1 槽位应平移到基准段之后")
+        # 各自槽位域：LOD0 从 0 起、LOD1 从基准池大小起（分段平移）
         self.assertEqual(json0.get("VGOffset"), 0)
-        self.assertEqual(json1.get("VGOffset"), 0)
+        self.assertEqual(json1.get("VGOffset"), 1)
         self.assertEqual(json0.get("VGCount"), 1)
         self.assertEqual(json1.get("VGCount"), 1)
         self.assertEqual(json0.get("VGMapAlgorithmVersion"), VG_MAP_ALGORITHM_VERSION)
@@ -511,31 +578,42 @@ class MultiLodBuildTests(unittest.TestCase):
         """WorkPageTabs 缺失时共用默认目录：查不到自己 drawcall 的 LOD 被跳过。
 
         完整性语义：请求了 2 个目标、只有 1 个生成 -> 必须报告未完整生成。
+        分组投影语义：LOD0（基准）无任何可收集候选时用零个基准物体匹配 LOD1，
+        LOD1 全部判为几何不匹配 -> 标 EFMILODProjectionSkipped 且不生成 VGMap。
         """
         (self.ws / "Config" / "WorkPageTabs.json").unlink()
         ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
             workspace_root=str(self.ws),
             unique_str_list=[self.u_lod0, self.u_lod1],
         )
-        # LOD1 的 drawcall 在默认 dump B 里 -> 生成；LOD0 查不到 -> 跳过
+        # LOD1 的 drawcall 在默认 dump B 里 -> 可收集但无基准可配；LOD0 查不到 -> 跳过
         self.assertFalse(ok, "存在未生成目标时不得报告完整成功")
         self.assertIn("未生成骨骼数据", message)
         json0 = self._read_submesh_json("LOD0", "aaaabbbb-100-0")
         json1 = self._read_submesh_json("LOD1", "ccccdddd-200-0")
         self.assertIsNone(json0.get("VGMap"), "默认目录无 LOD0 drawcall，应被跳过")
-        self.assertEqual(json1.get("VGMap"), {"0": 0})
-        self.assertEqual(json1.get("VGOffset"), 0)
+        # 投影过滤：LOD0 无物体作约束 -> LOD1 未匹配 -> 不生成 VGMap，只留裁决标记
+        self.assertIsNone(json1.get("VGMap"), "LOD1 无基准可配，应按投影未匹配跳过")
+        self.assertTrue(json1.get("EFMILODProjectionSkipped"))
+        self.assertEqual(json1.get("EFMILODReference"), "LOD0")
 
-    def test_independent_lod_mode_runs_dedup_on_both_sides(self):
-        """关闭分组投影时，两侧分别调用原有去重，不复用 LOD0 映射。"""
+    def test_projection_off_still_uses_baseline_partition_single_dedup(self):
+        """关闭分组投影时，过滤与镜像约束都关闭，但仍按 v10 独立分段。"""
         original = EFMIBoneMapBuilder.build_vg_maps
+        original_independent = EFMIBoneMapBuilder.build_independent_lod_maps
         calls = []
+        correspondence_args = []
 
         def wrapped(submesh_skeletons, *args, **kwargs):
             calls.append(kwargs.get("deduplicate"))
             return original(submesh_skeletons, *args, **kwargs)
 
+        def wrapped_independent(*args, **kwargs):
+            correspondence_args.append(kwargs.get("correspondence"))
+            return original_independent(*args, **kwargs)
+
         EFMIBoneMapBuilder.build_vg_maps = staticmethod(wrapped)
+        EFMIBoneMapBuilder.build_independent_lod_maps = staticmethod(wrapped_independent)
         try:
             ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
                 workspace_root=str(self.ws),
@@ -545,8 +623,12 @@ class MultiLodBuildTests(unittest.TestCase):
             )
         finally:
             EFMIBoneMapBuilder.build_vg_maps = staticmethod(original)
+            EFMIBoneMapBuilder.build_independent_lod_maps = staticmethod(original_independent)
         self.assertTrue(ok, message)
-        self.assertEqual(calls, [None, None])
+        # v10：每个 LOD 独立执行一次权重扩散去重（各自 dump、各自槽位段），
+        # 共 2 次；不再只做基准分区一次。
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(correspondence_args, [None], "关闭投影时不得把 LOD0 分组关系约束到 LOD1")
         json0 = self._read_submesh_json("LOD0", "aaaabbbb-100-0")
         json1 = self._read_submesh_json("LOD1", "ccccdddd-200-0")
         self.assertFalse(json0.get("EFMILODProjection"))
@@ -683,9 +765,11 @@ class MultiLodBuildTests(unittest.TestCase):
         )
         # 输入 json 缺失必须使联合快路径失效，绝不能继续“无需重新生成”
         self.assertNotIn("无需重新生成", message2)
-        # 存活的 LOD1 仍应保有有效 VGMap
+        # 更新语义：LOD0（基准）json 缺失 -> 零基准物体约束 -> LOD1 判为未匹配
+        # （批处理仍按失败回退普通导入；修复 LOD0 后重新导入即可重建匹配）
         json1 = self._read_submesh_json("LOD1", "ccccdddd-200-0")
-        self.assertEqual(json1.get("VGMap"), {"0": 0})
+        self.assertIsNone(json1.get("VGMap"))
+        self.assertTrue(json1.get("EFMILODProjectionSkipped"))
 
 
 class FallbackDrawcallTests(unittest.TestCase):
@@ -1225,6 +1309,267 @@ class SingleLodAtomicCacheTests(unittest.TestCase):
         )
         self.assertTrue(ok2, message2)
         self.assertEqual(cache_a.read_bytes(), source.read_bytes())
+
+
+class ProjectionImportFilterTests(unittest.TestCase):
+    """分组投影未匹配过滤 e2e：LOD0 物体约束 LOD1 导入。
+
+    覆盖：
+    - 未进入部件一对一配对的 LOD1 部件（未匹配）-> EFMILODProjectionSkipped、
+      无 VGMap、load_projection_skipped_targets 命中、幂等二次运行保持；
+    - 部件已配对但配对得分超 _CROSS_LOD_PART_IMPORT_SCORE_LIMIT（弱匹配）-> 同样跳过；
+    - 未收集到骨骼原始候选的 LOD1 部件（Blend 无 BLENDINDICES / dump 无骨骼来源）
+      -> 同样跳过且不使整批失败回退（关键：否则全批回退普通导入会把所有
+      "未知物体"一并导入）；
+    - 基准 LOD0 正常生成，不影响。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="efmi_proj_filter_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.dump_a = _make_dump(
+            Path(self.tmp) / "dumpA", "000100", CB_HASH, T0_HASH_A, 1.5
+        )
+        self.dump_b = _make_dump_multi(
+            Path(self.tmp) / "dumpB",
+            [
+                ("000200", CB_HASH_B, T0_HASH_B, 2.5),
+                ("000300", "eeee6666", "ffff7777", 3.5),
+            ],
+        )
+        self.ws = _make_workspace(self.tmp, self.dump_a, self.dump_b)
+        self.u_lod0 = _make_submesh_geo(
+            self.ws, "LOD0", "aaaabbbb-100-0",
+            [(0.0, 0.0, 0.0), (0.05, 0.0, 0.0)],
+        )
+        self.u_match = _make_submesh_geo(
+            self.ws, "LOD1", "ccccdddd-200-0",
+            [(0.0, 0.0, 0.0), (0.05, 0.0, 0.0)],
+        )
+        self.u_unknown = _make_submesh_geo(
+            self.ws, "LOD1", "eeeeffff-300-0",
+            [(5.0, 0.0, 0.0), (5.05, 0.0, 0.0)],
+        )
+        _write_json(self.ws / "Import.json", {
+            self.u_lod0: GAMETYPE, self.u_match: GAMETYPE, self.u_unknown: GAMETYPE,
+        })
+        _write_json(self.ws / "LOD0" / "ComponentName_DrawCallIndexList.json",
+                    {"aaaabbbb-100-0": ["000100"]})
+        _write_json(self.ws / "LOD1" / "ComponentName_DrawCallIndexList.json",
+                    {"ccccdddd-200-0": ["000200"], "eeeeffff-300-0": ["000300"]})
+
+    def _read_submesh_json(self, lod, bare):
+        for type_dir in (self.ws / lod / bare).iterdir():
+            if type_dir.is_dir() and type_dir.name.startswith("TYPE_"):
+                return json.loads((type_dir / f"{bare}.json").read_text(encoding="utf-8"))
+        return None
+
+    def test_unmatched_lod1_part_is_skipped_by_projection(self):
+        """LOD1 未知部件（与 LOD0 无几何对应）不生成 VGMap，仅写裁决标记。"""
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_match, self.u_unknown],
+        )
+        self.assertTrue(ok, message)
+        self.assertIn("按跨 LOD 投影未匹配跳过 1 个", message)
+
+        json0 = self._read_submesh_json("LOD0", "aaaabbbb-100-0")
+        json_match = self._read_submesh_json("LOD1", "ccccdddd-200-0")
+        json_unknown = self._read_submesh_json("LOD1", "eeeeffff-300-0")
+        self.assertEqual(json0.get("VGMap"), {"0": 0})
+        # v10（撤销 v9 共享槽位投影）：匹配部件也用**自己的 dump**
+        # 独立去重 + 分段平移（基准段大小 1 -> LOD1 槽位从 1 起），不再与 LOD0
+        # 共用同一槽位池（v9 共用槽位导致运行时 LOD1 读到 LOD0 矩阵、模型爆炸）。
+        self.assertEqual(json_match.get("VGMap"), {"0": 1})
+        self.assertEqual(json_match.get("VGOffset"), 1)
+        self.assertIsNone(json_unknown.get("VGMap"), "未匹配部件不得有 VGMap")
+        self.assertIsNone(json_unknown.get("VGCount"))
+        self.assertIsNone(json_unknown.get("VGOffset"))
+        self.assertTrue(json_unknown.get("EFMILODProjectionSkipped"))
+        self.assertTrue(json_unknown.get("EFMILODProjection"))
+        self.assertEqual(json_unknown.get("EFMILODReference"), "LOD0")
+        self.assertEqual(json_unknown.get("EFMILODLayoutVersion"),
+                         _efmi._CROSS_LOD_LAYOUT_VERSION)
+        # 未匹配部件仍保留工作空间来源缓存（日后清缓存/取消过滤可重建）
+        self.assertTrue(
+            (self.ws / "LOD1" / "eeeeffff-300-0" / "ModImpRuntime"
+             / "eeeeffff-300-0-BoneMatrix.buf").is_file()
+        )
+
+        skipped = EFMISkeletonMergeHelper.load_projection_skipped_targets(
+            str(self.ws), [self.u_lod0, self.u_match, self.u_unknown]
+        )
+        self.assertEqual(skipped, {self.u_unknown})
+
+        # 幂等：二次运行应走联合缓存快路径，不重复重算
+        ok2, message2 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_match, self.u_unknown],
+        )
+        self.assertTrue(ok2, message2)
+        self.assertIn("无需重新生成", message2)
+
+        # 自动顶点组匹配配对的账本读取：只收集目标侧（LOD1），且与基准键配对；
+        # 基准侧 json 的对应账本指向目标侧（row.unique_str 的 LOD != 基准），不重复收集
+        pairs = EFMISkeletonMergeHelper.load_lod_match_pairs(
+            str(self.ws), [self.u_lod0, self.u_match, self.u_unknown]
+        )
+        self.assertEqual(pairs, [{
+            "target_key": self.u_match,
+            "reference_key": self.u_lod0,
+            "target_lod": "LOD1",
+            "reference_lod": "LOD0",
+        }])
+        # 无 LOD 前缀的目标不参与配对
+        self.assertEqual(
+            EFMISkeletonMergeHelper.load_lod_match_pairs(str(self.ws), ["bare-1-0"]),
+            [],
+        )
+
+    def test_lod_match_pairs_do_not_consume_vgmap_as_object_mapping(self):
+        """自动链的账本只负责配物体，真实顶点组必须交给 Blender 节点重匹配。"""
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_match, self.u_unknown],
+        )
+        self.assertTrue(ok, message)
+
+        target_path = EFMISkeletonMergeHelper._resolve_submesh_json_path(
+            str(self.ws), self.u_match
+        )
+        payload = json.loads(Path(target_path).read_text(encoding="utf-8"))
+        payload.pop("VGMap", None)
+        first_row = dict(next(iter(payload["EFMILODCorrespondence"].values())))
+        # 即使账本中存在多个 local 对应、目标 JSON 不再带 VGMap，物体配对仍然
+        # 可读取；这些 local 行不能被 load_lod_match_pairs 换算成顶点组映射。
+        payload["EFMILODCorrespondence"]["1"] = first_row
+        _write_json(Path(target_path), payload)
+
+        reference_path = EFMISkeletonMergeHelper._resolve_submesh_json_path(
+            str(self.ws), self.u_lod0
+        )
+        reference_payload = json.loads(Path(reference_path).read_text(encoding="utf-8"))
+        reference_payload.pop("VGMap", None)
+        _write_json(Path(reference_path), reference_payload)
+
+        self.assertEqual(
+            EFMISkeletonMergeHelper.load_lod_match_pairs(
+                str(self.ws), [self.u_lod0, self.u_match]
+            ),
+            [{
+                "target_key": self.u_match,
+                "reference_key": self.u_lod0,
+                "target_lod": "LOD1",
+                "reference_lod": "LOD0",
+            }],
+        )
+
+    def test_weak_lod1_part_match_is_skipped_by_projection(self):
+        """部件已配对但得分超上限（弱匹配）仍视为几何匹配不成功，不导入。"""
+        ws = Path(self.tmp) / "ws_weak"
+        (ws / "Config" / "Tabs").mkdir(parents=True, exist_ok=True)
+        _write_json(ws / "Config" / "FrameAnalysisPath.json",
+                    {"frameAnalysisFolderPath": str(self.dump_b)})
+        _write_json(ws / "Config" / "WorkPageTabs.json", {
+            "activeTabId": "ws-tab-2",
+            "tabs": [
+                {"id": "ws-tab-1", "name": "LOD0"},
+                {"id": "ws-tab-2", "name": "LOD1"},
+            ],
+        })
+        _write_json(ws / "Config" / "Tabs" / "ws-tab-1.json",
+                    {"frameAnalysisFolderPath": str(self.dump_a)})
+        _write_json(ws / "Config" / "Tabs" / "ws-tab-2.json",
+                    {"frameAnalysisFolderPath": str(self.dump_b)})
+        # LOD0 基准在 x≈0；LOD1 部件在 x≈0.55（中心距过 0.75 门控仍可进入配对，
+        # 但点云相距 0.5+，配对得分超上限 -> 弱匹配）
+        u_a = _make_submesh_geo(
+            ws, "LOD0", "aaaabbbb-100-0",
+            [(0.0, 0.0, 0.0), (0.05, 0.0, 0.0)],
+        )
+        u_weak = _make_submesh_geo(
+            ws, "LOD1", "ccccdddd-200-0",
+            [(0.55, 0.0, 0.0), (0.60, 0.0, 0.0)],
+        )
+        _write_json(ws / "Import.json", {u_a: GAMETYPE, u_weak: GAMETYPE})
+        _write_json(ws / "LOD0" / "ComponentName_DrawCallIndexList.json",
+                    {"aaaabbbb-100-0": ["000100"]})
+        _write_json(ws / "LOD1" / "ComponentName_DrawCallIndexList.json",
+                    {"ccccdddd-200-0": ["000200"]})
+
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(ws),
+            unique_str_list=[u_a, u_weak],
+        )
+        self.assertTrue(ok, message)
+        json_a = next(
+            path for path in (ws / "LOD0" / "aaaabbbb-100-0").glob("TYPE_*/*.json")
+        )
+        payload_a = json.loads(json_a.read_text(encoding="utf-8"))
+        self.assertEqual(payload_a.get("VGMap"), {"0": 0})
+        json_weak = next(
+            path for path in (ws / "LOD1" / "ccccdddd-200-0").glob("TYPE_*/*.json")
+        )
+        payload_weak = json.loads(json_weak.read_text(encoding="utf-8"))
+        self.assertIsNone(payload_weak.get("VGMap"), "弱匹配部件不得有 VGMap")
+        self.assertTrue(payload_weak.get("EFMILODProjectionSkipped"))
+
+    def test_uncollectable_lod1_parts_are_skipped_not_failing_batch(self):
+        """收集失败的 LOD1 部件（无 BLENDINDICES / dump 无骨骼来源）也必须跳过。
+
+        它们是与 LOD0 无对应的“未知物体”；若让整批合并失败，导入会回退普通
+        导入把全部未知物体导入——正是用户报告的“没有效果”。
+        """
+        # 部件 1：json 有 Blend 类别但缺 BLENDINDICES 元素 -> collect 失败
+        u_no_blend = _make_submesh(self.ws, "LOD1", "11112222-400-0")
+        no_blend_json = next(
+            (self.ws / "LOD1" / "11112222-400-0").glob("TYPE_*/*.json")
+        )
+        payload = json.loads(no_blend_json.read_text(encoding="utf-8"))
+        payload["CategoryBufferList"][0]["D3D11ElementList"][0].pop("SemanticName", None)
+        payload["CategoryBufferList"][0]["D3D11ElementList"][0]["SemanticName"] = "POSITION"
+        no_blend_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        # 部件 2：json 正常但 ComponentName 无映射、dump 也无该 ib -> collect 失败
+        u_no_source = _make_submesh_geo(
+            self.ws, "LOD1", "99998888-500-0",
+            [(9.0, 0.0, 0.0), (9.05, 0.0, 0.0)],
+        )
+
+        _write_json(self.ws / "Import.json", {
+            self.u_lod0: GAMETYPE, self.u_match: GAMETYPE,
+            self.u_unknown: GAMETYPE, u_no_blend: GAMETYPE, u_no_source: GAMETYPE,
+        })
+
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_match, self.u_unknown,
+                             u_no_blend, u_no_source],
+        )
+        self.assertTrue(ok, f"收集失败的未知部件不得导致整批失败回退：{message}")
+        self.assertIn("按跨 LOD 投影未匹配跳过 3 个", message)
+
+        json_no_blend = self._read_submesh_json("LOD1", "11112222-400-0")
+        self.assertTrue(json_no_blend.get("EFMILODProjectionSkipped"))
+        self.assertIsNone(json_no_blend.get("VGMap"))
+        json_no_source = self._read_submesh_json("LOD1", "99998888-500-0")
+        self.assertTrue(json_no_source.get("EFMILODProjectionSkipped"))
+        self.assertIsNone(json_no_source.get("VGMap"))
+
+        skipped = EFMISkeletonMergeHelper.load_projection_skipped_targets(
+            str(self.ws),
+            [self.u_lod0, self.u_match, self.u_unknown, u_no_blend, u_no_source],
+        )
+        self.assertEqual(skipped, {self.u_unknown, u_no_blend, u_no_source})
+
+        # 幂等：带标记的未收集目标也应走快路径
+        ok2, message2 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_match, self.u_unknown,
+                             u_no_blend, u_no_source],
+        )
+        self.assertTrue(ok2, message2)
+        self.assertIn("无需重新生成", message2)
 
 
 if __name__ == "__main__":

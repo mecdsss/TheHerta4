@@ -981,7 +981,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                     f"run = CommandList{BS}ZZMI{BS}SetTextures",
                     "run = CommandListSkinTexture",
                     "; [mesh:LOD0.241deac5-56376-0.中文中文_透明0.75_copy] [vertex_count:15618]",
-                    "drawindexed = 56376, 0, 0",
+                    "drawindexed = 56376, 0, 3",
                 ]),
                 ("_config_path", temp_dir),
             ])
@@ -1026,6 +1026,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertIn("global $TTLAlpha0_75 = 0.75", sections["[Constants]"])
             self.assertIn("$" + BS + "TTL" + BS + "_1 = 56376", new_lines)
             self.assertIn("$" + BS + "TTL" + BS + "_2 = 0", new_lines)
+            self.assertIn("$" + BS + "TTL" + BS + "_3 = 3", new_lines)
             self.assertIn("run = CommandList" + BS + "TTL" + BS + "Draw", new_lines)
             ttl_ref_line = "Resource" + BS + "TTL" + BS + "TransparencyTex = ref Resource_TTLMap_Rkydfsmefl"
             self.assertIn(ttl_ref_line, new_lines)
@@ -1039,7 +1040,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertLess(new_lines.index(mask_channel_line), new_lines.index(mask_line))
 
     def test_ttl_if_switch_block_moved_with_condition(self):
-        """TTL：if/endif 条件块整体迁入新段并包住 _1/_2/run，原段删除"""
+        """TTL：if/endif 条件块整体迁入新段并包住 _1/_2/_3/run，原段删除"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
             diffuse_path = os.path.join(temp_dir, "diffuse.png")
@@ -1063,7 +1064,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                     "run = CommandListSkinTexture",
                     "if $swapkey0 == 0 && $swapkey1 == 0",
                     "  ; [mesh:LOD0.241deac5-56376-0.中文中文_透明0.75_copy] [vertex_count:15618]",
-                    "  drawindexed = 56376,0,0",
+                    "  drawindexed = 56376,0,3",
                     "endif",
                 ]),
                 ("_config_path", temp_dir),
@@ -1090,6 +1091,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertIn("if $swapkey0 == 0 && $swapkey1 == 0", new_lines)
             self.assertIn("    $" + BS + "TTL" + BS + "_1 = 56376", new_lines)
             self.assertIn("    $" + BS + "TTL" + BS + "_2 = 0", new_lines)
+            self.assertIn("    $" + BS + "TTL" + BS + "_3 = 3", new_lines)
             self.assertIn("    run = CommandList" + BS + "TTL" + BS + "Draw", new_lines)
             self.assertEqual(new_lines[-1], "endif")
             self.assertLess(new_lines.index("$" + BS + "TTL" + BS + "alpha = $TTLAlpha0_75"), new_lines.index("if $swapkey0 == 0 && $swapkey1 == 0"))
@@ -1494,7 +1496,7 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
         self.assertIn("$" + chr(92) + "TTL" + chr(92) + "_1 = 15255", stripped)
 
     def test_ttl_draw_lines_preserve_flags_when_block_starts_mid_if(self):
-        """TTL 块边界从 mesh 注释行开始（if 头在块外）时，flag 与 drawindexed
+        r"""TTL 块边界从 mesh 注释行开始（if 头在块外）时，flag 与 drawindexed
         都走非 if 路径——flag 必须在 $\TTL 参数之前被保留（回归：此前整批 54
         个 TTL 段标志被静默丢弃，导致可见 TTL 副本无法被命中）。"""
         node = node_postprocess_material.SSMTNode_PostProcess_Material()

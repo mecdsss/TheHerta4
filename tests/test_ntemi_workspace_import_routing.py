@@ -313,6 +313,35 @@ class ZZMISkeletonGroupCollectionTests(unittest.TestCase):
         self.assertEqual(collection.name, "SkeletonGroup_3.002")
 
 
+class EFMIAutoLODMatchNodeTests(unittest.TestCase):
+    def test_generated_node_recomputes_mapping_from_actual_blender_objects(self):
+        calls = []
+
+        class FakeMatchNode:
+            def execute_match(self, context):
+                calls.append(context)
+                return {"0": "371"}, "匹配完成"
+
+        node = FakeMatchNode()
+        context = object()
+        source = types.SimpleNamespace(name="LOD0.source")
+        target = types.SimpleNamespace(name="LOD1.target")
+
+        mapping, message = ui_func_import_ssmt._configure_and_execute_efmi_lod_match(
+            node, source, target, context
+        )
+
+        self.assertEqual(mapping, {"0": "371"})
+        self.assertEqual(message, "匹配完成")
+        self.assertEqual(calls, [context])
+        self.assertEqual(node.source_object, source.name)
+        self.assertEqual(node.target_object, target.name)
+        self.assertEqual(node.target_hash, "")
+        self.assertFalse(node.exact_hash_match)
+        self.assertEqual(node.match_threshold, 0.06)
+        self.assertFalse(node.use_chamfer_matching)
+
+
 class NTEMIWorkspaceImportRoutingTests(unittest.TestCase):
     def setUp(self):
         _created_mesh_calls.clear()

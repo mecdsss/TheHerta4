@@ -344,6 +344,20 @@ class DragNodeLocateTests(unittest.TestCase):
         self.assertEqual(part["ib_first_index"], 0)
         self.assertEqual(part["index_count"], 420)
 
+    def test_locate_component_preserves_shared_base_vertex(self):
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        for section_name in (
+            "[TextureOverride_abc123_abc123-43191A]",
+            "[TextureOverride_abc123_abc123-43191B]",
+        ):
+            sections[section_name][-1] = sections[section_name][-1].rsplit(",", 1)[0] + ", 3"
+
+        comp = node._locate_components(sections, ["abc123"])[0]
+
+        self.assertEqual(comp["vertex_base"], 3)
+        self.assertTrue(all(part["vertex_base"] == 3 for part in comp["parts"]))
+
     def test_cross_ib_draws_are_owned_by_mesh_prefix_instead_of_section_hash(self):
         node = _make_node(self.mod)
         sections = _cross_ib_sections()
@@ -391,6 +405,7 @@ class DragNodeLocateTests(unittest.TestCase):
             "if $swapkey6 == 5",
             "    $\\TTL\\_1 = 15255",
             "    $\\TTL\\_2 = 272901",
+            "    $\\TTL\\_3 = 3",
             "    run = CommandListSSMTTTLDraw_deadbeef_A",
             "endif",
         ]
@@ -401,6 +416,7 @@ class DragNodeLocateTests(unittest.TestCase):
 
         self.assertEqual(len(ttl_records), 1)
         self.assertEqual(ttl_records[0]["draw_count"], 15255)
+        self.assertEqual(ttl_records[0]["vertex_base"], 3)
 
     def test_object_id_map_assigned_from_mesh_comments(self):
         node = _make_node(self.mod)
@@ -1562,6 +1578,23 @@ class DragNodeEmitTests(unittest.TestCase):
         s1b = sections["[CustomShaderDragBakeSample1_abc123_43191P1_testns]"]
         self.assertIn("gs-t1 = Resourceabc123-43191BIB", s1b)
 
+    def test_redirect_base_vertex_reaches_bake_and_detect(self):
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        for section_name in (
+            "[TextureOverride_abc123_abc123-43191A]",
+            "[TextureOverride_abc123_abc123-43191B]",
+        ):
+            sections[section_name][-1] = sections[section_name][-1].rsplit(",", 1)[0] + ", 3"
+        comps = node._locate_components(sections, ["abc123"])
+
+        node._emit_sections(sections, comps, "testns")
+
+        sample = sections["[CustomShaderDragBakeSample1_abc123_43191P0_testns]"]
+        self.assertIn("drawindexed = 1, 6586, 3", sample)
+        detect = sections["[CustomShaderDragDetectabc123_43191P0_testns]"]
+        self.assertIn("z26 = 3", detect)
+
     def test_bake_offsets_cover_multiple_draws_in_one_ib_section(self):
         node = _make_node(self.mod)
         sections = _base_sections()
@@ -1666,6 +1699,8 @@ class DragNodeEmitTests(unittest.TestCase):
                   ).read_text(encoding="utf-8")
         self.assertIn("#define DETECT_OBJECT_FIRST IniParams[28].y", shader)
         self.assertIn("#define DETECT_OBJECT_SPAN  IniParams[28].z", shader)
+        self.assertIn("#define DETECT_VERTEX_BASE", shader)
+        self.assertIn("gIndexBuffer[indexBase + 0u] + DETECT_VERTEX_BASE", shader)
         self.assertIn(
             "for (uint objectIndex = objectFirst; objectIndex < objectLast; objectIndex++)",
             shader)
@@ -1816,6 +1851,45 @@ class DragNodeEmitTests(unittest.TestCase):
             kept = {int(zone_id): float(weight) for zone_id, weight in zip(row_ids, row_weights)}
             self.assertEqual(set(kept), {2, 3, 4, 255})
             self.assertAlmostEqual(kept[255], 0.6, places=6)
+
+    def test_sparse_bake_pads_zzmi_redirect_vertex_prefix(self):
+        """ZZMI RedirectSO 的 VLR 含 3 顶点前缀，而基础 Position.buf 不含；
+        烘焙必须在运行时索引空间补齐前缀，不能用 3 行 field 索引 6 行数组。"""
+        import tempfile
+
+        item = self._zone_item(0)
+        node = _make_node(self.mod, zone_objects=[item])
+        node._check_zone_radius_scale = lambda zones: False
+        node._read_position_buf = lambda *args: np.zeros((3, 3), dtype=np.float32)
+        node._get_reference_matrix_inv = lambda comp: None
+        node._get_export_space_matrix = lambda: np.eye(4)
+        node._get_non_mirror_mirror = lambda: None
+        node._buffer_dir = lambda sections, comp: "Meshes"
+        node._evaluate_zone_field = lambda positions, *args, **kwargs: np.ones(
+            len(positions), dtype=np.float32
+        )
+        comp = {
+            "vertex_count": 6,
+            "vertex_base": 3,
+            "base_name": "sample",
+            "comp_name": "sample",
+            "parts": [],
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            node._write_jiggle_masks(td, {}, comp, "testns")
+            ids = np.fromfile(
+                Path(td) / "Meshes" / "sampleJiggleZoneIDs.buf", dtype=np.uint32
+            ).reshape(-1, 4)
+            weights = np.fromfile(
+                Path(td) / "Meshes" / "sampleJiggleZoneWeights.buf", dtype=np.float32
+            ).reshape(-1, 4)
+
+        self.assertEqual(weights.shape, (6, 4))
+        self.assertTrue(bool(np.all(weights[:3] == 0.0)))
+        self.assertTrue(bool(np.all(ids[:3] == self.mod.INVALID_ZONE_ID)))
+        self.assertTrue(bool(np.all(weights[3:, 0] == 1.0)))
+        self.assertTrue(bool(np.all(ids[3:, 0] == 0)))
 
     def test_sparse_bake_includes_objects_even_when_propagation_off(self):
         """关闭沿表面扩散时，包含物体列表仍必须参与导出侧权重烘焙。"""
@@ -2197,6 +2271,33 @@ class DragNodeEmitTests(unittest.TestCase):
             params = np.fromfile(Path(td) / "res" / "drag_interaction" / "ZoneParams_testns.buf", dtype=np.float32).reshape(-1, 4)
         self.assertEqual(params.shape, (2, 4))
         self.assertEqual(params[1].tolist(), [0.0, 1.0, 0.0, 1.0])
+
+    def test_redirect_fallback_keeps_stub_prefix_invalid(self):
+        import tempfile
+
+        node = _make_node(self.mod)
+        comp = {
+            "base_name": "sample",
+            "comp_name": "sample",
+            "vertex_base": 3,
+            "base_resource": "ResourceSamplePosition",
+        }
+        sections = {"[ResourceSamplePosition]": ["filename = Meshes0000/sample-Position.buf"]}
+        with tempfile.TemporaryDirectory() as td:
+            node._write_masks_fallback(
+                td,
+                sections,
+                comp,
+                vertex_count=6,
+                fallback_zone_id=2,
+                vertex_base=3,
+            )
+            ids = np.fromfile(Path(td) / "Meshes0000" / "sampleJiggleZoneIDs.buf", dtype=np.uint32)
+            weights = np.fromfile(Path(td) / "Meshes0000" / "sampleJiggleZoneWeights.buf", dtype=np.float32)
+        self.assertTrue(np.all(ids[: 3 * 4] == self.mod.INVALID_ZONE_ID))
+        self.assertTrue(np.all(weights[: 3 * 4] == 0.0))
+        self.assertTrue(np.all(ids[3 * 4 :: 4] == 2))
+        self.assertTrue(np.all(weights[3 * 4 :: 4] == 1.0))
 
     def test_all_used_globals_declared(self):
         """发射的所有段中被引用的 $ 变量必须在 [Constants] 有 global 声明。
@@ -3424,6 +3525,49 @@ class DragCollisionTests(unittest.TestCase):
             # L0：每顶点 2 float4，共 8 顶点
             l0 = np.fromfile(p / "sampleColliderVertexL0.buf", dtype=np.float32)
             self.assertEqual(len(l0), 8 * 2 * 4)
+
+    def test_collision_l0_pads_zzmi_redirect_vertex_prefix(self):
+        import tempfile
+
+        node = _make_node(
+            self.mod,
+            collision_enabled=True,
+            zone_objects=[self._collider_item(0, ["Thigh"])],
+        )
+        verts = np.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float32,
+        )
+        triangles = np.array([[0, 1, 2]], dtype=np.int64)
+        node._read_position_buf = lambda *args: verts
+        node._read_component_triangles = lambda *args: (
+            triangles,
+            np.array(["Thigh"], dtype=object),
+        )
+        node._collider_l0_mask = lambda *args: np.array(
+            [False, False, False, True, True, True], dtype=bool
+        )
+        node._buffer_dir = lambda sections, comp: "Meshes"
+        comp = {
+            "vertex_count": 6,
+            "vertex_base": 3,
+            "base_name": "sample",
+            "comp_name": "sample",
+            "parts": [],
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(
+                node._write_collision_resources(td, {}, comp, "testns")
+            )
+            l0 = np.fromfile(
+                Path(td) / "Meshes" / "sampleColliderVertexL0.buf",
+                dtype=np.float32,
+            ).reshape(-1, 4)
+
+        self.assertEqual(l0.shape, (12, 4))
+        self.assertTrue(bool(np.all(l0[:6] == 0.0)))
+        self.assertTrue(bool(np.all(l0[7::2, 3] == 1.0)))
 
     def test_write_collision_resources_skips_when_no_collider_hits(self):
         import tempfile

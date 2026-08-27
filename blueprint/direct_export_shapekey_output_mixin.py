@@ -472,7 +472,8 @@ class DirectShapeKeyOutputMixin:
                 if f"post {res_name} = copy_desc" not in constants_content:
                     constants_lines.append(f"post {res_name} = copy_desc {res_name}_0")
             if len(base_resources) > 1:
-                vars_to_define.add("$swapkey100")
+                # 内部基础网格选择器不可复用 MultiFile 的公开动画帧参数。
+                vars_to_define.add("$ssmt_sk_base_mesh")
             if f"post run = CustomShader_{logical_hash}_Anim" not in constants_content:
                 constants_lines.append(f"post run = CustomShader_{logical_hash}_Anim")
 
@@ -631,7 +632,7 @@ class DirectShapeKeyOutputMixin:
                         "_0",
                         source_candidates=[res_name],
                     )
-                    block_lines.extend([f"    if $swapkey100 == {index}", f"        cs-u5 = copy {res_name}_0", f"        {res_name} = ref cs-u5", "    endif"])
+                    block_lines.extend([f"    if $ssmt_sk_base_mesh == {index}", f"        cs-u5 = copy {res_name}_0", f"        {res_name} = ref cs-u5", "    endif"])
             else:
                 res_name = res_to_bind[0]
                 ensure_resource_alias_section(

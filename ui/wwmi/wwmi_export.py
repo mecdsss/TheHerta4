@@ -111,7 +111,7 @@ class ExportWWMI:
 
     def add_constants_section(self, ini_builder: M_IniBuilder, draw_ib_model: DrawIBModelWWMI):
         constants_section = M_IniSection(M_SectionType.Constants)
-        constants_section.append("[Constants]")
+        constants_section.SectionName = "Constants"
         constants_section.append("global $required_wwmi_version = 0.91")
         constants_section.append("global $object_guid = " + str(draw_ib_model.extracted_object.index_count))
         constants_section.append("global $mesh_vertex_count = " + str(draw_ib_model.mesh_vertex_count))
@@ -166,7 +166,7 @@ class ExportWWMI:
 
     def add_present_section(self, ini_builder: M_IniBuilder, draw_ib_model: DrawIBModelWWMI):
         present_section = M_IniSection(M_SectionType.Present)
-        present_section.append("[Present]")
+        present_section.SectionName = "Present"
         present_section.append("if $object_detected")
         present_section.append("  if $mod_enabled")
         present_section.append("    post $object_detected = 0")

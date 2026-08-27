@@ -215,8 +215,9 @@
         ▼ ② 导出（ExportEFMI）
 [Blender 插件] 每 SubMeshModel：
    a. 导出前顶点组预处理（可选开关）：fill gaps / 剔 ignore / 按数字名排序
-   b. ★BLENDINDICES 升宽：合并骨架场景 R8G8B8A8_UINT → R16G16B16A16_UINT（运行时改 gametype 元素），
-      同步 CategoryStrideDict 与 INI Resource stride
+   b. ★BLENDINDICES 归一化：合并骨架场景将 R8/R16/R32 整数格式按原通道数、
+      原 signedness 统一到 R16 系（R32 仅在值域可承载时降宽），同步
+      CategoryStrideDict 与 INI Resource stride
    c. ★INI 变化（仅两处）：Resource_Blend stride 更新 + TextureOverride 段加
       `vb2->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_UINT`（见 §6.6）
    d. ★ENCODEDDATA 导出分支接通（若未来类型含 ENCODEDDATA）
@@ -226,16 +227,20 @@
 [Mod 输出] buffers + INI
 ```
 
-### 6.3 升宽策略（已确认：R16G16B16A16_UINT）
+### 6.3 BLENDINDICES 宽度归一化策略（最终口径：R16 整数系）
 
-- **目标格式 `R16G16B16A16_UINT`**（参考插件正统：导出时 `force_compatible_buffers_format(min=2,max=2)` 把 BLENDINDICES 统一为 16 位，stride 同步缩放）。
-- SSMT4 体系无现成 R16 系 EFMI 类型（BI4=`R8G8B8A8_UINT`、BI16=`R32G32B32A32_UINT`）→ 升宽在**导出时动态修改 gametype 元素**（运行时副本，不落盘改配置）：BLENDINDICES Format/ByteWidth/Stride → R16G16B16A16_UINT/8B。
+- **目标为同通道数、同 signedness 的 R16 整数 DXGI 格式**；常见四通道 UINT 即
+  `R16G16B16A16_UINT`。R8 升宽、R16 保持、R32 在实际索引可承载时降宽，
+  写盘前做精确范围检查，绝不截断。三通道因 DXGI 无对应 R16 整数格式而明确拒绝。
+- 归一化在**导出时动态修改 gametype 元素**（运行时副本，不落盘改配置），并同步
+  Format/ByteWidth/CategoryStrideDict/AlignedByteOffset；不是“发现一个 R32 就全体升 R32”。
 - 触发条件（已确认）：`logic_name == EFMI 且 import_merged_vgmap() 开启`。合并模式下无条件升宽（全局索引可能超 255），不做 VGCount 阈值判断。
 - 联动修改：
-  - `parse_elementname_data_dict` 的 R8 分支对 EFMI+合并场景允许 cast 到 uint16（替代现有 Fatal）；
-  - `convert_to_element_vertex_ndarray` 打包前 uint8 检查随之放宽（≤65535）；
+  - `parse_elementname_data_dict` 与 `convert_to_element_vertex_ndarray` 使用归一化后的
+    R16 signed/unsigned dtype，并按 `UINT <= 65535` / `SINT <= 32767` 精确检查；
   - INI `[Resource_*_Blend]` 的 stride 用新的 CategoryStrideDict（自动联动，见 §6.6）；
-  - INI 每个含 Blend 的 TextureOverride 段输出 `vb2->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_UINT`（见 §6.6）。
+  - INI 每个含 Blend 的 TextureOverride 段输出对应 SemanticIndex 的实际归一化
+    R16 格式（常见四通道见 §6.6）。
 
 ### 6.6 INI 变化规格（骨骼合并后，现有 INI 格式下）★用户关注点
 
@@ -289,7 +294,11 @@
 - [ ] 用户确认本计划书（§6.3 升宽目标、§6.4 反查方案 A/B、开关语义）
 
 ### 阶段 1：P0 修复（不依赖新数据，可立即做）
-- [x] G2 BLENDINDICES 升宽：`d3d11_gametype.widen_blendindices()`（R8→R16G16B16A16_UINT，ByteWidth 4→8，dtype/CategoryStrideDict/AlignedByteOffset 联动，幂等，R32 系跳过）+ `submesh_model.calc_buffer` 接入（EFMI + import_merged_vgmap）+ `blendindices_widened` 标记
+- [x] G2 BLENDINDICES 归一化：`d3d11_gametype.widen_blendindices()` 将
+  R8/R16/R32 整数格式按原通道数与 signedness 统一到 R16 系，ByteWidth、dtype、
+  CategoryStrideDict、AlignedByteOffset 联动且幂等；R32 降宽写盘前做范围检查，
+  不可承载则失败 + `submesh_model.calc_buffer` 接入（EFMI + import_merged_vgmap）+
+  `blendindices_widened` 标记
 - [x] INI 变化（§6.6）：合并模式 → `$\EFMIv1\component_id` + `run = CommandList_MergedSkeleton_ConnectComponent`；非合并模式 → ElementFormat 单行（stride 经 CategoryStrideDict 自动联动）
 - [x] G1 ENCODEDDATA 导出接通：`obj_buffer_helper._parse_encodeddata`（TBNCodec.encode_efmi_tools_r32_uint_from_tbn），替换被注释代码
 
@@ -392,6 +401,87 @@
 - [x] 合并后对每个 global VG 做最终权重扩散连通性复核：成员必须形成连通图，发现
   孤立/断开的组件立即拆回独立槽位；不再要求平面与每个凹槽底直接构成完全图。
 
+### 阶段 12：分组投影未匹配导入过滤（2026-08-26 用户决策）
+
+- [x] 语义：`EFMI LOD 分组投影` 模式下 LOD0 的物体 LOD1 的导入约束——LOD1 部件
+  若几何匹配不成功（未进入部件一对一配对，或配对得分超过 `_CROSS_LOD_PART_IMPORT_SCORE_LIMIT`=0.30
+  [0.5·对称最近邻点云中位距 + 0.25·bbox 间隙 + 0.10·中心距 + 0.05·尺寸误差 + 有界数量项]）
+  则不导入：不写 VGMap/VGCount/VGOffset，json 写 `EFMILODProjectionSkipped=True`
+  （连带 EFMILODLayoutVersion/EFMILODReference/EFMILODProjection），导入循环据此排除
+  该物体；导出侧因无 VGMap 也不纳入合并骨架。
+- [x] 未匹配部件仍发布 BoneMatrix/InstanceConfig 工作空间来源缓存（保留清缓存/取消
+  过滤后凭原文件重建的能力）；正常写回时撤销历史 `EFMILODProjectionSkipped` 标记。
+- [x] 联合缓存的幂等门控把有效跳过裁决视为“已处理”，不重算、不报缺口；
+  `clear_vgmap_cache` 一并清除该标记；`EFMILODLayoutVersion` 升 v6 使旧缓存
+  自动重建以应用新裁决。
+- [x] 含义修正（2026-08-27 用户实测反馈"没有效果"后查明）：LOD1 提取中还有
+  **收集失败**（dump/工作空间无骨骼来源、Blend 无 BLENDINDICES）的未知部件，
+  它们原本让 `ensure_skeleton_data` 整批失败 → 导入回退普通导入 → 全部物体
+  （含未知物体）导入——过滤完全没机会生效。修复：非基准 LOD 的未收集目标
+  同样纳入"投影未匹配"裁决（写 EFMILODProjectionSkipped 标记、json-only 事务），
+  且不计入整批失败（基准侧失败仍按原语义回退）；跳过分支同时清空历史
+  VGMap/VGCount/VGOffset 等残留键。真实工作空间验证：LOD0 14（全部生成）、
+  LOD1 110 = 12 匹配生成 + 98 投影未匹配跳过，无残留无标记目标，二次运行
+  走联合缓存快路径。
+- [x] 基准侧（LOD0）不做导入过滤；基准侧读取失败仍按原有失败语义整批回退
+  普通导入，不静默丢弃。回归：`tests/test_efmi_skeleton_lod.py` 新增未匹配/
+  弱匹配/未收集跳过用例，`test_without_tabs_both_lod_use_default_dump` 与
+  `test_joint_cache_invalidates_when_json_missing` 同步新语义。
+
+### 阶段 13：导入后自动创建跨 LOD 顶点组匹配链
+
+- [x] 语义：合并路线导入成功后，基于分组投影匹配账本（LOD1 json 的
+  `EFMILODCorrespondence`）自动给相关组插入「物体 >>> 物体组 >>> 顶点组处理
+  节点(组内全部部件匹配节点) >>> 输出」：每组一个 `SSMTNode_VertexGroupProcess`
+  插在 Object_Group 与输出/合并节点之间；每组每对匹配一个
+  `SSMTNode_VertexGroupMatch`（source_object = LOD0 物体、target_object = LOD1
+  物体、target_hash 留空、非精确路由），并立即调用 `execute_match`。映射来源是
+  当前 Blender 中两边实际导入物体的顶点组中心（阈值 0.06；关闭 Chamfer、形态键
+  与调试物体），不是导入前 JSON 的 VGMap/骨骼槽位账本。匹配结果由节点自己写入
+  映射文本；失败或零命中会明确计数并保留节点供人工调整。
+- [x] 数据来源：`EFMISkeletonMergeHelper.load_lod_match_pairs`——只收集
+  目标侧（row.unique_str 的 LOD == json EFMILODReference）避免与基准侧账本
+  重复；它只返回 `target_key/reference_key/target_lod/reference_lod` 四个配对字段，
+  刻意不读取两侧 `VGMap`，也不返回 `vg_mapping`。无对应/跳过标记/无 LOD 前缀
+  的目标不产生配对；无匹配对的组不加处理节点（避免 fill/merge 副作用）；回退
+  普通导入时不构建任何东西。
+- [x] 同轮追加：每组链中插入**重命名物体节点**
+  （LOD0 端组，规则 = LOD0 物体名 → 对应 LOD1 物体名，与匹配节点方向一致），
+  位于物体组与顶点组处理节点之间：物体 >>> 物体组 >>> [重命名 >>> 顶点组
+  处理(匹配节点)] >>> 输出；规则全部加在一个重命名节点（每组一个）。
+- [x] **统一顶点组编号修复**（用户反馈 LOD1 物体顶点组 1000+，并要求收窄范围）：
+  最初 LOD1 匹配部件保留自身恒等槽位空间（0..sum 各部件本地组），与 LOD0 编号
+  完全不共享，导入物体组名各自累加；随后 v9 改为把已对应的目标侧 local 投影到
+  **参考侧全局组 id**（跨 LOD 同名同号）——实测 LOD1 爆炸（LOD1 顶点组与 LOD0
+  共用同一批槽位，运行时 MergedSkeleton_Apply 对同一 component 每帧只导入一次
+  骨骼、仅允许更优 $lod_level 覆盖；同帧先 LOD0 后 LOD1 时 LOD1 网格读到 LOD0
+  已导入的矩阵，而 L0/L1 两侧矩阵数据不同）。
+  **v10（撤销 v9 共享槽位投影）**：每 LOD 用自己的 dump 独立
+  执行权重扩散去重（槽位从 0 起），非基准 LOD（LOD1）的整个编号空间**平移**到
+  基准 LOD 段之后（LOD0: 0..max0，LOD1: base 起，base = LOD0 段总槽位）——
+  两域不相交、全局唯一，跨 LOD 零共享零串扰。LOD1 每个部件挂**自己的**
+  component 槽位段与自己的绘制入口（无 full→lod BlendRemap），运行时把当前
+  LOD draw 的**自己的**矩阵写入**自己的**槽位。真实工作空间验证：
+  当前选择中的 LOD0/LOD1 各 10 个对象分别位于 [0, 370] 与 [371, 739]，
+  两域不相交；工作空间中被投影过滤的未匹配部件无 VGMap。
+- [x] **v13 分组投影开关语义**：投影不是让 LOD1 直接使用 LOD0 槽位，而是把
+  LOD0 的去重**分区关系**镜像为 LOD1 的约束：LOD0 同一去重组对应的 LOD1
+  组必须合并，不同 LOD0 组对应的 LOD1 组禁止互并；LOD1 结果仍整体平移到
+  自己的独立槽位段。开关开启时同时执行几何未匹配 LOD1 过滤和自动匹配链；
+  关闭时不传镜像约束、不过滤、不建链，双侧完全独立去重。
+- [x] **撤销把账本当顶点组映射的回归修复**：分组投影账本描述骨骼候选与分区关系，
+  不能代替导入后自主生成物体的匹配节点。曾把两侧 VGMap 直接换算为映射文本，
+  导致实际物体仍有正权重组（如组 0）未被改名，最终被 LOD 域校验拒绝；更换角色
+  时还会把角色特定槽位关系误当成通用规则。现恢复为“账本只配物体，节点重新匹配
+  实际物体”。`target_hash` 留空，避免重命名后的 `.001` 后缀绕过精确路由。
+- [x] **导出 LOD 域校验**：普通 LOD BlendIndices 只能引用本 LOD 本帧实际写入的
+  component 槽位；仅允许声明过的 same-IB 跨 LOD 折叠别名作为例外。过去只检查
+  全局大池，另一个 LOD 的合法 id 也会误过关；现在此类残留引用在写文件前失败。
+  same-IB 折叠是运行时复用 draw/component 的既有设计，不作为错误移除。
+- [x] **相同网络是合法输入**：取消“LOD1 与 LOD0 顶点数相同就疑似导错几何”的
+  推断和警告。不同 LOD 可以故意复用完全相同的拓扑、Position 与 Index；几何相同
+  本身不参与判错，实际正确性只由对应账本、槽位域和 BlendIndices 写盘校验决定。
+
 ### 阶段 5（明确不做，备忘）
 - ~~LOD BlendRemap~~（用户：不需要 LOD 相关内容）
 - ~~shapekey 批次导出~~（用户：保留现有 INI 格式）
@@ -419,7 +509,7 @@
 
 | # | 问题 | 决策 | 影响 |
 |---|---|---|---|
-| D1 | 升宽目标格式 | **BI16 型 `R32G32B32A32_UINT`** | §6.3 按此实施；与现有 BI16 类型一致，加载端可识别 |
+| D1 | BLENDINDICES 归一化目标 | **按原通道数归一化到 R16 整数 DXGI 格式**（常见四通道为 `R16G16B16A16_UINT`） | R8 升到 R16；R32 仅在实际索引可承载时降到 R16，写出前做范围检查，禁止静默截断；无需全量升到 R32 |
 | D2 | 骨骼数据生成方案 | **方案 A：Blender 侧反查 + 写回工作空间** | §6.4 按 A 实施；SSMT4 不动 |
 | D3 | 行为开关 | **复用 `import_merged_vgmap()`** | 导入/导出骨骼合并 + 升宽均随此开关（默认 True） |
 | D4 | 骨骼 buffer 缓存位置 | 照 NTEMI 模式 `ModImpRuntime/`（实施时确认） | §6.2 数据流 |

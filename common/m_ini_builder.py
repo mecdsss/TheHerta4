@@ -1,4 +1,6 @@
 import hashlib
+import os
+import tempfile
 
 
 class M_SectionType:
@@ -104,11 +106,44 @@ class M_IniBuilder:
         # 先判断是否为空，如果为空就不往里放了
         if not m_inisection.empty():
             self.ini_section_list.append(m_inisection)
+
+    @staticmethod
+    def _atomic_write_lines(config_ini_path: str, lines: list[str]) -> None:
+        """Write a UTF-8/LF INI without ever exposing a truncated destination."""
+        destination = os.path.abspath(config_ini_path)
+        destination_dir = os.path.dirname(destination)
+        os.makedirs(destination_dir, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(destination)}.",
+            suffix=".tmp",
+            dir=destination_dir,
+        )
+        descriptor_open = True
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                descriptor_open = False
+                handle.writelines(lines)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, destination)
+            temp_path = ""
+        finally:
+            if descriptor_open:
+                os.close(fd)
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
     
     def save_to_file_not_reorder(self,config_ini_path:str):
         '''
         不重新排序的版本，方便我们的ini格式和其它工具生成的ini格式进行对比。
         '''
+        # A builder may be previewed/saved more than once. Emission state belongs
+        # to one save operation; retaining it duplicates every line on the next save.
+        self.line_list.clear()
+        self.ini_section_name_set.clear()
         for ini_section in self.ini_section_list:
             section_name_exists = ini_section.SectionName in self.ini_section_name_set
             # if not section_name_exists:
@@ -141,13 +176,14 @@ class M_IniBuilder:
         # print("new ini sha256: " + sha256)
         if ini_sha256 != sha256:
             print("Write new mod ini because sha256 is not same.")
-            with open(config_ini_path,"w") as f:
-                f.writelines(self.line_list)
+            self._atomic_write_lines(config_ini_path, self.line_list)
         else:
             print("Skip write mod ini becuase sha256 is same, ini file content not changed so we are safe to skip.")
         pass
 
     def save_to_file(self,config_ini_path:str):
+        self.line_list.clear()
+        self.ini_section_name_set.clear()
         self.__append_section_line(M_SectionType.CrossIBPresent)
         
         self.__append_section_line(M_SectionType.ResourceID)
@@ -218,8 +254,7 @@ class M_IniBuilder:
         # print("new ini sha256: " + sha256)
         if ini_sha256 != sha256:
             print("Write new mod ini because sha256 is not same.")
-            with open(config_ini_path,"w") as f:
-                f.writelines(self.line_list)
+            self._atomic_write_lines(config_ini_path, self.line_list)
         else:
             print("Skip write mod ini becuase sha256 is same, ini file content not changed so we are safe to skip.")
 
@@ -265,4 +300,3 @@ class M_IniBuilder:
             return ""
             
         return sha256_value
-

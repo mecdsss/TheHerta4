@@ -53,6 +53,11 @@ class SubMeshModel:
     vg_count:int = field(init=False, default=0)
     vg_map_algorithm_version:int = field(init=False, default=0)
     merged_skeleton_metadata_valid:bool = field(init=False, default=True)
+    # EFMI 跨 LOD 对应账本（v9 投影写回；非基准 LOD 子网格记录与基准部件的关系）
+    efmi_lod_reference_component:str = field(init=False, default="")
+    efmi_lod_correspondence:dict = field(init=False, default_factory=dict)
+    efmi_lod_projection:bool = field(init=False, default=False)
+    efmi_lod_layout_version:int = field(init=False, default=0)
     # ZZMI 骨架分组号（渲染 cb1 对象变换配对；缺省 0 = 单骨架旧语义）
     skeleton_group:int = field(init=False, default=0)
     # ZZMI 逐部件 VGMap（局部骨骼 id -> 全局槽位；attach CS 按此写合并骨架）
@@ -100,6 +105,19 @@ class SubMeshModel:
         )
         self.merged_skeleton_metadata_valid = bool(
             getattr(submesh_metadata, "merged_skeleton_metadata_valid", True)
+        )
+        # EFMI 跨 LOD 对应账本（v9 投影写回；导出侧据此把 LOD 版本合并进同一逻辑部件）
+        self.efmi_lod_reference_component = str(
+            getattr(submesh_metadata, "efmi_lod_reference_component", "") or ""
+        )
+        self.efmi_lod_correspondence = dict(
+            getattr(submesh_metadata, "efmi_lod_correspondence", {}) or {}
+        )
+        self.efmi_lod_projection = bool(
+            getattr(submesh_metadata, "efmi_lod_projection", False)
+        )
+        self.efmi_lod_layout_version = int(
+            getattr(submesh_metadata, "efmi_lod_layout_version", 0) or 0
         )
         # ZZMI 骨架分组号（渲染 cb1 对象变换配对；缺省 0 = 单骨架旧语义）
         self.skeleton_group = int(getattr(submesh_metadata, "skeleton_group", 0) or 0)
@@ -342,6 +360,35 @@ class SubMeshModel:
             if GlobalConfig.logic_name == LogicName.ZZMI:
                 self._prepare_zzmi_merged_skeleton_vertex_groups(submesh_merged_obj)
             else:
+                # 打包级幂等升宽：SubMeshModel 构造时可能因导入/导出状态差异未
+                # 执行 widen，但**打包 dtype 必须与 INI 声明的 R16 全池布局一致**
+                # ——否则顶点组读回的是全局骨骼 id（>255，如 596/372），被 uint8
+                # 打包静默截断（596->84），运行时按 16 位读取 = 索引错位 = 权重爆炸。
+                # widen_blendindices 幂等：已 R16 时直接返回 False，不重复修改。
+                if (
+                    GlobalProterties.import_merged_vgmap()
+                    and bool(getattr(self.d3d11_game_type, "GPU_PreSkinning", False))
+                ):
+                    self.d3d11_game_type.widen_blendindices()
+                # EFMI 合并骨架的 BLENDINDICES 已统一归一化为 R16 系
+                # （widen_blendindices），全局骨骼池必须落在 uint16 可承载范围，
+                # 否则导出时 astype(uint16) 会把越界骨骼 id 截断错位。
+                # 多 LOD 分段平移（2026-08-27）后，LOD1 部件的组名 = 全局骨骼 id
+                # （基准段之后起算），可能远超其自身顶点组数量——上限必须按
+                # "最大组名（全局骨骼 id）"判定，不能按组数量判定（本地组数
+                # 自洽但全局 id 已越界时，旧检查会漏放并静默截断）。
+                numeric_group_ids = [
+                    int(vg.name)
+                    for vg in submesh_merged_obj.vertex_groups
+                    if re.fullmatch(r"[0-9]+", str(vg.name))
+                ]
+                max_global_bone_id = max(numeric_group_ids, default=-1)
+                if max_global_bone_id > 65535:
+                    raise RuntimeError(
+                        f"[EFMI骨骼合并] {self.unique_str} 全局骨骼 id "
+                        f"{max_global_bone_id} 超过 uint16 上限 "
+                        "65535，BLENDINDICES 无法以 R16 承载，请拆分骨架或减小骨骼池"
+                    )
                 self._prepare_merged_skeleton_vertex_groups(submesh_merged_obj)
 
         obj_buffer_result = ExportUtils.build_unity_obj_buffer_result(

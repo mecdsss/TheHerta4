@@ -17,9 +17,17 @@ from ...utils.json_utils import JsonUtils
 from ...utils.timer_utils import TimerUtils
 
 import bpy
+import numpy
 import os
 import re
 import shutil
+import tempfile
+
+# 与框架 cfg_ms_max_lod_level_count 一致；LodRemaps 每组件 4 个 LOD 槽位。
+_EFMI_MAX_LOD_LEVEL_COUNT = 4
+# 与 common.efmi_skeleton._CROSS_LOD_LAYOUT_VERSION 同步。旧版跨 LOD 编号
+# （尤其 v9 投影/v12 压缩）不能进入当前单池运行时。
+_EFMI_CROSS_LOD_LAYOUT_VERSION = 13
 
 @dataclass
 class ExportEFMI:
@@ -329,27 +337,88 @@ class ExportEFMI:
         self._efmi_stub_object_names = []
 
     def generate_buffer_files(self):
+        # 合并骨架部件（含 same-IB 槽位重定向）必须在本方法开始时已收集：
+        # 导出可能被按阶段调用（仅缓冲/仅 INI），不能依赖 export() 的预热。
+        self.prepare_merged_skeleton()
+
         buf_output_folder = GlobalConfig.path_generatemod_buffer_folder()
-
-        # 清理上次导出的残留 .buf：本次 INI 只引用本次导出的部件，旧缓冲
-        # （如上次导出了 LOD1 全部、这次只导出部分）会残留在 Meshes/ 里误导
-        # 排查且白占空间。INI 由同一次导出重新生成，全量重写自洽。
+        output_folder = os.path.abspath(buf_output_folder)
+        output_parent = os.path.dirname(output_folder)
+        os.makedirs(output_parent, exist_ok=True)
+        staging_folder = tempfile.mkdtemp(
+            prefix=f".{os.path.basename(output_folder) or 'efmi-buffers'}.stage-",
+            dir=output_parent,
+        )
         try:
-            if os.path.isdir(buf_output_folder):
-                removed_count = 0
-                for name in os.listdir(buf_output_folder):
-                    if not name.endswith(".buf"):
-                        continue
-                    try:
-                        os.remove(os.path.join(buf_output_folder, name))
-                        removed_count += 1
-                    except OSError:
-                        continue
-                if removed_count:
-                    print(f"[EFMI] 已清理 {removed_count} 个上次导出的残留 .buf")
-        except Exception as e:
-            print(f"[EFMI] 清理残留缓冲失败（继续导出）: {e}")
+            self._write_buffer_files_to_folder(staging_folder)
+            removed_count = self._publish_staged_buffer_bundle(
+                staging_folder,
+                output_folder,
+            )
+            if removed_count:
+                print(f"[EFMI] 已替换 {removed_count} 个上次导出的 .buf")
+        finally:
+            shutil.rmtree(staging_folder, ignore_errors=True)
 
+    @staticmethod
+    def _publish_staged_buffer_bundle(staging_folder: str, output_folder: str) -> int:
+        """Publish a complete buffer set with rollback on any replacement failure."""
+        staging_folder = os.path.abspath(staging_folder)
+        output_folder = os.path.abspath(output_folder)
+        output_parent = os.path.dirname(output_folder)
+        os.makedirs(output_folder, exist_ok=True)
+
+        staged_names = sorted(
+            name
+            for name in os.listdir(staging_folder)
+            if name.endswith(".buf") and os.path.isfile(os.path.join(staging_folder, name))
+        )
+        previous_names = sorted(
+            name
+            for name in os.listdir(output_folder)
+            if name.endswith(".buf") and os.path.isfile(os.path.join(output_folder, name))
+        )
+        backup_folder = tempfile.mkdtemp(
+            prefix=f".{os.path.basename(output_folder) or 'efmi-buffers'}.backup-",
+            dir=output_parent,
+        )
+        moved_previous = []
+        published = []
+        try:
+            for name in previous_names:
+                os.replace(
+                    os.path.join(output_folder, name),
+                    os.path.join(backup_folder, name),
+                )
+                moved_previous.append(name)
+            for name in staged_names:
+                os.replace(
+                    os.path.join(staging_folder, name),
+                    os.path.join(output_folder, name),
+                )
+                published.append(name)
+        except Exception:
+            # 回滚仅触及本次已经发布的文件和刚移入备份的旧 .buf。
+            for name in reversed(published):
+                published_path = os.path.join(output_folder, name)
+                try:
+                    if os.path.exists(published_path):
+                        os.remove(published_path)
+                except OSError:
+                    pass
+            for name in reversed(moved_previous):
+                backup_path = os.path.join(backup_folder, name)
+                try:
+                    if os.path.exists(backup_path):
+                        os.replace(backup_path, os.path.join(output_folder, name))
+                except OSError:
+                    pass
+            raise
+        finally:
+            shutil.rmtree(backup_folder, ignore_errors=True)
+        return len(previous_names)
+
+    def _write_buffer_files_to_folder(self, buf_output_folder: str):
         for submesh_model in self.submesh_model_list:
             print("ExportEFMI: 导出SubMeshModel，Unique标识: " + submesh_model.unique_str)
 
@@ -361,8 +430,51 @@ class ExportEFMI:
             for category, category_buf in submesh_model.category_buffer_dict.items():
                 category_buf_filename = submesh_model.unique_str + "-" + category + ".buf"
                 category_buf_filepath = os.path.join(buf_output_folder, category_buf_filename)
+                output_buf = category_buf
+                bone_aliases = getattr(
+                    self, "_efmi_merged_skeleton_bone_aliases", {}
+                )
+                if bone_aliases:
+                    output_buf, remapped_count = self._remap_blendindices_category_buffer(
+                        category_buf,
+                        category,
+                        submesh_model.d3d11_game_type,
+                        bone_aliases,
+                    )
+                    if remapped_count:
+                        print(
+                            f"[EFMI骨骼合并] {submesh_model.unique_str}: "
+                            f"已重定向 {remapped_count} 个 same-IB 跨 LOD 骨骼索引"
+                        )
+                # 不在这里按“当前 LOD 声明段”拦截 BLENDINDICES。统一 VGMap/LOD
+                # 分组投影允许目标 LOD 复用基准 LOD 的全局槽位；而快速局部导出
+                # 也可能只带一侧 LOD，无法从当前导出子集推导完整槽位域。这里
+                # 只负责写出已完成格式归一化的数据，不能把合法的跨 LOD 投影
+                # 当成“未声明槽位”拒绝。R8/R16/R32 的位宽和 uint16 范围仍在
+                # SubMeshModel/ObjBufferHelper 的打包前校验中严格处理。
                 with open(category_buf_filepath, 'wb') as f:
-                    category_buf.tofile(f)
+                    output_buf.tofile(f)
+
+        # 合并骨架 full→lod BlendRemap（R16_UINT，长度 = 基准部件 vg_count）。
+        if getattr(self, "has_merged_skeleton", False):
+            for part in getattr(self, "merged_skeleton_components", []) or []:
+                for draw in part.get("draws", []):
+                    remap = draw.get("remap")
+                    if not remap:
+                        continue
+                    arr = numpy.array(remap, dtype=numpy.uint64)
+                    if arr.size and arr.max() > 65535:
+                        raise RuntimeError(
+                            f"[EFMI骨骼合并] {draw.get('unique_str', '?')} 的 BlendRemap "
+                            f"含超过 uint16 上限的局部 id（{int(arr.max())}），无法以 R16_UINT 承载"
+                        )
+                    remap_buf_filename = draw["unique_str"] + "-BlendRemap.buf"
+                    remap_buf_path = os.path.join(buf_output_folder, remap_buf_filename)
+                    numpy.array(remap, dtype=numpy.uint16).tofile(remap_buf_path)
+                    print(
+                        f"[EFMI骨骼合并] 已导出 BlendRemap: {remap_buf_filename} "
+                        f"({len(remap)} 项)"
+                    )
 
     def _get_submesh_ib_key(self, submesh_model):
         if self.cross_ib_match_mode == 'INDEX_COUNT':
@@ -846,9 +958,8 @@ class ExportEFMI:
     def _lod_name_from_unique_str(unique_str: str) -> str:
         """解析 unique_str 的 LOD 前缀（'LOD0.xxx' -> 'LOD0'；无前缀 -> ''）。
 
-        与 WorkSpaceHelper.parse_lod_unique_str 语义一致；用于把合并骨架组件
-        按 LOD 分组（每 LOD 一套独立 MergedSkeleton 配置，见
-        _add_merged_skeleton_section）。
+        与 WorkSpaceHelper.parse_lod_unique_str 语义一致；用于排序/统计合并骨架
+        组件（同一骨架缓冲内的组件按其 LOD 段排序分配全局 id）。
         """
         normalized = str(unique_str or "").strip()
         if normalized.upper().startswith("LOD") and "." in normalized:
@@ -860,11 +971,20 @@ class ExportEFMI:
 
     @staticmethod
     def _validated_blendindices_layouts(submesh_models, context: str):
-        """返回实际 BLENDINDICES 布局；同一运行时命令列表内必须完全一致。"""
+        """返回实际 BLENDINDICES 布局；同一运行时命令列表内必须完全一致。
+
+        EFMI 骨骼合并全池共用一套粘合层，运行时对 vb 槽位只声明一种
+        BLENDINDICES ElementFormat（见 _add_merged_skeleton_section），
+        因此所有合并部件的最终布局必须一致（跨 LOD 亦然）。格式宽度
+        （R8/R16/R32）在 widen_blendindices 阶段已统一归一化到 R16 系
+        （d3d11_gametype.py）；此处仍不一致属于结构性数据问题（通道数 /
+        SemanticIndex / ExtractSlot 不同），需要修正差异部件的来源数据后重新导入。
+        """
         submesh_models = list(submesh_models)
         if not submesh_models:
             raise RuntimeError(f"{context}: 未找到对应子网格，无法确定 BLENDINDICES 布局")
         expected = None
+        expected_unique_str = None
         for submesh_model in submesh_models:
             game_type = getattr(submesh_model, "d3d11_game_type", None)
             if game_type is None:
@@ -877,231 +997,581 @@ class ExportEFMI:
                 )
             if expected is None:
                 expected = layouts
+                expected_unique_str = getattr(submesh_model, "unique_str", "?")
             elif layouts != expected:
                 raise RuntimeError(
-                    f"{context}: 同一 LOD 的 BLENDINDICES 布局不一致: "
-                    f"{expected} != {layouts}"
+                    f"{context}: 全池的 BLENDINDICES 布局不一致\n"
+                    f"  基准部件 {expected_unique_str}: {expected}\n"
+                    f"  差异部件 {getattr(submesh_model, 'unique_str', '?')}: {layouts}\n"
+                    "格式宽度（R8/R16/R32）已自动统一为 R16 系；若仍不一致，请检查"
+                    "差异部件的通道数 / SemanticIndex / ExtractSlot 与同 LOD 其他部件"
+                    "是否相同，修正来源数据后重新导入该部件"
                 )
         return expected or ()
 
-    def _get_merged_skeleton_component_info(self):
-        """收集 EFMI 骨骼合并（Merged Skeleton）组件信息。
+    @staticmethod
+    def _build_same_ib_bone_aliases(baseline_model, lod_model) -> dict[int, int]:
+        """把被折叠 LOD 部件自有槽位映射到 same-IB 基准部件槽位。
 
-        多 LOD 语义：构建端在各自 dump 上先建立原始候选对应，LOD0 执行一次
-        去重，LOD1 按对应关系同步分区；运行时槽位仍各自从 0 起，导出端按 LOD
-        分组生成多套独立合并骨架配置。
-        此处组件携带 lod 字段、component_id 按 LOD 组内分配（每 LOD 一套骨架，
-        id 只在组内有意义）。
-        仅收集 vg_count > 0（反查已写回）的子网格。
+        same-IB 只有一个游戏 draw，因此只能有一个 EntryPoint/component。非基准
+        LOD 的其它部件仍可能引用被折叠部件的独立槽位；若不重定向，这些槽位在
+        合并导出中无人写入，网格会读取未初始化矩阵并爆炸。
+
+        只重定向落在 ``lod_model`` 自有声明区间内的 VGMap 值。映射到其它仍存在
+        component 的去重值必须保留，不能误把整个 VGMap 都投影回基准 LOD。
         """
-        components = []
-        if GlobalProterties.import_merged_vgmap():
-            for submesh_model in self.submesh_model_list:
-                if not bool(
-                    getattr(submesh_model, "merged_skeleton_metadata_valid", True)
+        lod_vg_map = dict(getattr(lod_model, "vg_map", {}) or {})
+        if not lod_vg_map:
+            return {}
+
+        lod_start = int(getattr(lod_model, "vg_offset", 0) or 0)
+        lod_end = lod_start + int(getattr(lod_model, "vg_count", 0) or 0)
+        baseline_start = int(getattr(baseline_model, "vg_offset", 0) or 0)
+        baseline_count = int(getattr(baseline_model, "vg_count", 0) or 0)
+        correspondence = dict(
+            getattr(lod_model, "efmi_lod_correspondence", {}) or {}
+        )
+        baseline_unique = str(getattr(baseline_model, "unique_str", "") or "")
+
+        aliases: dict[int, int] = {}
+        for raw_local_id, raw_global_id in lod_vg_map.items():
+            local_id = int(raw_local_id)
+            source_global_id = int(raw_global_id)
+            if not (lod_start <= source_global_id < lod_end):
+                continue
+
+            corr = correspondence.get(str(local_id), correspondence.get(local_id))
+            if not isinstance(corr, dict) or "local_vg_id" not in corr:
+                raise RuntimeError(
+                    f"[EFMI骨骼合并] {getattr(lod_model, 'unique_str', '?')} "
+                    f"的自有骨骼 local {local_id}（全局槽 {source_global_id}）缺少跨 LOD 对应；"
+                    "same-IB 部件无法安全折叠。请重新执行骨骼合并反查/重新导入该角色"
+                )
+            reference_component = str(
+                corr.get("unique_str", corr.get("reference_component", ""))
+                or getattr(lod_model, "efmi_lod_reference_component", "")
+                or ""
+            )
+            if reference_component != baseline_unique:
+                raise RuntimeError(
+                    f"[EFMI骨骼合并] {getattr(lod_model, 'unique_str', '?')} "
+                    f"local {local_id} 的跨 LOD 参考部件为 "
+                    f"{reference_component or '空'}，但 same-IB 基准是 {baseline_unique}；"
+                    "元数据不一致，请重新执行骨骼合并反查/重新导入该角色"
+                )
+
+            baseline_local_id = int(corr.get("local_vg_id", local_id))
+            if not (0 <= baseline_local_id < baseline_count):
+                raise RuntimeError(
+                    f"[EFMI骨骼合并] {getattr(lod_model, 'unique_str', '?')} "
+                    f"local {local_id} 对应到越界的基准 local {baseline_local_id} "
+                    f"（{baseline_unique} 仅有 {baseline_count} 组）；请重新执行骨骼合并反查"
+                )
+            # MergedSkeleton_AttachComponent 并不读取 JSON 的 VGMap。它始终把
+            # 当前 draw 的 original_bone_id 写入 ``vg_offset + local_id``。
+            # 因而 same-IB 折叠后，LOD 槽位必须指向基准 component 的连续导入槽，
+            # 不能指向 baseline_vg_map 中的跨 component 去重槽。后一种槽位可能
+            # 属于只在另一 LOD 出现的 component，当前帧无人写入，表现为权重存在
+            # 但绑定到错误矩阵、运动时整片扭曲。
+            target_global_id = baseline_start + baseline_local_id
+            if not (0 <= source_global_id <= 65535 and 0 <= target_global_id <= 65535):
+                raise RuntimeError(
+                    "[EFMI骨骼合并] same-IB 骨骼别名超出 R16 范围: "
+                    f"{source_global_id} -> {target_global_id}"
+                )
+            aliases[source_global_id] = target_global_id
+        return aliases
+
+    @staticmethod
+    def _remap_blendindices_category_buffer(
+        category_buf,
+        category_name: str,
+        d3d11_game_type,
+        aliases: dict[int, int],
+    ):
+        """在写盘副本中重定向 R16 BLENDINDICES；不修改 SubMeshModel 原缓冲。"""
+        raw = numpy.ascontiguousarray(category_buf)
+        if raw.dtype != numpy.uint8:
+            raw = raw.view(numpy.uint8)
+        raw = raw.reshape(-1)
+        stride = int(
+            getattr(d3d11_game_type, "CategoryStrideDict", {}).get(
+                category_name, 0
+            )
+            or 0
+        )
+        if not aliases or stride <= 0 or raw.size == 0:
+            return raw, 0
+        if raw.size % stride != 0:
+            raise RuntimeError(
+                f"[EFMI骨骼合并] {category_name} 缓冲大小 {raw.size} "
+                f"不能被 stride {stride} 整除"
+            )
+
+        rows = raw.copy().reshape(-1, stride)
+        category_offset = 0
+        remapped_count = 0
+        for element in getattr(d3d11_game_type, "D3D11ElementList", []):
+            if str(getattr(element, "Category", "") or "") != category_name:
+                continue
+            width = int(getattr(element, "ByteWidth", 0) or 0)
+            semantic = str(getattr(element, "SemanticName", "") or "").upper()
+            if semantic == "BLENDINDICES":
+                element_format = str(getattr(element, "Format", "") or "").upper()
+                if not (
+                    element_format.startswith("R16")
+                    and element_format.endswith(("_UINT", "_SINT"))
+                    and width % 2 == 0
                 ):
-                    print(
-                        f"[EFMI骨骼合并] 警告 {getattr(submesh_model, 'unique_str', '?')}: "
-                        "骨骼合并元数据含非整数/越界值，该部件不进入合并骨架；"
-                        "请重新生成骨骼合并缓存"
+                    raise RuntimeError(
+                        "[EFMI骨骼合并] same-IB 骨骼重定向要求 R16 整数 "
+                        f"BLENDINDICES，实际为 {element_format}"
                     )
-                    continue
-                vg_count = int(getattr(submesh_model, "vg_count", 0) or 0)
-                if (
-                    vg_count > 0
-                    and bool(
-                        getattr(
-                            getattr(submesh_model, "d3d11_game_type", None),
-                            "GPU_PreSkinning",
-                            False,
-                        )
-                    )
-                ):
-                    components.append({
-                        "unique_str": submesh_model.unique_str,
-                        "lod": self._lod_name_from_unique_str(submesh_model.unique_str),
-                        "vg_offset": int(getattr(submesh_model, "vg_offset", 0) or 0),
-                        "vg_count": vg_count,
-                    })
-        # 按 (LOD, vg_offset) 排序；component_id 按 LOD 组内分配
-        components.sort(key=lambda c: (c["lod"], c["vg_offset"]))
+                field_bytes = rows[
+                    :, category_offset:category_offset + width
+                ].copy()
+                values = field_bytes.view("<u2").reshape(len(rows), width // 2)
+                for source_id, target_id in aliases.items():
+                    mask = values == int(source_id)
+                    hit_count = int(numpy.count_nonzero(mask))
+                    if hit_count:
+                        values[mask] = int(target_id)
+                        remapped_count += hit_count
+                rows[:, category_offset:category_offset + width] = (
+                    values.view(numpy.uint8).reshape(len(rows), width)
+                )
+            category_offset += width
+
+        return rows.reshape(-1), remapped_count
+
+    def _get_merged_skeleton_component_info(self):
+        """收集 EFMI 骨骼合并（Merged Skeleton）逻辑部件（v10/v11/v13）。
+
+        **每 LOD 槽位段相互独立**（撤销 v9 投影）：LOD0 段 0..max0、LOD1 段
+        base 起（见 EFMIBoneMapBuilder.build_independent_lod_maps），两域不相交、
+        全局唯一；v11/v13 追加镜像约束（L0 合并组 ⇒ L1 对应组合并、不同 L0 组
+        断边），值域不做压缩重排（v12 重排实测游戏内乱掉，已撤销）。因此：
+
+        - 每个子网格（含每个 LOD 版本）= 自己的 component，`vg_offset/vg_count`
+          取**该子网格自己的** json 元数据（v10 编号写入后的分段槽位）；
+        - 每个 component 只有一个绘制入口（自身换绑资源 + `$lod_level` =
+          该 LOD 级别），`remap` 恒 None——运行时 MergedSkeleton_Apply 把当前
+          LOD draw 的**自己的**矩阵写入**自己的**槽位段，跨 LOD 零共享；
+        - **same-IB 跨 LOD 部件**（脸部件等：两个 LOD 状态共用同一 IB/draw）：
+          LOD1 版本不生成独立 component，component_id_dict 映射到基准部件
+          的 component_id——同一 draw 只能有一个 EntryPoint（同 hash 会冲突），
+          参考插件 same-IB 规则 = 单入口、不做 LOD 检测，网格数据即基准网格；
+          同时把其它 LOD 网格对被折叠槽位的引用重定向到基准部件对应槽位，避免
+          独立 LOD 编号留下“被引用但无人写入”的骨骼区间。
+
+        v9 之所以爆炸：LOD1 顶点组编号投影进 LOD0 槽位 + 单池单骨架缓冲，
+        运行时对同一 component 每帧只导入一次骨骼、且仅允许更优（更小）
+        $lod_level 覆盖；同帧先 LOD0 后 LOD1（或混合状态）时 LOD1 网格读取的
+        是 LOD0 已导入的矩阵（L0/L1 两侧矩阵数据不同）→ 顶点爆炸。分段平移后
+        各 LOD 槽位域互不相交，LOD1 draw 的导入/读取永远落在自己的域内。
+
+        返回 (parts, component_id_dict)；component_id_dict: unique_str ->
+        所属部件 component_id（绘制入口据此发 EntryPoint）。
+        """
+        parts: list[dict] = []
         component_id_dict: dict[str, int] = {}
-        group_counter: dict[str, int] = {}
-        for comp in components:
-            lod = comp["lod"]
-            component_id_dict[comp["unique_str"]] = group_counter.get(lod, 0)
-            group_counter[lod] = group_counter.get(lod, 0) + 1
-        return components, component_id_dict
+        same_ib_bone_aliases: dict[int, int] = {}
+        same_ib_alias_targets_by_lod: dict[str, set[int]] = {}
+
+        def _lod_name(unique_str):
+            return self._lod_name_from_unique_str(unique_str)
+
+        eligible = []
+        for submesh_model in self.submesh_model_list:
+            if not bool(
+                getattr(submesh_model, "merged_skeleton_metadata_valid", True)
+            ):
+                print(
+                    f"[EFMI骨骼合并] 警告 {getattr(submesh_model, 'unique_str', '?')}: "
+                    "骨骼合并元数据含非整数/越界值，该部件不进入合并骨架；"
+                    "请重新生成骨骼合并缓存"
+                )
+                continue
+            vg_count = int(getattr(submesh_model, "vg_count", 0) or 0)
+            if not (
+                vg_count > 0
+                and bool(
+                    getattr(
+                        getattr(submesh_model, "d3d11_game_type", None),
+                        "GPU_PreSkinning",
+                        False,
+                    )
+                )
+            ):
+                continue
+            eligible.append(submesh_model)
+
+        # 被预处理成全局骨骼编号的部件不能再静默退回普通绘制：普通绘制不会运行
+        # MergedSkeleton_AttachComponent，全局编号会被当作原始局部编号读取，结果同样
+        # 是绑定错位。单池只能声明一种布局，因此混合通道数/槽位时直接拒绝导出。
+        if eligible:
+            self._validated_blendindices_layouts(
+                eligible,
+                "[EFMI骨骼合并] 合并候选",
+            )
+
+        # 多 LOD 单池只接受当前 v13 的“各 LOD 独立 + 分段平移”编号。
+        # 旧版数据即使区间表面上不重叠，也可能带投影/压缩语义；继续导出会让
+        # 正确格式的数据读取错误矩阵。单 LOD 不依赖此账本，保持兼容。
+        eligible_lods = {_lod_name(model.unique_str) for model in eligible}
+        if len(eligible_lods) > 1:
+            stale = []
+            for model in eligible:
+                version = int(
+                    getattr(model, "efmi_lod_layout_version", 0) or 0
+                )
+                if version != _EFMI_CROSS_LOD_LAYOUT_VERSION:
+                    stale.append(f"{model.unique_str}=v{version}")
+            if stale:
+                preview = ", ".join(stale[:12])
+                suffix = "..." if len(stale) > 12 else ""
+                raise RuntimeError(
+                    "[EFMI骨骼合并] 跨 LOD 骨骼缓存版本不兼容："
+                    f"当前需要 v{_EFMI_CROSS_LOD_LAYOUT_VERSION}，发现 {preview}{suffix}。"
+                    "请重新执行骨骼合并反查或重新导入该角色后再合并导出"
+                )
+
+        # 基准 LOD：优先 LOD0（含根目录工作空间）。
+        lod_names = {_lod_name(m.unique_str) for m in eligible}
+        baseline_lod = "LOD0" if "LOD0" in lod_names else ""
+
+        baseline_models = sorted(
+            (
+                m for m in eligible
+                if _lod_name(m.unique_str) == baseline_lod
+            ),
+            key=lambda m: (
+                _lod_name(m.unique_str),
+                int(getattr(m, "vg_offset", 0) or 0),
+            ),
+        )
+        non_baseline_models = sorted(
+            (
+                m for m in eligible
+                if _lod_name(m.unique_str) != baseline_lod
+            ),
+            key=lambda m: (
+                int(getattr(m, "vg_offset", 0) or 0),
+                getattr(m, "unique_str", ""),
+            ),
+        )
+
+        def _baseline_draw_key(model):
+            """基准部件相同 IB/draw 判定键（same-IB 合并专用）。"""
+            return (
+                str(getattr(model, "match_draw_ib", "") or ""),
+                str(getattr(model, "match_first_index", "") or ""),
+                str(getattr(model, "match_index_count", "") or ""),
+            )
+
+        baseline_part_by_draw: dict[tuple, dict] = {}
+        baseline_model_by_unique: dict[str, object] = {}
+        for model in baseline_models:
+            part = {
+                "component_id": len(parts),
+                "unique_str": model.unique_str,
+                "lod": baseline_lod,
+                "vg_offset": int(getattr(model, "vg_offset", 0) or 0),
+                "vg_count": int(getattr(model, "vg_count", 0) or 0),
+                "draws": [
+                    {
+                        "unique_str": model.unique_str,
+                        "lod_level": 0,
+                        "match_draw_ib": getattr(model, "match_draw_ib", ""),
+                        "match_index_count": str(
+                            getattr(model, "match_index_count", "") or ""
+                        ),
+                        "match_first_index": str(
+                            getattr(model, "match_first_index", "") or ""
+                        ),
+                        "remap": None,
+                    }
+                ],
+            }
+            parts.append(part)
+            baseline_part_by_draw[_baseline_draw_key(model)] = part
+            baseline_model_by_unique[model.unique_str] = model
+            component_id_dict[model.unique_str] = part["component_id"]
+
+        def _lod_level_of(lod_name: str) -> int:
+            try:
+                return int(lod_name[3:]) if lod_name[3:].isdigit() else 1
+            except (TypeError, ValueError, IndexError):
+                return 1
+
+        for model in non_baseline_models:
+            lod_level = _lod_level_of(_lod_name(model.unique_str))
+            # same-IB 跨 LOD：与某基准部件相同 IB/draw（且 IB 为真实 hash，空
+            # 占位不算）→ 并入基准部件（component_id_dict 映射、不生成独立
+            # component/draw 入口）。
+            baseline_part = None
+            if str(getattr(model, "match_draw_ib", "") or ""):
+                baseline_part = baseline_part_by_draw.get(_baseline_draw_key(model))
+            if baseline_part is not None:
+                component_id_dict[model.unique_str] = baseline_part["component_id"]
+                baseline_model = baseline_model_by_unique.get(
+                    baseline_part["unique_str"]
+                )
+                if baseline_model is not None:
+                    for source_id, target_id in self._build_same_ib_bone_aliases(
+                        baseline_model, model
+                    ).items():
+                        previous = same_ib_bone_aliases.get(source_id)
+                        if previous is not None and previous != target_id:
+                            raise RuntimeError(
+                                "[EFMI骨骼合并] same-IB 骨骼别名冲突: "
+                                f"{source_id} 同时映射到 {previous} / {target_id}"
+                            )
+                        same_ib_bone_aliases[source_id] = target_id
+                        same_ib_alias_targets_by_lod.setdefault(
+                            _lod_name(model.unique_str), set()
+                        ).add(target_id)
+                continue
+            # 不用“顶点数/拓扑与基准 LOD 相同”推断数据错位：游戏可以让多个
+            # LOD 故意复用完全相同的网络。骨骼正确性由对应账本、独立槽位域和
+            # 写盘前 BlendIndices 域校验决定，几何相同本身不是错误证据。
+            # 不同 IB（或直接对应）：独立部件，挂自己的槽位段（v10 编号保证
+            # 与基准/其它 LOD 不相交）、自己的绘制入口，remap 恒 None。
+            part = {
+                "component_id": len(parts),
+                "unique_str": model.unique_str,
+                "lod": _lod_name(model.unique_str),
+                "vg_offset": int(getattr(model, "vg_offset", 0) or 0),
+                "vg_count": int(getattr(model, "vg_count", 0) or 0),
+                "draws": [
+                    {
+                        "unique_str": model.unique_str,
+                        "lod_level": lod_level,
+                        "match_draw_ib": getattr(model, "match_draw_ib", ""),
+                        "match_index_count": str(
+                            getattr(model, "match_index_count", "") or ""
+                        ),
+                        "match_first_index": str(
+                            getattr(model, "match_first_index", "") or ""
+                        ),
+                        "remap": None,
+                    }
+                ],
+            }
+            # 槽位碰撞防线：独立部件的范围若与任一已有部件重叠，说明编号口径
+            # 不一致（缓存 v9 投影/旧版未重生成）——两个组件抢占同一批槽位 =
+            # LOD0/LOD1 串在一起，必须大声报错而不是输出坏 mod。
+            for existing in parts:
+                existing_start = existing["vg_offset"]
+                existing_end = existing_start + existing["vg_count"]
+                candidate_start = part["vg_offset"]
+                candidate_end = candidate_start + part["vg_count"]
+                if candidate_start < existing_end and existing_start < candidate_end:
+                    raise RuntimeError(
+                        f"[EFMI骨骼合并] {model.unique_str} 的合并骨架槽位范围 "
+                        f"[{candidate_start}, {candidate_end}) 与已有部件 "
+                        f"{existing['unique_str']} [{existing_start}, {existing_end}) 重叠："
+                        "该子网格的 VGOffset 与其它部件冲突（编号非分段平移，可能为"
+                        "旧版 v9 投影缓存或元数据未透传）。请清空骨骼合并缓存并重新"
+                        "执行骨骼合并反查后导出"
+                    )
+            parts.append(part)
+            component_id_dict[model.unique_str] = part["component_id"]
+
+        self._efmi_merged_skeleton_bone_aliases = same_ib_bone_aliases
+        self._efmi_same_ib_alias_targets_by_lod = {
+            lod_name: frozenset(target_ids)
+            for lod_name, target_ids in same_ib_alias_targets_by_lod.items()
+        }
+        if same_ib_bone_aliases:
+            print(
+                f"[EFMI骨骼合并] same-IB 跨 LOD 折叠生成 "
+                f"{len(same_ib_bone_aliases)} 个骨骼槽位重定向"
+                "（目标为基准 component 连续导入槽）"
+            )
+        return parts, component_id_dict
 
     def _add_merged_skeleton_section(self, ini_builder, command_lists_section=None):
         """生成 EFMI 骨骼合并（Merged Skeleton）INI 段（对齐 EFMI 1.4.1 运行时契约）。
 
-        内容（每 LOD 一套，名字加 _<LOD> 后缀）：Constants（$component_count/
-        $bones_count/$max_instance_count/$merged_skeleton_initialized——初始化变量
-        也必须按 LOD 独立，否则后一套骨架的 Initialize 会被前一套的
-        initialized=1 跳过、组件 offset/count 池永不写入）
-        + 5 个 Pool + Pool_ObjectSpatialIdentity（空间实例识别输入池，同样按
-        LOD 独立，避免两套骨架的实例 id 互踩）
-        + ResourceMergedSkeletonDataRW + CommandList_MergedSkeleton_ConnectComponent
+        单池语义（2026-08-28 改版，对齐参考插件 mod.ini.j2）：所有逻辑部件
+        （v10：每个子网格/每个 LOD 版本各为一个组件，槽位段分段平移不相交）
+        共用一套 MergedSkeleton 配置——一个 Constants 块（$component_count/
+        $bones_count/$max_instance_count/$merged_skeleton_initialized）
+        + 5 个 Pool（VertexGroupOffsets/Counts/LodRemaps/Instance_UpdateFrame/
+        Instance_LodLevel）+ Pool_ObjectSpatialIdentity + 一个
+        ResourceMergedSkeletonDataRW + CommandList_MergedSkeleton_ConnectComponent
         （守卫初始化 + 绑定 pools + AttachComponent + ElementFormat 16 位）+
-        CommandListInitializeMergedSkeleton（逐组件写 vg_offset/vg_count，LodRemaps 全 null）。
+        CommandListInitializeMergedSkeleton（逐部件写 vg_offset/vg_count，
+        LodRemaps 全 null——v10 无跨 LOD full→lod remap）。
 
-        多 LOD 语义：LOD0/LOD1 的原始对应先确定 LOD0 基准分区，再同步到 LOD1；
-        导出时仍按 LOD 各自生成独立的 Resource/Pool/CommandList/粘合层，
-        互不引用、互不混用。构建端 vg 槽位依旧各自从 0 起；组件 id 组内分配，
-        EntryPoint 只挂本组件所属 LOD 的粘合层。
-        无 LOD 前缀的组件（单 LOD/根目录工作空间）后缀为空，与旧版输出完全兼容。
+        多 LOD 语义（v10，撤销 v9 共享槽位投影）：每个 LOD 的
+        槽位段相互独立（LOD0 0..max0、LOD1 base 起），LOD1 绘制入口挂**自己**
+        的 component 槽位段；运行时 MergedSkeleton_Apply 把当前 LOD draw 自己的
+        矩阵写入自己的槽位段（remap=null 恒等路径），LOD0/LOD1 矩阵不共享
+        不混用。v9 投影实测 LOD1 爆炸 = LOD1 顶点组引用 LOD0 槽位 + 运行时对
+        同一 component 每帧只导入一次骨骼（仅更优 $lod_level 覆盖），同帧先
+        LOD0 后 LOD1 时 LOD1 网格读到 LOD0 矩阵。
+        相同 IB 的 LOD 绘制（脸部件）不生成第二入口（参考插件 same-IB 处理）。
+        运行时只有一根骨架缓冲、一套 Resource/Pool/BonesCount/粘合层，
+        不再逐 LOD 切换 EFMIv1 命名空间资源。
+        bones_count = max(vg_offset+vg_count)。
 
-        另向 command_lists_section 追加官方绘制管线粘合层（每 LOD 一套）
-        [CommandList_Component_DrawInstances_<LOD>]：命名空间配置赋值（component_count/
-        bones_count/instance_count——运行时只读 EFMIv1 命名空间内的值，漏赋 bones_count
-        会让合并骨骼按 0 根计算）+ Component_ReadConfig + 空间实例识别 +
-        ConnectComponent 回调挂载 + run Component_DrawInstances（运行时接管逐实例
-        迭代与 MergedSkeleton_Apply）。按用户要求不做 DRAW_TYPE 通道门控，全通道生效。
+        另向 command_lists_section 追加官方绘制管线粘合层（单套）
+        [CommandList_Component_DrawInstances]：命名空间配置赋值（component_count/
+        bones_count/instance_count——运行时只读 EFMIv1 命名空间内的值，漏赋
+        bones_count 会让合并骨骼按 0 根计算）+ Component_ReadConfig + 空间实例
+        识别 + ConnectComponent 回调挂载 + run Component_DrawInstances（运行时
+        接管逐实例迭代与 MergedSkeleton_Apply）。按用户要求不做 DRAW_TYPE
+        通道门控，全通道生效。
         """
         components = self.merged_skeleton_components
         if not components:
             return
 
-        # 按 LOD 分组（组内保持 vg_offset 序）
-        lod_groups: dict[str, list[dict]] = {}
-        for comp in components:
-            lod_groups.setdefault(comp["lod"], []).append(comp)
+        component_count = len(components)
+        # 骨骼总数口径：全池 max(vg_offset + vg_count)。部件 vg_offset 为
+        # 全绑定空间槽位（v10：各 LOD 分段平移后的不相交槽位段），合并骨架
+        # 缓冲与逐实例区域数学必须覆盖组件声明的最大槽位，否则越界空转。
+        bones_count = max(comp["vg_offset"] + comp["vg_count"] for comp in components)
+        max_instance_count = 8  # 与参考插件 cfg.max_instance_count 一致
 
         section = M_IniSection(M_SectionType.MergedSkeleton)
+        constants_section = M_IniSection(M_SectionType.Constants)
+        constants_section.SectionName = "Constants"
+        constants_section.append(f"global $component_count = {component_count}")
+        constants_section.append(f"global $bones_count = {bones_count}")
+        constants_section.append(f"global $max_instance_count = {max_instance_count}")
+        constants_section.append("global $merged_skeleton_initialized = 0")
+        constants_section.new_line()
 
-        for lod, lod_components in sorted(lod_groups.items()):
-            suffix = "_" + lod if lod else ""
-            component_count = len(lod_components)
-            # 骨骼总数口径修正：取本 LOD 内 max(vg_offset + vg_count)。
-            # 导出子集时 vg_offset 是本 LOD 全局槽位（可能远超导出内 sum(vg_count)），
-            # 合并骨架缓冲与逐实例区域数学必须覆盖组件声明的最大槽位，否则越界空转。
-            bones_count = max(comp["vg_offset"] + comp["vg_count"] for comp in lod_components)
-            max_instance_count = 8  # 与参考插件 cfg.max_instance_count 一致
+        section.append("[Pool_MergedSkeleton_Component_VertexGroupOffsets]")
+        section.append(f"pool_size = $component_count")
+        section.new_line()
 
-            section.append("[Constants]")
-            section.append(f"global $component_count{suffix} = {component_count}")
-            section.append(f"global $bones_count{suffix} = {bones_count}")
-            section.append(f"global $max_instance_count{suffix} = {max_instance_count}")
-            section.append(f"global $merged_skeleton_initialized{suffix} = 0")
-            section.new_line()
+        section.append("[Pool_MergedSkeleton_Component_VertexGroupCounts]")
+        section.append(f"pool_size = $component_count")
+        section.new_line()
 
-            section.append(f"[Pool_MergedSkeleton_Component_VertexGroupOffsets{suffix}]")
-            section.append(f"pool_size = $component_count{suffix}")
-            section.new_line()
+        section.append("[Pool_MergedSkeleton_Component_LodRemaps]")
+        section.append(f"pool_size = $component_count * $\\EFMIv1\\cfg_ms_max_lod_level_count")
+        section.new_line()
 
-            section.append(f"[Pool_MergedSkeleton_Component_VertexGroupCounts{suffix}]")
-            section.append(f"pool_size = $component_count{suffix}")
-            section.new_line()
+        section.append("[Pool_MergedSkeleton_Instance_UpdateFrame]")
+        section.append(f"pool_size = $component_count * $max_instance_count")
+        section.new_line()
 
-            section.append(f"[Pool_MergedSkeleton_Component_LodRemaps{suffix}]")
-            section.append(f"pool_size = $component_count{suffix} * $\\EFMIv1\\cfg_ms_max_lod_level_count")
-            section.new_line()
+        section.append("[Pool_MergedSkeleton_Instance_LodLevel]")
+        section.append(f"pool_size = $component_count * $max_instance_count")
+        section.new_line()
 
-            section.append(f"[Pool_MergedSkeleton_Instance_UpdateFrame{suffix}]")
-            section.append(f"pool_size = $component_count{suffix} * $max_instance_count{suffix}")
-            section.new_line()
+        # 空间实例识别输入池（官方管线必需：MergedSkeleton_Apply 经
+        # PoolSpatialIdentity_SpatialIds[$draw_call_instance_id] 取实例 id，
+        # 该池只能由 SpatialIdentity_IdentifyComponentInstances 以此池为输入填充）
+        section.append("[Pool_ObjectSpatialIdentity]")
+        section.append(f"pool_size = $max_instance_count * $\\EFMIv1\\cfg_spatial_instance_load_ratio")
+        section.append("pool_index_type = spatial")
+        section.append("pool_spatial_radius = $\\EFMIv1\\cfg_spatial_base_radius")
+        section.append("pool_expiration_timeout_frames = $\\EFMIv1\\cfg_spatial_expiration_frames")
+        section.append("pool_expiration_reset_elements = $\\EFMIv1\\cfg_spatial_expiration_reset")
+        section.append("pool_expiration_refresh_on_read = $\\EFMIv1\\cfg_spatial_expiration_read_refresh")
+        section.append("pool_variable_default_value = $\\EFMIv1\\cfg_spatial_detault_value")
+        section.new_line()
 
-            section.append(f"[Pool_MergedSkeleton_Instance_LodLevel{suffix}]")
-            section.append(f"pool_size = $component_count{suffix} * $max_instance_count{suffix}")
-            section.new_line()
+        section.append("[ResourceMergedSkeletonDataRW]")
+        section.append("type = RWBuffer")
+        section.append("format = R32G32B32A32_FLOAT")
+        section.append(
+            f"array = ($\\EFMIv1\\cfg_ms_implicit_bones_count + $\\EFMIv1\\cfg_ms_skeletons_count "
+            f"* $bones_count * $max_instance_count) * $\\EFMIv1\\cfg_ms_bone_entry_size"
+        )
+        section.new_line()
 
-            # 空间实例识别输入池（官方管线必需：MergedSkeleton_Apply 经
-            # PoolSpatialIdentity_SpatialIds[$draw_call_instance_id] 取实例 id，
-            # 该池只能由 SpatialIdentity_IdentifyComponentInstances 以此池为输入填充；
-            # 按 LOD 独立，避免两套骨架的实例 id 互踩）
-            section.append(f"[Pool_ObjectSpatialIdentity{suffix}]")
-            section.append(f"pool_size = $max_instance_count{suffix} * $\\EFMIv1\\cfg_spatial_instance_load_ratio")
-            section.append("pool_index_type = spatial")
-            section.append("pool_spatial_radius = $\\EFMIv1\\cfg_spatial_base_radius")
-            section.append("pool_expiration_timeout_frames = $\\EFMIv1\\cfg_spatial_expiration_frames")
-            section.append("pool_expiration_reset_elements = $\\EFMIv1\\cfg_spatial_expiration_reset")
-            section.append("pool_expiration_refresh_on_read = $\\EFMIv1\\cfg_spatial_expiration_read_refresh")
-            section.append("pool_variable_default_value = $\\EFMIv1\\cfg_spatial_detault_value")
-            section.new_line()
-
-            section.append(f"[ResourceMergedSkeletonDataRW{suffix}]")
-            section.append("type = RWBuffer")
-            section.append("format = R32G32B32A32_FLOAT")
+        section.append("[CommandList_MergedSkeleton_ConnectComponent]")
+        section.append("if !$merged_skeleton_initialized")
+        section.append("    $merged_skeleton_initialized = 1")
+        section.append("    run = CommandListInitializeMergedSkeleton")
+        section.append("endif")
+        section.append("Pool\\EFMIv1\\Input_MergedSkeleton_Component_VertexGroupOffsets = ref Pool_MergedSkeleton_Component_VertexGroupOffsets")
+        section.append("Pool\\EFMIv1\\Input_MergedSkeleton_Component_VertexGroupCounts = ref Pool_MergedSkeleton_Component_VertexGroupCounts")
+        section.append("Pool\\EFMIv1\\Input_MergedSkeleton_Component_LodRemaps = ref Pool_MergedSkeleton_Component_LodRemaps")
+        section.append("Pool\\EFMIv1\\Input_MergedSkeleton_Instance_UpdateFrame = ref Pool_MergedSkeleton_Instance_UpdateFrame")
+        section.append("Pool\\EFMIv1\\Input_MergedSkeleton_Instance_LodLevel = ref Pool_MergedSkeleton_Instance_LodLevel")
+        section.append("Resource\\EFMIv1\\Output_MergedSkeleton = ref ResourceMergedSkeletonDataRW")
+        section.append("run = CommandList\\EFMIv1\\MergedSkeleton_AttachComponent")
+        section.append("; BLENDINDICES layouts after merged-skeleton widening")
+        merged_unique_strs = {
+            draw["unique_str"]
+            for comp in components
+            for draw in comp.get("draws", [])
+        }
+        lod_submesh_models = [
+            model for model in self.submesh_model_list
+            if model.unique_str in merged_unique_strs
+        ]
+        blend_layouts = self._validated_blendindices_layouts(
+            lod_submesh_models,
+            "[EFMI骨骼合并] 全池",
+        )
+        for semantic_index, element_format, extract_slot in blend_layouts:
             section.append(
-                f"array = ($\\EFMIv1\\cfg_ms_implicit_bones_count + $\\EFMIv1\\cfg_ms_skeletons_count "
-                f"* $bones_count{suffix} * $max_instance_count{suffix}) * $\\EFMIv1\\cfg_ms_bone_entry_size"
+                f"{extract_slot}->ElementFormat(BLENDINDICES, {semantic_index}) = "
+                f"{element_format}"
             )
-            section.new_line()
+        section.new_line()
 
-            section.append(f"[CommandList_MergedSkeleton_ConnectComponent{suffix}]")
-            section.append(f"if !$merged_skeleton_initialized{suffix}")
-            section.append(f"    $merged_skeleton_initialized{suffix} = 1")
-            section.append(f"    run = CommandListInitializeMergedSkeleton{suffix}")
-            section.append("endif")
-            section.append(f"Pool\\EFMIv1\\Input_MergedSkeleton_Component_VertexGroupOffsets = ref Pool_MergedSkeleton_Component_VertexGroupOffsets{suffix}")
-            section.append(f"Pool\\EFMIv1\\Input_MergedSkeleton_Component_VertexGroupCounts = ref Pool_MergedSkeleton_Component_VertexGroupCounts{suffix}")
-            section.append(f"Pool\\EFMIv1\\Input_MergedSkeleton_Component_LodRemaps = ref Pool_MergedSkeleton_Component_LodRemaps{suffix}")
-            section.append(f"Pool\\EFMIv1\\Input_MergedSkeleton_Instance_UpdateFrame = ref Pool_MergedSkeleton_Instance_UpdateFrame{suffix}")
-            section.append(f"Pool\\EFMIv1\\Input_MergedSkeleton_Instance_LodLevel = ref Pool_MergedSkeleton_Instance_LodLevel{suffix}")
-            section.append(f"Resource\\EFMIv1\\Output_MergedSkeleton = ref ResourceMergedSkeletonDataRW{suffix}")
-            section.append("run = CommandList\\EFMIv1\\MergedSkeleton_AttachComponent")
-            section.append("; BLENDINDICES layouts after merged-skeleton widening")
-            lod_unique_strs = {comp["unique_str"] for comp in lod_components}
-            lod_submesh_models = [
-                model for model in self.submesh_model_list
-                if model.unique_str in lod_unique_strs
-            ]
-            blend_layouts = self._validated_blendindices_layouts(
-                lod_submesh_models,
-                f"[EFMI骨骼合并] {lod or '单 LOD'}",
-            )
-            for semantic_index, element_format, extract_slot in blend_layouts:
+        section.append("[CommandListInitializeMergedSkeleton]")
+        section.append("Resource\\EFMIv1\\OutputMergedSkeleton_Template = ref ResourceMergedSkeletonDataRW")
+        section.append("run = CommandList\\EFMIv1\\InitializeMergedSkeleton")
+        section.append("local $lod_level_count = $\\EFMIv1\\cfg_ms_max_lod_level_count")
+        section.append("local $component_id")
+        for component_id, comp in enumerate(components):
+            section.append(f"$component_id = {component_id}")
+            section.append(f"$Pool_MergedSkeleton_Component_VertexGroupOffsets[$component_id] = {comp['vg_offset']}")
+            section.append(f"$Pool_MergedSkeleton_Component_VertexGroupCounts[$component_id] = {comp['vg_count']}")
+            # LodRemaps：+0 恒 null（$lod_level=0 恒等路径）；其余槽位显式 null。
+            # v10 各 LOD 槽位段独立（无 cross-LOD full→lod BlendRemap），
+            # 任何 $lod_level 都走恒等路径，防残留误用永不写入的槽位。
+            for level in range(int(_EFMI_MAX_LOD_LEVEL_COUNT)):
                 section.append(
-                    f"{extract_slot}->ElementFormat(BLENDINDICES, {semantic_index}) = "
-                    f"{element_format}"
+                    f"Pool_MergedSkeleton_Component_LodRemaps[$component_id*$lod_level_count+{level}] = null"
                 )
-            section.new_line()
+        section.new_line()
 
-            section.append(f"[CommandListInitializeMergedSkeleton{suffix}]")
-            section.append(f"Resource\\EFMIv1\\OutputMergedSkeleton_Template = ref ResourceMergedSkeletonDataRW{suffix}")
-            section.append("run = CommandList\\EFMIv1\\InitializeMergedSkeleton")
-            section.append("local $lod_level_count = $\\EFMIv1\\cfg_ms_max_lod_level_count")
-            section.append("local $component_id")
-            for component_id, comp in enumerate(lod_components):
-                section.append(f"$component_id = {component_id}")
-                section.append(f"$Pool_MergedSkeleton_Component_VertexGroupOffsets{suffix}[$component_id] = {comp['vg_offset']}")
-                section.append(f"$Pool_MergedSkeleton_Component_VertexGroupCounts{suffix}[$component_id] = {comp['vg_count']}")
-                section.append(f"Pool_MergedSkeleton_Component_LodRemaps{suffix}[$component_id*$lod_level_count+0] = null")
-            section.new_line()
-
-            # 官方绘制管线粘合层（每 LOD 一套）：运行时 Component_DrawInstances
-            # 逐实例迭代、每实例 MergedSkeleton_Apply 后才回调组件绘制
-            # （CommandList_Draw_<部件前缀>）。identification_min_components 默认 4
-            # 是按整角色设定的；导出子集（如只有 2 个组件）时必须下调，否则空间
-            # 识别永远集不齐组件位数，实例被判 Unknown 而始终绘制原始网格
-            # （表现为"模组完全不生效"）。此处按本 LOD 组件数取 min(component_count, 4)。
-            if command_lists_section is not None:
-                command_lists_section.append(f"[CommandList_Component_DrawInstances{suffix}]")
-                command_lists_section.append("handling = skip")
-                command_lists_section.append(f"$\\EFMIv1\\component_count = $component_count{suffix}")
-                command_lists_section.append(f"$\\EFMIv1\\bones_count = $bones_count{suffix}")
-                command_lists_section.append(f"$\\EFMIv1\\instance_count = $max_instance_count{suffix}")
-                command_lists_section.append("run = CommandList\\EFMIv1\\Object_ReadConfig")
-                command_lists_section.append("$\\EFMIv1\\custom_mesh_scale = 1.00")
-                command_lists_section.append(
-                    "$\\EFMIv1\\identification_min_components = " + str(min(component_count, 4))
-                )
-                command_lists_section.append("run = CommandList\\EFMIv1\\Component_ReadConfig")
-                command_lists_section.append(
-                    f"Pool\\EFMIv1\\Input_ObjectSpatialIdentity = ref Pool_ObjectSpatialIdentity{suffix}"
-                )
-                command_lists_section.append(
-                    "run = CommandList\\EFMIv1\\SpatialIdentity_IdentifyComponentInstances"
-                )
-                command_lists_section.append(
-                    f"CommandList\\EFMIv1\\Callback_MergedSkeleton_ConnectComponent = "
-                    f"ref CommandList_MergedSkeleton_ConnectComponent{suffix}"
-                )
-                command_lists_section.append("run = CommandList\\EFMIv1\\Component_DrawInstances")
-                command_lists_section.new_line()
+        # 官方绘制管线粘合层（单套，所有 LOD 组件共用）：运行时
+        # Component_DrawInstances 逐实例迭代、每实例 MergedSkeleton_Apply 后
+        # 才回调组件绘制（CommandList_Draw_<部件前缀>）。identification_min_components
+        # 默认 4 是按整角色设定的；按本池组件数取 min(component_count, 4)。
+        if command_lists_section is not None:
+            command_lists_section.append("[CommandList_Component_DrawInstances]")
+            command_lists_section.append("handling = skip")
+            command_lists_section.append(f"$\\EFMIv1\\component_count = $component_count")
+            command_lists_section.append(f"$\\EFMIv1\\bones_count = $bones_count")
+            command_lists_section.append(f"$\\EFMIv1\\instance_count = $max_instance_count")
+            command_lists_section.append("run = CommandList\\EFMIv1\\Object_ReadConfig")
+            # 参考模板桥接：裸版 $lod_level（EntryPoint 写入）→ \EFMIv1\lod_level
+            # （框架 MergedSkeleton.ini 读取），务必在 Component_ReadConfig 之前。
+            command_lists_section.append("$\\EFMIv1\\lod_level = $lod_level")
+            command_lists_section.append("$\\EFMIv1\\custom_mesh_scale = 1.00")
+            command_lists_section.append(
+                "$\\EFMIv1\\identification_min_components = " + str(min(component_count, 4))
+            )
+            command_lists_section.append("run = CommandList\\EFMIv1\\Component_ReadConfig")
+            command_lists_section.append(
+                "Pool\\EFMIv1\\Input_ObjectSpatialIdentity = ref Pool_ObjectSpatialIdentity"
+            )
+            command_lists_section.append(
+                "run = CommandList\\EFMIv1\\SpatialIdentity_IdentifyComponentInstances"
+            )
+            command_lists_section.append(
+                "CommandList\\EFMIv1\\Callback_MergedSkeleton_ConnectComponent = "
+                "ref CommandList_MergedSkeleton_ConnectComponent"
+            )
+            command_lists_section.append("run = CommandList\\EFMIv1\\Component_DrawInstances")
+            command_lists_section.new_line()
 
         ini_builder.append_section(section)
+        ini_builder.append_section(constants_section)
 
 
     def _append_submesh_draw_bindings(self, section, submesh_model, drawib_model):
@@ -1159,28 +1629,35 @@ class ExportEFMI:
                         continue
                     section.append(texture_markup_info.mark_slot + " = " + texture_markup_info.get_resource_name())
 
-    def generate_ini_file(self):
-        ini_builder = M_IniBuilder()
+    def prepare_merged_skeleton(self):
+        """收集合并骨架逻辑部件（幂等，可在缓冲区生成前调用）。
 
-        # EFMI 骨骼合并（Merged Skeleton）组件信息初始化
+        generate_buffer_files 需要 same-IB 重定向与绘制入口数据，
+        generate_ini_file 需要部件池——两者都必须先于缓冲/INI 生成执行完。
+        """
+        if getattr(self, "_efmi_merged_skeleton_prepared", False):
+            return
         self.merged_skeleton_components, self.merged_skeleton_component_id_dict = (
             self._get_merged_skeleton_component_info()
         )
         self.has_merged_skeleton = len(self.merged_skeleton_components) > 0
+        self._efmi_merged_skeleton_prepared = True
         if self.has_merged_skeleton:
-            lod_bones: dict[str, int] = {}
-            for c in self.merged_skeleton_components:
-                lod = c["lod"]
-                lod_bones[lod] = max(
-                    lod_bones.get(lod, 0), c["vg_offset"] + c["vg_count"]
-                )
-            lod_summary = ", ".join(
-                f"{lod or '根'}: {count} 槽" for lod, count in sorted(lod_bones.items())
+            total_bones = max(
+                (c["vg_offset"] + c["vg_count"] for c in self.merged_skeleton_components),
+                default=0,
             )
             print(
-                f"[EFMI骨骼合并] 合并骨架: {len(self.merged_skeleton_components)} 个组件, "
-                f"按 LOD 独立分组: {lod_summary}"
+                f"[EFMI骨骼合并] 合并骨架: {len(self.merged_skeleton_components)} 个逻辑部件, "
+                f"单池共 {total_bones} 槽（跨 LOD 共用同一骨架缓冲）"
             )
+
+    def generate_ini_file(self):
+        ini_builder = M_IniBuilder()
+
+        # EFMI 骨骼合并（Merged Skeleton）部件信息（export() 已提前收集；
+        # 单独调用时兜底收集）
+        self.prepare_merged_skeleton()
 
         drawib_drawibmodel_dict = {
             drawib_model.draw_ib: drawib_model
@@ -1229,35 +1706,51 @@ class ExportEFMI:
 
             # ===== EFMI 骨骼合并组件：EntryPoint + 运行时回调绘制（官方 1.4.1 架构）=====
             # 按用户要求不做 DRAW_TYPE 通道门控：所有通道均生效。
-            merged_component_id = (
-                self.merged_skeleton_component_id_dict.get(submesh_model.unique_str)
-                if self.has_merged_skeleton
-                else None
-            )
+            # 合并侧发射按「逻辑部件的绘制入口」而非逐子网格：同 IB 跨 LOD 部件
+            # 只挂基准入口（参考插件 same-IB 处理），其 LOD 版本不生成第二入口。
+            if self.has_merged_skeleton:
+                merged_draw_entries = getattr(self, "_efmi_merged_draw_entries", None)
+                if merged_draw_entries is None:
+                    merged_draw_entries = {}
+                    for part in self.merged_skeleton_components:
+                        for draw in part.get("draws", []):
+                            merged_draw_entries[draw["unique_str"]] = (part, draw)
+                    self._efmi_merged_draw_entries = merged_draw_entries
+                draw_entry = merged_draw_entries.get(submesh_model.unique_str)
+                merged_component_id = draw_entry[0]["component_id"] if draw_entry else None
+            else:
+                merged_component_id = None
             if merged_component_id is not None:
+                part, draw_entry_info = draw_entry
                 # 段名用部件前缀（unique_str），与 Resource_<前缀>_* 命名约定一致，
-                # 直接能看出是哪个部件；数字 component_id 仅用于运行时变量
-                # （按 LOD 组内分配，只在本 LOD 的粘合层内有意义）。
+                # 直接能看出是哪个部件；数字 component_id 为全局值（所有 LOD 共用
+                # 一套粘合层/池，见 _add_merged_skeleton_section）。
                 component_prefix = submesh_model.unique_str.replace("-", "_")
                 entrypoint_section_name = "TextureOverride_EntryPoint_" + component_prefix
                 draw_command_name = "CommandList_Draw_" + component_prefix
-                component_lod = self._lod_name_from_unique_str(submesh_model.unique_str)
-                lod_suffix = "_" + component_lod if component_lod else ""
                 texture_override_ib_section.append("[" + entrypoint_section_name + "]")
-                texture_override_ib_section.append("hash = " + submesh_model.match_draw_ib)
-                texture_override_ib_section.append("match_first_index = " + submesh_model.match_first_index)
-                texture_override_ib_section.append("match_index_count = " + submesh_model.match_index_count)
+                texture_override_ib_section.append("hash = " + str(draw_entry_info.get("match_draw_ib", submesh_model.match_draw_ib)))
+                texture_override_ib_section.append("match_first_index = " + str(draw_entry_info.get("match_first_index", submesh_model.match_first_index)))
+                texture_override_ib_section.append("match_index_count = " + str(draw_entry_info.get("match_index_count", submesh_model.match_index_count)))
                 # 原始绘制压制直接放 EntryPoint（本机所有可用 mod 的实证写法）：
                 # 嵌套 CommandList 内的 handling=skip 在部分 3Dmigoto 分支不一定生效，
                 # 粘合层里仍保留一份作为双保险。
                 texture_override_ib_section.append("handling = skip")
                 texture_override_ib_section.append(f"$\\EFMIv1\\component_id = {merged_component_id}")
+                # $lod_level：仅当部件有多个（不同 IB 的）LOD 绘制入口时才写入
+                # （参考插件规则——same-IB 部件不做 LOD 检测，保持全局值）。
+                # 参考模板写**裸版** $lod_level（框架 API.ini 以裸名声明该全局），
+                # 再由粘合层拷贝到 \EFMIv1\lod_level；这里同步写裸版保证两处一致。
+                if len(part.get("draws", [])) > 1:
+                    texture_override_ib_section.append(
+                        f"$lod_level = {int(draw_entry_info.get('lod_level', 0) or 0)}"
+                    )
                 texture_override_ib_section.append("$\\EFMIv1\\gpu_posed = 1")
                 texture_override_ib_section.append(
                     "CommandList\\EFMIv1\\Callback_Component_DrawCustom = ref " + draw_command_name
                 )
                 texture_override_ib_section.append(
-                    "run = CommandList_Component_DrawInstances" + lod_suffix
+                    "run = CommandList_Component_DrawInstances"
                 )
                 if len(self.blueprint_model.keyname_mkey_dict.keys()) != 0:
                     texture_override_ib_section.append("$active" + str(active_index) + " = 1")
@@ -1284,6 +1777,15 @@ class ExportEFMI:
                     None,
                 )
                 merged_command_lists.new_line()
+                continue
+
+            if (
+                self.has_merged_skeleton
+                and submesh_model.unique_str in self.merged_skeleton_component_id_dict
+            ):
+                # same-IB 跨 LOD 部件（已并入基准 draw）：不生成任何入口——
+                # 参考插件对同 IB 部件的处理（单入口、无 LOD 检测），
+                # 否则与基准入口同 hash 冲突/双写。
                 continue
 
             texture_override_ib_section.append("[TextureOverride_" + submesh_model.unique_str.replace("-","_") + "]")
@@ -1469,6 +1971,24 @@ class ExportEFMI:
                 resource_buffer_section.append("filename = " + buffer_folder_name + "\\" + submesh_model.unique_str + "-" + category + ".buf")
                 resource_buffer_section.new_line()
 
+        # 合并骨架 full→lod BlendRemap 资源（R16_UINT；参考插件同款声明）
+        if getattr(self, "has_merged_skeleton", False):
+            for part in getattr(self, "merged_skeleton_components", []) or []:
+                for draw in part.get("draws", []):
+                    if not draw.get("remap"):
+                        continue
+                    remap_resource_name = (
+                        "Resource_" + draw["unique_str"].replace("-", "_") + "_BlendRemap"
+                    )
+                    resource_buffer_section.append("[" + remap_resource_name + "]")
+                    resource_buffer_section.append("type = Buffer")
+                    resource_buffer_section.append("format = R16_UINT")
+                    resource_buffer_section.append("stride = 2")
+                    resource_buffer_section.append(
+                        "filename = " + buffer_folder_name + "\\" + draw["unique_str"] + "-BlendRemap.buf"
+                    )
+                    resource_buffer_section.new_line()
+
         if not GlobalProterties.forbid_auto_texture_ini():
             resource_texture_section = M_IniSection(M_SectionType.ResourceTexture)
             appended_resource_names = set()
@@ -1649,6 +2169,9 @@ class ExportEFMI:
 
     def export(self):
         try:
+            # 合并骨架部件信息必须在缓冲区生成之前就绪（BlendRemap 导出依赖）。
+            self.prepare_merged_skeleton()
+
             TimerUtils.start_stage("缓冲文件生成")
             self.generate_buffer_files()
             TimerUtils.end_stage("缓冲文件生成")
@@ -1662,6 +2185,7 @@ class ExportEFMI:
     def export_buffers_only(self):
         """只导出 Buffer 文件，不生成 INI 配置"""
         try:
+            self.prepare_merged_skeleton()
             TimerUtils.start_stage("缓冲文件生成")
             self.generate_buffer_files()
             TimerUtils.end_stage("缓冲文件生成")

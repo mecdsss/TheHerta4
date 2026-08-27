@@ -82,6 +82,25 @@ _install_module(
 
 
 PKG = "_at_multi_frame_split_vmap_test_pkg"
+
+# 注册 fake 包链，使 toolkit/at_multi_frame_split.py 顶部的相对导入
+# `from ..utils.shapekey_rebase_utils import ...` 能在测试包内解析；
+# 装配模式与 test_buffer_cleanup_mergeskeleton.py 一致（_install_module + __path__）。
+for _pkg_name in (PKG, f"{PKG}.toolkit", f"{PKG}.utils"):
+    _pkg = _install_module(_pkg_name)
+    _pkg.__path__ = []
+
+# 真实加载 utils/shapekey_rebase_utils.py（纯 numpy、无 bpy 依赖），
+# 保证被测行为使用真实实现而非桩。
+_rebase_spec = importlib.util.spec_from_file_location(
+    f"{PKG}.utils.shapekey_rebase_utils",
+    Path(__file__).resolve().parents[1] / "utils" / "shapekey_rebase_utils.py",
+)
+_rebase_module = importlib.util.module_from_spec(_rebase_spec)
+sys.modules[_rebase_spec.name] = _rebase_module
+_rebase_spec.loader.exec_module(_rebase_module)
+
+
 module_path = Path(__file__).resolve().parents[1] / "toolkit" / "at_multi_frame_split.py"
 spec = importlib.util.spec_from_file_location(f"{PKG}.toolkit.at_multi_frame_split", module_path)
 split_module = importlib.util.module_from_spec(spec)

@@ -44,9 +44,15 @@ spec.loader.exec_module(dds_conversion)
 class DDSConversionTests(unittest.TestCase):
     """测试 DDS 转换工具的格式解析与值保留转换策略"""
 
-    def test_flags_always_ignore_srgb(self):
-        """所有贴图一律按原始数值读取（--ignore-srgb），不做色彩空间变换"""
-        self.assertEqual(["--ignore-srgb"], dds_conversion._texconv_colorspace_flags())
+    def test_flags_format_aware(self):
+        """色彩空间标志随输出格式走：sRGB 输出用 --srgb-in（先解码再编码=恒等，存原值），
+        线性 UNORM 输出用 --ignore-srgb（直接存原值）。避免二次 encode 变亮或误解码变暗。"""
+        self.assertEqual(["--srgb-in"], dds_conversion._texconv_colorspace_flags("bc7_unorm_srgb"))
+        self.assertEqual(["--srgb-in"], dds_conversion._texconv_colorspace_flags("B8G8R8A8_UNORM_SRGB"))
+        self.assertEqual(["--ignore-srgb"], dds_conversion._texconv_colorspace_flags("bc7_unorm"))
+        self.assertEqual(["--ignore-srgb"], dds_conversion._texconv_colorspace_flags("r8g8b8a8_unorm"))
+        # 大小写不敏感
+        self.assertEqual(["--srgb-in"], dds_conversion._texconv_colorspace_flags("BC7_UNORM_SRGB"))
 
     def test_custom_rule_format_is_authoritative(self):
         """自定义规则命中：格式完全由规则决定，不再按文件名推断类型"""
@@ -116,7 +122,7 @@ class DDSConversionTests(unittest.TestCase):
         texture_type, dds_format, _matched_by = dds_conversion.resolve_dds_target("TTLMap_BaseTex.png", props)
         self.assertEqual(texture_type, "TTLMap")
         self.assertEqual(dds_format, "bc7_unorm")
-        self.assertIn("--ignore-srgb", dds_conversion._texconv_colorspace_flags())
+        self.assertIn("--ignore-srgb", dds_conversion._texconv_colorspace_flags("bc7_unorm"))
 
     def test_unmatched_falls_back_to_default_format(self):
         """未命中任何规则时走默认 bc7_unorm"""

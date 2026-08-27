@@ -268,6 +268,33 @@ def _detect_ntemi_workspace() -> bool:
     return False
 
 
+def _configure_and_execute_efmi_lod_match(
+    match_node,
+    source_obj,
+    target_obj,
+    context,
+):
+    """配置自动匹配节点，并基于当前 Blender 物体立即生成映射文本。
+
+    EFMILODCorrespondence 只负责把 source_obj 与 target_obj 配成一对；这里不接收
+    也不消费任何 JSON/VGMap 映射，避免把导入前的骨骼账本误当成导入后物体的
+    顶点组命名空间。
+    """
+    match_node.source_object = source_obj.name
+    match_node.target_object = target_obj.name
+    # 统一顶点组模式使用同一个全局名称空间；一个处理节点连接的全部匹配表
+    # 必须覆盖该链上的所有导入物体。这里不能按源对象名称收窄，否则 LOD0/LOD1
+    # 的统一组会被拆成两套，后续全局槽位处理反而失去覆盖。
+    match_node.target_hash = ""
+    match_node.match_threshold = 0.06
+    match_node.use_chamfer_matching = False
+    match_node.use_shape_key = False
+    match_node.create_debug_objects = False
+    match_node.rename_format = True
+    match_node.exact_hash_match = False
+    return match_node.execute_match(context)
+
+
 def ImprotFromWorkSpaceFull(self, context):
     """从工作空间完整导入所有子模型并构建蓝图节点树"""
     workspace_collection = WorkSpaceHelper.create_and_get_workspace_collection()
@@ -315,6 +342,38 @@ def ImprotFromWorkSpaceFull(self, context):
             print(f"[EFMI骨骼合并] 预生成失败（不阻断导入）: {e}")
             traceback.print_exc()
             self.report({'WARNING'}, f"EFMI 骨骼合并预生成异常，已回退普通导入：{e}")
+
+        # 分组投影导入过滤：EFMI 多 LOD 投影模式下，LOD1 中几何匹配不成功的
+        # 部件（ensure_skeleton_data 已给 json 写入 EFMILODProjectionSkipped=True）
+        # 不导入——避免 LOD1 dump 里与 LOD0 无对应的未知物体混入。仅在骨骼合并
+        # 完整生成的合并路线生效；预生成失败回退普通导入时不应用该过滤。
+        if (
+            merged_vgmap_ready is True
+            and GlobalConfig.logic_name == LogicName.EFMI
+            and GlobalProterties.efmi_lod_group_projection()
+        ):
+            try:
+                from ..common.efmi_skeleton import EFMISkeletonMergeHelper as _EFMISkeletonHelper
+                projection_skipped = _EFMISkeletonHelper.load_projection_skipped_targets(
+                    GlobalConfig.path_workspace_folder(),
+                    [target["import_key"] for target in import_targets],
+                )
+                if projection_skipped:
+                    filtered_targets = [
+                        target for target in import_targets
+                        if target["import_key"] not in projection_skipped
+                    ]
+                    dropped = len(import_targets) - len(filtered_targets)
+                    import_targets = filtered_targets
+                    shown = "、".join(sorted(projection_skipped)[:5])
+                    suffix = "…" if len(projection_skipped) > 5 else ""
+                    detail = f"{shown}{suffix}"
+                    print(
+                        f"[EFMI骨骼合并] 跨 LOD 投影未匹配，跳过导入 {dropped} 个物体: {detail}"
+                    )
+                    self.report({'INFO'}, f"跨 LOD 投影未匹配，跳过导入 {dropped} 个物体: {detail}")
+            except Exception as e:
+                print(f"[EFMI骨骼合并] 读取投影未匹配标记失败（不阻断导入）: {e}")
 
     # ZZMI 骨骼合并数据预生成（与 EFMI 同构的分支选项）：
     # 复选框（import_merged_vgmap，「使用融合统一顶点组」）关闭时完全不执行，保持旧逻辑；
@@ -552,9 +611,186 @@ def ImprotFromWorkSpaceFull(self, context):
         output_node.location = (800, 0)
         output_node.label = "生成 Mod"
 
+        # EFMI 跨 LOD 自动处理链：账本只提供 LOD0/目标 LOD 的物体配对；
+        # 顶点组映射必须在导入完成后由匹配节点读取两边实际 Blender 物体并重算。
+        # 自动给相关组挂上重命名物体节点 + 顶点组处理节点：
+        #   - 重命名节点（LOD0 端组）：该组全部匹配对的 LOD0 物体名 -> LOD1 对应名，
+        #     插在物体组与顶点组处理节点中间（与匹配节点 LOD0→LOD1 方向一致）；
+        #   - 顶点组处理节点（LOD1/目标端组）：挂该组所有部件的顶点组匹配节点，
+        #     每个节点都调用 execute_match，从实际源/目标物体生成自己的映射文本。
+        # 结构：物体 >>> 物体组 >>> [重命名>>顶点组处理(匹配节点)] >>> 输出。
+        # 仅在 EFMI 合并路线完整成功时自动生成；无物体配对/回退普通导入时不动蓝图。
+        vg_process_by_group: dict[int, object] = {}
+        rename_by_group: dict[int, object] = {}
+        vg_match_created = 0
+        vg_match_failed = 0
+        created_auto_nodes = []
+        existing_text_names = set(
+            getattr(getattr(bpy, "data", None), "texts", {}).keys()
+        )
+        if (
+            merged_vgmap_ready is True
+            and GlobalConfig.logic_name == LogicName.EFMI
+            and GlobalProterties.efmi_lod_group_projection()
+        ):
+            try:
+                from ..common.efmi_skeleton import EFMISkeletonMergeHelper as _EFMISkeletonHelper
+                match_pairs = _EFMISkeletonHelper.load_lod_match_pairs(
+                    GlobalConfig.path_workspace_folder(),
+                    [target["import_key"] for target in import_targets],
+                )
+                record_by_key = {
+                    record["import_key"]: record for record in import_records
+                }
+                drawib_tabname_dict = WorkSpaceHelper.get_drawib_tabname_dict()
+
+                def _group_node_for_key(import_key: str):
+                    record = record_by_key.get(import_key)
+                    if record is None:
+                        return None
+                    tab_name = drawib_tabname_dict.get(record["draw_ib"])
+                    group_node = tab_group_nodes.get(tab_name) if tab_name else None
+                    return group_node or default_group_node
+
+                for pair in match_pairs:
+                    group_node = _group_node_for_key(pair["target_key"])
+                    if group_node is None:
+                        continue
+                    source_record = record_by_key.get(pair["reference_key"])
+                    target_record = record_by_key.get(pair["target_key"])
+                    if source_record is None or target_record is None:
+                        print(
+                            f"[EFMI自动链] 跳过配对 {pair['target_key']} -> "
+                            f"{pair['reference_key']}: 未找到导入物体"
+                        )
+                        continue
+                    source_obj = source_record["imported_obj"]
+                    target_obj = target_record["imported_obj"]
+
+                    # 重命名物体节点挂在 LOD0（源/基准）端所在组；
+                    # LOD0 物体名 -> 对应 LOD1 物体名（与匹配节点方向一致）
+                    rename_group = _group_node_for_key(pair["reference_key"]) or group_node
+                    rename_node = rename_by_group.get(id(rename_group))
+                    if rename_node is None:
+                        rename_node = tree.nodes.new('SSMTNode_Object_Rename')
+                        created_auto_nodes.append(rename_node)
+                        rename_node.label = "LOD前缀重命名"
+                        # 先按仍为 LOD0 的源物体名称选择并执行各自映射，再改成
+                        # LOD1 名称；否则同名目标已经存在时 Blender 会插入 .001，
+                        # 映射节点既无法稳定路由，也容易退化为全局串表。
+                        rename_node.defer_until_after_vertex_group_process = True
+                        rename_node.location = (
+                            540,
+                            rename_group.location.y if rename_group.location else 0,
+                        )
+                        rename_by_group[id(rename_group)] = rename_node
+                    rule = rename_node.rename_rules.add()
+                    rule.name = f"Rule_{len(rename_node.rename_rules):03d}"
+                    rule.search_str = source_obj.name
+                    rule.replace_str = target_obj.name
+
+                    # 顶点组处理节点挂在 LOD1（目标）端所在组
+                    vg_proc = vg_process_by_group.get(id(group_node))
+                    if vg_proc is None:
+                        vg_proc = tree.nodes.new('SSMTNode_VertexGroupProcess')
+                        created_auto_nodes.append(vg_proc)
+                        vg_proc.location = (
+                            640,
+                            group_node.location.y if group_node.location else 0,
+                        )
+                        vg_process_by_group[id(group_node)] = vg_proc
+                    pair_index = sum(
+                        1 for _p in match_pairs
+                        if _group_node_for_key(_p["target_key"]) is group_node
+                        and _p["target_key"] <= pair["target_key"]
+                    ) - 1
+
+                    match_node = tree.nodes.new('SSMTNode_VertexGroupMatch')
+                    created_auto_nodes.append(match_node)
+                    match_node.label = f"LOD匹配: {target_obj.name}"
+                    match_node.location = (
+                        320,
+                        (vg_proc.location.y if vg_proc.location else 0) - 240 * (pair_index + 1),
+                    )
+                    if vg_proc.inputs[-1].is_linked:
+                        vg_proc.inputs.new(
+                            'SSMTSocketObject', f"映射表 {len(vg_proc.inputs)}"
+                        )
+                    tree.links.new(match_node.outputs[0], vg_proc.inputs[-1])
+
+                    rename_map, match_message = _configure_and_execute_efmi_lod_match(
+                        match_node,
+                        source_obj,
+                        target_obj,
+                        context,
+                    )
+                    if not rename_map:
+                        vg_match_failed += 1
+                        print(
+                            f"[EFMI自动匹配] {source_obj.name} -> {target_obj.name} "
+                            f"执行失败: {match_message}"
+                        )
+                    else:
+                        vg_match_created += 1
+                        print(
+                            f"[EFMI自动匹配] {source_obj.name} -> {target_obj.name}: "
+                            f"{match_message}"
+                        )
+            except Exception as e:
+                print(f"[EFMI自动链] 自动创建处理链失败（不影响导入）: {e}")
+                # 本阶段是一个事务：任何异常都撤掉本轮新增节点、自动生成的映射
+                # 文本及其链接，不能把半条链留在蓝图里影响后续手工导出。
+                for node in reversed(created_auto_nodes):
+                    try:
+                        tree.nodes.remove(node)
+                    except (ReferenceError, RuntimeError, ValueError):
+                        pass
+                texts = getattr(getattr(bpy, "data", None), "texts", None)
+                if texts is not None:
+                    for text_name in set(texts.keys()) - existing_text_names:
+                        try:
+                            text = texts.get(text_name)
+                            if text is not None:
+                                texts.remove(text)
+                        except (ReferenceError, RuntimeError, ValueError):
+                            pass
+                created_auto_nodes.clear()
+                vg_process_by_group.clear()
+                rename_by_group.clear()
+                vg_match_created = 0
+                vg_match_failed = 0
+        if vg_match_created or vg_match_failed:
+            summary = f"已自动创建 {vg_match_created} 个顶点组匹配节点"
+            if vg_match_failed:
+                summary += f"，{vg_match_failed} 个执行失败（可手动补执行）"
+            print(f"[EFMI自动匹配] {summary}")
+            self.report({'INFO'}, summary)
+        if rename_by_group:
+            total_rules = sum(len(node.rename_rules) for node in rename_by_group.values())
+            print(f"[EFMI自动链] 已自动创建 {len(rename_by_group)} 个重命名物体节点（共 {total_rules} 条 LOD0→LOD1 前缀规则）")
+            self.report({'INFO'}, f"已自动创建 {len(rename_by_group)} 个重命名物体节点（共 {total_rules} 条规则）")
+
+        # 每组链路尾节点：组输出 -> [重命名(延迟执行)] -> [顶点组处理] -> 输出/合并。
+        # 节点拓扑保留“先重命名”便于表达 LOD0→LOD1 输出意图，执行器依据
+        # defer_until_after_vertex_group_process 保证实际顺序为“先 VG、后改名”。
+        chain_tail_by_group: dict[int, object] = {}
+        for grp_node in all_group_nodes:
+            tail = grp_node
+            rename_node = rename_by_group.get(id(grp_node))
+            vg_proc = vg_process_by_group.get(id(grp_node))
+            if rename_node is not None:
+                tree.links.new(tail.outputs[0], rename_node.inputs[0])
+                tail = rename_node
+            if vg_proc is not None:
+                tree.links.new(tail.outputs[0], vg_proc.inputs[0])
+                tail = vg_proc
+            chain_tail_by_group[id(grp_node)] = tail
+
         if len(output_node.inputs) > 0 and len(all_group_nodes) > 0:
             if len(all_group_nodes) == 1:
-                tree.links.new(all_group_nodes[0].outputs[0], output_node.inputs[0])
+                grp_node = all_group_nodes[0]
+                dest = chain_tail_by_group.get(id(grp_node)) or grp_node
+                tree.links.new(dest.outputs[0], output_node.inputs[0])
             else:
                 merge_node = tree.nodes.new('SSMTNode_Object_Group')
                 merge_node.label = "合并"
@@ -564,7 +800,8 @@ def ImprotFromWorkSpaceFull(self, context):
                 for grp_node in all_group_nodes:
                     if merge_node.inputs[-1].is_linked:
                         merge_node.inputs.new('SSMTSocketObject', f"Input {len(merge_node.inputs) + 1}")
-                    tree.links.new(grp_node.outputs[0], merge_node.inputs[-1])
+                    dest = chain_tail_by_group.get(id(grp_node)) or grp_node
+                    tree.links.new(dest.outputs[0], merge_node.inputs[-1])
 
                 tree.links.new(merge_node.outputs[0], output_node.inputs[0])
 

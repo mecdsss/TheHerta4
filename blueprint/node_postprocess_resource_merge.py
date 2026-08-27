@@ -2,7 +2,8 @@ import bpy
 import os
 import glob
 import hashlib
-from collections import OrderedDict
+import re
+import tempfile
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
@@ -10,12 +11,12 @@ from .node_postprocess_base import SSMTNode_PostProcess_Base
 class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
     bl_idname = 'SSMTNode_PostProcess_ResourceMerge'
     bl_label = '资源合并'
-    bl_description = '通过计算贴图文件内容的MD5哈希值，自动合并内容相同的资源引用并删除重复的贴图文件'
+    bl_description = '通过计算DDS贴图内容的MD5哈希值，自动合并内容相同的资源引用并删除重复的DDS贴图'
 
     def draw_buttons(self, context, layout):
-        layout.label(text="计算贴图文件MD5哈希值", icon='FILE_CACHE')
-        layout.label(text="合并内容相同的资源引用")
-        layout.label(text="自动删除重复的贴图文件")
+        layout.label(text="计算DDS贴图文件MD5哈希值", icon='FILE_CACHE')
+        layout.label(text="合并内容相同的DDS资源引用")
+        layout.label(text="自动删除重复的DDS贴图文件")
         layout.separator()
         layout.label(text="执行前会自动备份ini文件", icon='BACK')
 
@@ -40,7 +41,105 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         if not (normalized.startswith("[") and normalized.endswith("]")):
             return False
         normalized = normalized[1:-1]
-        return normalized.startswith("Resource")
+        return normalized.lower().startswith("resource")
+
+    @staticmethod
+    def _is_dds_filename(filename: str) -> bool:
+        return os.path.splitext(str(filename or "").strip())[1].lower() == ".dds"
+
+    @staticmethod
+    def _resolve_mod_local_path(mod_export_path: str, filename: str) -> str | None:
+        """Resolve an INI filename only when its real path stays inside the mod root."""
+        root = os.path.realpath(os.path.abspath(mod_export_path))
+        relative = str(filename or "").replace("\\", os.sep).replace("/", os.sep)
+        candidate = os.path.realpath(os.path.abspath(os.path.join(root, relative)))
+        root_compare = os.path.normcase(root)
+        candidate_compare = os.path.normcase(candidate)
+        try:
+            if os.path.commonpath((root_compare, candidate_compare)) != root_compare:
+                return None
+        except ValueError:
+            # Different Windows drives have no common path.
+            return None
+        return candidate
+
+    @classmethod
+    def _resource_filename_entries(cls, content: str):
+        """Return ordered resource filename records without rebuilding the INI.
+
+        Duplicate section names and preamble text deliberately remain represented by
+        their original line positions. Animation-driver and auto-appended blocks are
+        protected from this postprocessor.
+        """
+        lines = content.splitlines(keepends=True)
+        filename_pattern = re.compile(
+            r"^(?P<prefix>[ \t]*filename[ \t]*=[ \t]*)"
+            r"(?P<value>.*?)(?P<trailing>[ \t]*)(?P<newline>\r?\n)?$",
+            re.IGNORECASE,
+        )
+        driver_start = getattr(
+            cls, "ANIM_DRIVER_SECTION_MARKER_START", "; --- ANIMATION DRIVER SECTION ---"
+        )
+        driver_end = getattr(
+            cls, "ANIM_DRIVER_SECTION_MARKER_END", "; --- END ANIMATION DRIVER SECTION ---"
+        )
+        tail_detector = getattr(cls, "is_known_auto_appended_marker", None)
+        in_driver = False
+        current_section = ""
+        current_is_resource = False
+        current_has_filename = False
+        section_count = 0
+        entries = []
+
+        for line_index, line in enumerate(lines):
+            if driver_start in line:
+                in_driver = True
+                current_section = ""
+                current_is_resource = False
+                continue
+            if in_driver:
+                if driver_end in line:
+                    in_driver = False
+                continue
+            if callable(tail_detector) and tail_detector(line):
+                break
+
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                section_count += 1
+                current_section = stripped
+                current_is_resource = cls._is_resource_section(stripped)
+                current_has_filename = False
+                continue
+            if not current_is_resource or current_has_filename:
+                continue
+            match = filename_pattern.match(line)
+            if match is None:
+                continue
+            current_has_filename = True
+            entries.append({
+                "section": current_section,
+                "line_index": line_index,
+                "filename": match.group("value").strip(),
+                "match": match,
+            })
+
+        return lines, entries, section_count
+
+    @staticmethod
+    def _atomic_write_text(path: str, content: str):
+        folder = os.path.dirname(os.path.abspath(path))
+        fd, temporary_path = tempfile.mkstemp(prefix=".resource-merge-", suffix=".tmp", dir=folder)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as file_obj:
+                file_obj.write(content)
+            os.replace(temporary_path, path)
+        except Exception:
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+            raise
 
     def execute_postprocess(self, mod_export_path):
         print(f"[ResourceMerge] 开始执行，Mod导出路径: {mod_export_path}")
@@ -61,46 +160,30 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         print(f"[ResourceMerge] 正在处理ini文件: {ini_file}")
         self._create_cumulative_backup(ini_file, mod_export_path)
 
-        with open(ini_file, 'r', encoding='utf-8') as f:
+        with open(ini_file, 'r', encoding='utf-8', newline='') as f:
             content = f.read()
 
-        preserved_driver_content = ""
-        preserved_driver_content, content = self.split_anim_driver_block_content(content)
-        preserved_tail_content = ""
-        content, preserved_tail_content = self.split_auto_appended_tail_content(content)
-        if preserved_tail_content:
-            print("[ResourceMerge] 检测到自动追加尾块，将保留")
-
-        lines = content.splitlines()
-
-        sections = OrderedDict()
-        current_section = None
-
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('[') and stripped.endswith(']'):
-                current_section = stripped
-                sections[current_section] = []
-            elif current_section:
-                sections[current_section].append(line)
-
-        resource_sections = {k: v for k, v in sections.items() if self._is_resource_section(k)}
-        print(f"[ResourceMerge] ini中共有 {len(sections)} 个section，其中 {len(resource_sections)} 个Resource section")
+        lines, resource_entries, section_count = self._resource_filename_entries(content)
+        print(
+            f"[ResourceMerge] ini中共有 {section_count} 个section，"
+            f"其中 {len(resource_entries)} 个Resource section含filename"
+        )
 
         file_hash_to_first_ref = {}
-        files_to_delete = set()
+        files_to_delete: dict[str, str] = {}
 
-        for section_name, section_lines in resource_sections.items():
-            filename = next(
-                (l.split('=', 1)[1].strip() for l in section_lines if l.strip().startswith('filename =')),
-                None
-            )
-            if not filename:
-                print(f"[ResourceMerge] 跳过 {section_name}: 未找到filename")
+        for entry in resource_entries:
+            section_name = entry["section"]
+            filename = entry["filename"]
+            if not self._is_dds_filename(filename):
+                print(f"[ResourceMerge] 跳过 {section_name}: 非DDS贴图 {filename}")
                 continue
 
-            file_path = os.path.join(mod_export_path, filename.replace("/", os.sep))
-            if not os.path.exists(file_path):
+            file_path = self._resolve_mod_local_path(mod_export_path, filename)
+            if file_path is None:
+                print(f"[ResourceMerge] 跳过 {section_name}: 路径越出Mod目录 {filename}")
+                continue
+            if not os.path.isfile(file_path):
                 print(f"[ResourceMerge] 跳过 {section_name}: 文件不存在 {file_path}")
                 continue
 
@@ -112,57 +195,53 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
             print(f"[ResourceMerge] {section_name} -> {filename} (MD5: {file_hash[:16]}...)")
 
             if file_hash in file_hash_to_first_ref:
-                files_to_delete.add(file_path)
-                print(f"[ResourceMerge]   重复! 与 {file_hash_to_first_ref[file_hash]['section']} 相同")
+                primary_ref = file_hash_to_first_ref[file_hash]
+                primary_path = os.path.normcase(os.path.realpath(primary_ref['file_path']))
+                duplicate_path = os.path.normcase(os.path.realpath(file_path))
+                if duplicate_path != primary_path:
+                    files_to_delete[file_path] = filename
+                    print(f"[ResourceMerge]   重复! 与 {primary_ref['section']} 相同")
+                else:
+                    print(f"[ResourceMerge]   共享文件引用，与 {primary_ref['section']} 指向同一路径，保留文件")
             else:
                 file_hash_to_first_ref[file_hash] = {
                     'section': section_name,
-                    'filename': filename
+                    'filename': filename,
+                    'file_path': file_path,
                 }
+            entry["file_hash"] = file_hash
 
         print(f"[ResourceMerge] 扫描完成: {len(file_hash_to_first_ref)} 个唯一资源, {len(files_to_delete)} 个重复文件待删除")
 
         modified = False
-        for section_name, section_lines in resource_sections.items():
-            for i, line in enumerate(section_lines):
-                if line.strip().startswith('filename ='):
-                    original_filename = line.split('=', 1)[1].strip()
-                    file_path = os.path.join(mod_export_path, original_filename.replace("/", os.sep))
-
-                    if os.path.exists(file_path):
-                        file_hash = self.compute_file_hash(file_path)
-                        if file_hash and file_hash in file_hash_to_first_ref:
-                            primary_filename = file_hash_to_first_ref[file_hash]['filename']
-                            if original_filename != primary_filename:
-                                section_lines[i] = f"filename = {primary_filename}"
-                                modified = True
-                                print(f"[ResourceMerge] 引用替换: {original_filename} -> {primary_filename}")
-                    break
+        for entry in resource_entries:
+            file_hash = entry.get("file_hash")
+            if not file_hash or file_hash not in file_hash_to_first_ref:
+                continue
+            original_filename = entry["filename"]
+            primary_filename = file_hash_to_first_ref[file_hash]["filename"]
+            if original_filename == primary_filename:
+                continue
+            match = entry["match"]
+            lines[entry["line_index"]] = (
+                match.group("prefix")
+                + primary_filename
+                + match.group("trailing")
+                + (match.group("newline") or "")
+            )
+            modified = True
+            print(f"[ResourceMerge] 引用替换: {original_filename} -> {primary_filename}")
 
         if modified:
             print(f"[ResourceMerge] ini文件已修改，正在写入...")
-            new_content = []
-            if preserved_driver_content:
-                new_content.append(preserved_driver_content.rstrip())
-                new_content.append('')
-            for section_name, lines in sections.items():
-                new_content.append(section_name)
-                new_content.extend(lines)
-                new_content.append('')
-
-            if preserved_tail_content:
-                new_content.append('')
-                new_content.append(preserved_tail_content)
-
-            with open(ini_file, 'w', encoding='utf-8') as f:
-                f.write("\n".join(new_content))
+            self._atomic_write_text(ini_file, "".join(lines))
         else:
             print(f"[ResourceMerge] ini文件无需修改")
 
-        for file_path in files_to_delete:
+        for file_path, display_name in files_to_delete.items():
             try:
                 os.remove(file_path)
-                print(f"[ResourceMerge] 已删除重复文件: {os.path.relpath(file_path, mod_export_path)}")
+                print(f"[ResourceMerge] 已删除重复文件: {display_name}")
             except OSError as e:
                 print(f"[ResourceMerge] 删除文件失败 {file_path}: {e}")
 

@@ -130,14 +130,24 @@ class D3D11GameType:
         return new_dict
 
     def widen_blendindices(self) -> bool:
-        """将 BLENDINDICES 元素升宽（用于 EFMI 骨骼合并场景）。
+        """将 BLENDINDICES 元素统一归一化到 R16 系（用于 EFMI 骨骼合并场景）。
+
+        EFMI 合并骨架按 LOD 输出一套布局：运行时对 vb 槽位只声明一种
+        BLENDINDICES ElementFormat（efmi.py:1054-1058），且导出缓冲统一按
+        uint16 打包（FormatUtils.get_nptype_from_format），因此同 LOD 所有
+        部件的 BLENDINDICES 必须同为 R16 系。此处做两个方向的归一化：
+        - R8* 升宽到 R16*（保留通道数与符号）；
+        - R32*_UINT / R32*_SINT 降宽到 R16*（角色全局骨骼池远小于 65536，
+          uint16 无损承载；同 LOD 出现 R16/R32 混用即"布局不一致"直出失败的
+          根因——本方法在子网格构建期就把两侧统一，导出期校验不再报错）。
 
         修改运行时副本的元素 Format/ByteWidth，并联动重算 AlignedByteOffset 与
         CategoryStrideDict（get_total_structured_dtype 为动态计算，自动生效）。
-        已是 R16/R32 系时保持原通道数与格式；R8 系按相同通道数升至 R16。
+        已是 R16 系时保持原通道数与格式；R32 非整数格式（如 *_FLOAT）不是骨骼
+        索引语义，按旧行为保留不动。
 
         Returns:
-            是否发生了升宽修改。
+            是否发生了升/降宽修改。
         """
         widen_map = {
             "R8_UINT": ("R16_UINT", 2),
@@ -147,20 +157,42 @@ class D3D11GameType:
             "R8G8_SINT": ("R16G16_SINT", 4),
             "R8G8B8A8_SINT": ("R16G16B16A16_SINT", 8),
         }
+        downcast_map = {
+            "R32_UINT": ("R16_UINT", 2),
+            "R32G32_UINT": ("R16G16_UINT", 4),
+            "R32G32B32A32_UINT": ("R16G16B16A16_UINT", 8),
+            "R32_SINT": ("R16_SINT", 2),
+            "R32G32_SINT": ("R16G16_SINT", 4),
+            "R32G32B32A32_SINT": ("R16G16B16A16_SINT", 8),
+        }
 
         changed = False
         for element in self.D3D11ElementList:
             if str(getattr(element, "SemanticName", "") or "").upper() != "BLENDINDICES":
                 continue
             current_format = str(getattr(element, "Format", "") or "").upper()
-            # R16/R32 系已经能无损承载全局骨骼编号；必须保留通道数和真实布局，导出端
-            # 会按最终格式生成 ElementFormat，不能把 16 字节数据伪装成 R16。
-            if current_format.startswith("R16") or current_format.startswith("R32"):
+            # R16 系已是合并骨架的最终布局；必须保留通道数和真实布局，不能把
+            # 16 字节数据伪装成 R16（导出缓冲也按 R16 打包，格式与数据一致）。
+            if current_format.startswith("R16"):
                 continue
-            widened = widen_map.get(current_format)
-            if widened is None:
-                raise ValueError(f"不支持升宽的 BLENDINDICES 格式: {current_format}")
-            new_format, new_width = widened
+            if current_format.startswith("R32"):
+                if current_format in {"R32G32B32_UINT", "R32G32B32_SINT"}:
+                    # DXGI 没有 R16G16B16_UINT/SINT。旧逻辑会构造这个不存在的
+                    # ElementFormat，直到运行时才失败；不能把三通道 R32 假装降宽。
+                    raise ValueError(
+                        "三通道 R32 BLENDINDICES 无法归一化为有效的 R16 DXGI 格式: "
+                        f"{current_format}"
+                    )
+                downcasted = downcast_map.get(current_format)
+                if downcasted is None:
+                    # R32 非整数格式（*_FLOAT 等）不是骨骼索引语义，按旧行为保留
+                    continue
+                new_format, new_width = downcasted
+            else:
+                widened = widen_map.get(current_format)
+                if widened is None:
+                    raise ValueError(f"不支持升宽的 BLENDINDICES 格式: {current_format}")
+                new_format, new_width = widened
             old_width = int(getattr(element, "ByteWidth", 0) or 0)
             if old_width <= 0:
                 continue
@@ -168,7 +200,7 @@ class D3D11GameType:
             element.ByteWidth = new_width
             changed = True
             print(
-                f"[D3D11GameType] BLENDINDICES{element.SemanticIndex} 升宽: "
+                f"[D3D11GameType] BLENDINDICES{element.SemanticIndex} 归一化: "
                 f"{current_format} -> {new_format} (ByteWidth {old_width} -> {new_width})"
             )
 

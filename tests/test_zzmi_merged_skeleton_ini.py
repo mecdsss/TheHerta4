@@ -30,7 +30,9 @@ for package_name in (PKG, f"{PKG}.ui", f"{PKG}.ui.universal", f"{PKG}.common", f
 
 
 class _FakeIniSection:
-    def __init__(self, _section_type):
+    def __init__(self, section_type):
+        self.SectionType = section_type
+        self.SectionName = ""
         self.SectionLineList = []
 
     def append(self, line):
@@ -49,11 +51,22 @@ class _FakeIniBuilder:
 
 
 class _FakeIniSectionType:
+    Constants = "Constants"
+    Present = "Present"
     TextureOverrideIB = "TextureOverrideIB"
     TextureOverrideVB = "TextureOverrideVB"
     TextureOverrideVertexLimitRaise = "TextureOverrideVertexLimitRaise"
     ResourceBuffer = "ResourceBuffer"
     MergedSkeleton = "MergedSkeleton"
+
+
+def _all_builder_lines(builder):
+    lines = []
+    for section in builder.sections:
+        if section.SectionName:
+            lines.append(f"[{section.SectionName}]")
+        lines.extend(section.SectionLineList)
+    return lines
 
 
 class _FakeExportUnity:
@@ -291,12 +304,18 @@ class _FakeDrawIBModel:
         self.draw_number = 4643
         self.vertex_limit_hash = "dd9c8d5e"
         self.d3d11GameType = _FakeGameType()
+        # 游戏类型桩使用类属性作为默认值；每个 DrawIB 必须复制布局字典，
+        # 否则异构 BI4/BI16 回归测试会互相污染。
+        self.d3d11GameType.CategoryStrideDict = dict(
+            _FakeGameType.CategoryStrideDict
+        )
         self.category_hash_dict = {
             "Position": "122883aa",
             "Texcoord": "5c0fefda",
             "Blend": "bf543990",
         }
         self.submesh_model_list = submesh_model_list
+        self.category_buffer_dict = {}
         self.match_first_index_partname_dict = part_map or {}
         self.submesh_ib_dict = {
             submesh.unique_str: b"\x00\x00\x00\x00" for submesh in submesh_model_list
@@ -393,7 +412,7 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
             exporter.merged_skeleton_component_id_dict = {}
         builder = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder, model)
-        lines = builder.sections[0].SectionLineList
+        lines = _all_builder_lines(builder)
         return lines
 
     def test_vb_section_injects_copy_and_swap(self):
@@ -431,7 +450,7 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         )
         builder = _FakeIniBuilder()
         exporter.add_merged_skeleton_sections(builder)
-        lines = builder.sections[0].SectionLineList
+        lines = _all_builder_lines(builder)
         text = "\n".join(lines)
 
         self.assertIn("global $zz_ms_seen_c0 = 0", text)
@@ -493,7 +512,7 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         )
         builder = _FakeIniBuilder()
         exporter.add_merged_skeleton_sections(builder)
-        lines = builder.sections[0].SectionLineList
+        lines = _all_builder_lines(builder)
         text = "\n".join(lines)
 
         self.assertIn("[ResourceZZMergedSkeleton_G0]", text)
@@ -550,7 +569,7 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         # [Present] 只清理标记，不重放 attach。
         builder = _FakeIniBuilder()
         exporter.add_merged_skeleton_sections(builder)
-        present_text = "\n".join(builder.sections[0].SectionLineList).split("[Present]")[1]
+        present_text = "\n".join(_all_builder_lines(builder)).split("[Present]")[1]
         self.assertNotIn("run = CustomShaderZZMIMergedSkeletonAttach_", present_text)
         self.assertIn("$zz_ms_seen_c0 = 0", present_text)
         self.assertIn("$zz_ms_seen_c1 = 0", present_text)
@@ -574,7 +593,7 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         )
         builder = _FakeIniBuilder()
         exporter.add_merged_skeleton_sections(builder)
-        text = "\n".join(builder.sections[0].SectionLineList)
+        text = "\n".join(_all_builder_lines(builder))
 
         self.assertIn("array = 51", text)  # max(0+11, 31+20) = 51，而非 sum=31
 
@@ -622,7 +641,7 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         )
         builder = _FakeIniBuilder()
         exporter.add_merged_skeleton_sections(builder)
-        text = "\n".join(builder.sections[0].SectionLineList)
+        text = "\n".join(_all_builder_lines(builder))
 
         self.assertIn("[ResourceZZMergedSkeleton_G4]", text)
         self.assertEqual(text.count("[ResourceZZMergedSkeleton_G4]"), 1)
@@ -654,7 +673,7 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         )
         builder = _FakeIniBuilder()
         exporter.add_merged_skeleton_sections(builder)
-        text = "\n".join(builder.sections[0].SectionLineList)
+        text = "\n".join(_all_builder_lines(builder))
 
         self.assertIn("y1 = 513", text)
         self.assertIn("Dispatch = 9, 1, 1", text)
@@ -1190,9 +1209,10 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         self.assertEqual(target_map["a23aa8a3"]["target_own_vertices"], 3)
         self.assertEqual(target_map["a23aa8a3"]["deform_draws"],
                          [
-                             ("Resourcea23aa8a3Position", "Resourcea23aa8a3Blend", 3),
                              ("Resourceb20f90eaPosition", "Resourceb20f90eaBlend", 18776),
                          ])
+        self.assertFalse(target_map["a23aa8a3"]["target_has_real_geometry"])
+        self.assertEqual(target_map["a23aa8a3"]["so_owner_ib"], "b20f90ea")
         self.assertEqual(unredirected, {})
         # 已自动重定向 -> 不再报警
         out = self._capture_stdout(lambda: exporter._warn_merged_mesh_timing(unredirected))
@@ -1296,12 +1316,11 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         builder_a = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder_a, models[1])
         text_a = "\n".join(builder_a.sections[0].SectionLineList)
-        # target（a23aa8a3）：attach C0 + 绑定 carrier buffer + draw 合并网格
+        # target（a23aa8a3）：attach C0；纯占位 target 不再捕获/重放自己的 3 顶点
         self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C0", text_a)
         self.assertIn("vb2 = Resourceb20f90eaBlend", text_a)
         self.assertIn("vb0 = Resourceb20f90eaPosition", text_a)
         self.assertIn("draw = 18776, 0", text_a)
-        self.assertIn("ResourceZZRedirectSO_a23aa8a3 = ref so0", text_a)
         self.assertIn("so0 = ref ResourceZZRedirectSO_a23aa8a3", text_a)
 
         # 未参与重定向的 b30db54e 保持原样
@@ -1310,9 +1329,8 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         text_c = "\n".join(builder_c.sections[0].SectionLineList)
         self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C2", text_c)
         self.assertIn("draw = 4643, 0", text_c)
-        # b30 本身保持原 draw；若它是最后到达的依赖挂点，guarded replay 仍须
-        # 先把 target 的 3 个 stub 顶点写进 RedirectSO，再追加 carrier。
-        self.assertIn("vb0 = Resourcea23aa8a3Position\n    draw = 3, 0", text_c)
+        # b30 本身保持原 draw；它不是本计划的兼容挂点，不应执行重放。
+        self.assertNotIn("Resourcea23aa8a3Position", text_c)
         self.assertIn("so0 = ref ResourceZZRedirectSO_a23aa8a3", text_c)
 
     def test_redirect_draw_waits_for_dependencies_in_both_frame_orders(self):
@@ -1340,8 +1358,8 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
             "b20f90ea",
         )
 
-    def test_redirect_dependencies_always_include_target_component(self):
-        """即使 carrier 只引用其它 carrier 的骨骼，target SO 也必须先捕获。"""
+    def test_redirect_dependencies_omit_stub_target_when_not_referenced(self):
+        """纯占位 target 且 carrier 未引用其骨骼时，不应阻塞兼容 carrier。"""
         exporter, _models = self._group3_exporter()
         # b20f90ea 的合并几何改为引用自身 + b30db54e，故旧实现不会把
         # a23aa8a3(target) 加入 required_component_ids。
@@ -1349,7 +1367,65 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         _carrier_map, target_map, _unredirected = self._build_and_apply_plan(exporter)
         required = set(target_map["a23aa8a3"]["required_component_ids"])
         target_component_id = exporter.merged_skeleton_component_id_dict["a23aa8a3"]
-        self.assertIn(target_component_id, required)
+        self.assertNotIn(target_component_id, required)
+
+    def test_redirect_does_not_use_incompatible_stub_target_as_host(self):
+        """BI4 的占位 target 即使依赖齐全，也不能执行 BI16 carrier 重放。"""
+        exporter, models = self._group3_exporter()
+        models[1].d3d11GameType.CategoryStrideDict["Blend"] = 4
+        _carrier_map, target_map, _unredirected = self._build_and_apply_plan(exporter)
+
+        target_component_id = exporter.merged_skeleton_component_id_dict["a23aa8a3"]
+        carrier_component_id = exporter.merged_skeleton_component_id_dict["b20f90ea"]
+        self.assertNotIn(target_component_id, target_map["a23aa8a3"]["compatible_component_ids"])
+        self.assertIn(carrier_component_id, target_map["a23aa8a3"]["compatible_component_ids"])
+
+        builder_target = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vb_sections(builder_target, models[1])
+        text_target = "\n".join(builder_target.sections[0].SectionLineList)
+        self.assertNotIn("ResourceZZRedirectSO_a23aa8a3 = ref so0", text_target)
+        self.assertNotIn("$zz_ms_redirect_drawn_a23aa8a3 == 0", text_target)
+
+        builder_carrier = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vb_sections(builder_carrier, models[0])
+        text_carrier = "\n".join(builder_carrier.sections[0].SectionLineList)
+        self.assertIn("ResourceZZRedirectSO_a23aa8a3 = ref so0", text_carrier)
+        self.assertIn("draw = 18776, 0", text_carrier)
+
+    def test_real_target_with_incompatible_blend_layout_is_not_redirected(self):
+        """真实 target 与 carrier 的 Blend 布局不同，不能把整段重放伪装成兼容。"""
+        exporter, models = self._group3_exporter(
+            target_real_vertices=12314,
+            target_registered=True,
+        )
+        models[1].d3d11GameType.CategoryStrideDict["Blend"] = 4
+
+        carrier_map, target_map, unredirected = self._build_and_apply_plan(exporter)
+
+        self.assertEqual(carrier_map, {})
+        self.assertEqual(target_map, {})
+        self.assertEqual(
+            unredirected["b20f90ea"]["reason"],
+            "incompatible-blend-layout",
+        )
+        warning = self._capture_stdout(lambda: exporter._warn_merged_mesh_timing(unredirected))
+        self.assertIn("Blend 输入布局不兼容", warning)
+
+    def test_missing_blend_layout_is_not_assumed_compatible(self):
+        """布局元数据缺失时必须显式拒绝，不能让换角色后的未知格式静默重放。"""
+        exporter, models = self._group3_exporter()
+        models[0].d3d11GameType.CategoryStrideDict.pop("Blend")
+
+        carrier_map, target_map, unredirected = self._build_and_apply_plan(exporter)
+
+        self.assertEqual(carrier_map, {})
+        self.assertEqual(target_map, {})
+        self.assertEqual(
+            unredirected["b20f90ea"]["reason"],
+            "missing-blend-layout",
+        )
+        warning = self._capture_stdout(lambda: exporter._warn_merged_mesh_timing(unredirected))
+        self.assertIn("缺少可验证的 Blend 输入布局", warning)
 
     def test_redirect_ib_sections(self):
         """carrier/target 各自保留 render 身份；carrier 只换绑合并 SO，target
@@ -1370,7 +1446,7 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         self.assertIn("hash = b20f90ea", text)
         self.assertIn("vb0 = ResourceZZRedirectSO_a23aa8a3", text)
         self.assertIn("ib = Resource_LOD0.b20f90ea_19182_0_Index", text)
-        self.assertIn("vb1 = Resourceb20f90eaTexcoord", text)
+        self.assertIn("vb1 = ResourceZZRedirectTexcoord_a23aa8a3_b20f90ea_3", text)
         self.assertIn("drawindexed = 69612,0,3", text)
         self.assertIn("; [mesh:LOD0.b20f90ea-19182-0]", text)
         # carrier 的原 render draw 被 IB 级 skip 抑制
@@ -1380,6 +1456,58 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
         self.assertIn("hash = a23aa8a3", text)
         self.assertIn("ib = Resource_LOD0.a23aa8a3_42759_0_Index", text)
         self.assertNotIn("ib = null", text)
+
+    def test_redirect_texcoord_payload_matches_so_base_vertex(self):
+        """carrier 的 UV 前缀必须与 RedirectSO 的 base_vertex 完全相同。"""
+        submesh = self._attach_drawcalls(
+            _FakeSubmesh("LOD0.b20f90ea-19182-0", 184, 51, exported_vertex_count=5)
+        )
+        model = _FakeDrawIBModel("b20f90ea", [submesh])
+        source_bytes = bytes(range(5 * 20))
+        model.category_buffer_dict["Texcoord"] = source_bytes
+        exporter = self._make_exporter([model], self._group3_components())
+
+        payload, stride = exporter._build_redirect_texcoord_payload(
+            "b20f90ea",
+            {"target": "a23aa8a3", "base_vertex": 3, "vertex_count": 5},
+        )
+
+        self.assertEqual(stride, 20)
+        self.assertEqual(payload[: 3 * stride], b"\x00" * (3 * stride))
+        self.assertEqual(payload[3 * stride :], source_bytes)
+
+    def test_redirect_texcoord_resource_is_declared_and_written(self):
+        submesh = self._attach_drawcalls(
+            _FakeSubmesh("LOD0.b20f90ea-19182-0", 184, 51, exported_vertex_count=5)
+        )
+        model = _FakeDrawIBModel("b20f90ea", [submesh])
+        source_bytes = bytes(range(5 * 20))
+        model.category_buffer_dict["Texcoord"] = source_bytes
+        exporter = self._make_exporter([model], self._group3_components())
+        exporter._redirect_carrier_map = {
+            "b20f90ea": {
+                "target": "a23aa8a3",
+                "base_vertex": 3,
+                "vertex_count": 5,
+            }
+        }
+        exporter._redirect_target_map = {
+            "a23aa8a3": {"so_stride": 40}
+        }
+
+        builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(builder)
+        text = "\n".join(
+            line for section in builder.sections for line in section.SectionLineList
+        )
+        filename = "zz_redirect_texcoord_a23aa8a3_b20f90ea_3.buf"
+        self.assertIn(
+            "[ResourceZZRedirectTexcoord_a23aa8a3_b20f90ea_3]", text
+        )
+        self.assertIn("stride = 20", text)
+        self.assertIn(f"filename = Meshes/{filename}", text)
+        payload = (Path(_FAKE_MOD_FOLDER) / "Meshes" / filename).read_bytes()
+        self.assertEqual(payload, (b"\x00" * (3 * 20)) + source_bytes)
 
     def test_redirect_keeps_each_submesh_first_index(self):
         """同一 DrawIB 的多个子网格不能共用 target 首索引，否则会再次串台。"""
@@ -1415,14 +1543,14 @@ class ZZSIMergedMeshRedirectTests(unittest.TestCase):
             )
 
     def test_redirect_vlr_section(self):
-        """VertexLimitRaise：carrier = 3（stub SO），target = SO 总大小。"""
+        """VertexLimitRaise：纯占位 target 的 SO 由 carrier 拥有并声明总容量。"""
         exporter, models = self._group3_exporter()
         self._build_and_apply_plan(exporter)
 
         builder_b = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vlr_section(builder_b, models[0])
         text_b = "\n".join(builder_b.sections[0].SectionLineList)
-        self.assertIn("override_vertex_count = 3", text_b)
+        self.assertIn("override_vertex_count = 18779", text_b)
 
         builder_a = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vlr_section(builder_a, models[1])
