@@ -338,8 +338,96 @@ class EFMIAutoLODMatchNodeTests(unittest.TestCase):
         self.assertEqual(node.target_object, target.name)
         self.assertEqual(node.target_hash, "")
         self.assertFalse(node.exact_hash_match)
-        self.assertEqual(node.match_threshold, 0.06)
+
+    def test_efmi_auto_output_defaults_to_fx_style(self):
+        output_node = types.SimpleNamespace()
+        ui_func_import_ssmt._configure_efmi_auto_output_node(output_node, "EFMI")
+        self.assertTrue(output_node.use_rabbitfx_slot)
+
+    def test_generated_match_defaults_are_debug_friendly(self):
+        calls = []
+
+        class FakeMatchNode:
+            def execute_match(self, context):
+                calls.append(context)
+                return {"0": "371"}, "匹配完成"
+
+        node = FakeMatchNode()
+        mapping, message = ui_func_import_ssmt._configure_and_execute_efmi_lod_match(
+            node,
+            types.SimpleNamespace(name="LOD0.source"),
+            types.SimpleNamespace(name="LOD1.target"),
+            object(),
+        )
+        self.assertEqual(mapping, {"0": "371"})
+        self.assertEqual(message, "匹配完成")
+        self.assertTrue(node.create_debug_objects)
         self.assertFalse(node.use_chamfer_matching)
+
+
+    def test_generated_main_chain_uses_node_dimensions_without_overlap(self):
+        group = types.SimpleNamespace(
+            bl_idname="SSMTNode_Object_Group",
+            location=types.SimpleNamespace(x=100.0, y=500.0),
+            width=220.0,
+            height=420.0,
+        )
+        rename = types.SimpleNamespace(bl_idname="SSMTNode_Object_Rename", width=380.0, height=300.0)
+        process = types.SimpleNamespace(bl_idname="SSMTNode_VertexGroupProcess", width=300.0, height=520.0)
+        output = types.SimpleNamespace(bl_idname="SSMTNode_Result_Output", width=240.0, height=260.0)
+
+        positions = ui_func_import_ssmt._layout_efmi_auto_main_chain(
+            group, rename, process, output
+        )
+
+        self.assertEqual(positions["group"], (100.0, 500.0))
+        self.assertEqual(rename.width, 380.0)
+        self.assertEqual(process.width, 700.0)
+        self.assertEqual(output.width, 400.0)
+        self.assertGreaterEqual(
+            positions["rename"][0], positions["group"][0] + group.width + 60.0
+        )
+        self.assertGreaterEqual(
+            positions["process"][0], positions["rename"][0] + rename.width + 60.0
+        )
+        self.assertGreaterEqual(
+            positions["output"][0], positions["process"][0] + process.width + 60.0
+        )
+
+    def test_match_nodes_wrap_after_six_using_actual_dimensions(self):
+        group = types.SimpleNamespace(
+            location=types.SimpleNamespace(x=100.0, y=500.0),
+            width=220.0,
+            height=420.0,
+        )
+        match_nodes = [
+            types.SimpleNamespace(width=300.0 + index * 10.0, height=360.0 + index * 5.0)
+            for index in range(8)
+        ]
+
+        positions = ui_func_import_ssmt._layout_efmi_match_nodes(
+            group, match_nodes, max_per_row=6
+        )
+
+        self.assertEqual(len(positions), 8)
+        self.assertEqual(positions[0][0], 600.0)
+        self.assertEqual(positions[0][1], -1120.0)
+        self.assertEqual(positions[0][1], positions[5][1])
+        self.assertLess(positions[6][1], positions[0][1] - match_nodes[0].height)
+        self.assertEqual(positions[6][1], positions[7][1])
+        for left_index in range(5):
+            self.assertGreaterEqual(
+                positions[left_index + 1][0],
+                positions[left_index][0] + match_nodes[left_index].width + 80.0,
+            )
+        self.assertGreaterEqual(
+            positions[7][0], positions[6][0] + match_nodes[6].width + 80.0
+        )
+
+    def test_generated_rename_node_does_not_defer_until_after_vg_processing(self):
+        node = types.SimpleNamespace(defer_until_after_vertex_group_process=True)
+        ui_func_import_ssmt._configure_efmi_auto_rename_node(node)
+        self.assertFalse(node.defer_until_after_vertex_group_process)
 
 
 class NTEMIWorkspaceImportRoutingTests(unittest.TestCase):

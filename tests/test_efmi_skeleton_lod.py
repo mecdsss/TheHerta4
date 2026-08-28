@@ -357,6 +357,21 @@ def _make_submesh_geo(workspace, lod, bare, positions):
     return f"{lod}.{bare}"
 
 
+def _make_cpu_submesh(workspace, lod, bare):
+    """构造一个 CPU/无顶点组子网格 json（无 Blend 类别，GPU-PreSkinning=False）。
+
+    与 GPU 子网格的差异就是"没有可参与蒙皮合并的顶点组"：import 侧仍把它
+    作为静态网格导入，只是不生成 VGMap/骨骼槽位。
+    """
+    type_dir = workspace / lod / bare / ("TYPE_" + GAMETYPE)
+    type_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(type_dir / f"{bare}.json", {
+        "GamePreset": "EFMI",
+        "GPU-PreSkinning": False,
+    })
+    return f"{lod}.{bare}"
+
+
 class MultiLodBuildTests(unittest.TestCase):
     """构建端 e2e：两个 LOD 各自用自己的 dump，LOD1 复用 LOD0 分区。"""
 
@@ -1570,6 +1585,326 @@ class ProjectionImportFilterTests(unittest.TestCase):
         )
         self.assertTrue(ok2, message2)
         self.assertIn("无需重新生成", message2)
+
+
+class CpuProjectionAdjudicationTests(unittest.TestCase):
+    """CPU/无顶点组非基准 LOD 对象的投影裁决（契约 T3/T4/T5）。
+
+    归档实况（F8/F10/F11）：68 个 LOD1 CPU 目标（GPU-PreSkinning=False、无
+    VGMap、无跳过标记）全部绕过 LOD0 几何匹配裁决并被错误导入；32 个 GPU
+    unknown 被拦截。本组用例把 CPU 目标放进与 GPU 同等的 LOD0 裁决——
+    CPU 无顶点组/骨骼候选无法进入点云配对，几何对应证据退化为 draw IB
+    是否在基准侧同现：
+    - 未匹配（IB 不在 LOD0）-> EFMILODProjectionSkipped、无 VGMap、导入侧排除；
+    - 匹配成功（同 IB 同现）-> EFMILODProjectionMatched、无 VGMap、导入侧放行；
+    - 缺状态（旧缓存既无 VGMap 也无裁决标记）-> 导入侧 fail-closed 默认排除。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="efmi_cpu_proj_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.dump_a = _make_dump(
+            Path(self.tmp) / "dumpA", "000100", CB_HASH, T0_HASH_A, 1.5
+        )
+        self.dump_b = _make_dump_multi(
+            Path(self.tmp) / "dumpB",
+            [
+                ("000200", CB_HASH_B, T0_HASH_B, 2.5),
+                ("000300", "eeee6666", "ffff7777", 3.5),
+            ],
+        )
+        self.ws = _make_workspace(self.tmp, self.dump_a, self.dump_b)
+        self.u_lod0 = _make_submesh_geo(
+            self.ws, "LOD0", "aaaabbbb-100-0",
+            [(0.0, 0.0, 0.0), (0.05, 0.0, 0.0)],
+        )
+        self.u_match = _make_submesh_geo(
+            self.ws, "LOD1", "ccccdddd-200-0",
+            [(0.0, 0.0, 0.0), (0.05, 0.0, 0.0)],
+        )
+        self.u_gpu_unknown = _make_submesh_geo(
+            self.ws, "LOD1", "eeeeffff-300-0",
+            [(5.0, 0.0, 0.0), (5.05, 0.0, 0.0)],
+        )
+        _write_json(self.ws / "Import.json", {
+            self.u_lod0: GAMETYPE, self.u_match: GAMETYPE, self.u_gpu_unknown: GAMETYPE,
+        })
+        _write_json(self.ws / "LOD0" / "ComponentName_DrawCallIndexList.json",
+                    {"aaaabbbb-100-0": ["000100"]})
+        _write_json(self.ws / "LOD1" / "ComponentName_DrawCallIndexList.json",
+                    {"ccccdddd-200-0": ["000200"], "eeeeffff-300-0": ["000300"]})
+
+    def _read_submesh_json(self, lod, bare):
+        for type_dir in (self.ws / lod / bare).iterdir():
+            if type_dir.is_dir() and type_dir.name.startswith("TYPE_"):
+                return json.loads((type_dir / f"{bare}.json").read_text(encoding="utf-8"))
+        return None
+
+    def test_cpu_lod1_unmatched_is_skipped_by_projection(self):
+        """T3：LOD1 CPU 与 LOD0 无同 IB 几何对应 → 写跳过标记、无 VGMap、导入侧排除。"""
+        cpu_unknown = _make_cpu_submesh(self.ws, "LOD1", "eeeeffff-600-0")
+        cpu_unknown2 = _make_cpu_submesh(self.ws, "LOD1", "11119999-700-0")
+        _write_json(self.ws / "Import.json", {
+            self.u_lod0: GAMETYPE, self.u_match: GAMETYPE, self.u_gpu_unknown: GAMETYPE,
+            cpu_unknown: GAMETYPE, cpu_unknown2: GAMETYPE,
+        })
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_match, self.u_gpu_unknown,
+                             cpu_unknown, cpu_unknown2],
+        )
+        self.assertTrue(ok, message)
+
+        for bare in ("eeeeffff-600-0", "11119999-700-0"):
+            payload = self._read_submesh_json("LOD1", bare)
+            self.assertIsNone(payload.get("VGMap"), f"{bare} 不得生成 VGMap")
+            self.assertIsNone(payload.get("VGCount"))
+            self.assertIsNone(payload.get("VGOffset"))
+            self.assertTrue(payload.get("EFMILODProjectionSkipped"),
+                            f"{bare} 应写投影未匹配标记")
+            self.assertEqual(payload.get("EFMILODReference"), "LOD0")
+            self.assertEqual(payload.get("EFMILODLayoutVersion"),
+                             _efmi._CROSS_LOD_LAYOUT_VERSION)
+            self.assertTrue(payload.get("EFMILODProjection"))
+
+        all_keys = [self.u_lod0, self.u_match, self.u_gpu_unknown,
+                    cpu_unknown, cpu_unknown2]
+        skipped = EFMISkeletonMergeHelper.load_projection_skipped_targets(
+            str(self.ws), all_keys
+        )
+        self.assertEqual(skipped, {self.u_gpu_unknown, cpu_unknown, cpu_unknown2},
+                         "GPU unknown 与 CPU unknown 都必须在导入侧被排除")
+
+        decisions = EFMISkeletonMergeHelper.classify_projection_import_targets(
+            str(self.ws), all_keys
+        )
+        self.assertEqual({k for k, v in decisions.items() if v == "import"},
+                         {self.u_lod0, self.u_match})
+        self.assertEqual(decisions[cpu_unknown], "skip")
+        self.assertEqual(decisions[cpu_unknown2], "skip")
+        self.assertEqual(decisions[self.u_gpu_unknown], "skip")
+
+        # 幂等：二次运行（联合缓存快路径）不改变 CPU 裁决标记
+        ok2, message2 = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_match, self.u_gpu_unknown,
+                             cpu_unknown, cpu_unknown2],
+        )
+        self.assertTrue(ok2, message2)
+        for bare in ("eeeeffff-600-0", "11119999-700-0"):
+            payload = self._read_submesh_json("LOD1", bare)
+            self.assertTrue(payload.get("EFMILODProjectionSkipped"), f"{bare} 幂等保持")
+
+    def test_cpu_lod1_matched_by_same_ib_is_importable(self):
+        """T4：LOD1 CPU 与 LOD0 同 IB（同现组件）→ 明确匹配成功、无 VGMap、导入侧放行。"""
+        cpu_same_ib = _make_cpu_submesh(self.ws, "LOD1", "aaaabbbb-100-0")
+        _write_json(self.ws / "Import.json", {
+            self.u_lod0: GAMETYPE, self.u_match: GAMETYPE, self.u_gpu_unknown: GAMETYPE,
+            cpu_same_ib: GAMETYPE,
+        })
+        all_keys = [self.u_lod0, self.u_match, self.u_gpu_unknown, cpu_same_ib]
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=all_keys,
+        )
+        self.assertTrue(ok, message)
+
+        payload = self._read_submesh_json("LOD1", "aaaabbbb-100-0")
+        self.assertIsNone(payload.get("VGMap"), "CPU 匹配成功也不得生成 VGMap")
+        self.assertIsNone(payload.get("VGCount"))
+        self.assertIsNone(payload.get("VGOffset"))
+        self.assertTrue(payload.get("EFMILODProjectionMatched"),
+                        "CPU 匹配成功应写明确匹配成功标记")
+        self.assertIsNone(payload.get("EFMILODProjectionSkipped"))
+        self.assertEqual(payload.get("EFMILODReference"), "LOD0")
+        self.assertEqual(payload.get("EFMILODLayoutVersion"),
+                         _efmi._CROSS_LOD_LAYOUT_VERSION)
+        self.assertTrue(payload.get("EFMILODProjection"))
+
+        decisions = EFMISkeletonMergeHelper.classify_projection_import_targets(
+            str(self.ws), all_keys
+        )
+        self.assertEqual(decisions[cpu_same_ib], "import", "CPU 匹配成功应放行导入")
+        skipped = EFMISkeletonMergeHelper.load_projection_skipped_targets(
+            str(self.ws), all_keys
+        )
+        self.assertNotIn(cpu_same_ib, skipped)
+
+        # CPU 匹配目标没有顶点组/账本，不进入自动匹配链配对（GL 对照仍配对）
+        pairs = EFMISkeletonMergeHelper.load_lod_match_pairs(str(self.ws), all_keys)
+        self.assertEqual([pair["target_key"] for pair in pairs], [self.u_match])
+
+    def test_cpu_lod1_missing_state_is_fail_closed(self):
+        """T5：投影模式下 LOD1 CPU 既无 VGMap 也无裁决标记（旧缓存/半成品）→ 默认排除。"""
+        cpu_stale = _make_cpu_submesh(self.ws, "LOD1", "99990000-800-0")
+        all_keys = [self.u_lod0, self.u_match, cpu_stale]
+        _write_json(self.ws / "Import.json", {
+            self.u_lod0: GAMETYPE, self.u_match: GAMETYPE, cpu_stale: GAMETYPE,
+        })
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=all_keys,
+        )
+        self.assertTrue(ok, message)
+
+        # 旧缓存/半成品仿真：裁决后人为清掉 CPU 目标的标记与版本键，
+        # 模拟从未经过本轮裁决的遗留 json（C4：旧缓存不会自动补标记）。
+        stale_json_path = EFMISkeletonMergeHelper._resolve_submesh_json_path(
+            str(self.ws), cpu_stale
+        )
+        payload = json.loads(Path(stale_json_path).read_text(encoding="utf-8"))
+        payload.pop("EFMILODProjectionSkipped", None)
+        payload.pop("EFMILODProjectionMatched", None)
+        payload.pop("EFMILODLayoutVersion", None)
+        payload.pop("EFMILODProjection", None)
+        _write_json(Path(stale_json_path), payload)
+
+        decisions = EFMISkeletonMergeHelper.classify_projection_import_targets(
+            str(self.ws), all_keys
+        )
+        self.assertEqual(decisions[cpu_stale], "fail_closed",
+                         "缺状态的旧缓存不得默认导入（C4 fail-closed）")
+        self.assertEqual(decisions[self.u_lod0], "import", "基准 LOD 行为不变")
+        self.assertEqual(decisions[self.u_match], "import", "匹配 GPU 仍导入")
+
+    def test_import_filter_whitelist_semantics_reproduce_68_cpu_case(self):
+        """归档 68 CPU 实况复现：无对应 CPU 全部排除，匹配/基准/GPU 对照照常。"""
+        cpu_unknown = _make_cpu_submesh(self.ws, "LOD1", "eeeeffff-600-0")
+        cpu_unknown2 = _make_cpu_submesh(self.ws, "LOD1", "11119999-700-0")
+        cpu_same_ib = _make_cpu_submesh(self.ws, "LOD1", "aaaabbbb-100-0")
+        all_keys = [self.u_lod0, self.u_match, self.u_gpu_unknown,
+                    cpu_unknown, cpu_unknown2, cpu_same_ib]
+        _write_json(self.ws / "Import.json", {k: GAMETYPE for k in all_keys})
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=all_keys,
+        )
+        self.assertTrue(ok, message)
+
+        decisions = EFMISkeletonMergeHelper.classify_projection_import_targets(
+            str(self.ws), all_keys
+        )
+        importable = sorted(k for k, v in decisions.items() if v == "import")
+        self.assertEqual(importable, sorted([self.u_lod0, self.u_match, cpu_same_ib]),
+                         "只有基准/匹配 GPU/匹配 CPU 放行")
+        self.assertEqual(decisions[cpu_unknown], "skip")
+        self.assertEqual(decisions[cpu_unknown2], "skip")
+        self.assertEqual(decisions[self.u_gpu_unknown], "skip")
+
+        # 旧过滤（纯黑名单）漏过的正是这批缺标记的 CPU；新裁决全部有明确状态
+        skipped = EFMISkeletonMergeHelper.load_projection_skipped_targets(
+            str(self.ws), all_keys
+        )
+        self.assertEqual(skipped, {self.u_gpu_unknown, cpu_unknown, cpu_unknown2})
+
+    def test_all_cpu_workspace_adjudicates_non_baseline_by_ib(self):
+        """全 CPU 工作空间：LOD1 CPU 按 LOD0 CPU 的 IB 同现裁决（groups 为空路径）。"""
+        cpu_lod0 = _make_cpu_submesh(self.ws, "LOD0", "ddddaaaa-100-0")
+        cpu_same_ib = _make_cpu_submesh(self.ws, "LOD1", "ddddaaaa-100-0")
+        cpu_unknown = _make_cpu_submesh(self.ws, "LOD1", "eeeeffff-600-0")
+        all_keys = [cpu_lod0, cpu_same_ib, cpu_unknown]
+        _write_json(self.ws / "Import.json", {k: GAMETYPE for k in all_keys})
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=all_keys,
+        )
+        self.assertTrue(ok, message)
+
+        same_payload = self._read_submesh_json("LOD1", "ddddaaaa-100-0")
+        self.assertTrue(same_payload.get("EFMILODProjectionMatched"),
+                        "与 LOD0 CPU 同 IB 的 LOD1 CPU 应匹配成功")
+        self.assertIsNone(same_payload.get("VGMap"))
+        unknown_payload = self._read_submesh_json("LOD1", "eeeeffff-600-0")
+        self.assertTrue(unknown_payload.get("EFMILODProjectionSkipped"))
+        self.assertIsNone(unknown_payload.get("VGMap"))
+
+        decisions = EFMISkeletonMergeHelper.classify_projection_import_targets(
+            str(self.ws), all_keys
+        )
+        self.assertEqual({k for k, v in decisions.items() if v == "import"},
+                         {cpu_lod0, cpu_same_ib})
+        self.assertEqual(decisions[cpu_unknown], "skip")
+
+    def test_project_whitelist_applies_when_ensure_fails(self):
+        """T5 变体（review round 2）：ensure 失败路径白名单仍生效。
+
+        裁决标记在 ensure 内部任何失败点之前写入——即使 GPU 构建失败使
+        ensure 返回 False（回退普通导入），导入侧白名单仍能依 json 标记
+        排除 CPU unknown（skip）与缺状态目标（fail_closed），放行匹配成功者。
+        """
+        # 构造 ensure 失败：LOD1 目标 json 缺失（子网格目录不存在）→ 无法收集、
+        # 无法写标记 → 保持未处理 → ensure 返回 False。
+        broken = "LOD1.ccccdddd-999-0"
+        cpu_unknown = _make_cpu_submesh(self.ws, "LOD1", "eeeeffff-600-0")
+        cpu_same_ib = _make_cpu_submesh(self.ws, "LOD1", "aaaabbbb-100-0")
+        all_keys = [self.u_lod0, self.u_match, broken, cpu_unknown, cpu_same_ib]
+        _write_json(self.ws / "Import.json", {k: GAMETYPE for k in all_keys})
+
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=all_keys,
+        )
+        self.assertFalse(ok, "broken 目标不可生成应使 ensure 失败")
+        self.assertIn("未生成骨骼数据", message)
+
+        # CPU 裁决标记先于失败点写入（T5 变体的数据前提）
+        unknown_payload = self._read_submesh_json("LOD1", "eeeeffff-600-0")
+        self.assertTrue(unknown_payload.get("EFMILODProjectionSkipped"))
+        self.assertIsNone(unknown_payload.get("VGMap"))
+        matched_payload = self._read_submesh_json("LOD1", "aaaabbbb-100-0")
+        self.assertTrue(matched_payload.get("EFMILODProjectionMatched"))
+        self.assertIsNone(matched_payload.get("VGMap"))
+
+        # 白名单仍生效：只有 基准/匹配 GPU/匹配 CPU 放行
+        decisions = EFMISkeletonMergeHelper.classify_projection_import_targets(
+            str(self.ws), all_keys
+        )
+        importable = {k for k, v in decisions.items() if v == "import"}
+        self.assertEqual(importable, {self.u_lod0, self.u_match, cpu_same_ib})
+        self.assertEqual(decisions[cpu_unknown], "skip")
+        self.assertEqual(decisions[broken], "fail_closed")
+
+    def test_fallback_reference_matches_classify_for_lod1_only(self):
+        """兜底基准判定与 classify 同口径（reference_lod 推导）。
+
+        ui_func_import_ssmt._projection_fail_closed_decisions 与
+        classify_projection_import_targets 使用同一基准规则：reference_lod =
+        'LOD0'（请求中存在时）否则按字典序首个 LOD；无 LOD 前缀目标不受
+        投影约束。LOD1-only 工作空间 → 基准即 LOD1、全部放行（兜底与主路径
+        不分裂）；LOD0 存在时无状态的非基准目标 fail-closed。
+        """
+        keys_lod1_only = ["LOD1.aaaa1111-1-0", "LOD1.bbbb2222-2-0"]
+        self.assertEqual(
+            EFMISkeletonMergeHelper.classify_projection_import_targets(
+                str(self.ws), keys_lod1_only
+            ),
+            {k: "import" for k in keys_lod1_only},
+        )
+        self.assertEqual(
+            EFMISkeletonMergeHelper.classify_projection_import_targets(
+                str(self.ws), ["bare-no-lod-1-0"]
+            ),
+            {"bare-no-lod-1-0": "import"},
+        )
+        keys_mixed = ["LOD0.aaaa1111-1-0", "LOD1.bbbb2222-2-0", "LOD1.cccc3333-3-0"]
+        decisions = EFMISkeletonMergeHelper.classify_projection_import_targets(
+            str(self.ws), keys_mixed
+        )
+        self.assertEqual(decisions["LOD0.aaaa1111-1-0"], "import")
+        self.assertEqual(decisions["LOD1.bbbb2222-2-0"], "fail_closed")
+        self.assertEqual(decisions["LOD1.cccc3333-3-0"], "fail_closed")
+
+    def test_cpu_lod1_projection_off_writes_no_marker(self):
+        """C5 对照：关闭分组投影时 CPU 目标保持旧行为（不写裁决标记、不参与过滤）。"""
+        cpu_unknown = _make_cpu_submesh(self.ws, "LOD1", "eeeeffff-600-0")
+        ok, message = EFMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws),
+            unique_str_list=[self.u_lod0, self.u_match, cpu_unknown],
+            lod_group_projection=False,
+        )
+        self.assertTrue(ok, message)
+        payload = self._read_submesh_json("LOD1", "eeeeffff-600-0")
+        self.assertIsNone(payload.get("EFMILODProjectionSkipped"))
+        self.assertIsNone(payload.get("EFMILODProjectionMatched"))
+        self.assertIsNone(payload.get("VGMap"))
+        # 匹配 GPU 在 projection=False 下仍照常生成 VGMap（独立去重路径）
+        match_payload = self._read_submesh_json("LOD1", "ccccdddd-200-0")
+        self.assertEqual(match_payload.get("VGMap"), {"0": 1})
 
 
 if __name__ == "__main__":

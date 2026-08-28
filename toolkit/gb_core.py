@@ -413,6 +413,65 @@ def sampled_field(verts_world, source_positions, source_weights,
     return field
 
 
+def projected_sampled_field(verts_world, source_positions, source_weights,
+                            ball_matrix_world, strength_scale=1.0):
+    """接收侧投影采样场：球内目标顶点取**全源点云**最近源顶点的原始权重。
+
+    与 sampled_field 的差异（预览方向修复）：
+    - sampled_field 要求“目标顶点与源点同时落在球内”（球 = 权重来源范围），
+      源/接收侧不重叠时接收侧场恒为 0 —— GB 会话预览停留在调试物体自身；
+    - 本函数把球退化为“接收区域”：**球内目标顶点才获得权重，权重 = 最近
+      源点权重点**（最近邻在全源点云上做，不要求源点也在球内）。
+      这使“匹配目标对象/合集与源不重叠”时，接收侧也能即时显示非零权重。
+
+    Args:
+        verts_world: (N, 3) 接收侧（目标对象/合集）顶点世界坐标。
+        source_positions: (M, 3) 权重来源侧顶点世界坐标（源点云）。
+        source_weights: (M,) 与 source_positions 对应的原始权重。
+        ball_matrix_world: (4, 4) 球的前向世界矩阵（缩放=半径）。
+        strength_scale: 倍率（默认 1.0 = 原样保留源权重）。
+
+    Returns:
+        (N,) float64 权重：球内接收顶点 = 最近源顶点权重 × 倍率，球外为 0。
+        源点云为空时返回全零。
+    """
+    verts = np.asarray(verts_world, dtype=np.float64).reshape(-1, 3)
+    src_pos = np.asarray(source_positions, dtype=np.float64).reshape(-1, 3)
+    src_w = np.asarray(source_weights, dtype=np.float64).reshape(-1)
+    n = verts.shape[0]
+    if n == 0 or src_pos.shape[0] == 0:
+        return np.zeros(n, dtype=np.float64)
+
+    v_local = _to_ball_local(verts, ball_matrix_world)
+    if v_local is None:
+        return np.zeros(n, dtype=np.float64)
+    s_local = _to_ball_local(src_pos, ball_matrix_world)
+    if s_local is None:
+        return np.zeros(n, dtype=np.float64)
+
+    v_d2 = np.einsum("ij,ij->i", v_local, v_local)
+    # 球 = 接收区域：球内目标顶点（d < 1）才获得权重，球外严格为 0
+    inside = v_d2 < 1.0
+    if not np.any(inside):
+        return np.zeros(n, dtype=np.float64)
+
+    v_idx = np.nonzero(inside)[0]
+    # 最近邻对整个源点云（不限于球内源点），并在**球局部帧**内比较
+    # （diff = v_local - s_local，与 sampled_field 一致；用世界帧混比会因
+    # 平移/旋转/非均匀缩放把最近源归属指错）。
+    nearest = np.empty(v_idx.size, dtype=np.int64)
+    chunk = 512
+    for start in range(0, v_idx.size, chunk):
+        end = min(start + chunk, v_idx.size)
+        diff = v_local[v_idx[start:end], None, :] - s_local[None, :, :]
+        d2 = np.einsum("ijk,ijk->ij", diff, diff)
+        nearest[start:end] = np.argmin(d2, axis=1)
+
+    field = np.zeros(n, dtype=np.float64)
+    field[v_idx] = src_w[nearest] * float(strength_scale)
+    return field
+
+
 def merge_fields_max(fields):
     """多个球的权重场按逐点 max 合并。
 

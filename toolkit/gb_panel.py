@@ -3,6 +3,7 @@
 import bpy
 
 from . import gb_operators
+from . import gb_preview
 
 
 class GB_PT_MainPanel(bpy.types.Panel):
@@ -43,12 +44,18 @@ class GB_PT_MainPanel(bpy.types.Panel):
 
         # 新建入口（始终可用，支持同时开多个不同调试物体的会话）
         box.label(text="选中一个 Source/Target 调试物体开始新会话", icon='QUESTION')
-        box.operator(gb_operators.GB_OT_StartFromDebug.bl_idname,
+        sub = box.column(align=True)
+        sub.prop(props, "start_direction", expand=False)
+        sub.prop(props, "start_create_missing")
+        sub.operator(gb_operators.GB_OT_StartFromDebug.bl_idname,
                      text="从选中调试物体创建高斯球", icon='ADD')
+        sub.label(text="提示: 选中 Target_ 调试物体 + 反向=写回原物体/源合集",
+                  icon='QUESTION')
 
         if running:
             col = box.column(align=True)
             col.prop(props, "normalize_on_confirm")
+            col.prop(props, "clear_outside_on_write")
 
             # 会话列表：勾选 = 参与确认写入；行首图标 = 设为活动会话
             list_box = box.box()
@@ -66,8 +73,9 @@ class GB_PT_MainPanel(bpy.types.Panel):
                     emboss=False)
                 act_op.session_id = session_id
 
-                # 会话标签
-                mode_label = "源→目标" if session.mode == 'source' else "目标自身"
+                # 会话标签（顶点组 + 传递方向 + 球/目标计数）
+                mode_label = gb_preview.direction_label(
+                    session.mode, getattr(session, "direction", ""))
                 row.label(text=f"{session.vg_name} ({mode_label}, "
                                f"{len(session.ball_names)}球/{len(session.targets)}目标)",
                           icon='GROUP_VERTEX')
@@ -79,6 +87,21 @@ class GB_PT_MainPanel(bpy.types.Panel):
                     icon='CHECKBOX_HLT' if session.selected else 'CHECKBOX_DEHLT',
                     emboss=False)
                 sel_op.session_id = session_id
+
+                # 写入对象集合可视化：方向箭头 + 实际将写入的物体名
+                tgt_names = session.target_names()
+                shown = "、".join(tgt_names[:4])
+                if len(tgt_names) > 4:
+                    shown += " 等"
+                if tgt_names:
+                    list_box.label(
+                        text=f"    ↳ 写入: {shown}", icon='RIGHTARROW')
+                # 评估反馈（骨骼/形态键不可用时说明预览与基础网格一致）
+                for tcache in session.targets.values():
+                    if tcache.eval_note:
+                        list_box.label(text=f"    ↪ {tcache.eval_note}",
+                                       icon='INFO')
+                        break
 
             n_sel = len(gb_operators._selected_sessions())
             row = box.row(align=True)
@@ -97,6 +120,8 @@ class GB_PT_MainPanel(bpy.types.Panel):
         row = box.row(align=True)
         row.operator(gb_operators.GB_OT_AddBall.bl_idname,
                      text="添加球", icon='ADD')
+        row.operator(gb_operators.GB_OT_DuplicateBall.bl_idname,
+                     text="复制活动球", icon='DUPLICATE')
         row.operator(gb_operators.GB_OT_RemoveBall.bl_idname,
                      text="删除活动球", icon='REMOVE')
 
@@ -145,18 +170,29 @@ class GB_PT_MainPanel(bpy.types.Panel):
         box.label(text="预览", icon='HIDE_OFF')
         col = box.column(align=True)
         col.prop(props, "heat_opacity", slider=True)
+        col.prop(props, "preview_mode")
+        if props.preview_mode == 'SINGLE':
+            box.label(text="单球贡献：在视口选中球，只看它自己的权重场",
+                      icon='INFO')
         col.prop(props, "tick_interval")
         col.prop(props, "xray_preview")
         col.prop(props, "only_nearest_island")
+        col.prop(props, "use_evaluated_preview")
+        if props.use_evaluated_preview:
+            box.label(text="评估位置=形态键当前值+骨骼当前姿态（depsgraph），"
+                      "顶点数变化自动回退基础网格", icon='INFO')
 
         # 每个会话 × 每个目标的覆盖统计
         sessions = gb_operators._sessions
         for session_id in gb_operators._sorted_sessions():
             session = sessions[session_id]
+            arrow = ("→" if session.direction != "reverse"
+                     else "←")
             for tcache in session.targets.values():
                 if tcache.preview_info:
                     box.label(
-                        text=f"[{session.vg_name} → {tcache.name}] {tcache.preview_info}",
+                        text=f"[{session.vg_name} {arrow} {tcache.name}] "
+                             f"{tcache.preview_info}",
                         icon='INFO')
 
     def _draw_tips(self, layout, context):
@@ -165,10 +201,15 @@ class GB_PT_MainPanel(bpy.types.Panel):
         col = box.column()
         col.scale_y = 0.8
         col.label(text="· 预览为热力图，确认前不写入真实权重；")
+        col.label(text="· 预览默认用形态键+骨骼姿态评估位置（真实热力图），"
+                  "可关回基础网格；")
+        col.label(text="· 组合权重=多球逐点取最大（与写入一致）；单球贡献"
+                  "=只看活动球；")
         col.label(text="· 可同时开多个会话，热力图叠加显示；")
         col.label(text="· 勾选多个会话按勾选顺序依次写入+规格化；")
         col.label(text="· 写入后在球位置生成绿方块(Source)/黄球(Target)；")
-        col.label(text="· v1 用基础网格位置（不含骨骼/形态键变形）。")
+        col.label(text="· 反向(目标→源)写在原物体/源合集上，需显式选择方向；")
+        col.label(text="· 缺组时可勾选'显式创建缺失组'按球范围补权。")
 
 
 gb_panel_list = (

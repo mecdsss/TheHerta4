@@ -450,6 +450,74 @@ class SampledFieldTests(unittest.TestCase):
         self.assertEqual(float(field[0]), 0.0)
 
 
+class ProjectedSampledFieldTests(unittest.TestCase):
+    """接收侧投影采样场（gb_core.projected_sampled_field）。
+
+    预览方向修复（gaussian-preview-target-fix t3）：GB 会话的采样场语义从
+    “球内源点最近邻”（sampled_field，球=权重来源范围）改为“球内目标顶点取
+    **全源点云**最近源点权重”（本函数，球=接收区域）。这让“源侧与接收侧
+    不重叠”时接收侧（目标对象/合集）也能即时显示非零权重——不再停留在源
+    调试物体自身。sampled_field 原样保留（既有 gb_core 语义与测试锁定不动）。
+    """
+
+    def _field(self, target_verts, src_pos, src_w, matrix=None, scale=1.0):
+        if matrix is None:
+            matrix = _identity()
+        return gb_core.projected_sampled_field(
+            target_verts, src_pos, src_w, matrix, strength_scale=scale)
+
+    def test_nonzero_when_source_outside_ball(self):
+        # 回归核心：源点全在球外（源/接收侧不重叠）时，球内目标顶点仍取
+        # 最近源点权重（旧 sampled_field 语义返回全零——预览停留在源调试物体）
+        src_pos = np.array([[5.0, 0.0, 0.0]])
+        src_w = np.array([0.9])
+        verts = np.array([[0.0, 0.0, 0.0]])
+        field = self._field(verts, src_pos, src_w)
+        self.assertAlmostEqual(float(field[0]), 0.9, places=6)
+
+    def test_projection_between_two_source_clusters(self):
+        # 球覆盖空区域、源分居两侧：目标取最近（而非更远但更重）的源点权重
+        src_pos = np.array([[-2.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+        src_w = np.array([0.9, 0.6])
+        verts = np.array([[0.2, 0.0, 0.0]])  # 距 (2,0,0)=1.8 < 距 (-2,0,0)=2.2
+        field = self._field(verts, src_pos, src_w)
+        self.assertAlmostEqual(float(field[0]), 0.6, places=6)
+
+    def test_outside_target_vertices_still_zero(self):
+        # 球仍是接收区域：球外目标顶点严格为 0
+        src_pos = np.array([[0.0, 0.0, 0.0]])
+        src_w = np.array([0.9])
+        verts = np.array([[2.0, 0.0, 0.0], [-1.5, 0.0, 0.0]])
+        field = self._field(verts, src_pos, src_w)
+        np.testing.assert_array_equal(field, np.zeros(2))
+
+    def test_nearest_source_from_full_cloud(self):
+        # 目标取全点云最近源顶点权重（不限于球内源点）
+        src_pos = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        src_w = np.array([0.4, 0.9])
+        verts = np.array([[0.9, 0.0, 0.0]])
+        field = self._field(verts, src_pos, src_w)
+        self.assertAlmostEqual(float(field[0]), 0.9, places=6)
+
+    def test_matches_sampled_when_sources_inside_ball(self):
+        # 重叠场景（源/目标同位）：投影语义与既有 sampled_field 一致（无回归）
+        src_pos = np.array([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
+        src_w = np.array([0.9, 0.3])
+        verts = np.array([[0.05, 0.0, 0.0], [0.45, 0.0, 0.0]])
+        proj = self._field(verts, src_pos, src_w)
+        samp = gb_core.sampled_field(verts, src_pos, src_w, _identity())
+        np.testing.assert_allclose(proj, samp, atol=1e-12)
+
+    def test_strength_scale_and_empty_source(self):
+        src_pos = np.array([[0.0, 0.0, 0.0]])
+        src_w = np.array([0.8])
+        verts = np.array([[0.1, 0.0, 0.0]])
+        self.assertAlmostEqual(
+            float(self._field(verts, src_pos, src_w, scale=0.5)[0]), 0.4, places=6)
+        np.testing.assert_array_equal(
+            self._field(verts, np.zeros((0, 3)), np.zeros(0)), np.zeros(1))
+
+
 class GeodesicFieldTests(unittest.TestCase):
     """沿表面传播（测地）权重场：接触点种子 + Dijkstra 表面距离。"""
 
@@ -605,6 +673,44 @@ class GeodesicFieldTests(unittest.TestCase):
         np.testing.assert_array_equal(gb_core.geodesic_field(verts, far, 1.0, 4.6, edges), np.zeros(10))
         # 零顶点
         self.assertEqual(gb_core.geodesic_field(np.zeros((0, 3)), ball, 1.0, 4.6, edges).shape, (0,))
+
+
+class MultiBallMergeDeterminismTests(unittest.TestCase):
+    """多球组合规则固化（NW3）：max 合并的结果与球顺序无关、确定性。"""
+
+    def test_merge_max_permutation_invariant(self):
+        fields = [
+            np.array([0.1, 0.9, 0.0, 0.3]),
+            np.array([0.5, 0.2, 0.7, 0.3]),
+            np.array([0.4, 0.8, 0.2, 0.0]),
+        ]
+        base = gb_core.merge_fields_max(fields)
+        shuffled = gb_core.merge_fields_max(list(reversed(fields)))
+        np.testing.assert_array_equal(base, shuffled)
+        np.testing.assert_array_equal(base, [0.5, 0.9, 0.7, 0.3])
+
+    def test_merge_max_disjoint_and_overlap_deterministic(self):
+        # 不相交球（互补支撑）+ 重叠区取最大：结果与逐球顺序无关
+        left = np.array([0.8, 0.5, 0.0, 0.0])
+        right = np.array([0.2, 0.6, 0.9, 0.1])
+        a = gb_core.merge_fields_max([left, right])
+        b = gb_core.merge_fields_max([right, left])
+        np.testing.assert_array_equal(a, b)
+        np.testing.assert_array_equal(a, [0.8, 0.6, 0.9, 0.1])
+
+    def test_merge_max_single_enabled_ball_identity(self):
+        field = np.array([0.7, 0.0, 0.4])
+        merged = gb_core.merge_fields_max([field])
+        np.testing.assert_array_equal(merged, field)
+
+    def test_merge_max_matches_maximum_of_all_balls(self):
+        # 多球重叠：任一顶点的组合权重 = 该顶点在所有球上的最大值
+        rng = np.random.default_rng(42)
+        n_verts, n_balls = 64, 5
+        fields = [rng.random(n_verts) for _ in range(n_balls)]
+        merged = gb_core.merge_fields_max(fields)
+        expected = np.maximum.reduce(fields)
+        np.testing.assert_allclose(merged, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

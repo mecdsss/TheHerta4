@@ -38,8 +38,13 @@ v9 投影（LOD1 顶点组引用 LOD0 基准槽位 + 运行时 full→lod BlendR
 LOD0→LOD1 顶点组匹配节点；账本本身不充当物体顶点组映射表。
 几何匹配不成功的 LOD1 部件（未进入部件配对或配对得分超
 _CROSS_LOD_PART_IMPORT_SCORE_LIMIT）不生成 VGMap、json 写入
-EFMILODProjectionSkipped=True，导入侧据此排除。约束、过滤和自动匹配链均由
-lod_group_projection 开关统一控制；关闭后两侧只按各自 dump 独立去重。
+EFMILODProjectionSkipped=True，导入侧据此排除。CPU/无顶点组（GPU-PreSkinning=
+false）子网格不参与骨骼合并，但投影模式下非基准 LOD 的 CPU 目标仍须接受
+LOD0 几何匹配裁决（draw IB 同现判定）：匹配成功写 EFMILODProjectionMatched=True
+（可导入、不生成 VGMap），匹配失败写 EFMILODProjectionSkipped=True（导入侧
+排除）；导入侧对缺状态的非基准 LOD 目标 fail-closed 默认排除（旧缓存不会
+自动补标记）。约束、过滤和自动匹配链均由 lod_group_projection 开关统一控制；
+关闭后两侧只按各自 dump 独立去重。
 """
 
 # 注解延迟求值（PEP 563）：避免类定义期解析 numpy.ndarray 等注解，
@@ -1301,6 +1306,7 @@ class EFMIBoneMapBuilder:
         protected_pairs: set[tuple[tuple[str, int], tuple[str, int]]] | None = None,
         constraint_labels: dict[tuple[str, int], object] | None = None,
         deduplicate: bool | None = None,
+        lifetime_domains: dict[str, object] | None = None,
     ) -> tuple[dict[str, dict], dict[str, int]]:
         """跨子网格按"矩阵硬门控 + 权重扩散确认"去重构建 vg_map（同部件不去重）。
 
@@ -1317,6 +1323,12 @@ class EFMIBoneMapBuilder:
             - constraint_labels: 跨 LOD 迭代产生的临时语义标签。两个候选都已有
               标签且标签不同时，其并查集组不可合并；无标签候选可附着到一侧，
               但不能再作为桥把两个不同标签的组串起来。
+            - lifetime_domains: 组件级“运行时更新生命周期”域（unique_str ->
+              域标签，如 frozenset 的 LOD 集合）。跨组件去重共享槽位只在其
+              生命周期域相同时才安全：槽由维护组件在其绘制距离写入，若某网格
+              出现的距离下维护者不绘制，槽就无人写入（R1 悬空槽）。
+              两个候选都带域且域不同时断边；缺域候选可附着到一侧，但不能再
+              作为桥把两个不同域的组串起来（与 constraint_labels 同构）。
         返回: (vg_maps, vg_offsets)
 
         去重判据（分层，矩阵是必要条件——几何接近无权推翻矩阵不一致）：
@@ -1576,16 +1588,29 @@ class EFMIBoneMapBuilder:
                 continue
             normalized_constraint_labels[key] = label
 
+        normalized_lifetime_domains = {
+            str(unique_str): domain
+            for unique_str, domain in (lifetime_domains or {}).items()
+        }
+
         def _candidate_label(idx: int):
             candidate = candidates[idx]
             return normalized_constraint_labels.get((
                 str(candidate["unique_str"]), int(candidate["local_vg_id"])
             ))
 
+        def _candidate_domain(idx: int):
+            return normalized_lifetime_domains.get(
+                str(candidates[idx]["unique_str"])
+            )
+
         group_labels: list[set] = []
+        group_domains: list[set] = []
         for idx in range(n):
             label = _candidate_label(idx)
             group_labels.append(set() if label is None else {label})
+            domain = _candidate_domain(idx)
+            group_domains.append(set() if domain is None else {domain})
 
         def is_protected(i: int, j: int) -> bool:
             left = (str(candidates[i]["unique_str"]), int(candidates[i]["local_vg_id"]))
@@ -1648,6 +1673,11 @@ class EFMIBoneMapBuilder:
             # 跨 LOD 语义冲突拒绝：不同标签的两组不能被无标签候选桥接。
             if len(group_labels[ra] | group_labels[rb]) > 1:
                 return
+            # 生命周期域冲突拒绝（I1）：不同“运行时更新生命周期”域的组件共享
+            # 槽位会在某 LOD 距离留下无人写入的悬空槽（R1）；与标签同构地
+            # 禁止无域候选把两个不同域的组桥接起来。
+            if len(group_domains[ra] | group_domains[rb]) > 1:
+                return
             # 只要两组之间存在一条真实扩散桥即可尝试合并；随后对合并结果
             # 做整组连通性复核。这样不会把平面和每个凹槽底强行当作完全图，
             # 也不会允许没有任何桥接的孤立成员混入。
@@ -1664,6 +1694,7 @@ class EFMIBoneMapBuilder:
             group_submeshes[rb] = group_submeshes[ra] | group_submeshes[rb]
             group_members[rb] = merged_members
             group_labels[rb] = group_labels[ra] | group_labels[rb]
+            group_domains[rb] = group_domains[ra] | group_domains[rb]
 
         def edge_dimensions(edge) -> tuple[float, ...]:
             """把通过边投影到可共同收紧的无量纲“不相似度”维度。
@@ -1795,6 +1826,9 @@ class EFMIBoneMapBuilder:
                 labels = group_labels[i] | group_labels[j]
                 if len(labels) > 1:
                     continue
+                domains = group_domains[i] | group_domains[j]
+                if len(domains) > 1:
+                    continue
                 component_pair = tuple(sorted((component_i, component_j)))
                 edges_by_component_pair.setdefault(component_pair, []).append(
                     (i, j, evaluation)
@@ -1883,6 +1917,46 @@ class EFMIBoneMapBuilder:
         )
 
     @staticmethod
+    def _component_lifetime_domains(
+        collected_by_lod: dict[str, dict[str, tuple]],
+    ) -> dict[str, dict[str, frozenset]]:
+        """按“跨 LOD 同 IB（同一 draw）”归组，计算每部件的运行时更新生命周期域。
+
+        I1 共享槽安全域：组件 A/B 共享槽位时，槽由其中一方在其绘制距离写入
+        （MergedSkeleton_AttachComponent 写当前 draw 自身声明段）。若某网格
+        出现的 LOD 距离下槽维护者不绘制，槽无人写入（R1 悬空槽冻结）——
+        因此只有**域相同**的组件才允许跨组件去重共享槽位：
+        - same-IB 跨 LOD 部件（脸等：LOD0/LOD1 同一 draw 单入口）域 = 该 draw
+          出现的全部 LOD（{LOD0, LOD1}）；
+        - L0-only 组件（其 L1 版本是不同 IB/draw，独立 EntryPoint）域 = {LOD0}；
+        - 独立 LOD1 部件域 = {LOD1}。
+
+        域标签取 unique_str 首段 IB 哈希（与 submesh_metadata 的
+        ``bare_unique_str.split("-")[0]`` 口径一致），忽略工作空间级缺前缀的
+        单 LOD 场景（whole-string 作为 IB，域恒单元素，去重行为不变）。
+
+        返回 {lod_name: {unique_str: frozenset(域内 LOD 名集合)}}。
+        """
+        def _ib_of(unique_str: str) -> str:
+            bare = str(unique_str or "")
+            if bare.upper().startswith("LOD") and "." in bare:
+                bare = bare.split(".", 1)[1]
+            return bare.split("-")[0] if "-" in bare else bare
+
+        presence: dict[str, set] = {}
+        for lod_name, submeshes in (collected_by_lod or {}).items():
+            for unique_str in submeshes:
+                presence.setdefault(_ib_of(unique_str), set()).add(str(lod_name))
+
+        domains_by_lod: dict[str, dict[str, frozenset]] = {}
+        for lod_name, submeshes in (collected_by_lod or {}).items():
+            domains_by_lod[lod_name] = {
+                unique_str: frozenset(presence.get(_ib_of(unique_str), ()))
+                for unique_str in submeshes
+            }
+        return domains_by_lod
+
+    @staticmethod
     def build_independent_lod_maps(
         collected_by_lod: dict[str, dict[str, tuple]],
         reference_lod: str,
@@ -1939,9 +2013,14 @@ class EFMIBoneMapBuilder:
             for unique_str, entry in (collected_by_lod.get(reference_lod, {}) or {}).items()
             if unique_str not in projection_skip_by_lod.get(reference_lod, ())
         }
+        # I1 生命周期域：跨 LOD 同 IB（同一 draw）归组，跨组件去重只在域相同时允许。
+        lifetime_domains_by_lod = EFMIBoneMapBuilder._component_lifetime_domains(
+            collected_by_lod
+        )
         if reference_retained:
             baseline_maps, baseline_offsets = EFMIBoneMapBuilder.build_vg_maps(
-                reference_retained
+                reference_retained,
+                lifetime_domains=lifetime_domains_by_lod.get(reference_lod),
             )
         else:
             baseline_maps, baseline_offsets = {}, {}
@@ -1999,6 +2078,7 @@ class EFMIBoneMapBuilder:
             lod_maps, lod_offsets = EFMIBoneMapBuilder.build_vg_maps(
                 retained,
                 constraint_labels=constraint_labels,
+                lifetime_domains=lifetime_domains_by_lod.get(lod_name),
             )
             # v11 镜像强制：同一 L0 合并组的全部目标候选强制共用最小槽位
             # （build_vg_maps 的标签只断不同组，不并同组）。只重定目标侧
@@ -3264,7 +3344,10 @@ class EFMISkeletonMergeHelper:
         始终互不重叠，绝不会让 LOD1 直接引用 LOD0 槽位。
         只有 LOD0 时直接独立计算，不要求 LOD1 存在；明确标记为
         GPU-PreSkinning=false 的 CPU 子网格不参与骨骼合并，也不会因此使 GPU
-        子网格整批回退。对应成功的部件写入 EFMILODCorrespondence/EFMILOD*
+        子网格整批回退。投影模式下，非基准 LOD 的 CPU 目标仍参与 LOD0 几何
+        匹配裁决（IB 同现判定）并写回 EFMILODProjectionMatched /
+        EFMILODProjectionSkipped 标记（C1/C2/C3），但永不生成 VGMap。
+        对应成功的部件写入 EFMILODCorrespondence/EFMILOD*
         诊断账本；开关开启时，该账本还用于构造 LOD1 去重约束标签，但不共享
         或重排 LOD0 的实际槽位编号。
 
@@ -3299,24 +3382,55 @@ class EFMISkeletonMergeHelper:
             groups.setdefault(cls._parse_lod_name(unique_str), []).append(unique_str)
         lod_group_projection = bool(lod_group_projection)
 
+        # C1：CPU/无顶点组目标不得因 GPU-PreSkinning=False 提前退出跨 LOD 几何
+        # 匹配流程（归档 68 CPU unknown：黑白名单过滤漏过、全部被错误导入）。
+        # 投影模式下，非基准 LOD 的 CPU 目标执行与 GPU 同等的 LOD0 几何匹配
+        # 裁决（CPU 无顶点组/骨骼候选，无法进入 build_cross_lod_correspondence
+        # 的点云配对，其可用的几何对应证据是 draw IB 是否在基准侧同现）：
+        # 匹配成功写 EFMILODProjectionMatched=True（C2：可导入、不生成 VGMap），
+        # 匹配失败写 EFMILODProjectionSkipped=True（C3：导入侧排除、不生成
+        # VGMap）。基准 LOD 的 CPU 目标与投影关闭场景保持原行为（只跳过骨骼
+        # 合并，仍可导入）。
+        cpu_matched: set[str] = set()
+        cpu_skipped: set[str] = set()
+        cpu_adjudication_failed: list[str] = []
+        if lod_group_projection and non_skeletal_unique_str_list:
+            cpu_matched, cpu_skipped, cpu_adjudication_failed = (
+                cls._adjudicate_cpu_projection_targets(
+                    workspace_root=workspace_root,
+                    cpu_unique_str_list=non_skeletal_unique_str_list,
+                    groups=groups,
+                    request_unique_strs=set(unique_str_list),
+                )
+            )
+            adjudicated_cpu = cpu_matched | cpu_skipped
+        else:
+            adjudicated_cpu = set()
+        cpu_adjudication_suffix = cls._cpu_adjudication_summary(
+            cpu_matched, cpu_skipped, cpu_adjudication_failed
+        )
+
         if not groups:
-            skipped_label = "、".join(non_skeletal_unique_str_list[:5])
-            suffix = "…" if len(non_skeletal_unique_str_list) > 5 else ""
+            unhandled_cpu = sorted(set(non_skeletal_unique_str_list) - adjudicated_cpu)
+            skipped_label = "、".join(unhandled_cpu[:5])
+            suffix = "…" if len(unhandled_cpu) > 5 else ""
             if skipped_label:
                 return True, (
                     "没有需要合并骨骼的 GPU 蒙皮子网格，已跳过非蒙皮子网格: "
-                    f"{skipped_label}{suffix}。"
+                    f"{skipped_label}{suffix}。{cpu_adjudication_suffix}"
                 )
-            return False, "没有子网格需要处理。"
+            return False, "没有子网格需要处理。" + cpu_adjudication_suffix
 
+        unhandled_non_skeletal = sorted(set(non_skeletal_unique_str_list) - adjudicated_cpu)
         skipped_non_skeletal_message = ""
-        if non_skeletal_unique_str_list:
-            skipped_label = "、".join(non_skeletal_unique_str_list[:5])
-            suffix = "…" if len(non_skeletal_unique_str_list) > 5 else ""
+        if unhandled_non_skeletal:
+            skipped_label = "、".join(unhandled_non_skeletal[:5])
+            suffix = "…" if len(unhandled_non_skeletal) > 5 else ""
             skipped_non_skeletal_message = (
                 "；已跳过非蒙皮子网格: "
                 f"{skipped_label}{suffix}"
             )
+        skipped_non_skeletal_message += cpu_adjudication_suffix
 
         parsers_by_lod: dict[str, EFMILogParser | None] = {}
 
@@ -4024,7 +4138,8 @@ class EFMISkeletonMergeHelper:
         """给子网格 json 写入“跨 LOD 投影未匹配”裁决标记。
 
         写 EFMILODProjectionSkipped=True + 布局版本/基准 LOD/投影开关三件套，
-        供幂等门控与导入侧过滤读取；不写任何 VGMap 系列字段。
+        供幂等门控与导入侧过滤读取；不写任何 VGMap 系列字段。同时清除对侧
+        的“匹配成功”标记，保证任一 json 至多携带一种裁决。
         """
         submesh_json["EFMILODLayoutVersion"] = _CROSS_LOD_LAYOUT_VERSION
         submesh_json["EFMILODReference"] = (
@@ -4033,6 +4148,145 @@ class EFMISkeletonMergeHelper:
         )
         submesh_json["EFMILODProjection"] = True
         submesh_json["EFMILODProjectionSkipped"] = True
+        submesh_json.pop("EFMILODProjectionMatched", None)
+
+    @staticmethod
+    def _mark_projection_matched(submesh_json: dict, cross_lod_info: dict | None) -> None:
+        """给子网格 json 写入“跨 LOD 投影匹配成功”裁决标记（CPU/无顶点组目标）。
+
+        与 _mark_projection_skipped 同构：EFMILODProjectionMatched=True +
+        布局版本/基准 LOD/投影开关三件套。匹配成功只是“几何匹配裁决通过”，
+        不写任何 VGMap 系列字段——CPU 目标永无顶点组，静态网格导入。
+        """
+        submesh_json["EFMILODLayoutVersion"] = _CROSS_LOD_LAYOUT_VERSION
+        submesh_json["EFMILODReference"] = (
+            str(cross_lod_info.get("reference_lod", "") or "")
+            if cross_lod_info else ""
+        )
+        submesh_json["EFMILODProjection"] = True
+        submesh_json["EFMILODProjectionMatched"] = True
+        submesh_json.pop("EFMILODProjectionSkipped", None)
+
+    @staticmethod
+    def _cpu_ib_intersects_baseline(unique_str: str, baseline_strs: set[str]) -> bool:
+        """CPU/无顶点组目标的 LOD0 几何对应判定（draw IB 同现）。
+
+        CPU 目标没有顶点组/骨骼候选，无法进入基于蒙皮点云的
+        build_cross_lod_correspondence 配对；其可用的几何匹配证据是子网格名
+        首段的 draw IB hash 是否在基准 LOD 侧同现（归档调查 F11：68 个 CPU
+        的 IB 与 LOD0 全部 20 个零交集 → 按几何匹配语义全部应判“未匹配”）。
+        """
+        bare = str(unique_str or "").split(".", 1)[-1]
+        ib = bare.split("-", 1)[0].strip().lower()
+        if not ib:
+            return False
+        for item in baseline_strs:
+            other_ib = str(item or "").split(".", 1)[-1].split("-", 1)[0].strip().lower()
+            if other_ib == ib:
+                return True
+        return False
+
+    @classmethod
+    def _adjudicate_cpu_projection_targets(
+        cls,
+        workspace_root: str,
+        cpu_unique_str_list: list[str],
+        groups: dict[str, list[str]],
+        request_unique_strs: set[str],
+    ) -> tuple[set[str], set[str], list[str]]:
+        """对非基准 LOD 的 CPU/无顶点组目标执行 LOD0 几何匹配裁决并写回 json。
+
+        裁决语义（契约 C1/C2/C3）：
+        - draw IB 在基准 LOD 侧同现 → 匹配成功：写 EFMILODProjectionMatched=True
+          （C2：导入侧放行、不生成 VGMap/骨骼槽位）；
+        - 不同现 → 匹配失败：写 EFMILODProjectionSkipped=True（C3：导入侧排除、
+          不生成 VGMap；无来源缓存可发布，只提交 json 事务）。
+        基准 LOD 的 CPU 目标不裁决、不写标记（C5：LOD0 行为不变）。
+        返回 (匹配成功集合, 匹配失败集合, 写入失败列表)——失败目标由外层按
+        “未处理”报告，导入侧对无标记目标 fail-closed 排除（C4）。
+        """
+        matched: set[str] = set()
+        skipped: set[str] = set()
+        failures: list[str] = []
+        if not cpu_unique_str_list:
+            return matched, skipped, failures
+
+        found_lods = sorted(
+            set(groups.keys())
+            | {cls._parse_lod_name(u) for u in request_unique_strs}
+            - {""}
+        )
+        reference_lod = "LOD0" if "LOD0" in found_lods else (
+            found_lods[0] if found_lods else ""
+        )
+        if not reference_lod:
+            return matched, skipped, failures
+
+        # 基准侧的“可与目标对应的物体” = 基准 LOD 组内全部目标 + 基准 LOD 的
+        # CPU 目标（同 IB 跨 LOD 组件可能两侧都是 CPU/无顶点组）。
+        baseline_strs = set(groups.get(reference_lod, []) or [])
+        baseline_strs |= {
+            u for u in cpu_unique_str_list
+            if cls._parse_lod_name(u) == reference_lod
+        }
+        cross_lod_info = {"reference_lod": reference_lod}
+        stale_keys = (
+            "VGMap", "VGOffset", "VGCount", "VGMapAlgorithmVersion",
+            "VGMapDedupEnabled",
+        )
+        for unique_str in cpu_unique_str_list:
+            lod_name = cls._parse_lod_name(unique_str)
+            if not lod_name or lod_name == reference_lod:
+                continue
+            json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+            if not json_path:
+                failures.append(unique_str)
+                continue
+            try:
+                payload = JsonUtils.LoadFromFile(json_path)
+            except Exception:
+                failures.append(unique_str)
+                continue
+            if not isinstance(payload, dict):
+                failures.append(unique_str)
+                continue
+            is_matched = cls._cpu_ib_intersects_baseline(unique_str, baseline_strs)
+            # 清历史键：半成品 VGMap 系列与对侧裁决标记，避免幂等判定歧义。
+            for stale_key in stale_keys:
+                payload.pop(stale_key, None)
+            if is_matched:
+                cls._mark_projection_matched(payload, cross_lod_info)
+            else:
+                cls._mark_projection_skipped(payload, cross_lod_info)
+            try:
+                cls._atomic_publish_skeleton_transaction([], payload, json_path)
+            except Exception as e:
+                print(f"[EFMI骨骼合并] 写入 CPU 投影裁决标记失败 {unique_str}: {e}")
+                failures.append(unique_str)
+                continue
+            (matched if is_matched else skipped).add(unique_str)
+        return matched, skipped, failures
+
+    @staticmethod
+    def _cpu_adjudication_summary(
+        cpu_matched: set[str],
+        cpu_skipped: set[str],
+        cpu_failures: list[str],
+    ) -> str:
+        """CPU 投影裁决结果的消息后缀（无结果时返回空串）。"""
+        parts = []
+        if cpu_matched or cpu_skipped:
+            parts.append(
+                f"CPU 投影裁决：{len(cpu_matched)} 个匹配成功可导入、"
+                f"{len(cpu_skipped)} 个未匹配跳过"
+            )
+        if cpu_failures:
+            shown = "、".join(sorted(cpu_failures)[:5])
+            suffix = "…" if len(cpu_failures) > 5 else ""
+            parts.append(
+                f"{len(cpu_failures)} 个 CPU 目标裁决标记写入失败: {shown}{suffix}"
+            )
+        return ("；" + "；".join(parts)) if parts else ""
 
     @classmethod
     def _publish_skeleton_source_cache(
@@ -4231,6 +4485,25 @@ class EFMISkeletonMergeHelper:
             and bool(payload.get("EFMILODProjection", False)) == bool(projection_enabled)
         )
 
+    @staticmethod
+    def _is_projection_matched(payload: dict, projection_enabled: bool) -> bool:
+        """判定 json 是否携带“跨 LOD 投影匹配成功”裁决且与当前投影开关一致。
+
+        与 _is_projection_skipped 同构：标记、布局版本与投影开关三者同时匹配
+        才算有效裁决。“匹配成功”只用于 CPU/无顶点组目标（无 VGMap、静态网格
+        导入），导入侧据此放行非基准 LOD 目标。
+        """
+        if not isinstance(payload, dict) or payload.get("EFMILODProjectionMatched") is not True:
+            return False
+        try:
+            layout_version = int(payload.get("EFMILODLayoutVersion", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return (
+            layout_version == _CROSS_LOD_LAYOUT_VERSION
+            and bool(payload.get("EFMILODProjection", False)) == bool(projection_enabled)
+        )
+
     @classmethod
     def load_projection_skipped_targets(
         cls,
@@ -4254,6 +4527,123 @@ class EFMISkeletonMergeHelper:
             if cls._is_projection_skipped(payload, True):
                 skipped.add(unique_str)
         return skipped
+
+    @staticmethod
+    def _has_valid_vgmap(payload: dict) -> bool:
+        """轻量 VGMap 有效性（导入过滤用）：非空映射 + 正 VGCount + 非负 VGOffset。
+
+        完整校验（缓存文件大小等）由 _efmi_cache_intact 负责；本方法只判断
+        “json 携带了可行的 GPU 几何匹配成功证据”。
+        """
+        vg_map = payload.get("VGMap")
+        if not isinstance(vg_map, dict) or not vg_map:
+            return False
+        try:
+            vg_count = int(payload.get("VGCount", 0) or 0)
+            vg_offset = int(payload.get("VGOffset", -1) or -1)
+        except (TypeError, ValueError):
+            return False
+        return vg_count > 0 and vg_offset >= 0
+
+    @classmethod
+    def classify_projection_import_targets(
+        cls,
+        workspace_root: str,
+        unique_str_list: list[str],
+    ) -> dict[str, str]:
+        """投影模式下逐目标导入裁决：'import' | 'skip' | 'fail_closed'。
+
+        供导入侧在投影模式（efmi_lod_group_projection）下对所有 import_targets
+        使用——不依赖合并预生成是否成功（裁决标记在 ensure 内部任何失败点
+        之前已写入，失败路径同样必须过滤）：
+        - 基准 LOD（reference_lod，动态推导：请求含 'LOD0' 则取之，否则按
+          字典序取首个 LOD）或无 LOD 前缀：'import'（C5：基准 LOD 行为不变，
+          C4 只约束非基准 LOD）；
+        - 非基准 LOD：
+          * json 携带有效 EFMILODProjectionSkipped（版本/开关三件套一致）→
+            'skip'（C3：几何匹配不成功，明确排除）；
+          * json 携带有效 EFMILODProjectionMatched（版本/开关三件套一致，
+            CPU/无顶点组目标匹配成功）→ 'import'（C2：可导入、无 VGMap）；
+          * 有可行 VGMap → 'import'（GPU 几何匹配成功，C5）；
+          * 其余（缺状态/旧缓存/半成品/json 不可读）→ 'fail_closed'
+            （C4：**默认排除**，绝不放行无明确成功结果的非基准 LOD 目标）。
+
+        选择“白名单放行”而非旧“黑名单剔除”：旧缓存不会自动补标记，只有
+        显式成功证据才能通过过滤。可直接调用本方法；需要在 classify 异常时
+        自动降级 fail-closed 兜底，请使用 resolve_projection_import_decisions。
+        """
+        lods = sorted({cls._parse_lod_name(u) for u in unique_str_list} - {""})
+        reference_lod = "LOD0" if "LOD0" in lods else (lods[0] if lods else "")
+        decisions: dict[str, str] = {}
+        for unique_str in unique_str_list:
+            lod_name = cls._parse_lod_name(unique_str)
+            if not lod_name or lod_name == reference_lod:
+                decisions[unique_str] = "import"
+                continue
+            json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+            payload = None
+            if json_path:
+                try:
+                    payload = JsonUtils.LoadFromFile(json_path)
+                except Exception:
+                    payload = None
+            if not isinstance(payload, dict):
+                decisions[unique_str] = "fail_closed"
+                continue
+            if cls._is_projection_skipped(payload, True):
+                decisions[unique_str] = "skip"
+            elif cls._is_projection_matched(payload, True):
+                decisions[unique_str] = "import"
+            elif cls._has_valid_vgmap(payload):
+                decisions[unique_str] = "import"
+            else:
+                decisions[unique_str] = "fail_closed"
+        return decisions
+
+    @classmethod
+    def fallback_projection_import_decisions(
+        cls,
+        unique_str_list: list[str],
+    ) -> dict[str, str]:
+        """classify 无法执行时的 fail-closed 兜底裁决（'import' | 'fail_closed'）。
+
+        基准判定与 classify_projection_import_targets **完全同一口径**（动态
+        reference_lod 推导，不硬编码 LOD0）：reference_lod = 请求中存在
+        'LOD0' 则取之，否则按字典序取首个 LOD；无 LOD 前缀目标不受投影约束。
+        LOD1-only 工作空间（请求中无 LOD0）→ 基准即 LOD1、全部放行，与主
+        路径不分裂；LOD0 存在时非基准 LOD 目标一律 fail-closed（缺状态/
+        裁决不可用 → 默认排除，绝不 fail-open）。
+        """
+        lods = sorted({cls._parse_lod_name(u) for u in unique_str_list} - {""})
+        reference_lod = "LOD0" if "LOD0" in lods else (lods[0] if lods else "")
+        decisions: dict[str, str] = {}
+        for unique_str in unique_str_list:
+            lod_name = cls._parse_lod_name(unique_str)
+            if not lod_name or lod_name == reference_lod:
+                decisions[unique_str] = "import"
+            else:
+                decisions[unique_str] = "fail_closed"
+        return decisions
+
+    @classmethod
+    def resolve_projection_import_decisions(
+        cls,
+        workspace_root: str,
+        unique_str_list: list[str],
+    ) -> dict[str, str]:
+        """投影模式下导入过滤裁决总入口（classify + fail-closed 兜底，不抛错）。
+
+        正常情况委托 classify_projection_import_targets；classify 抛异常时降级
+        到 fallback_projection_import_decisions（与 classify 同一动态
+        reference_lod 口径，非基准 LOD 目标一律 fail-closed）——调用方无需
+        自行 try/except，也绝不会因 classify 异常而跳过过滤（契约 C4：
+        缺状态/裁决不可用不得放行）。
+        """
+        try:
+            return cls.classify_projection_import_targets(workspace_root, unique_str_list)
+        except Exception as e:
+            print(f"[EFMI骨骼合并] 投影裁决分类失败，降级 fail-closed 兜底: {e}")
+            return cls.fallback_projection_import_decisions(unique_str_list)
 
     @classmethod
     def load_lod_match_pairs(
@@ -4357,7 +4747,8 @@ class EFMISkeletonMergeHelper:
                     "VGMapDedupEnabled", "SkeletonGroup", "EFMILODLayoutVersion",
                     "EFMILODReference", "EFMILODProjection", "EFMILODBaselineGroupCount", "EFMILODGroupCount",
                     "EFMILODActualGroupCount", "EFMILODMissingBaselineCount",
-                    "EFMILODCorrespondence", "EFMILODProjectionSkipped"
+                    "EFMILODCorrespondence", "EFMILODProjectionSkipped",
+                    "EFMILODProjectionMatched"
                 ):
                     payload.pop(key, None)
                 try:

@@ -268,6 +268,135 @@ def _detect_ntemi_workspace() -> bool:
     return False
 
 
+def _parse_import_lod_prefix(import_key: str) -> str:
+    """解析 import_key 的 LOD 前缀（'LOD1.xxx' -> 'LOD1'；无前缀 -> ''）。
+
+    与 common/efmi_skeleton.EFMISkeletonMergeHelper._parse_lod_name 语义一致
+    （本模块无 bpy 依赖可直接 import 的测试面，故本地实现）。
+    """
+    if "." in import_key and import_key.split(".", 1)[0].upper().startswith("LOD"):
+        return import_key.split(".", 1)[0]
+    return ""
+
+
+def _projection_fail_closed_decisions(import_keys: list[str]) -> dict[str, str]:
+    """classify 不可用/异常时的 fail-closed 兜底裁决（'import' | 'fail_closed'）。
+
+    基准判定与 common/efmi_skeleton.EFMISkeletonMergeHelper.
+    classify_projection_import_targets **同一口径**：reference_lod = 'LOD0'
+    （请求中存在时）否则按字典序首个 LOD；无 LOD 前缀目标不受投影约束。
+    **LOD1-only 工作空间**（请求中无 LOD0）→ 基准即 LOD1，全部放行（与
+    classify 一致，避免兜底与主路径口径分裂）；LOD0 存在时非基准 LOD 目标
+    一律 fail-closed（缺状态/裁决不可用 → 默认排除，绝不 fail-open）。
+    """
+    lods = sorted({_parse_import_lod_prefix(key) for key in import_keys} - {""})
+    reference_lod = "LOD0" if "LOD0" in lods else (lods[0] if lods else "")
+    decisions: dict[str, str] = {}
+    for key in import_keys:
+        lod_name = _parse_import_lod_prefix(key)
+        if not lod_name or lod_name == reference_lod:
+            decisions[key] = "import"
+        else:
+            decisions[key] = "fail_closed"
+    return decisions
+
+
+def _node_xy(node):
+    location = getattr(node, "location", None)
+    return (
+        float(getattr(location, "x", 0.0) if location is not None else 0.0),
+        float(getattr(location, "y", 0.0) if location is not None else 0.0),
+    )
+
+
+def _node_size(node):
+    return (
+        max(1.0, float(getattr(node, "width", 300.0) or 300.0)),
+        max(1.0, float(getattr(node, "height", 200.0) or 200.0)),
+    )
+
+
+def _layout_efmi_auto_main_chain(
+    group_node,
+    rename_node=None,
+    process_node=None,
+    output_node=None,
+    horizontal_gap=160.0,
+):
+    """Lay out group -> rename -> VG process -> output from the approved template."""
+    template_widths = {
+        "group": 200.0,
+        "rename": 380.0,
+        "process": 700.0,
+        "output": 400.0,
+    }
+    # 按调用角色套模板宽度（不依赖 bl_idname）：真实节点与测试桩一致生效，
+    # 布局坐标也随之使用模板后的宽度（与测试契约的坐标断言自洽）。
+    for key, node in (
+        ("group", group_node),
+        ("rename", rename_node),
+        ("process", process_node),
+        ("output", output_node),
+    ):
+        if node is not None:
+            node.width = template_widths[key]
+    positions = {"group": _node_xy(group_node)}
+    current = group_node
+    current_x, base_y = positions["group"]
+    for key, node in (
+        ("rename", rename_node),
+        ("process", process_node),
+        ("output", output_node),
+    ):
+        if node is None:
+            continue
+        current_width, _ = _node_size(current)
+        current_x += current_width + horizontal_gap
+        positions[key] = (current_x, base_y)
+        current = node
+    return positions
+
+
+def _layout_efmi_match_nodes(
+    group_node,
+    match_nodes,
+    max_per_row=6,
+    horizontal_gap=80.0,
+    vertical_gap=700.0,
+    offset_x=500.0,
+    offset_y=1200.0,
+):
+    """Place matching nodes in a max-six-column grid using actual dimensions."""
+    if not match_nodes:
+        return []
+    base_x, base_y = _node_xy(group_node)
+    _, group_height = _node_size(group_node)
+    start_y = base_y - group_height - offset_y
+    positions = []
+    row_y = start_y
+    for row_start in range(0, len(match_nodes), max_per_row):
+        row = match_nodes[row_start:row_start + max_per_row]
+        current_x = base_x + offset_x
+        row_height = max(_node_size(node)[1] for node in row)
+        for node in row:
+            positions.append((current_x, row_y))
+            node_width, _ = _node_size(node)
+            current_x += node_width + horizontal_gap
+        row_y -= row_height + vertical_gap
+    return positions
+
+
+def _configure_efmi_auto_rename_node(rename_node):
+    """Keep generated rename nodes in normal chain order before VG processing."""
+    rename_node.defer_until_after_vertex_group_process = False
+
+
+def _configure_efmi_auto_output_node(output_node, logic_name):
+    """Apply EFMI-only defaults to an automatically generated output node."""
+    if str(logic_name or "").upper() == "EFMI":
+        output_node.use_rabbitfx_slot = True
+
+
 def _configure_and_execute_efmi_lod_match(
     match_node,
     source_obj,
@@ -289,7 +418,7 @@ def _configure_and_execute_efmi_lod_match(
     match_node.match_threshold = 0.06
     match_node.use_chamfer_matching = False
     match_node.use_shape_key = False
-    match_node.create_debug_objects = False
+    match_node.create_debug_objects = True
     match_node.rename_format = True
     match_node.exact_hash_match = False
     return match_node.execute_match(context)
@@ -343,37 +472,81 @@ def ImprotFromWorkSpaceFull(self, context):
             traceback.print_exc()
             self.report({'WARNING'}, f"EFMI 骨骼合并预生成异常，已回退普通导入：{e}")
 
-        # 分组投影导入过滤：EFMI 多 LOD 投影模式下，LOD1 中几何匹配不成功的
-        # 部件（ensure_skeleton_data 已给 json 写入 EFMILODProjectionSkipped=True）
-        # 不导入——避免 LOD1 dump 里与 LOD0 无对应的未知物体混入。仅在骨骼合并
-        # 完整生成的合并路线生效；预生成失败回退普通导入时不应用该过滤。
+        # 分组投影导入过滤（契约 C1-C5）：EFMI 多 LOD 投影模式下，非基准 LOD 目标
+        # 只放行“明确匹配成功”者——GPU 有 VGMap / CPU/无顶点组有
+        # EFMILODProjectionMatched；明确的投影未匹配（EFMILODProjectionSkipped）
+        # 与缺状态（旧缓存/半成品/裁决缺失）一律剔除（fail-closed，C4）。
+        # 过滤不依赖合并预生成**成功**（merged_vgmap_ready is True）：裁决标记
+        # 由 ensure_skeleton_data 在内部任何失败点之前写入，因此合并预生成失败、
+        # 回退普通导入时同样必须过滤，绝不让 CPU unknown（68 个实况）借“合并
+        # 失败”路径绕过 C4 重新漏过。仅当本次导入实际执行过合并预生成
+        #（merged_vgmap_ready 为 True 或 False）时生效；复选框关闭（None，未
+        # 执行预生成、无裁决标记可依赖）时保留旧普通导入语义（C5 单 LOD/投影
+        # 关闭/未开启合并行为不变）。
         if (
-            merged_vgmap_ready is True
+            merged_vgmap_ready is not None
             and GlobalConfig.logic_name == LogicName.EFMI
             and GlobalProterties.efmi_lod_group_projection()
         ):
             try:
                 from ..common.efmi_skeleton import EFMISkeletonMergeHelper as _EFMISkeletonHelper
-                projection_skipped = _EFMISkeletonHelper.load_projection_skipped_targets(
-                    GlobalConfig.path_workspace_folder(),
-                    [target["import_key"] for target in import_targets],
-                )
-                if projection_skipped:
-                    filtered_targets = [
-                        target for target in import_targets
-                        if target["import_key"] not in projection_skipped
-                    ]
-                    dropped = len(import_targets) - len(filtered_targets)
-                    import_targets = filtered_targets
-                    shown = "、".join(sorted(projection_skipped)[:5])
-                    suffix = "…" if len(projection_skipped) > 5 else ""
-                    detail = f"{shown}{suffix}"
-                    print(
-                        f"[EFMI骨骼合并] 跨 LOD 投影未匹配，跳过导入 {dropped} 个物体: {detail}"
-                    )
-                    self.report({'INFO'}, f"跨 LOD 投影未匹配，跳过导入 {dropped} 个物体: {detail}")
             except Exception as e:
-                print(f"[EFMI骨骼合并] 读取投影未匹配标记失败（不阻断导入）: {e}")
+                print(f"[EFMI骨骼合并] 导入投影过滤模块加载失败（不阻断导入）: {e}")
+                _EFMISkeletonHelper = None
+
+            decisions: dict[str, str] | None = None
+            if _EFMISkeletonHelper is not None:
+                try:
+                    decisions = _EFMISkeletonHelper.classify_projection_import_targets(
+                        GlobalConfig.path_workspace_folder(),
+                        [target["import_key"] for target in import_targets],
+                    )
+                except Exception as e:
+                    # classify 异常不得跳过过滤：与 decisions is None 相同，
+                    # 降级到 fail-closed 兜底（非基准 LOD 目标默认排除）。
+                    print(f"[EFMI骨骼合并] 投影裁决分类失败，降级 fail-closed 兜底: {e}")
+            if decisions is None:
+                decisions = _projection_fail_closed_decisions(
+                    [target["import_key"] for target in import_targets]
+                )
+            dropped_keys = [
+                key for key, decision in decisions.items()
+                if decision != "import"
+            ]
+            if dropped_keys:
+                before = len(import_targets)
+                import_targets = [
+                    target for target in import_targets
+                    if decisions.get(target["import_key"], "fail_closed") == "import"
+                ]
+                dropped = before - len(import_targets)
+                fail_closed_keys = [
+                    key for key, decision in decisions.items()
+                    if decision == "fail_closed"
+                ]
+                shown = "、".join(sorted(dropped_keys)[:5])
+                suffix = "…" if len(dropped_keys) > 5 else ""
+                detail = f"{shown}{suffix}"
+                print(
+                    f"[EFMI骨骼合并] 跨 LOD 投影未匹配/缺状态，跳过导入 "
+                    f"{dropped} 个物体: {detail}"
+                )
+                self.report(
+                    {'INFO'},
+                    f"跨 LOD 投影未匹配/缺状态，跳过导入 {dropped} 个物体: {detail}",
+                )
+                if fail_closed_keys:
+                    fc_shown = "、".join(sorted(fail_closed_keys)[:3])
+                    fc_suffix = "…" if len(fail_closed_keys) > 3 else ""
+                    print(
+                        f"[EFMI骨骼合并] 其中 {len(fail_closed_keys)} 个缺少明确"
+                        f"投影匹配状态（旧缓存/半成品）: {fc_shown}{fc_suffix}"
+                    )
+                    self.report(
+                        {'WARNING'},
+                        f"{len(fail_closed_keys)} 个目标缺少投影匹配状态，"
+                        f"已按 fail-closed 排除: {fc_shown}{fc_suffix}",
+                    )
 
     # ZZMI 骨骼合并数据预生成（与 EFMI 同构的分支选项）：
     # 复选框（import_merged_vgmap，「使用融合统一顶点组」）关闭时完全不执行，保持旧逻辑；
@@ -608,8 +781,10 @@ def ImprotFromWorkSpaceFull(self, context):
             group_current_y -= 300
 
         output_node = tree.nodes.new('SSMTNode_Result_Output')
-        output_node.location = (800, 0)
+        output_node.location = (0, 0)
         output_node.label = "生成 Mod"
+        # EFMI 自动输出默认使用 RabbitFX/FX 风格。
+        _configure_efmi_auto_output_node(output_node, GlobalConfig.logic_name)
 
         # EFMI 跨 LOD 自动处理链：账本只提供 LOD0/目标 LOD 的物体配对；
         # 顶点组映射必须在导入完成后由匹配节点读取两边实际 Blender 物体并重算。
@@ -624,6 +799,7 @@ def ImprotFromWorkSpaceFull(self, context):
         rename_by_group: dict[int, object] = {}
         vg_match_created = 0
         vg_match_failed = 0
+        match_nodes_by_group: dict[int, list[object]] = {}
         created_auto_nodes = []
         existing_text_names = set(
             getattr(getattr(bpy, "data", None), "texts", {}).keys()
@@ -675,14 +851,9 @@ def ImprotFromWorkSpaceFull(self, context):
                         rename_node = tree.nodes.new('SSMTNode_Object_Rename')
                         created_auto_nodes.append(rename_node)
                         rename_node.label = "LOD前缀重命名"
-                        # 先按仍为 LOD0 的源物体名称选择并执行各自映射，再改成
-                        # LOD1 名称；否则同名目标已经存在时 Blender 会插入 .001，
-                        # 映射节点既无法稳定路由，也容易退化为全局串表。
-                        rename_node.defer_until_after_vertex_group_process = True
-                        rename_node.location = (
-                            540,
-                            rename_group.location.y if rename_group.location else 0,
-                        )
+                        # 自动链保持普通执行顺序：先按规则重命名，再进入顶点组处理。
+                        _configure_efmi_auto_rename_node(rename_node)
+                        rename_node.location = (0, 0)
                         rename_by_group[id(rename_group)] = rename_node
                     rule = rename_node.rename_rules.add()
                     rule.name = f"Rule_{len(rename_node.rename_rules):03d}"
@@ -694,10 +865,7 @@ def ImprotFromWorkSpaceFull(self, context):
                     if vg_proc is None:
                         vg_proc = tree.nodes.new('SSMTNode_VertexGroupProcess')
                         created_auto_nodes.append(vg_proc)
-                        vg_proc.location = (
-                            640,
-                            group_node.location.y if group_node.location else 0,
-                        )
+                        vg_proc.location = (0, 0)
                         vg_process_by_group[id(group_node)] = vg_proc
                     pair_index = sum(
                         1 for _p in match_pairs
@@ -708,10 +876,9 @@ def ImprotFromWorkSpaceFull(self, context):
                     match_node = tree.nodes.new('SSMTNode_VertexGroupMatch')
                     created_auto_nodes.append(match_node)
                     match_node.label = f"LOD匹配: {target_obj.name}"
-                    match_node.location = (
-                        320,
-                        (vg_proc.location.y if vg_proc.location else 0) - 240 * (pair_index + 1),
-                    )
+                    match_node.location = (0, 0)
+                    match_node.width = 300.0
+                    match_nodes_by_group.setdefault(id(group_node), []).append(match_node)
                     if vg_proc.inputs[-1].is_linked:
                         vg_proc.inputs.new(
                             'SSMTSocketObject', f"映射表 {len(vg_proc.inputs)}"
@@ -759,6 +926,34 @@ def ImprotFromWorkSpaceFull(self, context):
                 rename_by_group.clear()
                 vg_match_created = 0
                 vg_match_failed = 0
+        # 所有自动节点创建完成后统一按批准模板布局，严格按绝对坐标、模板宽度
+        # 和实际高度计算，确保输出始终位于顶点组处理右侧。
+        for group_node in all_group_nodes:
+            rename_node = rename_by_group.get(id(group_node))
+            vg_proc = vg_process_by_group.get(id(group_node))
+            positions = _layout_efmi_auto_main_chain(
+                group_node, rename_node, vg_proc, output_node
+            )
+            if rename_node is not None:
+                rename_node.location = positions["rename"]
+            if vg_proc is not None:
+                vg_proc.location = positions["process"]
+            if output_node is not None:
+                output_node.location = positions["output"]
+            match_nodes = match_nodes_by_group.get(id(group_node), [])
+            for match_node, position in zip(
+                match_nodes,
+                _layout_efmi_match_nodes(
+                    group_node,
+                    match_nodes,
+                    max_per_row=6,
+                    vertical_gap=700.0,
+                    offset_x=500.0,
+                    offset_y=1200.0,
+                ),
+            ):
+                match_node.location = position
+
         if vg_match_created or vg_match_failed:
             summary = f"已自动创建 {vg_match_created} 个顶点组匹配节点"
             if vg_match_failed:

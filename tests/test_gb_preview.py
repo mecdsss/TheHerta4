@@ -175,6 +175,13 @@ class UniformScaleTests(unittest.TestCase):
     def test_small_noise_still_uniform(self):
         self.assertTrue(gb_preview.is_uniform_scale((1.0, 1.0 + 1e-6, 1.0)))
 
+    def test_non_positive_uniform_rejected(self):
+        """回归：负/零缩放不是合法快速路径前提（负 cutoff 语义错误）。"""
+        self.assertFalse(gb_preview.is_uniform_scale((-1.0, -1.0, -1.0)))
+        self.assertFalse(gb_preview.is_uniform_scale((-0.5, -0.5, -0.5)))
+        self.assertFalse(gb_preview.is_uniform_scale((0.0, 0.0, 0.0)))
+        self.assertTrue(gb_preview.is_uniform_scale((0.5, 0.5, 0.5)))
+
 
 class GeodesicFastPathTests(unittest.TestCase):
     """NU2/NU4：均匀缩放快速路径与逐球 geodesic_field 结果一致。"""

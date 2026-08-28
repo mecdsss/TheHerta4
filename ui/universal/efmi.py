@@ -29,6 +29,13 @@ _EFMI_MAX_LOD_LEVEL_COUNT = 4
 # （尤其 v9 投影/v12 压缩）不能进入当前单池运行时。
 _EFMI_CROSS_LOD_LAYOUT_VERSION = 13
 
+# --- I3 同 IB 折叠蒙皮兼容性阈值（导出不变量，独立于去重 match_tolerance）---
+# 跨 LOD 对应账本（EFMILODCorrespondence）每行的 matrix_diff = 4x3 矩阵逐项
+# 最大绝对差。same-IB 折叠复用同一 draw，L0/L1 版本的同一根骨骼只允许捕获
+# 抖动级差异；实测错误对应（L1 骨骼匹配到 L0 另一根骨骼）差异达 272~449。
+# 超过该阈值即拒绝静默折叠（raise），绝不产出“L1 显示套 L0 骨骼”的错误权重。
+_SAME_IB_FOLD_MAX_MATRIX_DIFF = 1.0
+
 @dataclass
 class ExportEFMI:
 
@@ -1047,6 +1054,29 @@ class ExportEFMI:
                     f"的自有骨骼 local {local_id}（全局槽 {source_global_id}）缺少跨 LOD 对应；"
                     "same-IB 部件无法安全折叠。请重新执行骨骼合并反查/重新导入该角色"
                 )
+
+            # I3 折叠蒙皮兼容性：same-IB 折叠要求 L1 骨骼与基准骨骼语义一致。
+            # matrix_diff 超过阈值说明该 local 被对应到基准侧另一根骨骼
+            # （实测错误对应 272~449），静默折叠会把 L1 蒙皮语义套到 L0 骨骼段，
+            # 必须大声拒绝而不是产出错误权重。缺 matrix_diff 的旧账本按兼容
+            # 处理（不阻塞既有元数据），有值就必须通过阈值校验。
+            matrix_diff = corr.get("matrix_diff")
+            if matrix_diff is not None:
+                try:
+                    parsed_matrix_diff = float(matrix_diff)
+                except (TypeError, ValueError):
+                    parsed_matrix_diff = float("inf")
+                if (
+                    not numpy.isfinite(parsed_matrix_diff)
+                    or parsed_matrix_diff > _SAME_IB_FOLD_MAX_MATRIX_DIFF
+                ):
+                    raise RuntimeError(
+                        f"[EFMI骨骼合并] {getattr(lod_model, 'unique_str', '?')} "
+                        f"local {local_id}（全局槽 {source_global_id}）的跨 LOD 对应骨骼"
+                        f" matrix_diff={parsed_matrix_diff:.3f} 超过 same-IB 折叠阈值 "
+                        f"{_SAME_IB_FOLD_MAX_MATRIX_DIFF}：L1 蒙皮语义与基准部件不一致，"
+                        "拒绝静默折叠。请重新执行骨骼合并反查/重新导入该角色"
+                    )
             reference_component = str(
                 corr.get("unique_str", corr.get("reference_component", ""))
                 or getattr(lod_model, "efmi_lod_reference_component", "")
@@ -1081,6 +1111,99 @@ class ExportEFMI:
                 )
             aliases[source_global_id] = target_global_id
         return aliases
+
+    @staticmethod
+    def _validate_merged_slot_reachability(
+        parts: list[dict],
+        component_id_dict: dict[str, int],
+        submesh_models,
+        bone_aliases: dict[int, int],
+    ) -> None:
+        """I2 导出前可达性守卫：每个存活 Blend 引用的槽在其出现距离必被维护者写入。
+
+        存活部件 P（含 same-IB 折叠家族）绘制于距离集 D(P)：基准 L0 部件 =
+        {LOD0} ∪ 被折叠同 IB 兄弟所在 LOD（同一 draw 单入口，任何距离都执行
+        同一 EntryPoint，写 P 自己的声明段）；独立 LOD1 部件 = {LOD1}。
+
+        每个槽 s 属于 P 家族引用的 Blend 槽集合（VGMap 值，已按 same-IB 别名
+        重定向）：
+        - s 落在 P 自己的声明段 → 由 P 自己写入 → 安全；
+        - 否则 s 落在另一部件 Q 的声明段 → 由 Q 的绘制写入 → 必须满足
+          D(P) ⊆ D(Q)（Q 在 P 出现的每个距离都绘制），不满足 → RuntimeError
+          指名部件/槽号，与既有槽位重叠/R16 越界守卫同风格（fail-closed）；
+        - s 落在任何导出部件声明段之外（局部导出子集未包含维护者）→ 无法归属，
+          仅告警不阻塞导出（与既有快速/局部导出语义一致）。
+
+        单 LOD 导出（少于 2 个带前缀 LOD）不存在跨距离悬空问题，直接放行。
+        """
+        part_by_id = {int(p["component_id"]): p for p in parts}
+        if len(part_by_id) <= 1:
+            return
+        # 单 LOD 判定用整个池的家族距离集（含被折叠的 same-IB 兄弟），
+        # 不能只看 parts 的 unique_str——基准部件的 LOD 名只有基准那一侧。
+        pool_lod_names = {
+            ExportEFMI._lod_name_from_unique_str(str(unique_str))
+            for unique_str in component_id_dict
+        }
+        if len(pool_lod_names - {""}) < 2:
+            return
+        segments = [
+            (
+                p,
+                int(p["vg_offset"]),
+                int(p["vg_offset"]) + int(p["vg_count"]),
+            )
+            for p in parts
+        ]
+        draw_distances: dict[int, frozenset] = {}
+        for unique_str, component_id in component_id_dict.items():
+            current = set(draw_distances.get(int(component_id), ()))
+            current.add(ExportEFMI._lod_name_from_unique_str(str(unique_str)))
+            draw_distances[int(component_id)] = frozenset(current - {""})
+        aliases = {int(k): int(v) for k, v in (bone_aliases or {}).items()}
+        for part in parts:
+            part_component_id = int(part["component_id"])
+            part_lods = draw_distances.get(part_component_id, frozenset())
+            for model in submesh_models:
+                model_unique = str(getattr(model, "unique_str", "") or "")
+                if component_id_dict.get(model_unique) != part_component_id:
+                    continue
+                vg_map = dict(getattr(model, "vg_map", {}) or {})
+                ref_slots = {
+                    int(aliases.get(int(raw_slot), int(raw_slot)))
+                    for raw_slot in vg_map.values()
+                }
+                for slot in sorted(ref_slots):
+                    owner = next(
+                        (
+                            q
+                            for q, q_start, q_end in segments
+                            if q_start <= slot < q_end
+                        ),
+                        None,
+                    )
+                    if owner is None:
+                        print(
+                            f"[EFMI骨骼合并] 警告 {model_unique} 引用槽 {slot} "
+                            "不属于任何导出部件声明段（局部导出未包含维护者，"
+                            "跳过可达性校验）"
+                        )
+                        continue
+                    if int(owner["component_id"]) == part_component_id:
+                        continue
+                    owner_lods = draw_distances.get(
+                        int(owner["component_id"]), frozenset()
+                    )
+                    if not part_lods.issubset(owner_lods):
+                        raise RuntimeError(
+                            f"[EFMI骨骼合并] {model_unique} 引用槽 {slot} "
+                            f"由部件 {owner['unique_str']} 的声明段维护，但该部件只在 "
+                            f"{sorted(owner_lods) or '无前缀'} 距离绘制，"
+                            f"而引用网格在 {sorted(part_lods)} 距离出现："
+                            "该槽在部分 LOD 距离无人写入（跨组件悬空骨骼引用，"
+                            "L1 距离蒙皮会冻结在 identity）。请重新执行骨骼合并反查/"
+                            "重新导入该角色后导出"
+                        )
 
     @staticmethod
     def _remap_blendindices_category_buffer(
@@ -1389,6 +1512,14 @@ class ExportEFMI:
                 f"{len(same_ib_bone_aliases)} 个骨骼槽位重定向"
                 "（目标为基准 component 连续导入槽）"
             )
+        # I2 可达性守卫：写盘前验证每个存活 Blend 引用槽在其出现距离必被维护者
+        # 写入；违反（跨组件悬空引用）明确拒绝导出，绝不产出坏 mod。
+        self._validate_merged_slot_reachability(
+            parts,
+            component_id_dict,
+            self.submesh_model_list,
+            same_ib_bone_aliases,
+        )
         return parts, component_id_dict
 
     def _add_merged_skeleton_section(self, ini_builder, command_lists_section=None):

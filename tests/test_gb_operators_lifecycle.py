@@ -68,6 +68,12 @@ class _Vec3:
     def __iter__(self):
         return iter((self.x, self.y, self.z))
 
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, i):
+        return (self.x, self.y, self.z)[i]
+
     def copy(self):
         return _Vec3(self.x, self.y, self.z)
 
@@ -666,6 +672,67 @@ class SingleBallPreviewTests(GBStubTestCase):
         self.assertIn("组合", tcache.preview_info)
 
 
+class GeodesicFallbackTests(GBStubTestCase):
+    """NU4 回归：负/零均匀缩放不得走世界邻接表快速路径（负 cutoff 语义错误）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.verts = np.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0],
+             [0.0, 1.0, 0.0]])
+        self.edges = np.array([[0, 1], [1, 2], [2, 3], [3, 0], [0, 2]])
+        self.strength, self.falloff = 1.0, 4.6
+
+    def _make_negative_ball(self):
+        center = np.array([0.2, 0.2, 0.0])
+        neg = -0.5
+        m = np.eye(4)
+        m[:3, 3] = center
+        m[0, 0] = m[1, 1] = m[2, 2] = neg
+        ball = _make_ball("GB_Ball_Neg", 99, matrix=_FakeMatrix(m))
+        ball.scale = _Vec3(neg, neg, neg)
+        ball.gb_ball.strength = self.strength
+        ball.gb_ball.falloff_k = self.falloff
+        return ball, m
+
+    def test_negative_uniform_scale_falls_back_to_slow_path(self):
+        """负均匀缩放必须回退逐球 geodesic_field（负 cutoff 会产出错误场）。"""
+        ball, m = self._make_negative_ball()
+        tcache = gb_operators._GBTargetCache("T")
+        tcache.verts_world = self.verts
+        tcache.edge_verts = self.edges
+
+        result = gb_operators._geodesic_field_for_ball(
+            ball, tcache, self.verts)
+        slow = gb_core.geodesic_field(
+            self.verts, m, self.strength, self.falloff, self.edges)
+        np.testing.assert_allclose(result, slow, atol=1e-12)
+        # 快速路径未被使用（未触发世界邻接表构建）
+        self.assertIsNone(tcache.adjacency)
+
+    def test_positive_uniform_scale_still_uses_fast_path(self):
+        """正值均匀缩放仍走快速路径，且结果与慢路径一致（防过度收紧）。"""
+        center = np.array([0.2, 0.2, 0.0])
+        pos = 0.9
+        m = np.eye(4)
+        m[:3, 3] = center
+        m[0, 0] = m[1, 1] = m[2, 2] = pos
+        ball = _make_ball("GB_Ball_Pos", 98, matrix=_FakeMatrix(m))
+        ball.scale = _Vec3(pos, pos, pos)
+        ball.gb_ball.strength = self.strength
+        ball.gb_ball.falloff_k = self.falloff
+        tcache = gb_operators._GBTargetCache("T")
+        tcache.verts_world = self.verts
+        tcache.edge_verts = self.edges
+
+        result = gb_operators._geodesic_field_for_ball(
+            ball, tcache, self.verts)
+        slow = gb_core.geodesic_field(
+            self.verts, m, self.strength, self.falloff, self.edges)
+        np.testing.assert_allclose(result, slow, atol=1e-9)
+        self.assertIsNotNone(tcache.adjacency)   # 快速路径生效
+
+
 class LifecycleTests(GBStubTestCase):
     """NU5：undo/redo 一致性、孤儿清理、删除匹配/清理不遗留处理器。"""
 
@@ -683,9 +750,11 @@ class LifecycleTests(GBStubTestCase):
     def test_undo_validation_adopts_restored_ball(self):
         session = _make_session(6, mode="target",
                                 direction=gb_resolve.DIRECTION_SELF)
+        # 真实 StartFromDebug 形状：root 也带 gb_vg_name（持久重建属性）
         root = _FakeObj("GB_Session_Bone")
         root["gb_session_root"] = True
         root["gb_session_id"] = 6
+        root["gb_vg_name"] = "Bone"
         data.objects.append(root)
         session.session_root_name = root.name
         session.ball_names = []
@@ -694,8 +763,32 @@ class LifecycleTests(GBStubTestCase):
         ball = _make_ball("GB_Bone_002", 6)
         gb_operators._validate_sessions_after_undo()
         self.assertIn(ball.name, session.ball_names)
+        # 根绝不能作为球被收养（与 _build_session_from_objects 语义一致）
+        self.assertNotIn(root.name, session.ball_names)
         # 根仍在 → 会话保留
         self.assertIn(6, gb_operators._sessions)
+
+    def test_undo_validation_does_not_adopt_root_as_ball(self):
+        """回归：_sync_session_objects 收养扫描必须排除 gb_session_root。
+
+        StartFromDebug 的 root 带 gb_vg_name；若无排除，root 会被收进
+        ball_names（球列表污染、后续场计算把空物体当球处理）。
+        """
+        session = _make_session(13, mode="target",
+                                direction=gb_resolve.DIRECTION_SELF)
+        root = _FakeObj("GB_Session_Bone")
+        root["gb_session_root"] = True
+        root["gb_session_id"] = 13
+        root["gb_vg_name"] = "Bone"           # 对齐真实形状
+        data.objects.append(root)
+        ball = _make_ball("GB_Bone_001", 13)
+        session.session_root_name = root.name
+        session.ball_names = [ball.name]
+        gb_operators._sessions[13] = session
+
+        gb_operators._sync_session_objects(session)
+
+        self.assertEqual(session.ball_names, [ball.name])
 
     def test_restore_orphan_session_from_persisted_objects(self):
         target = _make_target("TargetMesh")
@@ -761,6 +854,48 @@ class LifecycleTests(GBStubTestCase):
         self.assertIn(gb_operators._on_undo_post, handlers.load_post)
         gb_operators.unregister_app_handlers()
         self.assertNotIn(gb_operators._on_undo_post, handlers.undo_post)
+
+    def test_shutdown_unregisters_all_handlers(self):
+        """复现 t8 阻塞级缺陷：shutdown() 必须完整注销 undo/redo/load 处理器。
+
+        修复前 shutdown() 调用不存在的 _unregister_app_handlers() 抛 NameError
+        （被 toolkit/__init__.py 裸 except 吞掉），三条 handler 列表内回调残留、
+        注册标志不复位 —— 本测试在修复前必须 fail。
+        """
+        handlers = gb_operators.bpy.app.handlers
+        gb_operators.unregister_app_handlers()          # 清基线
+        gb_operators.register_app_handlers()
+        self.assertTrue(gb_operators._handlers_registered)
+        for lst in (handlers.undo_post, handlers.redo_post, handlers.load_post):
+            self.assertEqual(lst.count(gb_operators._on_undo_post), 1)
+
+        gb_operators.shutdown()                          # 插件注销路径
+
+        self.assertFalse(gb_operators._handlers_registered)
+        for name, lst in (("undo_post", handlers.undo_post),
+                          ("redo_post", handlers.redo_post),
+                          ("load_post", handlers.load_post)):
+            self.assertNotIn(gb_operators._on_undo_post, lst, name)
+
+    def test_handler_register_unregister_idempotent(self):
+        """重复注册/注销幂等：不重复追加、不重复移除、注册标志复位后可再注册。"""
+        handlers = gb_operators.bpy.app.handlers
+        gb_operators.unregister_app_handlers()
+        gb_operators.register_app_handlers()
+        gb_operators.register_app_handlers()     # 第二次注册 no-op
+        for lst in (handlers.undo_post, handlers.redo_post, handlers.load_post):
+            self.assertEqual(lst.count(gb_operators._on_undo_post), 1)
+        gb_operators.unregister_app_handlers()
+        gb_operators.unregister_app_handlers()   # 第二次注销 no-op
+        for lst in (handlers.undo_post, handlers.redo_post, handlers.load_post):
+            self.assertNotIn(gb_operators._on_undo_post, lst)
+        self.assertFalse(gb_operators._handlers_registered)
+        # 标志已复位 → 可再次注册（模拟重复 enable/disable 插件）
+        gb_operators.register_app_handlers()
+        self.assertTrue(gb_operators._handlers_registered)
+        self.assertIn(gb_operators._on_undo_post, handlers.undo_post)
+        gb_operators.unregister_app_handlers()
+        self.assertFalse(gb_operators._handlers_registered)
 
 
 if __name__ == "__main__":

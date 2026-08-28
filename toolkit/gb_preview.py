@@ -139,16 +139,19 @@ def geometry_mix_value(use_evaluated: bool) -> float:
 # ---------------------------------------------------------------------------
 
 def is_uniform_scale(scale, rel_tol: float = 1e-4) -> bool:
-    """均匀缩放判定：|sx-sy|,|sy-sz| ≤ rel_tol*max(|s|,1e-6)。
+    """正均匀缩放判定：sx≈sy≈sz 且全部 > 0。
 
-    均匀缩放球可复用世界坐标邻接表做沿表面传播；非均匀（椭球）必须回退
-    逐球局部邻接表的 geodesic_field。
+    均匀缩放球可复用世界坐标邻接表做沿表面传播；非均匀（椭球）或
+    负/零缩放（镜像/退化，surface_distances_uniform_scale 的 cutoff 语义
+    不成立）必须回退逐球局部邻接表的 geodesic_field。
     """
     s = np.asarray(scale, dtype=np.float64).reshape(-1)
     if s.size < 3:
-        return True
+        return bool(np.all(s > 0))
     s = s[:3]
-    bound = rel_tol * max(float(np.max(np.abs(s))), 1e-6)
+    if not np.all(s > 0):
+        return False
+    bound = rel_tol * max(float(np.max(s)), 1e-6)
     return bool(np.allclose(s, s[0], rtol=0.0, atol=bound))
 
 

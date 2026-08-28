@@ -53,6 +53,29 @@ class GB_Properties(bpy.types.PropertyGroup):
     island_info: bpy.props.StringProperty(name="网格岛", default="")
     preview_info: bpy.props.StringProperty(name="预览", default="")
 
+    # -- 新建会话行为（双向/合法缺失补权；默认保持现状行为）----------------
+    start_direction: bpy.props.EnumProperty(
+        name="写入方向",
+        items=(
+            ('AUTO', "自动", "Source_ 调试物体=正向写入同源目标集合；"
+                     "Target_ 调试物体=目标自身（现状行为）"),
+            ('REVERSE', "反向（目标→源）", "Target_ 调试物体反向写回原物体/"
+                     "原合集多物体分发，需显式选择"),
+        ),
+        default='AUTO',
+        description="从调试物体新建会话时的权重写入方向；反向写源侧属于"
+                    "用户原数据修改，需显式选择")
+    start_create_missing: bpy.props.BoolProperty(
+        name="显式创建缺失组", default=False,
+        description="任一侧顶点组不存在时，显式创建并按高斯球范围生成权重"
+                    "（合法缺失/未匹配顶点组可补权，不会误判为匹配失败；"
+                    "反向写源侧必须开启才会自动建组）")
+    clear_outside_on_write: bpy.props.BoolProperty(
+        name="写入时球外清零", default=False,
+        description="确认写入时把球外顶点（权重场为 0）的该组权重移除；"
+                    "默认关闭 = 球外保留原组值",
+        update=_mark_dirty)
+
     # -- 确认行为 ----------------------------------------------------------
     normalize_on_confirm: bpy.props.BoolProperty(
         name="确认后规格化", default=True,
@@ -73,6 +96,23 @@ class GB_Properties(bpy.types.PropertyGroup):
         name="透视预览", default=True,
         description="被模型自身遮挡的背面权重以低透明度幽灵层透视显示；"
                     "关闭后只显示可见表面的权重")
+    use_evaluated_preview: bpy.props.BoolProperty(
+        name="预览使用变形后位置", default=True,
+        description="热力图与写入计算使用形态键/骨骼姿态评估后的顶点位置"
+                    "（depsgraph 非破坏评估；顶点数改变时自动回退基础网格并提示）。"
+                    "关闭则回到 v1 的基础网格位置",
+        update=_mark_dirty)
+    preview_mode: bpy.props.EnumProperty(
+        name="预览模式",
+        items=(
+            ('COMBINED', "组合权重",
+             "显示全部启用球逐点取最大合并后的权重（与写入一致）"),
+            ('SINGLE', "单球贡献",
+             "只显示当前活动球的独立贡献，便于逐个球调试"),
+        ),
+        default='COMBINED',
+        description="组合权重=max 合并全部启用球；单球贡献=只显示活动球",
+        update=_mark_dirty)
 
     # -- 运行节奏 ------------------------------------------------------------
     tick_interval: bpy.props.FloatProperty(

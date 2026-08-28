@@ -81,7 +81,11 @@ from .pc_operators import pc_operators_list, shutdown as pc_shutdown
 from .pc_panel import pc_panel_list
 
 from .gb_properties import gb_properties_list, GB_Properties, GB_BallSettings
-from .gb_operators import gb_operators_list, shutdown as gb_shutdown
+from .gb_operators import (
+    gb_operators_list,
+    shutdown as gb_shutdown,
+    register_app_handlers as gb_register_app_handlers,
+)
 from .gb_panel import gb_panel_list
 
 __all__ = [
@@ -470,6 +474,10 @@ def register():
             print(f"[TheHerta4]   注册PC面板失败: {op_class.__name__} - {e}")
 
     # 高斯权重球（实验功能）
+    try:
+        gb_register_app_handlers()
+    except Exception as e:
+        print(f"[TheHerta4]   注册GB生命周期处理器失败: {e}")
     for op_class in gb_properties_list:
         try:
             bpy.utils.register_class(op_class)
