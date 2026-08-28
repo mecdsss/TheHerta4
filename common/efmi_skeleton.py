@@ -1962,6 +1962,7 @@ class EFMIBoneMapBuilder:
         reference_lod: str,
         projection_skip_by_lod: dict[str, set[str]] | None = None,
         correspondence: dict | None = None,
+        deduplicate: bool | None = None,
     ) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, int]], int]:
         """把各 LOD 的槽位编号建成**相互独立、分段平移**的全局空间（v10/v11/v13）。
 
@@ -2000,6 +2001,8 @@ class EFMIBoneMapBuilder:
         （非基准 LOD 的起始基址），用于统计数据与后续 LOD2+ 的继续平移。
         ``correspondence`` 为 build_cross_lod_correspondence 的返回值，缺省
         None 时退化为纯 v10 行为（各自去重 + 平移，无镜像约束）。
+        ``deduplicate`` 透传给 build_vg_maps：False 时不执行权重扩散去重
+        （每根骨骼独占槽位），None 沿用全局 _DEDUP_ENABLED。
         """
         projection_skip_by_lod = projection_skip_by_lod or {}
         reference_lod = str(reference_lod or "").strip()
@@ -2021,6 +2024,7 @@ class EFMIBoneMapBuilder:
             baseline_maps, baseline_offsets = EFMIBoneMapBuilder.build_vg_maps(
                 reference_retained,
                 lifetime_domains=lifetime_domains_by_lod.get(reference_lod),
+                deduplicate=deduplicate,
             )
         else:
             baseline_maps, baseline_offsets = {}, {}
@@ -2079,6 +2083,7 @@ class EFMIBoneMapBuilder:
                 retained,
                 constraint_labels=constraint_labels,
                 lifetime_domains=lifetime_domains_by_lod.get(lod_name),
+                deduplicate=deduplicate,
             )
             # v11 镜像强制：同一 L0 合并组的全部目标候选强制共用最小槽位
             # （build_vg_maps 的标签只断不同组，不并同组）。只重定目标侧
@@ -3321,6 +3326,7 @@ class EFMISkeletonMergeHelper:
         unique_str_list: list[str],
         force: bool = False,
         lod_group_projection: bool = True,
+        dedup_enabled: bool | None = None,
     ) -> tuple[bool, str]:
         """为 EFMI 工作空间的子网格生成并写回骨骼合并数据（幂等）。
 
@@ -3351,8 +3357,13 @@ class EFMISkeletonMergeHelper:
         诊断账本；开关开启时，该账本还用于构造 LOD1 去重约束标签，但不共享
         或重排 LOD0 的实际槽位编号。
 
+        ``dedup_enabled`` 控制顶点组去重（权重扩散合并）：None（省略）沿用全局
+        _DEDUP_ENABLED；False 时不执行任何去重，每根骨骼独占槽位
+        （build_vg_maps 的恒等映射路径，与 _DEDUP_ENABLED=False 语义一致）。
+
         返回 (是否成功, 描述)。
         """
+        effective_dedup = _DEDUP_ENABLED if dedup_enabled is None else bool(dedup_enabled)
         if not unique_str_list:
             return False, "没有子网格需要处理。"
 
@@ -3496,7 +3507,9 @@ class EFMISkeletonMergeHelper:
                         # 不能当作缓存缺失，否则每次导入都重算整个联合缓存。
                         projection_skipped_in_joint.add(unique_str)
                         continue
-                    if not cls._efmi_cache_intact(payload, json_path, unique_str):
+                    if not cls._efmi_cache_intact(
+                        payload, json_path, unique_str, expected_dedup_enabled=effective_dedup
+                    ):
                         joint_cache_ready = False
                         break
                     if (
@@ -3541,6 +3554,7 @@ class EFMISkeletonMergeHelper:
                     parser=parser,
                     force=True,
                     collect_only=True,
+                    dedup_enabled=effective_dedup,
                 )
                 collected_by_lod[lod_name] = collected
 
@@ -3606,6 +3620,7 @@ class EFMISkeletonMergeHelper:
                     reference_lod,
                     projection_skip_by_lod,
                     correspondence=correspondence if lod_group_projection else None,
+                    deduplicate=effective_dedup,
                 )
             )
 
@@ -3642,6 +3657,7 @@ class EFMISkeletonMergeHelper:
                         projection_skip_by_lod.get(lod_name, set())
                         if lod_group_projection else None
                     ),
+                    dedup_enabled=effective_dedup,
                 )
                 total_written += written
                 total_skipped += skipped
@@ -3673,6 +3689,7 @@ class EFMISkeletonMergeHelper:
                 unique_str_list=group_list,
                 parser=parser,
                 force=force,
+                dedup_enabled=effective_dedup,
             )
             total_written += written
             total_skipped += skipped
@@ -3707,6 +3724,7 @@ class EFMISkeletonMergeHelper:
         collect_only: bool = False,
         cross_lod_info: dict | None = None,
         projection_skip_parts: set[str] | None = None,
+        dedup_enabled: bool | None = None,
     ) -> tuple[int, int, str] | tuple[dict[str, tuple], dict[str, dict], int]:
         """为单个 LOD 组的子网格生成并写回骨骼合并数据（幂等）。
 
@@ -3718,6 +3736,9 @@ class EFMISkeletonMergeHelper:
         返回 (written, skipped, 描述消息)；vg_offsets 在该组内从 0 起分配，
         与其它 LOD 组完全独立。collect_only=True 时只返回原始候选和元数据，
         不写文件，供跨 LOD 对应阶段使用。
+
+        ``dedup_enabled`` 控制本组 build_vg_maps 的顶点组去重：None 沿用全局
+        _DEDUP_ENABLED；False 时该组每根骨骼独占槽位（恒等映射，不去重）。
         """
         if not unique_str_list:
             return 0, 0, "没有子网格需要处理。"
@@ -3749,7 +3770,7 @@ class EFMISkeletonMergeHelper:
                 resolved_cache[unique_str] = False
                 continue
             cache_intact = cls._efmi_cache_intact(
-                cached_json, json_path, unique_str
+                cached_json, json_path, unique_str, expected_dedup_enabled=dedup_enabled
             )
             if (
                 cache_intact
@@ -3948,6 +3969,7 @@ class EFMISkeletonMergeHelper:
                 submesh_skeletons,
                 protected_pairs=protected_pairs,
                 constraint_labels=constraint_labels,
+                deduplicate=dedup_enabled,
             )
 
         # 写回工作空间 json + 复制骨骼池缓存
@@ -4002,7 +4024,9 @@ class EFMISkeletonMergeHelper:
             submesh_json["VGOffset"] = vg_offset
             submesh_json["VGMap"] = {str(k): int(v) for k, v in sorted(vg_map.items())}
             submesh_json["VGMapAlgorithmVersion"] = _VG_MAP_ALGORITHM_VERSION
-            submesh_json["VGMapDedupEnabled"] = bool(_DEDUP_ENABLED)
+            submesh_json["VGMapDedupEnabled"] = (
+                bool(_DEDUP_ENABLED) if dedup_enabled is None else bool(dedup_enabled)
+            )
 
             # 联合 LOD 对应只写诊断/后续处理元数据，不改变本 LOD 的运行时
             # offset 布局。这样 LOD0/LOD1 仍可各自挂载自己的骨骼池，同时保留
@@ -4399,13 +4423,20 @@ class EFMISkeletonMergeHelper:
         }
 
     @classmethod
-    def _efmi_cache_intact(cls, submesh_json: dict, json_path: str, unique_str: str) -> bool:
+    def _efmi_cache_intact(
+        cls,
+        submesh_json: dict,
+        json_path: str,
+        unique_str: str,
+        expected_dedup_enabled: bool | None = None,
+    ) -> bool:
         """EFMI 缓存快路径完整性校验（版本 + schema + 映射覆盖 + 骨骼缓存文件）。
 
         与 ZZMI 的 _zzmi_cache_intact 同构：任何一项缺失都判定缓存不完整，
         整批重建——骨骼池复制失败 / 工作空间搬迁漏掉 ModImpRuntime / 旧算法
         缓存都不允许带着半成品 VGMap 永久幂等跳过。校验项：
-        - VGMapAlgorithmVersion == 当前算法版本、VGMapDedupEnabled == 全局开关；
+        - VGMapAlgorithmVersion == 当前算法版本、VGMapDedupEnabled ==
+          期望去重开关（省略时沿用全局 _DEDUP_ENABLED）；
         - VGCount/VGOffset 存在且非负；
         - VGMap 非空、键完整覆盖 0..VGCount-1 且槽位非负；全零矩阵骨骼
           不参与去重，但从 v15 起也必须保留独立稳定槽位；
@@ -4428,7 +4459,12 @@ class EFMISkeletonMergeHelper:
         if cache_version != _VG_MAP_ALGORITHM_VERSION:
             return False
         cache_dedup_enabled = submesh_json.get("VGMapDedupEnabled")
-        if not isinstance(cache_dedup_enabled, bool) or cache_dedup_enabled != bool(_DEDUP_ENABLED):
+        expected_dedup = (
+            bool(_DEDUP_ENABLED)
+            if expected_dedup_enabled is None
+            else bool(expected_dedup_enabled)
+        )
+        if not isinstance(cache_dedup_enabled, bool) or cache_dedup_enabled != expected_dedup:
             return False
 
         vg_map = submesh_json.get("VGMap")

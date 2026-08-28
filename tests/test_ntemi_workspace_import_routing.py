@@ -518,6 +518,12 @@ class MergedSkeletonFallbackRoutingTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     global_properties,
+                    "efmi_lod_group_dedup",
+                    side_effect=lambda: True,
+                    create=True,
+                ),
+                mock.patch.object(
+                    global_properties,
                     "set_import_merged_vgmap",
                     side_effect=lambda value: option_updates.append(bool(value)),
                     create=True,

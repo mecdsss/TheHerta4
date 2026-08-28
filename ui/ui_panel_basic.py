@@ -335,7 +335,7 @@ class PanelBasicInformation(bpy.types.Panel):
             or BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
         )
 
-        layout.label(text="TheHerta4 v4.4.36", icon='INFO')
+        layout.label(text="TheHerta4 v4.4.37", icon='INFO')
         layout.label(text=TR.translate("SSMT缓存文件夹路径: ") + GlobalConfig.ssmtlocation)
         layout.label(text=TR.translate("当前配置名称: ") + GlobalConfig.gamename)
         layout.label(text=TR.translate("当前游戏预设: ") + GlobalConfig.logic_name)
@@ -534,6 +534,9 @@ class PanelBasicInformation(bpy.types.Panel):
         # EFMI 专用：多 LOD 使用 LOD0 分组投影，关闭则两侧独立去重。
         if GlobalConfig.logic_name == LogicName.EFMI:
             layout.prop(global_properties, "efmi_lod_group_projection")
+            # EFMI 顶点组去重开关：关闭时不执行权重扩散去重（恒等映射，
+            # 每根骨骼独占槽位），用于去重误并/偏移诊断与回滚。
+            layout.prop(global_properties, "efmi_lod_group_dedup")
 
         if GlobalConfig.logic_name == LogicName.WWMI or GlobalConfig.logic_name == LogicName.NTEMI:
             layout.prop(global_properties, "import_skip_empty_vertex_groups")

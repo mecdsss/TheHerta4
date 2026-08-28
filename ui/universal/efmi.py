@@ -35,6 +35,9 @@ _EFMI_CROSS_LOD_LAYOUT_VERSION = 13
 # 抖动级差异；实测错误对应（L1 骨骼匹配到 L0 另一根骨骼）差异达 272~449。
 # 超过该阈值即拒绝静默折叠（raise），绝不产出“L1 显示套 L0 骨骼”的错误权重。
 _SAME_IB_FOLD_MAX_MATRIX_DIFF = 1.0
+_SAME_IB_FOLD_STRONG_GEOMETRY_MAX_MATRIX_DIFF = 16.0
+_SAME_IB_FOLD_MAX_COMPONENT_SCORE = 1e-5
+_SAME_IB_FOLD_MAX_CENTROID_DISTANCE = 1e-5
 
 @dataclass
 class ExportEFMI:
@@ -1066,15 +1069,37 @@ class ExportEFMI:
                     parsed_matrix_diff = float(matrix_diff)
                 except (TypeError, ValueError):
                     parsed_matrix_diff = float("inf")
+                component_score = corr.get("component_score")
+                centroid_distance = corr.get("centroid_distance")
+                try:
+                    parsed_component_score = float(component_score)
+                    parsed_centroid_distance = float(centroid_distance)
+                except (TypeError, ValueError):
+                    parsed_component_score = float("inf")
+                    parsed_centroid_distance = float("inf")
+                baseline_local_id = int(corr.get("local_vg_id", local_id))
+                strong_geometry_evidence = (
+                    baseline_local_id == local_id
+                    and numpy.isfinite(parsed_component_score)
+                    and parsed_component_score <= _SAME_IB_FOLD_MAX_COMPONENT_SCORE
+                    and numpy.isfinite(parsed_centroid_distance)
+                    and parsed_centroid_distance <= _SAME_IB_FOLD_MAX_CENTROID_DISTANCE
+                )
+                allowed_matrix_diff = (
+                    _SAME_IB_FOLD_STRONG_GEOMETRY_MAX_MATRIX_DIFF
+                    if strong_geometry_evidence
+                    else _SAME_IB_FOLD_MAX_MATRIX_DIFF
+                )
                 if (
                     not numpy.isfinite(parsed_matrix_diff)
-                    or parsed_matrix_diff > _SAME_IB_FOLD_MAX_MATRIX_DIFF
+                    or parsed_matrix_diff > allowed_matrix_diff
                 ):
                     raise RuntimeError(
                         f"[EFMI骨骼合并] {getattr(lod_model, 'unique_str', '?')} "
                         f"local {local_id}（全局槽 {source_global_id}）的跨 LOD 对应骨骼"
                         f" matrix_diff={parsed_matrix_diff:.3f} 超过 same-IB 折叠阈值 "
-                        f"{_SAME_IB_FOLD_MAX_MATRIX_DIFF}：L1 蒙皮语义与基准部件不一致，"
+                        f"{allowed_matrix_diff}（强几何证据={strong_geometry_evidence}）："
+                        "L1 蒙皮语义与基准部件不一致，"
                         "拒绝静默折叠。请重新执行骨骼合并反查/重新导入该角色"
                     )
             reference_component = str(

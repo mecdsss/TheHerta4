@@ -181,6 +181,12 @@ class GlobalProterties(bpy.types.PropertyGroup):
         default=True,
     ) # type: ignore
 
+    efmi_lod_group_dedup: bpy.props.BoolProperty(
+        name="EFMI 顶点组去重",
+        description="EFMI 骨骼合并时是否执行权重扩散去重：开启时相同骨骼跨组件共享槽位（节省骨骼槽）；关闭时每根骨骼独占槽位（恒等映射，不做任何合并）。关闭适用于确认去重误并/偏移时诊断与回滚",
+        default=True,
+    ) # type: ignore
+
     ignore_muted_shape_keys: bpy.props.BoolProperty(
         name="忽略未启用的形态键",
         description="勾选此项后，未勾选启用的形态键在生成Mod时会被忽略，勾选的形态键会参与生成Mod",
@@ -441,6 +447,14 @@ class GlobalProterties(bpy.types.PropertyGroup):
     @classmethod
     def efmi_lod_group_projection(cls):
         return cls._bool_attr("efmi_lod_group_projection", True)
+
+    @classmethod
+    def efmi_lod_group_dedup(cls):
+        """EFMI 骨骼合并是否执行顶点组去重（权重扩散合并）。
+
+        开启 = 相同骨骼跨组件共享槽位；关闭 = 恒等映射、每根骨骼独占槽位。
+        """
+        return cls._bool_attr("efmi_lod_group_dedup", True)
 
     @classmethod
     def ignore_muted_shape_keys(cls):

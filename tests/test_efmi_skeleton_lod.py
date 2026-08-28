@@ -294,6 +294,26 @@ class EFMICacheSchemaTests(unittest.TestCase):
             oversized, str(self.json_path), self.bare
         ))
 
+    def test_cache_intact_respects_expected_dedup_enabled(self):
+        """关闭去重生成的缓存（DedupEnabled=False）在期望关闭时仍视为完整，
+        开启去重时则失效——去重开关是缓存键的一部分。"""
+        no_dedup_payload = dict(self.payload, VGMapDedupEnabled=False)
+        self.assertFalse(EFMISkeletonMergeHelper._efmi_cache_intact(
+            no_dedup_payload, str(self.json_path), self.bare
+        ))
+        self.assertTrue(EFMISkeletonMergeHelper._efmi_cache_intact(
+            no_dedup_payload,
+            str(self.json_path),
+            self.bare,
+            expected_dedup_enabled=False,
+        ))
+        self.assertFalse(EFMISkeletonMergeHelper._efmi_cache_intact(
+            self.payload,
+            str(self.json_path),
+            self.bare,
+            expected_dedup_enabled=False,
+        ))
+
 
 def _make_dump_multi(dump_dir, draw_specs):
     """同 _make_dump 但支持多个 drawcall（每个 (draw_index, cb_hash, t0_hash, bone_tx)）。"""

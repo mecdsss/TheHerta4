@@ -456,6 +456,7 @@ def ImprotFromWorkSpaceFull(self, context):
                 workspace_root=GlobalConfig.path_workspace_folder(),
                 unique_str_list=import_keys,
                 lod_group_projection=GlobalProterties.efmi_lod_group_projection(),
+                dedup_enabled=GlobalProterties.efmi_lod_group_dedup(),
             )
             print(f"[EFMI骨骼合并] {message}")
             merged_vgmap_ready = bool(ok)

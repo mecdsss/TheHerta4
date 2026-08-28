@@ -268,6 +268,39 @@ class LifetimeDomainDedupTests(unittest.TestCase):
             "单 LOD 模式（v10 语义）不得因生命周期约束回退去重",
         )
 
+    def test_dedup_disabled_yields_identity_slots_across_lods(self):
+        """deduplicate=False 时每根骨骼独占槽位（恒等映射），两 LOD 均不去重。"""
+        bone = _bone(0.0)
+        collected = {
+            "LOD0": {
+                "LOD0.facea-1-0": _entry([bone], {0: _sig((0.0, 0.0, 0.0))}),
+                "LOD0.faceb-2-0": _entry([bone], {0: _sig((1.0, 0.0, 0.0))}),
+            },
+            "LOD1": {
+                "LOD1.facea-3-0": _entry([bone], {0: _sig((0.01, 0.0, 0.0))}),
+                "LOD1.faceb-4-0": _entry([bone], {0: _sig((1.01, 0.0, 0.0))}),
+            },
+        }
+        maps, offsets, base = EFMIBoneMapBuilder.build_independent_lod_maps(
+            collected, "LOD0", deduplicate=False
+        )
+        self.assertNotEqual(
+            maps["LOD0"]["LOD0.facea-1-0"][0],
+            maps["LOD0"]["LOD0.faceb-2-0"][0],
+            "关闭去重后位相同矩阵也不得跨组件合并槽位",
+        )
+        # 每个 local 恒等映射到自己的 vg_offset + local
+        for lod_name in ("LOD0", "LOD1"):
+            for unique_str, part_map in maps[lod_name].items():
+                offset = offsets[lod_name][unique_str]
+                for local_id, global_slot in part_map.items():
+                    self.assertEqual(
+                        global_slot, offset + int(local_id),
+                        "关闭去重时应保持 local -> vg_offset + local 恒等映射",
+                    )
+        # 平移基址仍非零（LOD1 段在基准段之后）
+        self.assertGreater(base, 0)
+
 
 class ExportSlotReachabilityTests(unittest.TestCase):
     """I2：导出前对存活 Blend 引用槽做可达性校验，违反即明确拒绝。"""
@@ -354,6 +387,29 @@ class SameIbFoldSkinningCompatibilityTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "matrix_diff|骨骼矩阵差异|蒙皮语义"):
             ExportEFMI._build_same_ib_bone_aliases(baseline, lod)
+
+    def test_same_ib_fold_accepts_moderate_matrix_diff_with_strong_geometry_evidence(self):
+        """佩丽卡 f4f4158a：几何/局部组证据近乎精确时允许 10.806 的跨帧矩阵差。"""
+        baseline = _FakePreSkindSubmesh(
+            "LOD0.f4f4158a-480-0", 365, 6, match_draw_ib="f4f4158a",
+            vg_map={str(i): 365 + i for i in range(6)},
+        )
+        lod = _FakePreSkindSubmesh(
+            "LOD1.f4f4158a-480-0", 734, 6, match_draw_ib="f4f4158a",
+            ref_component="LOD0.f4f4158a-480-0",
+            vg_map={str(i): 734 + i for i in range(6)},
+            corr={
+                str(i): {
+                    "local_vg_id": i,
+                    "matrix_diff": 10.806 if i == 1 else 3.410,
+                    "component_score": 9.39e-7,
+                    "centroid_distance": 3.6e-7,
+                }
+                for i in range(6)
+            },
+        )
+        aliases = ExportEFMI._build_same_ib_bone_aliases(baseline, lod)
+        self.assertEqual(aliases, {734 + i: 365 + i for i in range(6)})
 
     def test_same_ib_fold_accepts_compatible_l1_skinning(self):
         """矩阵接近（捕获抖动级差异）的 L1 部件保持可折叠，不误杀正常脸部件。"""
