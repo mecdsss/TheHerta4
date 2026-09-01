@@ -20,6 +20,7 @@ import bpy
 import math
 import array
 import hashlib
+import os
 import re
 import struct
 from concurrent.futures import ThreadPoolExecutor
@@ -356,10 +357,27 @@ class SubMeshModel:
                 run_merged_skeleton_preprocess = True
             elif GlobalConfig.logic_name == LogicName.ZZMI and self.vg_count > 0:
                 run_merged_skeleton_preprocess = True
+
+        # 双套顶点组导出转换（t9 方案 A：合并与非合并路径统一身份化）：
+        # EFMI 去重对象（json 带 VGMap 合并元数据）在任一 EFMI 导出路径（合并骨架
+        # 模式或非合并路径）下，先把合并槽更名回「源组中权重强度最强者」的非去重
+        # 身份（Z 组更名），使导出 BLENDINDICES 落在原初身份命名空间——运行时全链
+        # 本以身份（VGOffset+local）为键（t9 §2.1），VB 直写身份消除「引用 canonical
+        # 槽」的跨组件间接层（F1 根治 + F4 族减轻）。
+        # 更名只改名不排序；补缺/排序/断言 index==name 由下方各分支统一执行一次。
+        dualset_eligible = (
+            GlobalConfig.logic_name == LogicName.EFMI
+            and self.vg_map_algorithm_version > 0
+            and self.merged_skeleton_metadata_valid
+            and bool(getattr(self.d3d11_game_type, "GPU_PreSkinning", False))
+        )
         if run_merged_skeleton_preprocess:
             if GlobalConfig.logic_name == LogicName.ZZMI:
                 self._prepare_zzmi_merged_skeleton_vertex_groups(submesh_merged_obj)
             else:
+                # EFMI 合并骨架模式：更名回非去重身份后再走既有预处理链。
+                if dualset_eligible:
+                    self._apply_dualset_export_rename(submesh_merged_obj)
                 # 打包级幂等升宽：SubMeshModel 构造时可能因导入/导出状态差异未
                 # 执行 widen，但**打包 dtype 必须与 INI 声明的 R16 全池布局一致**
                 # ——否则顶点组读回的是全局骨骼 id（>255，如 596/372），被 uint8
@@ -390,6 +408,21 @@ class SubMeshModel:
                         "65535，BLENDINDICES 无法以 R16 承载，请拆分骨架或减小骨骼池"
                     )
                 self._prepare_merged_skeleton_vertex_groups(submesh_merged_obj)
+        elif dualset_eligible:
+            # EFMI 去重对象走非合并/其它逻辑导出（原 D2-B 路径保持）：更名回
+            # 非去重身份 + 复用预处理链一次成型。更名失败即中止（fail-closed）。
+            self._apply_dualset_export_rename(submesh_merged_obj)
+            # S2（t20）/ B1 真落地（t22）：非合并路径补 widen——更名后身份
+            # ∈ [0, Σvg_count) 可能 >255，而本工作区 Blend 原生 R8G8B8A8_UINT；
+            # 不升宽则 _parse_blendindices 的 R8 范围检查抛 Fatal
+            # （obj_buffer_helper.py:430-465）→ 导出中断。
+            # t22 移除 import_merged_vgmap()/GPU_PreSkinning 门控：elif 可达条件
+            # （dualset_eligible 含 GPU_PreSkinning）使二者恒真/恒假（t21 §1.1：
+            # elif ⟺ run_merged_skeleton_preprocess=False ⟹ checkbox False——
+            # 门控挂复选框 = 死代码，widen 永不触发）。widen 幂等（已 R16 返
+            # False），无条件调用多调无害；合并分支行为不变。
+            self.d3d11_game_type.widen_blendindices()
+            self._prepare_merged_skeleton_vertex_groups(submesh_merged_obj)
 
         obj_buffer_result = ExportUtils.build_unity_obj_buffer_result(
             obj=submesh_merged_obj,
@@ -424,6 +457,229 @@ class SubMeshModel:
         )
 
         self._deduplicate_draw_calls()
+
+    def _apply_dualset_export_rename(self, obj):
+        """双套顶点组导出转换（M1 挂载点，t3 规格 §2/§6.1）：合并槽更名回运行时身份。
+
+        两边分离契约（t3 设计 §2/§3；身份映射权威实现对照任务书
+        ``get_dualset_slot_identity_map`` 别名 = ``build_per_mesh_identity_map``）：
+        BL 侧顶点组名 = 合并槽位号（去重池命名空间，**永不直接写盘**）；导出侧
+        更名回运行时身份 = 本组件成员身份（``VGOffset + local`` 语义，per-mesh
+        覆盖层，含未更名槽），随后写盘 BLENDINDICES 落在自己 attach 必写的
+        自属声明段内。
+
+        非合并导出路径（F1 主场景根治）：EFMI 去重对象（json 带 VGMap 合并元数据）
+        在本次导出未走合并骨架预处理链时，把临时导出对象上的合并槽顶点组名
+        （去重全局 id）更名回本组件成员身份（per-mesh 身份选择主判 = 顶点数
+        vertex_count，2026-08-29 用户裁决「顶点组多的那一边」，见
+        efmi_skeleton.select_dualset_export_identity），随后复用
+        _prepare_merged_skeleton_vertex_groups 的「剔非数字 -> 补缺 -> 排序 ->
+        断言 index==name」纪律一次成型。
+
+        - 单源槽恒等（e(s)==s），无实际操作；
+        - 合并槽且本组件成员 ≠ 原槽：更名（如槽 371 -> 身份 596）；
+        - 身份唯一性定理（t3 §1.3）保证改名不会撞名：e(s)≠s 时 e(s) 必不在
+          槽位集合内，也不与其它槽的导出身份重复；
+        - 失败即中止导出（fail-closed，A1-A5 + FC-1：槽无本组件成员时
+          build_per_mesh_identity_map 直接 RuntimeError，不静默回退槽位直写；
+          写盘路径另有 FC-2 产物域断言兜底）；
+        - 本方法只做「槽位名→身份名」更名；补缺/排序/断言 index==name 由调用方
+          在各自分支统一执行一次（合并/非合并共用同一预处理纪律，防双重执行）。
+        """
+        if obj is None or obj.type != 'MESH':
+            return
+        if not obj.vertex_groups:
+            return
+        # 仅 EFMI 去重对象适用：有 VGMap 合并元数据（算法版本号 > 0）。
+        if self.vg_map_algorithm_version <= 0 or not self.merged_skeleton_metadata_valid:
+            return
+        workspace_root = str(GlobalConfig.path_workspace_folder() or "").strip()
+        if not workspace_root:
+            return
+        from .efmi_skeleton import EFMIBoneMapBuilder
+
+        # S1（t20 容错对称化）：build_dualset_export_table 的表级 fail-closed
+        # 断言（A1 VGMap 键集 / A3 identity 单射 / A4 强度可得 / B10 跨 LOD 段）
+        # 抛 RuntimeError 时，本调用点保留 fail-closed 语义（不静默回退槽位直写，
+        # 与 rekey 侧一致地捕获），但把错误信息包装为带「子网格 / 断言 / 恢复
+        # 指引」的可操作文本——避免构造期裸 abort 留下空目录且无指引。
+        try:
+            component_unique_str = str(
+                self.workspace_unique_str or self.unique_str or ""
+            ).strip()
+            # t25 方向 A（v3）：per-mesh 身份映射——导出身份 = 本组件成员身份，
+            # 全量覆盖（含未更名槽）。根治 t24 型「跨组件 canonical 单写者时序
+            # 塌陷」：网格引用落回自己 attach 必写的身份域。
+            rename_map = EFMIBoneMapBuilder.build_per_mesh_identity_map(
+                workspace_root, component_unique_str
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"[EFMI双套导出] {obj.name}（{self.unique_str}）导出转换表构建失败，"
+                f"中止导出（fail-closed，不静默回退槽位直写）。\n"
+                f"原因: {exc}\n"
+                "恢复指引: 请在工作空间执行「骨骼合并反查/重新导入」确保 VGMap "
+                "元数据完整后重试；若反复失败请检查是否存在外部进程反复清除工作区 "
+                "json（Config/Tabs 或 TYPE_ 目录）"
+            ) from exc
+        if not rename_map:
+            return
+
+        # t31/佩丽卡场景A硬化（fail-closed，不放宽 FC-2；失败点前移 + 可操作指引）：
+        # per-mesh 更名表键域 = 本组件当前 json VGMap 引用槽。带权重的数字组名
+        # 必须 ⊆ 该域 ∪ 折叠基准段（与 FC-2 的「自属段 ∪ 折叠目标」同口径：
+        # same-IB 折叠的 TEMP 合并拷贝会携带基准 LOD0 部件的槽位，属合法折叠
+        # 目标）——旧导入/旧缓存场景对象的数字顶点组（如佩丽卡重建前的旧合并
+        # 槽 371..647）不在该域内：静默跳过会让其原样直写、到 FC-2 才在产物级
+        # 被拦（消息难定位「373..393 从哪来」）。这里在 M1 更名点前置拒绝：
+        # 报「场景对象顶点组与工作区骨骼元数据不同期，请重新导入该角色」并
+        # 列出具体槽位（不再静默直写）。
+        self._assert_dualset_weighted_groups_in_identity_domain(
+            obj,
+            set(rename_map.keys()),
+            workspace_root,
+            str(self.unique_str or ""),
+        )
+
+        renamed_count = 0
+        for vg in list(obj.vertex_groups):
+            name = str(vg.name)
+            if re.fullmatch(r"[0-9]+", name) is None:
+                continue
+            slot = int(name)
+            target = rename_map.get(slot)
+            if target is None or target == slot:
+                continue
+            vg.name = str(target)
+            renamed_count += 1
+        if renamed_count == 0:
+            return
+        print(
+            f"[EFMI双套导出] {obj.name}: {renamed_count} 个合并槽更名回非去重身份，"
+            "(补缺/排序/断言由调用方预处理链统一执行)"
+        )
+
+    @staticmethod
+    def _dualset_registered_slots_union(workspace_root: str) -> set[int]:
+        """全工作区所有组件 json VGMap 引用槽并集（t16 C-ii，统一骨架/单池语义）。
+
+        骨骼合并后全场共用一副骨架：任一组件引用另一组件的**已注册槽**时，
+        被引用组件生成占位符保持该槽注册——跨组件引用是设计内合法状态。故
+        放行域 = 当前 json 全组件（LOD0/LOD1…）VGMap 引用槽并集（动态读；
+        未注册/旧代槽不在并集内 → 照旧 fail-closed）。json 元数据缺失/被清
+        （t15 场景）时并集为空 → 调用方按「元数据缺失」分支报错（与
+        「未注册槽」原因区分）。
+        """
+        slots: set[int] = set()
+        ws = str(workspace_root or "")
+        if not ws or not os.path.isdir(ws):
+            return slots
+        try:
+            for lod_name in os.listdir(ws):
+                lod_root = os.path.join(ws, lod_name)
+                if not os.path.isdir(lod_root) or not lod_name.upper().startswith("LOD"):
+                    continue
+                for bare in os.listdir(lod_root):
+                    folder = os.path.join(lod_root, bare)
+                    if not os.path.isdir(folder) or bare.startswith("DedupedTextures"):
+                        continue
+                    for entry in os.listdir(folder):
+                        tdir = os.path.join(folder, entry)
+                        if not os.path.isdir(tdir) or not entry.startswith("TYPE_"):
+                            continue
+                        jp = os.path.join(tdir, bare + ".json")
+                        if not os.path.isfile(jp):
+                            continue
+                        try:
+                            import json as _json
+                            with open(jp, encoding="utf-8") as f:
+                                payload = _json.load(f)
+                            vg_map = payload.get("VGMap")
+                            if isinstance(vg_map, dict):
+                                for raw_value in vg_map.values():
+                                    # 注意：槽位 0 是合法注册槽，不能用
+                                    # `raw_value or ""`（0 会被当假值吞掉）。
+                                    text_value = str(raw_value).strip()
+                                    if text_value.isdigit():
+                                        slots.add(int(text_value))
+                        except Exception:
+                            continue
+                        break
+        except OSError:
+            pass
+        return slots
+
+    @staticmethod
+    def _assert_dualset_weighted_groups_in_identity_domain(
+        obj, domain: set[int], workspace_root: str = "", component_unique_str: str = ""
+    ) -> None:
+        """域前置断言：带权重数字组名 ⊆ 本组件身份域 ∪ 全工作区已注册槽并集。
+
+        语义依据（t16 C-ii，用户领域裁决）：骨骼合并后全场共用一副骨架，不同
+        前缀物体的顶点组设计上可以互相引用——A 引用 B 的槽时，B 生成占位符
+        保持该槽注册（占位符机制的存在理由）。故放行域 = 本组件 VGMap 引用槽
+        ∪ **全工作区所有组件已注册槽并集**（动态读当前 json；不再限于 L0 段）。
+
+        fail-closed 牙齿保留：**未注册/旧代槽照旧拦截**（不在并集内，如佩丽卡
+        旧时代 373..393）；json 元数据缺失/被清（t15 场景，并集为空）时报
+        「元数据缺失」明确消息，与「未注册槽」原因区分。与 FC-2 同口径：
+        只查**带权重（weight>0）** 数字组名——无权重组不写盘（0 哨兵/空组
+        惰性），skip_empty=False 全量空组工作流不受影响。
+
+        对象无网格数据（单测桩/退化对象）时无法读取权重，退化为检查全部数字
+        组名（保守）。
+        """
+        slot_by_index: dict[int, int] = {}
+        for idx, vg in enumerate(obj.vertex_groups):
+            name = str(vg.name)
+            if re.fullmatch(r"[0-9]+", name) is None:
+                continue
+            slot_by_index[getattr(vg, "index", idx)] = int(name)
+
+        weighted_slots: set[int] | None = None
+        data = getattr(obj, "data", None)
+        vertices = getattr(data, "vertices", None) if data is not None else None
+        if vertices is not None:
+            weighted_slots = set()
+            for vertex in vertices:
+                for group in getattr(vertex, "groups", ()) or ():
+                    if float(getattr(group, "weight", 0.0) or 0.0) > 0.0:
+                        slot = slot_by_index.get(getattr(group, "group", -1))
+                        if slot is not None:
+                            weighted_slots.add(slot)
+        if weighted_slots is None:
+            weighted_slots = set(slot_by_index.values())
+        if not weighted_slots:
+            return
+
+        registered_union = (
+            SubMeshModel._dualset_registered_slots_union(workspace_root)
+            if workspace_root else set()
+        )
+        allowed = set(domain) | registered_union
+        out_of_domain = sorted(weighted_slots - allowed)
+        if not out_of_domain:
+            return
+        preview = out_of_domain[:20]
+        suffix = "…" if len(out_of_domain) > 20 else ""
+        if not registered_union:
+            # 元数据缺失/被清（t15 场景）：全组件 json 均无已注册槽 → 与
+            # 「未注册槽」原因区分，给出检查工作区 json / 重新导入指引。
+            raise RuntimeError(
+                f"[EFMI双套导出/域前置] {getattr(obj, 'name', '?')} 的数字顶点组 "
+                f"{preview}{suffix}（共 {len(out_of_domain)} 个）无法判定槽位归属："
+                "当前工作区没有任何组件 json 携带 VGMap 已注册槽（骨骼合并元数据"
+                "缺失/被清除，或 json 被外部进程改写）。请检查工作区 json 或按当前"
+                "工作区 json 重新导入该角色（含合并顶点组开关）后重试"
+            )
+        raise RuntimeError(
+            f"[EFMI双套导出/域前置] {getattr(obj, 'name', '?')} 的数字顶点组 "
+            f"{preview}{suffix}（共 {len(out_of_domain)} 个）不在当前工作区已注册"
+            "槽集合（本组件 VGMap 引用槽 ∪ 全工作区所有组件已注册槽）内：未注册/"
+            "旧代槽（旧导入/旧缓存/外部进程改写 json 遗留）。产物将引用运行时未注册"
+            "槽位，中止导出（fail-closed，不静默直写）。请按当前工作区 json 重新导入"
+            "该角色后重试"
+        )
 
     @staticmethod
     def _fill_vertex_group_gaps(obj):

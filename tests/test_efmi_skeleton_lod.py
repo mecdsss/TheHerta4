@@ -441,7 +441,14 @@ class MultiLodBuildTests(unittest.TestCase):
         self.assertTrue(ok, message)
         json0 = self._read_submesh_json("LOD0", "aaaabbbb-100-0")
         self.assertEqual(json0.get("VGMap"), {"0": 0})
-        self.assertNotIn("EFMILODReference", json0)
+        # F6（t1 §3.4）：单 LOD 批次也盖章「三件套」使 json 自描述（reference
+        # 留空、projection=False）；下次联合导入时版本门控据此整批重算平移，
+        # 不再产生「非规范布局」的临时状态。
+        self.assertEqual(
+            json0.get("EFMILODLayoutVersion"), _efmi._CROSS_LOD_LAYOUT_VERSION
+        )
+        self.assertEqual(json0.get("EFMILODReference"), "")
+        self.assertFalse(json0.get("EFMILODProjection"))
 
     def test_non_skinned_efmi_targets_do_not_abort_gpu_merge_batch(self):
         """EFMI CPU 子网格无 BLENDINDICES，不应导致 GPU 合并批次整体回退。"""
@@ -1925,6 +1932,83 @@ class CpuProjectionAdjudicationTests(unittest.TestCase):
         # 匹配 GPU 在 projection=False 下仍照常生成 VGMap（独立去重路径）
         match_payload = self._read_submesh_json("LOD1", "ccccdddd-200-0")
         self.assertEqual(match_payload.get("VGMap"), {"0": 1})
+
+
+class MergedMetadataRestoreTests(unittest.TestCase):
+    """t15 活性修复：清骨骼合并VGMap缓存 + 重导入后合并元数据必须恢复。
+
+    实况（佩丽卡 13:12）：清缓存（clear_vgmap_cache）后重导入时复选框关闭 →
+    导入预生成 ensure 被门控跳过 → json 三键保持被清空（L0 段读空 → 域前置
+    全拦）。修复：missing_merged_metadata_exist 供导入侧判定「无论复选框如何
+    都修复性重生成」；键完好时返回 False（幂等快路径，零行为变化）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="efmi_meta_restore_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.ws = Path(self.tmp) / "ws"
+        (self.ws / "LOD0" / "aaaabbbb-100-0" / ("TYPE_" + GAMETYPE)).mkdir(
+            parents=True, exist_ok=True
+        )
+        self.gpu_json = (
+            self.ws / "LOD0" / "aaaabbbb-100-0" / ("TYPE_" + GAMETYPE) / "aaaabbbb-100-0.json"
+        )
+
+    def _write_gpu_json(self, payload):
+        self.gpu_json.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def test_present_keys_yield_false(self):
+        """GPU json 键完好 → False（幂等快路径，不触发修复重生成）。"""
+        self._write_gpu_json({
+            "GPU-PreSkinning": True,
+            "VGMap": {"0": 0, "1": 1},
+            "VGMapAlgorithmVersion": 15,
+        })
+        self.assertFalse(
+            EFMISkeletonMergeHelper.missing_merged_metadata_exist(
+                str(self.ws), ["LOD0.aaaabbbb-100-0"]
+            )
+        )
+
+    def test_cleared_keys_yield_true(self):
+        """清缓存后（三键缺失）→ True（t15 修复触发条件）。"""
+        self._write_gpu_json({"GPU-PreSkinning": True})
+        self.assertTrue(
+            EFMISkeletonMergeHelper.missing_merged_metadata_exist(
+                str(self.ws), ["LOD0.aaaabbbb-100-0"]
+            )
+        )
+
+    def test_cpu_json_not_counted(self):
+        """CPU（GPU-PreSkinning=False）无 VGMap 不参与判定 → 仅 CPU 时 False。"""
+        self._write_gpu_json({"GPU-PreSkinning": False})
+        self.assertFalse(
+            EFMISkeletonMergeHelper.missing_merged_metadata_exist(
+                str(self.ws), ["LOD0.aaaabbbb-100-0"]
+            )
+        )
+
+    def test_unresolved_target_skipped(self):
+        """无法解析的 json 跳过；空请求集 → False。"""
+        self.assertFalse(
+            EFMISkeletonMergeHelper.missing_merged_metadata_exist(
+                str(self.ws), []
+            )
+        )
+
+
+class MergedMetadataImportGateSourceTests(unittest.TestCase):
+    """源码级回归：EFMI 导入预生成门控含元数据缺失修复分支（t15）。"""
+
+    def test_gate_includes_missing_metadata_repair(self):
+        src = (REPO_ROOT / "ui" / "ui_func_import_ssmt.py").read_text(encoding="utf-8")
+        self.assertIn("missing_merged_metadata_exist", src,
+                      "导入侧必须调用 missing_merged_metadata_exist（t15 修复）")
+        region = src[src.index("def ImprotFromWorkSpaceFull("):]
+        self.assertIn("_efmi_merged_metadata_missing", region,
+                      "预生成门控必须并入元数据缺失分支")
+        self.assertIn("or _efmi_merged_metadata_missing", region,
+                      "门控 = 复选框开 或 元数据缺失（t15：复选框关但键缺也修复重生成）")
 
 
 if __name__ == "__main__":

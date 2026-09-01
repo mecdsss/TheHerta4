@@ -414,6 +414,10 @@ def _configure_and_execute_efmi_lod_match(
     # 统一顶点组模式使用同一个全局名称空间；一个处理节点连接的全部匹配表
     # 必须覆盖该链上的所有导入物体。这里不能按源对象名称收窄，否则 LOD0/LOD1
     # 的统一组会被拆成两套，后续全局槽位处理反而失去覆盖。
+    # t14 回退：t12 曾把 target_hash 改为专属目标前缀（针对「映射全并集交叉
+    # 污染 df4b620c_copy」假设），经用户手动匹配实验 + t11 §6.6（映射键两两
+    # 不相交、正确映射并集无害）+ t13-D（用户构建不含 t12）证实非本案病根，
+    # 已按用户指令回退为 ""（与 t12 前一致），防修复堆积污染后续排查。
     match_node.target_hash = ""
     match_node.match_threshold = 0.06
     match_node.use_chamfer_matching = False
@@ -442,11 +446,32 @@ def ImprotFromWorkSpaceFull(self, context):
     # JSON 残留 VGMap 造成“部分全局组 + 部分局部组”的混合命名空间。
     merged_vgmap_ready: bool | None = None
 
+    # t15 活性修复（佩丽卡 13:12 实况）：用户「清骨骼合并VGMap缓存 + 重新导入」
+    # 时若复选框关闭，预生成 ensure 被跳过 → json 三键保持被清空（L0 段读空 →
+    # 域前置全拦）。这里检测「合并元数据缺失」：无论复选框如何，缺失即修复性
+    # 重生成（键完好时 missing_merged_metadata_exist=False → 门控保持原语义，
+    # 幂等零行为变化；复选框开时行为不变）。
+    _efmi_merged_metadata_missing = False
+    if GlobalConfig.logic_name == LogicName.EFMI:
+        try:
+            from ..common.efmi_skeleton import EFMISkeletonMergeHelper as _EFMIMergeHelper
+            _efmi_merged_metadata_missing = bool(
+                _EFMIMergeHelper.missing_merged_metadata_exist(
+                    GlobalConfig.path_workspace_folder(),
+                    [target["import_key"] for target in import_targets],
+                )
+            )
+        except Exception:
+            _efmi_merged_metadata_missing = False
+
     # EFMI 骨骼合并数据预生成：导入前把 FrameAnalysis 反查的 VGMap 写回工作空间 json，
     # 使导入流程走全局骨骼索引（json 有 VGMap 且 import_merged_vgmap 开启时自动生效）。
     if (
         GlobalConfig.logic_name == LogicName.EFMI
-        and GlobalProterties.import_merged_vgmap()
+        and (
+            GlobalProterties.import_merged_vgmap()
+            or _efmi_merged_metadata_missing
+        )
     ):
         merged_vgmap_ready = False
         try:

@@ -429,6 +429,16 @@ class ExportEFMI:
         return len(previous_names)
 
     def _write_buffer_files_to_folder(self, buf_output_folder: str):
+        # FC-4（C9）：折叠死段集合与写盘断言所需的折叠别名目标。
+        folded_dead_segments: list[dict] = getattr(
+            self, "_efmi_folded_dead_segments", []
+        ) or []
+        fold_alias_targets: dict[int, int] = getattr(
+            self, "_efmi_fold_alias_targets", {}
+        ) or {}
+        merged_draw_entries: dict = getattr(
+            self, "_efmi_merged_draw_entries", {}
+        ) or {}
         for submesh_model in self.submesh_model_list:
             print("ExportEFMI: 导出SubMeshModel，Unique标识: " + submesh_model.unique_str)
 
@@ -456,12 +466,37 @@ class ExportEFMI:
                             f"[EFMI骨骼合并] {submesh_model.unique_str}: "
                             f"已重定向 {remapped_count} 个 same-IB 跨 LOD 骨骼索引"
                         )
-                # 不在这里按“当前 LOD 声明段”拦截 BLENDINDICES。统一 VGMap/LOD
-                # 分组投影允许目标 LOD 复用基准 LOD 的全局槽位；而快速局部导出
-                # 也可能只带一侧 LOD，无法从当前导出子集推导完整槽位域。这里
-                # 只负责写出已完成格式归一化的数据，不能把合法的跨 LOD 投影
-                # 当成“未声明槽位”拒绝。R8/R16/R32 的位宽和 uint16 范围仍在
-                # SubMeshModel/ObjBufferHelper 的打包前校验中严格处理。
+                # FC-2 写盘域断言（t3 设计 §4，替代旧注释 :459-464 的「不按段拦截」）：
+                # 对**产物缓冲**（无论更名/折叠/I2 是否执行，与源头无关）断言——
+                # 写盘 BLENDINDICES ⊆ 自属声明段 ∪ 折叠别名目标段；越段即
+                # RuntimeError 中止导出（fail-closed，不静默写盘）。前置条件 =
+                # EFMI 合并候选（dualset_eligible：EFMI + VGMap 算法版本>0 +
+                # 元数据有效 + GPU_PreSkinning），非 EFMI/ZZMI/CPU 路径不激活。
+                # 为何不是旧「按 LOD 声明段拦截」：投影/快速局部导出允许保留部件
+                # 引用其它部件的池槽位（canonical 借位），但必须经更名消化成
+                # 自属身份；此处断言的是更名后身份域，不是原始槽位域。
+                if (
+                    str(getattr(GlobalConfig, "logic_name", "") or "") == "EFMI"
+                    and int(getattr(submesh_model, "vg_map_algorithm_version", 0) or 0) > 0
+                    and bool(
+                        getattr(submesh_model, "merged_skeleton_metadata_valid", True)
+                    )
+                    and bool(
+                        getattr(
+                            getattr(submesh_model, "d3d11_game_type", None),
+                            "GPU_PreSkinning",
+                            False,
+                        )
+                    )
+                ):
+                    self._assert_fc2_fc4_written_blendindices(
+                        submesh_model=submesh_model,
+                        category=category,
+                        output_buf=output_buf,
+                        folded_dead_segments=folded_dead_segments,
+                        fold_alias_targets=fold_alias_targets,
+                        bound=submesh_model.unique_str in merged_draw_entries,
+                    )
                 with open(category_buf_filepath, 'wb') as f:
                     output_buf.tofile(f)
 
@@ -491,6 +526,285 @@ class ExportEFMI:
             return f"indexcount_{submesh_model.match_index_count}"
         else:
             return f"{submesh_model.match_draw_ib}_{submesh_model.match_first_index}"
+
+    @staticmethod
+    def _extract_active_blendindices_values(category_buf, category_name, d3d11_game_type):
+        """从打包类别缓冲提取**权重 > 0** 的 BLENDINDICES 值（R16 整数系；无 bpy）。
+
+        关键语义：Blender 侧打包（vertexgroup_utils.get_blendweights_blendindices_
+        v4_fast）对未占用通道写 **index=0 + weight=0.0**——0 通道运行时被权重
+        0 消去（mesh_create_helper 的 valid_mask 同口径），不会参与蒙皮。因此
+        FC-2 写盘断言**只能断言权重 > 0 的通道**：零权重通道的索引（0 哨兵等）
+        运行时惰性，断言其段归属会造成全量误报（所有 LOD1 部件的段都不含槽 0）。
+
+        与 ``_remap_blendindices_category_buffer`` 同构：按 CategoryStrideDict
+        切行、逐元素按 AlignedByteOffset 定位；非 R16 整数 BLENDINDICES =
+        未升宽的合并形态，抛 RuntimeError（合并候选必然已 widen 到 R16 系）。
+        权重格式支持 UNORM/SNORM/UINT（原始 ≠ 0 即活跃）与 FLOAT（> 0.0）；
+        **无 BLENDWEIGHT 元素**（刚性/单骨 BI-only 布局，如 GPU_P12_N4_T8_BI4_）
+        按「仅通道 0 活跃」处理（F1/t5：无权重即无混合，运行时只读通道 0，
+        未占用通道的 index=0 哨兵不是活跃引用）。
+        返回 numpy int64 一维数组（无活跃通道/空缓冲返回空数组）。
+        """
+        raw = numpy.ascontiguousarray(category_buf)
+        if raw.dtype != numpy.uint8:
+            raw = raw.view(numpy.uint8)
+        raw = raw.reshape(-1)
+        stride = int(
+            getattr(d3d11_game_type, "CategoryStrideDict", {}).get(
+                category_name, 0
+            )
+            or 0
+        )
+        if stride <= 0 or raw.size == 0:
+            return numpy.empty((0,), dtype=numpy.int64)
+        if raw.size % stride != 0:
+            raise RuntimeError(
+                f"[EFMI骨骼合并/FC-2] {category_name} 缓冲大小 {raw.size} "
+                f"不能被 stride {stride} 整除"
+            )
+        rows = raw.reshape(-1, stride)
+        weight_positions: dict[int, tuple[int, int, str]] = {}
+        index_positions: dict[int, tuple[int, int, str]] = {}
+        category_offset = 0
+        for element in getattr(d3d11_game_type, "D3D11ElementList", []):
+            if str(getattr(element, "Category", "") or "") != category_name:
+                continue
+            width = int(getattr(element, "ByteWidth", 0) or 0)
+            semantic = str(getattr(element, "SemanticName", "") or "").upper()
+            semantic_index = int(getattr(element, "SemanticIndex", 0) or 0)
+            element_format = str(getattr(element, "Format", "") or "").upper()
+            record = (category_offset, width, element_format)
+            if semantic == "BLENDINDICES":
+                index_positions[semantic_index] = record
+            elif semantic == "BLENDWEIGHT" or semantic == "BLENDWEIGHTS":
+                weight_positions[semantic_index] = record
+            category_offset += width
+
+        collected = []
+        for semantic_index, (index_offset, index_width, index_format) in sorted(
+            index_positions.items()
+        ):
+            if not (
+                index_format.startswith("R16")
+                and index_format.endswith(("_UINT", "_SINT"))
+                and index_width % 2 == 0
+            ):
+                raise RuntimeError(
+                    "[EFMI骨骼合并/FC-2] 写盘域断言要求 R16 整数 "
+                    f"BLENDINDICES，实际为 {index_format}（未执行 widen 升宽的"
+                    "合并候选不可断言，中止导出）"
+                )
+            index_field = numpy.ascontiguousarray(
+                rows[:, index_offset:index_offset + index_width]
+            )
+            index_values = index_field.view("<u2").reshape(len(rows), index_width // 2)
+            # 权重掩码：同 SemanticIndex 的 BLENDWEIGHT，逐 (顶点,通道) 判定
+            # 权重 > 0（零权重通道的索引运行时惰性——打包器对未占用通道写
+            # index=0 + weight=0，不可断言其段归属）。
+            weight_record = weight_positions.get(semantic_index)
+            if weight_record is None:
+                # F1（t5 修复）：无 BLENDWEIGHT 元素 = 刚性/单骨（BI-only）布局
+                # （如 GPU_P12_N4_T8_BI4_）。打包器对未占用通道写 index=0 哨兵
+                # 且**没有权重字节可消去**——运行时无权重即无混合，只读通道 0
+                # （单骨刚性），通道 1-3 的哨兵 0 不是活跃骨骼引用。故只把通道 0
+                # 视为活跃通道：哨兵 0 不得计为越段引用（否则 0000 刚性部件的
+                # 合法合并导出被自身断言拦死）；通道 0 为 0 时（绑定骨骼 0 的
+                # 部件）仍按真实引用断言。
+                mask = numpy.zeros(index_values.shape, dtype=bool)
+                if index_values.shape[1] >= 1:
+                    mask[:, 0] = True
+            else:
+                weight_offset, weight_width, weight_format = weight_record
+                weight_field = numpy.ascontiguousarray(
+                    rows[:, weight_offset:weight_offset + weight_width]
+                )
+                mask = ExportEFMI._positive_weight_mask(
+                    weight_field, weight_width, weight_format, index_values.shape[1]
+                )
+            active = index_values[mask]
+            if active.size == 0:
+                continue
+            collected.append(active.reshape(-1).astype(numpy.int64))
+        if not collected:
+            return numpy.empty((0,), dtype=numpy.int64)
+        return numpy.concatenate(collected)
+
+    @staticmethod
+    def _positive_weight_mask(weight_field, weight_width: int, weight_format: str,
+                              channels: int):
+        """权重元素 > 0 的 (n, channels) 逐通道掩码（BLENDWEIGHT 同口径）。
+
+        UNORM/SNORM/UINT（整数位型）：原始 ≠ 0 即活跃（精度无损，0 值只来自
+        未占用通道）；FLOAT：解码后 > 0.0。通道数按格式串推导
+        （R8G8B8A8 → 4×u8；R16G16B16A16 → 4×u16；R8 → 1×u8）。权重字段通道数
+        与索引字段不一致时：权重覆盖到的通道按权重判定，其余视为不活跃
+        （运行时同样无权重惰性）。
+        """
+        if weight_width <= 0 or channels <= 0:
+            return numpy.zeros((len(weight_field), channels), dtype=bool)
+        component_bits = []
+        for token in re.findall(r"[RGBA](\d+)", str(weight_format or "")):
+            try:
+                component_bits.append(int(token))
+            except (TypeError, ValueError):
+                continue
+        if not component_bits:
+            raise RuntimeError(
+                f"[EFMI骨骼合并/FC-2] 无法解析 BLENDWEIGHT 格式 {weight_format}"
+            )
+        comp_bytes = component_bits[0] // 8
+        declared_channels = max(1, weight_width // max(comp_bytes, 1))
+        if weight_width % max(comp_bytes, 1) != 0:
+            raise RuntimeError(
+                f"[EFMI骨骼合并/FC-2] BLENDWEIGHT 宽度 {weight_width} 与格式 "
+                f"{weight_format} 的组件位宽不匹配"
+            )
+        if weight_format.endswith("_FLOAT"):
+            dtype = numpy.float32 if comp_bytes == 4 else (
+                numpy.float16 if comp_bytes == 2 else numpy.float32
+            )
+            values = weight_field.view(dtype).reshape(len(weight_field), -1)
+            mask = values > 0.0
+        elif "SNORM" in weight_format:
+            dtype = numpy.int32 if comp_bytes == 4 else (
+                numpy.int16 if comp_bytes == 2 else numpy.int8
+            )
+            values = weight_field.view(dtype).reshape(len(weight_field), -1)
+            mask = values != 0
+        else:
+            # UNORM / UINT / 其它整数位型：原始非零即活跃
+            dtype = numpy.uint32 if comp_bytes == 4 else (
+                numpy.uint16 if comp_bytes == 2 else numpy.uint8
+            )
+            values = weight_field.view(dtype).reshape(len(weight_field), -1)
+            mask = values != 0
+        weight_channels = mask.shape[1]
+        if weight_channels == channels:
+            return mask
+        if weight_channels == 1:
+            return numpy.repeat(mask, channels, axis=1)
+        aligned = numpy.zeros((len(weight_field), channels), dtype=bool)
+        covered = min(weight_channels, channels)
+        aligned[:, :covered] = mask[:, :covered]
+        return aligned
+
+    def _assert_fc2_fc4_written_blendindices(
+        self,
+        submesh_model,
+        category: str,
+        output_buf,
+        folded_dead_segments: list[dict],
+        fold_alias_targets: dict[int, int],
+        bound: bool,
+    ) -> None:
+        """FC-2 写盘域断言 + FC-4 死段零写入断言（C4/C9，产物级硬闸）。
+
+        - FC-2：写盘 BLENDINDICES ⊆ ``[vg_offset, vg_offset+vg_count) ∪
+          折叠别名目标段 ∪ 全工作区已注册槽并集``（t18，用户拍板，接 t17 终验
+          铁证），违反 → RuntimeError（比对的是**最终写盘缓冲**，与更名/折叠/
+          I2 是否执行无关——旧版/绕开更名路径直写槽位在此必被拦；跨组件已注册
+          槽 = 单池全局骨骼身份，合法放行；json 元数据缺失时并集为空 → 退化为
+          自属段 ∪ 折叠目标 + 「元数据缺失」明确消息，fail-closed 不弱化）。
+        - FC-4：绑定网格（有 merged draw entry / 独立入口）的写盘索引不得命中
+          任何折叠死段（t2 三死段）。折叠部件自身（未绑定、无独立 EntryPoint、
+          INI 不注册其段）的缓冲是未绑定死文件，其值域落在自己声明段内属
+          FC-2 合法域，FC-4 豁免并只在日志提示（供 t5 §7.3-3 对照说明）。
+        """
+        from ...common.efmi_skeleton import EFMIBoneMapBuilder
+        from ...common.submesh_model import SubMeshModel as _SubMeshModel
+
+        unique_str = str(getattr(submesh_model, "unique_str", "") or "")
+        vg_offset = int(getattr(submesh_model, "vg_offset", 0) or 0)
+        vg_count = int(getattr(submesh_model, "vg_count", 0) or 0)
+        segment = (vg_offset, vg_offset + vg_count)
+        indices = self._extract_active_blendindices_values(
+            output_buf, category, submesh_model.d3d11_game_type
+        )
+        if indices.size == 0:
+            return
+        targets = set(int(v) for v in fold_alias_targets.values())
+        # t18：全工作区已注册槽并集（复用 submesh_model._dualset_registered_slots_union，
+        # 不复制实现；无法解析工作区时 None = 不启用并集 = 原单组件口径）。
+        registered_extra = None
+        try:
+            _pf = getattr(GlobalConfig, "path_workspace_folder", None)
+            _workspace_root = str(_pf() or "") if callable(_pf) else ""
+        except Exception:
+            _workspace_root = ""
+        if _workspace_root and os.path.isdir(_workspace_root):
+            try:
+                registered_extra = _SubMeshModel._dualset_registered_slots_union(
+                    _workspace_root
+                )
+            except Exception:
+                registered_extra = None
+        if registered_extra is None:
+            # 未启用并集（工作区不可解析）：原单组件口径（验证器原消息）。
+            EFMIBoneMapBuilder.validate_export_indices_in_segment(
+                segment, targets, indices, component_label=unique_str
+            )
+        else:
+            # 并集口径：先做集合成员判定（含两因区分），再把剔除并集成员后的
+            # 索引交给原验证器做自属段/折叠目标结构断言（验证器本口径不变）。
+            import numpy as _np
+            in_segment = (
+                (indices >= segment[0]) & (indices < segment[1])
+            ).astype(bool)
+            in_targets_arr = _np.zeros(indices.size, dtype=bool)
+            for target in targets:
+                in_targets_arr |= indices == target
+            in_union_arr = _np.zeros(indices.size, dtype=bool)
+            for slot in registered_extra:
+                in_union_arr |= indices == slot
+            bad_mask = ~(in_segment | in_targets_arr | in_union_arr)
+            if bad_mask.any():
+                bad_values = indices[bad_mask]
+                preview = sorted({int(v) for v in bad_values})[:20]
+                suffix = "…" if len(preview) == 20 and len(set(bad_values.tolist())) > 20 else ""
+                if not registered_extra:
+                    # 元数据缺失/被清（t15 场景）：与「未注册槽」原因区分
+                    #（fail-closed 保持）。
+                    raise RuntimeError(
+                        f"[EFMI双套导出/FC-2] {unique_str} 写盘 BLENDINDICES "
+                        f"{preview}{suffix}（共 {len(bad_values)} 项）无法判定槽位归属："
+                        "全工作区已注册槽并集为空（骨骼合并元数据缺失/被清除，或 json "
+                        "被外部进程改写）。产物将引用运行时未注册/未写入的骨骼槽位，"
+                        "中止导出（fail-closed，不静默写盘）。请检查工作区 json 或按"
+                        "当前工作区 json 重新导入该角色（含合并顶点组开关）后重试"
+                    )
+                raise RuntimeError(
+                    f"[EFMI双套导出/FC-2] {unique_str} 写盘 BLENDINDICES 越出"
+                    f"运行时身份域 [{segment[0]},{segment[1]}) ∪ 折叠目标 "
+                    f"{sorted(targets)[:10]} ∪ 全工作区已注册槽 {len(registered_extra)} 项，"
+                    f"非法引用 {preview}{suffix}（共 {len(bad_values)} 项）。产物将"
+                    "引用未注册/段隙/越界槽位，中止导出（fail-closed，不静默写盘）。"
+                    "请重新执行骨骼合并反查/重新导入该角色后重试"
+                )
+            EFMIBoneMapBuilder.validate_export_indices_in_segment(
+                segment, targets, indices[~in_union_arr],
+                component_label=unique_str,
+            )
+        # FC-4：绑定网格不得命中折叠死段（0000 即 [717,729)∪[817,827)∪[903,962)）。
+        if not bound:
+            return
+        if folded_dead_segments:
+            dead_mask = numpy.zeros(indices.size, dtype=bool)
+            for item in folded_dead_segments:
+                dead_start, dead_end = int(item["segment"][0]), int(item["segment"][1])
+                dead_mask |= (indices >= dead_start) & (indices < dead_end)
+            if dead_mask.any():
+                hits = sorted({int(v) for v in indices[dead_mask]})[:20]
+                raise RuntimeError(
+                    f"[EFMI骨骼合并/FC-4] {unique_str} 写盘 BLENDINDICES 命中"
+                    f"被折叠 LOD 家族死段: {hits}（这些槽位运行时无人写入、"
+                    "INI 不注册）。产物将引用不存在骨骼，中止导出（fail-closed）。"
+                    "请重新执行骨骼合并反查/重新导入该角色"
+                )
+        else:
+            print(
+                f"[EFMI骨骼合并/FC-4] {unique_str} 死段槽位零写入（无折叠家族）"
+            )
 
     def _append_drawindexed_instanced_with_shader_replace(self, section, drawcall_list, draw_offset_dict):
         """将 drawcall 列表写入 section，对着色器替换物体使用 run 逻辑替代 instanced 绘制。"""
@@ -1063,7 +1377,14 @@ class ExportEFMI:
             # （实测错误对应 272~449），静默折叠会把 L1 蒙皮语义套到 L0 骨骼段，
             # 必须大声拒绝而不是产出错误权重。缺 matrix_diff 的旧账本按兼容
             # 处理（不阻塞既有元数据），有值就必须通过阈值校验。
-            matrix_diff = corr.get("matrix_diff")
+            # 用户领域裁决（2026-09-01，已拍板）：折叠判据 = **rotation-only**
+            # ``matrix_diff_rotation``（旋转/尺度块差，去掉捕获帧世界平移伪影——
+            # 跨环境捕获固有，世界平移 = 捕获帧角色世界位置的环境噪声，不携带
+            # 骨骼身份；佩丽卡脸部 raw 368-409 而旋转语义 53/53 <2.0）；旧账本无
+            # 该字段时回退 raw matrix_diff（行为不变）。阈值 16.0/1.0 未放宽：
+            # 旋转/尺度真实不兼容时 rotation 差仍超阈值 → 拒绝；用户明确不再补
+            # n<3 守卫 / 中位数残差 / 审计日志（接受现状）。
+            matrix_diff = corr.get("matrix_diff_rotation", corr.get("matrix_diff"))
             if matrix_diff is not None:
                 try:
                     parsed_matrix_diff = float(matrix_diff)
@@ -1137,12 +1458,86 @@ class ExportEFMI:
             aliases[source_global_id] = target_global_id
         return aliases
 
+    def _rekey_same_ib_aliases_by_export_identity(
+        self, aliases: dict[int, int]
+    ) -> dict[int, int]:
+        """t10（方案 A4）：把 same-IB 折叠 aliases 的 source 键（槽位号）换算为
+        双套导出身份 e(s)。
+
+        合并模式应用双套更名后，写盘缓冲的 BLENDINDICES = e(s)（合并槽最强源组
+        身份，非槽位号）。折叠 aliases 的 source（被折叠 LOD 部件自有声明段的
+        槽位号）若更名，原槽位号在缓冲中已不存在，remap 永不命中 → 该 LOD 的
+        折叠骨骼引用无人重定向 → 读未初始化槽 → 爆炸。本方法把更名过的 source
+        键换为 e(s)（单源槽 e(s)==s 原样保留）。
+
+        边界：
+        - 无工作区 / 建表失败（A3/A4/B10 或未初始化）：不换算、保持原 aliases
+          （折叠既有行为不变），并打警告——调用方若同时生效了更名会导致折叠
+          失配，由更名侧 fail-closed 兜底；
+        - e(s) 注入性（规格 §1.3 推论 1/2）：更名目标不在槽位集合内 ⇒ 不会与
+          其它未更名 source 键撞车；防御性复查仍保留（损坏数据时大声失败）。
+        """
+        if not aliases:
+            return aliases
+        _workspace_folder = getattr(GlobalConfig, "path_workspace_folder", None)
+        try:
+            workspace_root = (
+                str(_workspace_folder() or "").strip()
+                if callable(_workspace_folder)
+                else ""
+            )
+        except Exception:
+            workspace_root = ""
+        if not workspace_root:
+            print(
+                "[EFMI骨骼合并] 警告：无法定位工作区，same-IB 折叠 aliases "
+                "未按双套导出身份换算（保持槽位键语义）"
+            )
+            return aliases
+        from ...common.efmi_skeleton import EFMIBoneMapBuilder
+
+        try:
+            table = EFMIBoneMapBuilder.get_dualset_export_table_cached(
+                workspace_root
+            )
+        except RuntimeError as exc:
+            print(
+                "[EFMI骨骼合并] 警告：折叠 aliases 身份换算跳过 "
+                f"（建表失败: {str(exc)[:120]}），保持槽位键语义"
+            )
+            return aliases
+        if not table:
+            return aliases
+        e_of = {
+            slot: row["export_identity"]
+            for slot, row in table.items()
+            if row.get("renamed")
+        }
+        if not e_of:
+            return aliases
+        rekeyed: dict[int, int] = {}
+        changed = False
+        for source_id, target_id in aliases.items():
+            new_source = e_of.get(source_id, source_id)
+            if new_source in rekeyed and rekeyed[new_source] != target_id:
+                raise RuntimeError(
+                    "[EFMI骨骼合并] same-IB 折叠 aliases 按导出身份换算后 "
+                    f"source {new_source} 映射冲突（{rekeyed[new_source]} != "
+                    f"{target_id}）——导出身份非注入，数据损坏或陈旧，拒绝导出"
+                )
+            if new_source != source_id:
+                changed = True
+            rekeyed[new_source] = target_id
+        return rekeyed if changed else aliases
+
     @staticmethod
     def _validate_merged_slot_reachability(
         parts: list[dict],
         component_id_dict: dict[str, int],
         submesh_models,
         bone_aliases: dict[int, int],
+        export_identity_map: dict[int, int] | None = None,
+        per_mesh_maps: dict[str, dict[int, int]] | None = None,
     ) -> None:
         """I2 导出前可达性守卫：每个存活 Blend 引用的槽在其出现距离必被维护者写入。
 
@@ -1150,13 +1545,14 @@ class ExportEFMI:
         {LOD0} ∪ 被折叠同 IB 兄弟所在 LOD（同一 draw 单入口，任何距离都执行
         同一 EntryPoint，写 P 自己的声明段）；独立 LOD1 部件 = {LOD1}。
 
-        每个槽 s 属于 P 家族引用的 Blend 槽集合（VGMap 值，已按 same-IB 别名
-        重定向）：
-        - s 落在 P 自己的声明段 → 由 P 自己写入 → 安全；
-        - 否则 s 落在另一部件 Q 的声明段 → 由 Q 的绘制写入 → 必须满足
+        每个写盘索引 t 属于 P 家族引用的 Blend 索引集合（S5：t10 双套更名后
+        写盘缓冲为导出身份 e(s) 而非槽位——先用 export_identity_map 把 VGMap
+        槽位换算为 e(s)，再经 same-IB 别名（值亦为身份）重定向）：
+        - t 落在 P 自己的声明段 → 由 P 自己写入 → 安全；
+        - 否则 t 落在另一部件 Q 的声明段 → 由 Q 的绘制写入 → 必须满足
           D(P) ⊆ D(Q)（Q 在 P 出现的每个距离都绘制），不满足 → RuntimeError
-          指名部件/槽号，与既有槽位重叠/R16 越界守卫同风格（fail-closed）；
-        - s 落在任何导出部件声明段之外（局部导出子集未包含维护者）→ 无法归属，
+          指名部件/索引号，与既有槽位重叠/R16 越界守卫同风格（fail-closed）；
+        - t 落在任何导出部件声明段之外（局部导出子集未包含维护者）→ 无法归属，
           仅告警不阻塞导出（与既有快速/局部导出语义一致）。
 
         单 LOD 导出（少于 2 个带前缀 LOD）不存在跨距离悬空问题，直接放行。
@@ -1186,6 +1582,7 @@ class ExportEFMI:
             current.add(ExportEFMI._lod_name_from_unique_str(str(unique_str)))
             draw_distances[int(component_id)] = frozenset(current - {""})
         aliases = {int(k): int(v) for k, v in (bone_aliases or {}).items()}
+        e_of = {int(k): int(v) for k, v in (export_identity_map or {}).items()}
         for part in parts:
             part_component_id = int(part["component_id"])
             part_lods = draw_distances.get(part_component_id, frozenset())
@@ -1194,10 +1591,15 @@ class ExportEFMI:
                 if component_id_dict.get(model_unique) != part_component_id:
                     continue
                 vg_map = dict(getattr(model, "vg_map", {}) or {})
-                ref_slots = {
-                    int(aliases.get(int(raw_slot), int(raw_slot)))
-                    for raw_slot in vg_map.values()
-                }
+                # t25/per-mesh（v3）：写盘缓冲索引 = 该模型自己的 per-mesh 身份
+                # （本组件成员身份，含未更名槽/canonical 跨组件槽），非全局
+                # e(s)——先按 model 的 per-mesh map 换算，缺省回退全局 e_of，
+                # 再经折叠别名（值为身份）重定向。
+                pm_map = (per_mesh_maps or {}).get(model_unique, {}) or {}
+                ref_slots = set()
+                for raw_slot in vg_map.values():
+                    value = int(pm_map.get(int(raw_slot), int(e_of.get(int(raw_slot), int(raw_slot)))))
+                    ref_slots.add(int(aliases.get(value, value)))
                 for slot in sorted(ref_slots):
                     owner = next(
                         (
@@ -1292,6 +1694,108 @@ class ExportEFMI:
 
         return rows.reshape(-1), remapped_count
 
+    @staticmethod
+    def _missing_fold_baseline_unique_str(
+        workspace_root: str,
+        model,
+        present_baseline_by_unique: dict,
+    ) -> str:
+        """F2（t5 修复）：返回「缺基准的 same-IB 折叠候选」的基准 unique_str。
+
+        判定：给定非基准 LOD 模型（未折叠路径），若工作空间存在**同 bare** 的
+        基准部件——bare 名 = ``<drawib>-<count>-<first>``，同 bare ⟺ 同
+        IB/draw 三元组 ⟺ 同一游戏 draw（same-IB 折叠家族）——且其 json 携带
+        有效 VGMap（GPU 合并候选，非 CPU/投影排除），但该基准不在本次导出批次
+        （``present_baseline_by_unique``）中 → 返回该基准 unique_str（调用方
+        fail-closed 中止导出）；否则返回空串（真独立部件/基准已在批次内/无
+        工作空间上下文，放行）。
+
+        - 同 bare 判定不依赖跨 LOD 对应账本的 reference_component（几何配对
+          部件的 reference bare ≠ 自身 bare，不会误判；无账本的旧数据仍按
+          ``LOD0.<bare>`` 前缀兜底识别）；
+        - 基准候选唯一按 bare 推导，不读对象 match 属性（该属性在缺基准场景
+          下无从取得），与 ``_baseline_draw_key`` 的 C8 同源口径一致；
+        - 缺 efmi_skeleton 模块的环境（单元测试 fake 包）按目录形态+VGMap
+          轻量探测退化为同样语义（生产环境始终走模块权威实现）。
+        """
+        try:
+            from ...common.efmi_skeleton import EFMISkeletonMergeHelper
+        except ImportError:
+            EFMISkeletonMergeHelper = None
+
+        def _probe_json_path(candidate: str) -> str:
+            if EFMISkeletonMergeHelper is not None:
+                try:
+                    return EFMISkeletonMergeHelper._resolve_submesh_json_path(
+                        workspace_root, candidate
+                    )
+                except Exception:
+                    return ""
+            if not workspace_root or not os.path.isdir(workspace_root):
+                return ""
+            lod, bare = candidate.split(".", 1) if "." in candidate else ("", candidate)
+            submesh_dir = os.path.join(
+                os.path.join(workspace_root, lod) if lod else workspace_root, bare
+            )
+            if not os.path.isdir(submesh_dir):
+                return ""
+            for dirname in sorted(os.listdir(submesh_dir)):
+                if not dirname.startswith("TYPE_"):
+                    continue
+                probe = os.path.join(submesh_dir, dirname, bare + ".json")
+                if os.path.isfile(probe):
+                    return probe
+            return ""
+
+        def _has_vgmap(payload) -> bool:
+            if EFMISkeletonMergeHelper is not None:
+                try:
+                    return EFMISkeletonMergeHelper._has_valid_vgmap(payload)
+                except Exception:
+                    pass
+            vg_map = payload.get("VGMap") if isinstance(payload, dict) else None
+            if not isinstance(vg_map, dict) or not vg_map:
+                return False
+            try:
+                vg_count = int(payload.get("VGCount", 0) or 0)
+                vg_offset = int(payload.get("VGOffset", -1) or -1)
+            except (TypeError, ValueError):
+                return False
+            return vg_count > 0 and vg_offset >= 0
+
+        own = str(getattr(model, "unique_str", "") or "").strip()
+        if "." not in own:
+            return ""
+        _lod_name, bare = own.split(".", 1)
+        if not bare:
+            return ""
+        candidates: list[str] = []
+        ref_component = str(
+            getattr(model, "efmi_lod_reference_component", "") or ""
+        ).strip()
+        if "." in ref_component:
+            _ref_lod, ref_bare = ref_component.split(".", 1)
+            if ref_bare == bare:
+                candidates.append(ref_component)
+        fallback_candidate = "LOD0." + bare
+        if fallback_candidate not in candidates:
+            candidates.append(fallback_candidate)
+        for candidate in candidates:
+            # 基准已在本次导出批次内：同 bare 必同 key，未被折叠属数据不一致
+            # 或键异常——同样不能静默按独立部件导出，返回候选让调用方中止。
+            if candidate in present_baseline_by_unique:
+                return candidate
+            json_path = _probe_json_path(candidate)
+            if not json_path:
+                continue
+            try:
+                payload = JsonUtils.LoadFromFile(json_path)
+            except Exception:
+                continue
+            if _has_vgmap(payload):
+                return candidate
+        return ""
+
     def _get_merged_skeleton_component_info(self):
         """收集 EFMI 骨骼合并（Merged Skeleton）逻辑部件（v10/v11/v13）。
 
@@ -1302,8 +1806,9 @@ class ExportEFMI:
 
         - 每个子网格（含每个 LOD 版本）= 自己的 component，`vg_offset/vg_count`
           取**该子网格自己的** json 元数据（v10 编号写入后的分段槽位）；
-        - 每个 component 只有一个绘制入口（自身换绑资源 + `$lod_level` =
-          该 LOD 级别），`remap` 恒 None——运行时 MergedSkeleton_Apply 把当前
+        - 每个 component 只有一个绘制入口（自身换绑资源；`$lod_level` 仅保留
+          在 draws 元数据里供诊断/测试，不再写入 INI——见下方裸版桥接移除说明），
+          `remap` 恒 None——运行时 MergedSkeleton_Apply 把当前
           LOD draw 的**自己的**矩阵写入**自己的**槽位段，跨 LOD 零共享；
         - **same-IB 跨 LOD 部件**（脸部件等：两个 LOD 状态共用同一 IB/draw）：
           LOD1 版本不生成独立 component，component_id_dict 映射到基准部件
@@ -1325,6 +1830,9 @@ class ExportEFMI:
         component_id_dict: dict[str, int] = {}
         same_ib_bone_aliases: dict[int, int] = {}
         same_ib_alias_targets_by_lod: dict[str, set[int]] = {}
+        # FC-4（C9）：same-IB 折叠家族 LOD1 声明段（运行时死段）与别名目标记录
+        self._efmi_folded_dead_segments: list[dict] = []
+        self._efmi_fold_alias_targets: dict[int, int] = {}
 
         def _lod_name(unique_str):
             return self._lod_name_from_unique_str(unique_str)
@@ -1410,9 +1918,38 @@ class ExportEFMI:
         )
 
         def _baseline_draw_key(model):
-            """基准部件相同 IB/draw 判定键（same-IB 合并专用）。"""
+            """基准部件相同 IB/draw 判定键（same-IB 合并专用）。
+
+            C8（P6 同源）：IB 判定键与 ``common/efmi_skeleton.efmi_ib_key``
+            （I1 生命周期域同源实现）保持一致——match_draw_ib 缺失时回退按
+            unique_str 推导（同一 draw 的各 LOD 版本共享同一 IB hash），防止
+            三视图漂移导致折叠漏判。匹配 draw_ib 缺省时**优先 import 调用
+            efmi_ib_key 单一实现**（T6-F6 消除复制粘贴漂移）；仅当模块不可达
+            （测试夹具 fake 包）才退化为内联同算法，并有等价性单测兜底
+            （tests/test_efmi_export_identity_separation.py::IbKeyEquivalenceTests）。
+            """
+            draw_ib = str(getattr(model, "match_draw_ib", "") or "")
+            if not draw_ib:
+                raw_unique = str(
+                    getattr(model, "workspace_unique_str", "") or ""
+                ) or str(getattr(model, "unique_str", "") or "")
+                try:
+                    from ...common.efmi_skeleton import efmi_ib_key as _efmi_ib_key_provider
+                except ImportError:
+                    _efmi_ib_key_provider = None
+                if _efmi_ib_key_provider is not None:
+                    draw_ib = _efmi_ib_key_provider(raw_unique)
+                else:
+                    # 测试夹具环境缺 efmi_skeleton 模块时的内联兜底——与
+                    # efmi_ib_key 同算法（去 LOD 前缀 + 首段），等价性由
+                    # IbKeyEquivalenceTests 全量断言。
+                    if raw_unique.upper().startswith("LOD") and "." in raw_unique:
+                        raw_unique = raw_unique.split(".", 1)[1]
+                    draw_ib = (
+                        raw_unique.split("-")[0] if "-" in raw_unique else raw_unique
+                    )
             return (
-                str(getattr(model, "match_draw_ib", "") or ""),
+                draw_ib,
                 str(getattr(model, "match_first_index", "") or ""),
                 str(getattr(model, "match_index_count", "") or ""),
             )
@@ -1446,6 +1983,18 @@ class ExportEFMI:
             baseline_model_by_unique[model.unique_str] = model
             component_id_dict[model.unique_str] = part["component_id"]
 
+        # F2（t5 修复）：工作空间根，供「缺基准的 same-IB 折叠候选」判定。
+        _ws_root = ""
+        try:
+            _ws_root_provider = getattr(GlobalConfig, "path_workspace_folder", None)
+            _ws_root = (
+                str(_ws_root_provider() or "").strip()
+                if callable(_ws_root_provider)
+                else ""
+            )
+        except Exception:
+            _ws_root = ""
+
         def _lod_level_of(lod_name: str) -> int:
             try:
                 return int(lod_name[3:]) if lod_name[3:].isdigit() else 1
@@ -1458,10 +2007,11 @@ class ExportEFMI:
             # 占位不算）→ 并入基准部件（component_id_dict 映射、不生成独立
             # component/draw 入口）。
             baseline_part = None
-            if str(getattr(model, "match_draw_ib", "") or ""):
+            if _baseline_draw_key(model)[0]:
                 baseline_part = baseline_part_by_draw.get(_baseline_draw_key(model))
             if baseline_part is not None:
                 component_id_dict[model.unique_str] = baseline_part["component_id"]
+                before_fold_count = len(same_ib_bone_aliases)
                 baseline_model = baseline_model_by_unique.get(
                     baseline_part["unique_str"]
                 )
@@ -1479,7 +2029,39 @@ class ExportEFMI:
                         same_ib_alias_targets_by_lod.setdefault(
                             _lod_name(model.unique_str), set()
                         ).add(target_id)
+                # FC-4（C9）：被折叠 LOD 部件的自属声明段 = 运行时死段（同 IB
+                # 只保留基准 EntryPoint，INI 永不注册该段）。记录供写盘断言
+                # （_write_buffer_files_to_folder）与日志（prepare_merged_skeleton）。
+                folded_segment_start = int(getattr(model, "vg_offset", 0) or 0)
+                folded_segment_end = folded_segment_start + int(
+                    getattr(model, "vg_count", 0) or 0
+                )
+                if folded_segment_end > folded_segment_start:
+                    self._efmi_folded_dead_segments.append({
+                        "unique_str": str(model.unique_str),
+                        "segment": (folded_segment_start, folded_segment_end),
+                    })
                 continue
+            # F2（t5 修复）：未折叠的非基准部件若实为 same-IB 折叠候选（与
+            # 工作空间某基准共用同一游戏 draw，bare 名 = drawib-count-first =
+            # 同 IB/draw 三元组），但基准未进入本次导出批次 → fail-closed 中止。
+            # 同一 draw 只能有一个入口（同 hash 冲突/双写），且其声明段在折叠
+            # 语义下为运行时死段：静默按独立部件导出 = t2「引用不存在骨骼」
+            # 根因再入，FC-4 死段保护也因此空转。
+            missing_baseline = ExportEFMI._missing_fold_baseline_unique_str(
+                _ws_root, model, baseline_model_by_unique
+            )
+            if missing_baseline:
+                raise RuntimeError(
+                    f"[EFMI骨骼合并/F2] {str(getattr(model, 'unique_str', '') or '')} "
+                    "是 same-IB 折叠候选（与工作空间基准 "
+                    f"{missing_baseline} 共用同一游戏 draw/IB），但该基准未进入"
+                    "本次导出批次——同一 draw 不允许存在两个入口（与基准入口同 "
+                    "hash 冲突/双写），且其自属段在折叠语义下为运行时死段：静默"
+                    "按独立部件导出会产出「引用不存在骨骼」的坏模组。请确保导出"
+                    "批次包含全部 LOD0 基准部件（完整重新导入/全量导出）后重试"
+                    "（fail-closed）"
+                )
             # 不用“顶点数/拓扑与基准 LOD 相同”推断数据错位：游戏可以让多个
             # LOD 故意复用完全相同的网络。骨骼正确性由对应账本、独立槽位域和
             # 写盘前 BlendIndices 域校验决定，几何相同本身不是错误证据。
@@ -1531,21 +2113,120 @@ class ExportEFMI:
             lod_name: frozenset(target_ids)
             for lod_name, target_ids in same_ib_alias_targets_by_lod.items()
         }
+        # t10（方案 A4，t9 报告 §5-A4）：合并模式双套更名后，写盘缓冲的
+        # BLENDINDICES 已是导出身份 e(s)（合并槽最强源组身份，非槽位号），
+        # same-IB 折叠 aliases 的 source 键必须同步换算为 e(s)，否则 `_remap_`
+        # 按槽位号匹配将永不命中（更名后缓冲里不存在槽位号）。
+        # 单源槽 e(s)==s 恒等不变化；合并槽 e(s) 为注入（A2 断言）⇒ 无键冲突。
+        if same_ib_bone_aliases:
+            renamed_aliases = self._rekey_same_ib_aliases_by_export_identity(
+                same_ib_bone_aliases
+            )
+            if renamed_aliases is not same_ib_bone_aliases:
+                self._efmi_merged_skeleton_bone_aliases = renamed_aliases
+                print(
+                    "[EFMI骨骼合并] same-IB 折叠 aliases 已按双套导出身份"
+                    f"（e(s)）重写: {len(renamed_aliases)} 项"
+                )
         if same_ib_bone_aliases:
             print(
                 f"[EFMI骨骼合并] same-IB 跨 LOD 折叠生成 "
                 f"{len(same_ib_bone_aliases)} 个骨骼槽位重定向"
                 "（目标为基准 component 连续导入槽）"
             )
+            # FC-4（C9）：记录折叠别名目标（写盘断言 FC-2 的允许集合之一）。
+            self._efmi_fold_alias_targets = {
+                int(k): int(v) for k, v in same_ib_bone_aliases.items()
+            }
+        if self._efmi_folded_dead_segments:
+            preview_segments = ", ".join(
+                f"{item['unique_str']}[{item['segment'][0]},{item['segment'][1]})"
+                for item in self._efmi_folded_dead_segments[:8]
+            )
+            suffix = "…" if len(self._efmi_folded_dead_segments) > 8 else ""
+            print(
+                "[EFMI骨骼合并] same-IB 折叠死段（运行时不注册、无人写入）: "
+                f"{preview_segments}{suffix}"
+            )
+        # C9：绘制入口集合（绑定网格的 unique_str）。折叠部件无独立入口 →
+        # 其 Blend.buf 属未绑定死文件；_write_buffer_files_to_folder 据此区分
+        # FC-4 断言对象（只对绑定网格做死段零写入）并打印死段佐证。
+        self._efmi_merged_draw_entries = {
+            draw["unique_str"]: (part, draw)
+            for part in parts
+            for draw in part.get("draws", [])
+        }
         # I2 可达性守卫：写盘前验证每个存活 Blend 引用槽在其出现距离必被维护者
         # 写入；违反（跨组件悬空引用）明确拒绝导出，绝不产出坏 mod。
+        # S5（t20）：守卫校验键 = 写盘索引 = 导出身份 e(s)，需按 e_of 表换算
+        # （t10 更名后缓冲是身份而非槽位）。
+        export_identity_map = self._build_dualset_export_identity_map()
+        # t25/per-mesh（v3）：守卫校验键必须是**每个模型自己的 per-mesh 身份**
+        # （写盘索引 = 本组件成员身份，非全局 e(s)）——逐模型构建，跨组件引用
+        # 校验落点与写盘索引一致。
+        pm_ws = ""
+        try:
+            _pf = getattr(GlobalConfig, "path_workspace_folder", None)
+            pm_ws = str(_pf() or "").strip() if callable(_pf) else ""
+        except Exception:
+            pm_ws = ""
+        per_mesh_maps: dict[str, dict[int, int]] = {}
+        if pm_ws:
+            from ...common.efmi_skeleton import EFMIBoneMapBuilder
+            for _m in self.submesh_model_list:
+                _us = str(getattr(_m, "unique_str", "") or "").strip()
+                if not _us:
+                    continue
+                try:
+                    per_mesh_maps[_us] = (
+                        EFMIBoneMapBuilder.build_per_mesh_identity_map(
+                            pm_ws, _us
+                        )
+                    )
+                except RuntimeError as exc:
+                    # T6-F5（t6-F5）：FC-1 的 RuntimeError 是「槽无自属成员/表
+                    # 不一致」的**预期** fail-closed 信号——I2 守卫允许按全局
+                    # e_of 严格路径回退（与其自身校验键语义一致），但必须打
+                    # warn 日志便于故障定位；**其它异常（数据损坏/IO 错误等）
+                    # 一律上抛**，不得在守卫层静默吞掉真正的问题。
+                    print(
+                        f"[EFMI骨骼合并] 警告 {_us} 的 per-mesh 身份映射不可用"
+                        f"（{str(exc)[:200]}），I2 可达性守卫回退全局 e_of 严格"
+                        "路径（FC-2 写盘域断言仍兜底）"
+                    )
+                    per_mesh_maps[_us] = {}
         self._validate_merged_slot_reachability(
             parts,
             component_id_dict,
             self.submesh_model_list,
             same_ib_bone_aliases,
+            export_identity_map=export_identity_map,
+            per_mesh_maps=per_mesh_maps,
         )
         return parts, component_id_dict
+
+    def _build_dualset_export_identity_map(self) -> dict[int, int]:
+        """构建槽位→导出身份 e(s) 表（t10 更名语义；缓存命中零成本）。"""
+        try:
+            _workspace_folder = getattr(GlobalConfig, "path_workspace_folder", None)
+            workspace_root = (
+                str(_workspace_folder() or "").strip()
+                if callable(_workspace_folder)
+                else ""
+            )
+        except Exception:
+            workspace_root = ""
+        if not workspace_root:
+            return {}
+        from ...common.efmi_skeleton import EFMIBoneMapBuilder
+        try:
+            table = EFMIBoneMapBuilder.get_dualset_export_table_cached(workspace_root)
+        except RuntimeError:
+            return {}
+        return {
+            int(slot): int(row["export_identity"])
+            for slot, row in table.items()
+        }
 
     def _add_merged_skeleton_section(self, ini_builder, command_lists_section=None):
         """生成 EFMI 骨骼合并（Merged Skeleton）INI 段（对齐 EFMI 1.4.1 运行时契约）。
@@ -1681,6 +2362,24 @@ class ExportEFMI:
         section.append("run = CommandList\\EFMIv1\\InitializeMergedSkeleton")
         section.append("local $lod_level_count = $\\EFMIv1\\cfg_ms_max_lod_level_count")
         section.append("local $component_id")
+        # C10（t3 设计 P7）：注册前断言——折叠家族 LOD1 死段永不注册为独立组件。
+        # 折叠部件已并入基准 component（component_id_dict 映射），本列表只含
+        # 绑定组件；此断言是防御性兜底：若未来任何路径把死段当独立组件注册
+        # （运行时无人 attach → 引用即「不存在骨骼」），在此大声失败。
+        dead_segments_for_ini = getattr(self, "_efmi_folded_dead_segments", []) or []
+        for comp in components:
+            comp_start = int(comp["vg_offset"])
+            comp_end = comp_start + int(comp["vg_count"])
+            for dead_item in dead_segments_for_ini:
+                dead_start, dead_end = int(dead_item["segment"][0]), int(dead_item["segment"][1])
+                if comp_start < dead_end and dead_start < comp_end:
+                    raise RuntimeError(
+                        f"[EFMI骨骼合并/C10] 折叠死段 "
+                        f"{dead_item['unique_str']}[{dead_start},{dead_end}) "
+                        f"被注册为独立组件 {comp['unique_str']} "
+                        f"[{comp_start},{comp_end})：运行时无人写入该段，"
+                        "中止导出（fail-closed）"
+                    )
         for component_id, comp in enumerate(components):
             section.append(f"$component_id = {component_id}")
             section.append(f"$Pool_MergedSkeleton_Component_VertexGroupOffsets[$component_id] = {comp['vg_offset']}")
@@ -1705,9 +2404,13 @@ class ExportEFMI:
             command_lists_section.append(f"$\\EFMIv1\\bones_count = $bones_count")
             command_lists_section.append(f"$\\EFMIv1\\instance_count = $max_instance_count")
             command_lists_section.append("run = CommandList\\EFMIv1\\Object_ReadConfig")
-            # 参考模板桥接：裸版 $lod_level（EntryPoint 写入）→ \EFMIv1\lod_level
-            # （框架 MergedSkeleton.ini 读取），务必在 Component_ReadConfig 之前。
-            command_lists_section.append("$\\EFMIv1\\lod_level = $lod_level")
+            # 注意：不再写 $\EFMIv1\lod_level = $lod_level 裸版桥接——框架
+            # API.ini 的 `global $lod_level = 0` 在 namespace=EFMIv1 下声明的是
+            # $\EFMIv1\lod_level 而非裸版全局；裸版 $lod_level 在本导出中从未
+            # 被任何 EntryPoint 赋值（v10/v13 每个子网格 = 独立 component，
+            # 单绘制入口），此前该行在 3Dmigoto 加载时必然报
+            # "Variable not recognized: lod_level"，且被丢弃后 $\EFMIv1\lod_level
+            # 恒等于框架默认 0——无论删除与否运行时语义一致，故整段移除。
             command_lists_section.append("$\\EFMIv1\\custom_mesh_scale = 1.00")
             command_lists_section.append(
                 "$\\EFMIv1\\identification_min_components = " + str(min(component_count, 4))
@@ -1893,14 +2596,12 @@ class ExportEFMI:
                 # 粘合层里仍保留一份作为双保险。
                 texture_override_ib_section.append("handling = skip")
                 texture_override_ib_section.append(f"$\\EFMIv1\\component_id = {merged_component_id}")
-                # $lod_level：仅当部件有多个（不同 IB 的）LOD 绘制入口时才写入
-                # （参考插件规则——same-IB 部件不做 LOD 检测，保持全局值）。
-                # 参考模板写**裸版** $lod_level（框架 API.ini 以裸名声明该全局），
-                # 再由粘合层拷贝到 \EFMIv1\lod_level；这里同步写裸版保证两处一致。
-                if len(part.get("draws", [])) > 1:
-                    texture_override_ib_section.append(
-                        f"$lod_level = {int(draw_entry_info.get('lod_level', 0) or 0)}"
-                    )
+                # 不再写裸版 $lod_level：v10/v13 下每个 component 恒为单绘制入口
+                # （len(draws)==1，含 same-IB 折叠，draws 不追加第二入口），此写入
+                # 永不触发；且裸版 $lod_level 无全局声明（框架 API.ini 的声明在
+                # namespace=EFMIv1 名下），一旦触发同样会报未识别变量。各 LOD 的
+                # 矩阵归属已由独立 component 槽位段（段平移互不相交）保证，运行时
+                # $\EFMIv1\lod_level 恒为框架默认 0 即可，无需逐入口传递。
                 texture_override_ib_section.append("$\\EFMIv1\\gpu_posed = 1")
                 texture_override_ib_section.append(
                     "CommandList\\EFMIv1\\Callback_Component_DrawCustom = ref " + draw_command_name

@@ -336,6 +336,9 @@ class EFMIAutoLODMatchNodeTests(unittest.TestCase):
         self.assertEqual(calls, [context])
         self.assertEqual(node.source_object, source.name)
         self.assertEqual(node.target_object, target.name)
+        # t14 回退：t12 曾把 target_hash 改为专属目标前缀；用户指令确认非本案
+        # 病根（t11 §6.6 键不相交 + t13-D 用户构建不含 t12），恢复为 ""（与
+        # t12 前一致）。
         self.assertEqual(node.target_hash, "")
         self.assertFalse(node.exact_hash_match)
 

@@ -55,6 +55,9 @@ import os
 import re
 import shutil
 import tempfile
+import json
+from collections import defaultdict
+
 import numpy
 
 from ..utils.json_utils import JsonUtils
@@ -126,11 +129,32 @@ _CROSS_LOD_MATRIX_SCORE_SCALE = 1.5
 # 其后的"多维度投票"判据（几何维度可推翻矩阵不一致）经"测试"工作空间 08-10 dump
 # 实测产生 42 组矩阵不可兼容的误并（195 组中），已废止并回到分层判据。
 # 再遇误判先查数据一致性（清除 VGMap 缓存重导），再考虑关开关。
-# 变更策略或 Position/Blend 数据后，VGMapAlgorithmVersion 会让旧结果自动失效；
+# 变更策略后，VGMapAlgorithmVersion 会让旧结果自动失效；Position/Blend **数据**
+# 变更由 _efmi_cache_intact 的源数据指纹（EFMIVGMapSourceFingerprint，
+# mtime_ns+size，F1/t1）自动失效整批重算——不再需要手动清缓存。
 # 也可用面板的清理按钮提前删除缓存。
 # 权重扩散去重是 EFMI 合并模式的默认行为。关闭只用于诊断/回滚；关闭后
 # build_vg_maps 仍返回安全的恒等映射，不会改变原始蒙皮。
 _DEDUP_ENABLED = True
+
+
+def efmi_ib_key(unique_str: str) -> str:
+    """从 unique_str 提取 IB 判定键（首段 draw IB hash，C8/P6 同源实现）。
+
+    ``_component_lifetime_domains``（I1 生命周期域）、``ui/universal/efmi.py``
+    的 same-IB 折叠判定（``_baseline_draw_key`` 的 match_draw_ib 缺省回退）与
+    I2 距离集共用本函数作为 IB 键的唯一规范化来源：同一 draw 的各 LOD 版本
+    （LOD0.x-y-z / LOD1.x-y-z）必须得到同一 IB 键，否则折叠判定/去重域/导出
+    校验三视图漂移会漏判折叠、残留未注册段。
+
+    语义：去掉 LOD 前缀（``LOD0.``/``LOD1.``），取剩余 bare 名首段
+    （``-`` 分隔第一段 = draw IB hash）；无 ``-`` 时 whole-string 即 IB
+    （单 LOD 工作空间，域恒单元素，去重行为不变）。
+    """
+    bare = str(unique_str or "")
+    if bare.upper().startswith("LOD") and "." in bare:
+        bare = bare.split(".", 1)[1]
+    return bare.split("-")[0] if "-" in bare else bare
 
 
 class EFMILogParser:
@@ -790,6 +814,879 @@ class EFMIBoneMapBuilder:
                 ),
             }
         return result
+
+    # ------------------------------------------------------------------
+    # 双套顶点组导出转换（t3 规格 §2/§4：BL 合并组 -> 导出运行时身份）
+    #
+    # 两边分离契约（t3 设计 §2/§3，t4 固化）：
+    # - **BL 侧**：Blender 内顶点组名 = 合并槽位号（去重池命名空间，mesh_
+    #   create_helper.import_vertex_groups），编辑/雕刻/权重均在此空间，**永不
+    #   直接写盘**；
+    # - **导出侧**：写盘 BLENDINDICES 一律是运行时身份（VGOffset+local，自属
+    #   声明段内）——经 build_per_mesh_identity_map（对照任务书
+    #   get_dualset_slot_identity_map 别名，t3 术语统一）更名回身份域，
+    #   FC-2 写盘域断言兜底（validate_export_indices_in_segment）。
+    # 身份选择主判 = 顶点数（vertex_count，用户 2026-08-29 裁决「顶点组多的
+    # 那一边」），非 weight_total（weight_total 仍收集用于 A4 强度可得性）。
+    # 本部分为无 bpy 依赖的纯数据层：外部（submesh_model M1 挂载点）调用
+    # build_dualset_export_table 获全表后再对临时导出对象顶点组更名。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def validate_export_indices_in_segment(
+        segment: tuple[int, int],
+        fold_alias_targets=(),
+        indices=(),
+        component_label: str = "",
+    ) -> None:
+        """FC-2 写盘域断言：索引值域必须 ⊆ 本部件自属声明段 ∪ 折叠别名目标段。
+
+        唯一写盘合法性判据（t3 设计 §4）：产物级 BLENDINDICES ∈
+        ``[segment_start, segment_end) ∪ fold_alias_targets``。这是「两边分离」
+        的硬闸：写盘索引要么是自己的运行时身份（自属段，运行时必写入），要么
+        是 same-IB 折叠别名目标（基准部件连续导入槽，运行时同样必写入）；任何
+        无法映射到合法运行时身份的引用一律 RuntimeError 中止导出（fail-closed，
+        不静默写盘、不回退槽位直写）。
+
+        无 bpy/numpy 强依赖（纯数据层），单测可直测（tests U1）；与更名/折叠/
+        I2 是否执行无关——对**产物缓冲**断言，任何绕过更名的直写路径（旧版/
+        工作区缺失）都会在此被拦下（t2 R-B）。
+
+        Args:
+            segment: 本部件声明段 ``(start, end)``（VGOffset, VGOffset+VGCount）。
+            fold_alias_targets: same-IB 折叠别名目标值集合（均为基准声明段身份）；
+                空集合时等价于纯段内断言。
+            indices: 待校验的写盘索引（int 可迭代或 numpy 数组）。
+            component_label: 错误信息中的部件标识（unique_str）。
+        """
+        try:
+            seg_start = int(segment[0])
+            seg_end = int(segment[1])
+        except (TypeError, ValueError, IndexError) as exc:
+            raise RuntimeError(
+                f"[EFMI双套导出/FC-2] {component_label} 声明段非法: {segment!r}"
+            ) from exc
+        if seg_end <= seg_start:
+            raise RuntimeError(
+                f"[EFMI双套导出/FC-2] {component_label} 声明段为空 "
+                f"[{seg_start},{seg_end})，写盘索引无合法身份可归，中止导出"
+            )
+        targets: set[int] = set()
+        for raw_target in fold_alias_targets or ():
+            try:
+                targets.add(int(raw_target))
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    f"[EFMI双套导出/FC-2] {component_label} 折叠别名目标非法: "
+                    f"{raw_target!r}"
+                )
+        if isinstance(indices, numpy.ndarray):
+            arr = numpy.asarray(indices)
+        else:
+            try:
+                arr = numpy.asarray(list(indices))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"[EFMI双套导出/FC-2] {component_label} 写盘索引不可解析: {exc}"
+                ) from exc
+        if arr.dtype.kind == "f" and (numpy.isnan(arr).any() or numpy.isinf(arr).any()):
+            raise RuntimeError(
+                f"[EFMI双套导出/FC-2] {component_label} 写盘索引含 NaN/Inf，中止导出"
+            )
+        try:
+            arr = arr.astype(numpy.int64)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                f"[EFMI双套导出/FC-2] {component_label} 写盘索引不可解析: {exc}"
+            ) from exc
+        if arr.size == 0:
+            return
+        valid = (arr >= seg_start) & (arr < seg_end)
+        for target in targets:
+            valid |= arr == target
+        bad = arr[~valid]
+        if bad.size:
+            preview = sorted({int(v) for v in bad})[:20]
+            suffix = "…" if len(preview) == 20 and len(set(bad.tolist())) > 20 else ""
+            allowed = f"[{seg_start},{seg_end}) ∪ 折叠目标 {sorted(targets)[:10]}"
+            raise RuntimeError(
+                f"[EFMI双套导出/FC-2] {component_label} 写盘 BLENDINDICES 越出"
+                f"运行时身份域 {allowed}，非法引用 {preview}{suffix}（共 "
+                f"{len(bad)} 项）。产物将引用运行时未注册/未写入的骨骼槽位，"
+                "中止导出（fail-closed，不静默写盘）。请重新执行骨骼合并反查/"
+                "重新导入该角色后重试"
+            )
+
+    @staticmethod
+    def _declared_source_buffers(submesh_json: dict) -> dict[str, str]:
+        """json 声明的 Position/Blend 源 buffer（F1 指纹用）：FileName -> FileName。
+
+        与 ``_dualset_workspace_strength`` 同口径：CategoryBufferList 中
+        FileName 以 ``-Position.buf`` / ``-Blend.buf`` 结尾的文件。无声明返回
+        空 dict（该 json 不适用源数据指纹校验）。
+        """
+        declared: dict[str, str] = {}
+        for category_buffer in submesh_json.get("CategoryBufferList", []) or []:
+            if not isinstance(category_buffer, dict):
+                continue
+            file_name = str(category_buffer.get("FileName", "") or "")
+            lowered = file_name.lower()
+            if lowered.endswith("-position.buf") or lowered.endswith("-blend.buf"):
+                declared[file_name] = file_name
+        return declared
+
+    @staticmethod
+    def _vgmap_source_fingerprint(submesh_dir: str, submesh_json: dict) -> dict | None:
+        """F1 源数据指纹：命名为 ``FileName -> [mtime_ns, size]``（缺失文件记 None）。
+
+        json 声明了 Position/Blend.buf（去重结果依赖其内容）时，写回缓存必须
+        携带此指纹；``_efmi_cache_intact`` 据此在源数据变更（重新提取 dump /
+        替换绑定姿势 buffer）而 json 未变时自动失效整批重算。无声明返回 None
+        （不适用指纹校验）。
+        """
+        declared = EFMIBoneMapBuilder._declared_source_buffers(submesh_json)
+        if not declared:
+            return None
+        fingerprint: dict = {}
+        for file_name in declared:
+            path = os.path.join(submesh_dir, file_name)
+            try:
+                stat_result = os.stat(path)
+            except OSError:
+                fingerprint[file_name] = None
+            else:
+                fingerprint[file_name] = [
+                    int(stat_result.st_mtime_ns),
+                    int(stat_result.st_size),
+                ]
+        return fingerprint
+
+    # t14：导出会话级建表缓存。build_dualset_export_table 每次全量扫工作区
+    # （解析全部含 VGMap json + 逐子网格 Position/Blend.buf 重算 weight_total，
+    # 含扩散 PCA），导出 N 个子网格时若每个 SubMeshModel 各建一次 = N 倍
+    # 开销（0000 场景 ~33 导出子网格 × 建表 = 用户实测「明显变慢」）。
+    # 缓存按 (workspace_root, 指纹) 复用：指纹 = 工作区全部 json 的
+    # (mtime_ns, size) 摘要（添加/删除/修改任一 json 即失效重建）。
+    # 冻结接口 build_dualset_export_table 不变；新入口 additive。
+    _dualset_table_cache: dict = {}
+
+    @staticmethod
+    def _dualset_table_fingerprint(workspace_root: str) -> tuple:
+        """工作区 json 文件指纹（path 相对名 + mtime_ns + size），不读内容。
+
+        覆盖全部 .json（含非 VGMap 的元数据 json）——任一工作区 json 增删改
+        都会改指纹，保守失效；仅在指纹与缓存不一致时才重建表。
+        """
+        if not workspace_root or not os.path.isdir(workspace_root):
+            return ()
+        entries = []
+        for dirpath, _dirs, files in os.walk(workspace_root):
+            for name in files:
+                if not name.lower().endswith(".json"):
+                    continue
+                full = os.path.join(dirpath, name)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                rel = os.path.relpath(full, workspace_root)
+                entries.append((rel, st.st_mtime_ns, st.st_size))
+        return tuple(sorted(entries))
+
+    @staticmethod
+    def get_dualset_export_table_cached(
+        workspace_root: str,
+        recompute_strength: bool = True,
+    ) -> dict[int, dict]:
+        """导出会话级缓存入口：同一工作区同指纹只建表一次，全导出复用。
+
+        - 语义/断言与 build_dualset_export_table 完全一致（首个真实调用即
+          build 本体：A1/A3/A4/B10 fail-closed 原样生效），缓存只消除重复
+          全量重建；
+        - 指纹变化（工作区中途增删改 json）→ 下次调用自动重建；
+        - **缓存键 = (workspace_root, recompute_strength)**：True/False 各自
+          独立缓存（t15 F1 修复）——False（纯逻辑单测/无 dump 环境）不再
+          错误复用 True 的真实强度表，参数语义严格成立；
+        - 无工作区 / 指纹为空 → 退化为直接建表（不缓存）；
+        - 已知设计取舍（F2，文档化）：指纹仅覆盖 .json，不含 Position/Blend.buf
+          内容——仅 buffer 变化不触发重建（缓冲与 json 同事务写入，低危；
+          如需更保守可将 buf 的 (mtime_ns,size) 并入指纹，成本仅多 stat）。
+        """
+        if not workspace_root:
+            return EFMIBoneMapBuilder.build_dualset_export_table(
+                workspace_root, recompute_strength
+            )
+        fingerprint = EFMIBoneMapBuilder._dualset_table_fingerprint(workspace_root)
+        if not fingerprint:
+            return EFMIBoneMapBuilder.build_dualset_export_table(
+                workspace_root, recompute_strength
+            )
+        cache_key = (workspace_root, bool(recompute_strength))
+        cached = EFMIBoneMapBuilder._dualset_table_cache.get(cache_key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+        table = EFMIBoneMapBuilder.build_dualset_export_table(
+            workspace_root, recompute_strength
+        )
+        EFMIBoneMapBuilder._dualset_table_cache[cache_key] = (
+            fingerprint, table
+        )
+        return table
+
+    @staticmethod
+    def build_per_mesh_identity_map(
+        workspace_root: str,
+        component_unique_str: str,
+        recompute_strength: bool = True,
+    ) -> dict[int, int]:
+        """per-mesh 身份映射（t25 方向 A / t3 §4.3c v3）：槽 s → e_M(s)。
+
+        语义：对组件 C（unique_str）的每个引用槽 s，导出身份 = **槽成员中属于
+        组件 C 的成员身份**（VGOffset_C + local），按 v2 顶点数裁决（多本组件
+        成员时）；**槽无本组件成员时 FC-1 中止**（数据损坏即 RuntimeError，
+        不静默回退全局 e(s)——t24 §6 / t25 notes 实证 0000 1275 引用 0 违反，
+        违反即数据损坏/未重导入）。
+
+        与 v2 全局 e(s) 的关系：本映射是**全量覆盖层**（含未更名槽与 canonical
+        恒等槽）——凡 canonical 属其它组件的槽，写盘索引改写为本组件成员身份，
+        使网格引用落回**自己 attach 必写的身份域**（自写自读、时序无关），根治
+        t24 d173f868 型「跨组件 canonical 单写者时序塌陷」。
+
+        FC-1 双重 fail-closed：本函数 raise 后，submesh_model 的 M1 更名点
+        （_apply_dualset_export_rename）按 RuntimeError 中止导出；efmi.py 的
+        I2 可达性守卫调用点（:1664-1665）``except Exception`` 吞掉并回退全局
+        e(s) 严格路径——两条路径都不会静默放行越段引用（FC-2 写盘断言兜底）。
+
+        输出 {slot(int): e_M(s)(int)}；供 submesh_model M1 更名与 efmi.py
+        rekey/守卫同步使用。只覆盖组件 C 的 VGMap 引用槽（其网格顶点组实际
+        存在的槽），不映射全表（避免无关槽的回退洪泛）。
+        """
+        table = EFMIBoneMapBuilder.get_dualset_export_table_cached(
+            workspace_root, recompute_strength
+        )
+        # 定位组件 C 的身份段 [vg_offset, vg_offset+vg_count) 与其 VGMap 引用槽
+        seg = None
+        ref_slots: list[int] = []
+        for _dir, submesh_json in EFMIBoneMapBuilder._iter_submesh_jsons(
+            workspace_root
+        ):
+            if submesh_json.get("__unique_str__") == component_unique_str:
+                offset = int(submesh_json.get("VGOffset", 0) or 0)
+                count = int(submesh_json.get("VGCount", 0) or 0)
+                seg = (offset, offset + count)
+                vg_map = submesh_json.get("VGMap") or {}
+                ref_slots = sorted({int(v) for v in vg_map.values()})
+                break
+        if seg is None:
+            raise RuntimeError(
+                f"[EFMI双套导出] 找不到组件 {component_unique_str} 的 "
+                "VGOffset/VGCount（工作区不一致或缓存陈旧），中止导出"
+            )
+        result: dict[int, int] = {}
+        for slot in ref_slots:
+            row = table.get(slot)
+            members = row.get("members", []) if row is not None else []
+            self_members = [
+                m for m in members
+                if seg[0] <= int(m.get("identity", -1)) < seg[1]
+            ]
+            # FC-1（t3 设计 §4 / t6-F4）：引用槽既不在建表结果中（row is None，
+            # 表与 json 不一致/陈旧缓存）也没有「身份落在本组件声明段」的成员
+            # ——合并为同一条拒绝路径：该引用无法映射到本组件任何合法运行时
+            # 身份，一律大声中止（fail-closed），绝不静默回退槽位原值/全局 e(s)
+            # （越段直写 = 引用运行时未注册/未写入的骨骼槽位）。t2/t24 实证
+            # 0000 0 违反——违反即数据损坏/工作区经旧工具链处理/未重导入。
+            if not self_members:
+                raise RuntimeError(
+                    f"[EFMI双套导出/FC-1] {component_unique_str} 引用槽 {slot} "
+                    "无法映射到本组件的合法运行时身份（槽不在建表结果中或成员"
+                    "集中无任何身份落于本组件声明段 "
+                    f"[{seg[0]},{seg[1]})）：VGMap 与 VGOffset/VGCount 不一致、"
+                    "缓存陈旧或工作区经旧工具链处理，中止导出（fail-closed）。"
+                    "请重新执行骨骼合并反查/重新导入该角色"
+                )
+            if len(self_members) == 1:
+                result[slot] = int(self_members[0]["identity"])
+                continue
+            # 多本组件成员：v2 顶点数精确裁决 + tie-break（同 select 语义）
+            counts = [int(m.get("vertex_count", 0) or 0) for m in self_members]
+            best = max(counts)
+            tied = [m for m, c in zip(self_members, counts) if c == best]
+            canonical_self = [m for m in tied if m["identity"] == int(slot)]
+            if canonical_self:
+                result[slot] = int(canonical_self[0]["identity"])
+            else:
+                result[slot] = min(int(m["identity"]) for m in tied)
+        return result
+
+    @staticmethod
+    def select_dualset_export_identity(slot: int, members: list[dict]) -> int:
+        """合并槽导出身份 = 顶点数最多成员身份 + 三层 tie-break（t3 §4 v2，t18）。
+
+        members: [{'local': int, 'identity': int, 'vertex_count': int, ...}, ...]
+        - 主度量 = vertex_count（驱动顶点数，compute_driven_signatures 字段；
+          用户 2026-08-29 裁决：改为「顶点组多的那一边」）；与 canonical 判据
+          weighted_vertex_count 的差异：vertex_count 含位置有限性过滤（inf/NaN
+          顶点不计），canonical 无该过滤——两者排序可不同，更名不恒空（t18
+          等价性分析实证）；
+        - 单源槽（len==1）：恒等（identity == 槽位号，canonical 恒等式）；
+        - 并列（计数型精确相等，无容差）：① canonical 成员（identity == slot）
+          优先；② identity 升序；③ 正常数据不可达 fail-closed；
+        - 缺 vertex_count 的成员按 0 参与（B7 全零韧性）。
+        """
+        if len(members) == 1:
+            return members[0]["identity"]
+        counts = [int(m.get("vertex_count", 0) or 0) for m in members]
+        best = max(counts)
+        tied = [m for m, c in zip(members, counts) if c == best]
+        canonical = [m for m in tied if m["identity"] == slot]
+        if canonical:
+            return canonical[0]["identity"]
+        return min(m["identity"] for m in tied)
+
+    @staticmethod
+    def build_dualset_export_table(
+        workspace_root: str,
+        recompute_strength: bool = True,
+    ) -> dict[int, dict]:
+        """反查工作区 json 构建「合并槽 -> 导出身份」全表（t3 §3，无新增持久化）。
+
+        输入：workspace_root（EFMI 工作空间根，含 LOD0/LOD1 子网格目录）。
+        输出：{slot: {"export_identity": int, "renamed": bool, "members": [
+              {"comp": unique_str, "local": int, "identity": int,
+               "weight_total": float, "vertex_count": int}]}}
+        - identity = VGOffset + local（非去重身份；VGOffset 连续累加 ⇒ 全局单射，
+          t3 §3.2）；
+        - 身份选择主判 = vertex_count（驱动顶点数；用户 2026-08-29 裁决「顶点组
+          多的那一边」，见 select_dualset_export_identity）；weight_total 仍收集
+          用于 A4 强度可得性核算（recompute_strength=True 时对每个子网格用工作区
+          json 同目录的 Position.buf + Blend.buf 调用 compute_driven_signatures
+          重算，与去重运行期同一函数同一口径；buffer 缺失/损坏时该成员按 0——
+          B7 全零成员韧性）；recompute_strength=False 供纯逻辑单测/无 dump 环境
+          （全部按 0）。
+        - 单源槽恒等；合并槽按 select_dualset_export_identity（含三层 tie-break）。
+        - fail-closed 断言（写入输出表前）：
+            A1：VGMap 键集必须 == 0..VGCount-1（缺项 = 成员不完整，拒绝转换）；
+            A3：identity 全局单射（VGOffset 段重叠/陈旧 json ⇒ RuntimeError）；
+            A4：任一子网格 json 声明了 Position/Blend 类别但 buffer 物理缺失 ⇒
+                RuntimeError（强度数据不可得，拒绝转换、不静默回退槽位直写）；
+            B10：跨 LOD 段共享槽位号（违反 v10/v11 段不相交布局）⇒ RuntimeError；
+            B11（FC-3，t3 设计 §4）：任一 VGMap 引用槽必须落在全池声明段并集内
+                （损坏数据引用「无人声明」槽位 ⇒ RuntimeError）；「越出自属段」
+                的池共享按设计语义保持允许（canonical 借位）。
+        """
+        table: dict[int, dict] = {}
+        slot_members: dict[int, list[dict]] = defaultdict(list)
+        identity_owner: dict[int, str] = {}
+        slot_lod_prefixes: dict[int, set] = defaultdict(set)
+        missing_strength_components: list[str] = []
+        # B11（FC-3）：全部声明段 [vg_offset, vg_offset+vg_count) 的精确并集
+        # （逐段判定；投影跳过部件会在声明段间留下空隙，包围盒会漏放凹槽引用）。
+        declared_pool_bounds: list[int] = []
+        declared_segments: list[tuple[int, int]] = []
+        for submesh_dir, submesh_json in EFMIBoneMapBuilder._iter_submesh_jsons(
+            workspace_root
+        ):
+            vg_offset = int(submesh_json.get("VGOffset", 0) or 0)
+            vg_map = submesh_json.get("VGMap") or {}
+            vg_count = int(submesh_json.get("VGCount", 0) or 0)
+            unique_str = submesh_json.get("__unique_str__", "")
+            lod_prefix = str(unique_str or "").split(".", 1)[0]
+            declared_pool_bounds.extend([vg_offset, vg_offset + vg_count])
+            declared_segments.append((vg_offset, vg_offset + vg_count))
+            # A1：VGMap 键集必须 == 0..VGCount-1（损坏 json 不得静默纳入——
+            # 缺项会导致成员列表不完整、该槽 e(s) 可能算错，M1 生产路径 fail-closed）。
+            if len(vg_map) != vg_count:
+                raise RuntimeError(
+                    f"[EFMI双套导出] VGMap 键集不完整（A1）：{unique_str} "
+                    f"VGMap({len(vg_map)} 键) != VGCount({vg_count})，拒绝转换"
+                )
+            strength = {}
+            if recompute_strength:
+                if EFMIBoneMapBuilder._is_dualset_strength_missing(
+                    submesh_dir, submesh_json
+                ):
+                    missing_strength_components.append(unique_str)
+                try:
+                    strength = EFMIBoneMapBuilder._dualset_workspace_strength(
+                        submesh_dir, submesh_json
+                    )
+                except Exception:
+                    strength = {}
+            for raw_local, raw_slot in vg_map.items():
+                local = int(raw_local)
+                slot = int(raw_slot)
+                identity = vg_offset + local
+                prev = identity_owner.get(identity)
+                if prev is not None and prev != unique_str:
+                    raise RuntimeError(
+                        f"[EFMI双套导出] identity {identity} 被多组件同时占用 "
+                        f"({prev} 与 {unique_str})——VGOffset 段重叠或陈旧 json，"
+                        "中止转换（断言 A3）"
+                    )
+                identity_owner[identity] = unique_str
+                slot_lod_prefixes[slot].add(lod_prefix)
+                sig = strength.get(local)
+                weight_total = 0.0
+                vertex_count = 0
+                if isinstance(sig, dict):
+                    try:
+                        weight_total = float(sig.get("weight_total", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        weight_total = 0.0
+                    try:
+                        vertex_count = int(sig.get("vertex_count", 0) or 0)
+                    except (TypeError, ValueError):
+                        vertex_count = 0
+                slot_members[slot].append({
+                    "comp": unique_str,
+                    "local": local,
+                    "identity": identity,
+                    "weight_total": weight_total,
+                    "vertex_count": vertex_count,
+                })
+        if missing_strength_components:
+            raise RuntimeError(
+                "[EFMI双套导出] 强度数据不可得（A4）：以下子网格声明了 "
+                f"Position/Blend 类别但 buffer 缺失: {missing_strength_components}。"
+                "无法重算 weight_total，拒绝转换（不静默回退槽位直写）"
+            )
+        # B11（FC-3，t3 设计 §4 / t6-F3）：任一 VGMap 引用槽必须落在**声明段精确
+        # 并集**内（逐段比对 [vg_offset, vg_offset+vg_count)，任一命中即合法）。
+        # - 引用「无人声明」的槽位 = 数据损坏（t2 §1.2 的 B 空洞槽）；
+        # - 「越出自属段」的池共享（canonical 借位）是设计语义，仍允许；
+        # - 不用包围盒 [min,max)：投影跳过部件会在声明段间留空隙，凹槽引用
+        #   （落进空隙的损坏数据）不能被包围盒放行（T6-F3）。
+        if declared_segments:
+            pool_lo = min(declared_pool_bounds)
+            pool_hi = max(declared_pool_bounds)
+            b11_violations: list[tuple[str, str, int]] = []
+            for _submesh_dir, submesh_json in EFMIBoneMapBuilder._iter_submesh_jsons(
+                workspace_root
+            ):
+                unique_str = submesh_json.get("__unique_str__", "")
+                for raw_local, raw_slot in (submesh_json.get("VGMap") or {}).items():
+                    slot = int(raw_slot)
+                    if not any(
+                        seg_start <= slot < seg_end
+                        for seg_start, seg_end in declared_segments
+                    ):
+                        b11_violations.append((unique_str, raw_local, slot))
+            if b11_violations:
+                preview = ", ".join(
+                    f"{us}:{local}->{slot}" for us, local, slot in b11_violations[:12]
+                )
+                suffix = "…" if len(b11_violations) > 12 else ""
+                raise RuntimeError(
+                    "[EFMI双套导出] VGMap 引用槽越出声明段精确并集（B11/FC-3）: "
+                    f"{preview}{suffix}（声明段并集 [{pool_lo},{pool_hi})，共 "
+                    f"{len(b11_violations)} 项）——引用了无人声明的骨骼槽位"
+                    "（含段间/段内空洞），数据损坏或陈旧，中止转换"
+                )
+        cross_lod_collisions = [
+            slot for slot, lod_set in slot_lod_prefixes.items()
+            if len(lod_set) > 1
+        ]
+        if cross_lod_collisions:
+            raise RuntimeError(
+                f"[EFMI双套导出] 跨 LOD 段共享槽位号（B10）: {sorted(cross_lod_collisions)}"
+                "——违反 v10/v11 段不相交布局（LOD0 段与 LOD1 平移段不允许撞车），"
+                "中止转换"
+            )
+        for slot, members in slot_members.items():
+            e = EFMIBoneMapBuilder.select_dualset_export_identity(slot, members)
+            table[slot] = {
+                "export_identity": e,
+                "renamed": e != slot,
+                "members": members,
+            }
+        return table
+
+    # ------------------------------------------------------------------
+    # t6 契约入口（tests/test_dualset_vg_convert.py 单一导入点）
+    # 同语义暴露四个公开接口：select_export_identity / build_export_table /
+    # compute_weight_total / run。规格 §3.3/A4/B10 的 fail-closed 由
+    # build_dualset_export_table（A3/A4/B10）与 run（A2/A4/B10 汇总）落实。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def select_export_identity(slot: int, members: list[dict]) -> int:
+        """t6 契约别名：委托 select_dualset_export_identity（同语义）。"""
+        return EFMIBoneMapBuilder.select_dualset_export_identity(slot, members)
+
+    @staticmethod
+    def build_export_table(slot_members: dict[int, list[dict]]) -> dict[int, dict]:
+        """t6 契约：由聚合后的 slot->members 构建决策表（纯函数，无 I/O）。
+
+        输出 {slot: {'slot', 'member_count', 'members', 'export_identity', 'renamed'}}——
+        与 t5 原型 build_export_table 结构一致。
+        """
+        table = {}
+        for slot, members in slot_members.items():
+            e = EFMIBoneMapBuilder.select_dualset_export_identity(slot, members)
+            table[slot] = {
+                "slot": slot,
+                "member_count": len(members),
+                "members": members,
+                "export_identity": e,
+                "renamed": e != slot,
+            }
+        return table
+
+    @staticmethod
+    def compute_weight_total(
+        position_buf_path: str,
+        blend_buf_path: str,
+        submesh_json_dict: dict,
+    ) -> dict[int, float]:
+        """t6 契约：每 local 的 weight_total（Σ 有效通道原始权重）。
+
+        - 任一必需 buf 缺失 ⇒ 返回 {}（A4 权威语义，不静默取 0，与产品
+          compute_driven_signatures L661 口径一致）；
+        - buffer 与 stride 不对齐 ⇒ 抛 ValueError（拒绝，不静默截断）；
+        - w==0 的 local 丢弃（产品 L759 语义）。
+        实现为独立直读（不委托吞异常的 compute_driven_signatures），保证
+        对齐/缺失语义上抛给调用方。
+        """
+        if not os.path.isfile(position_buf_path) or not os.path.isfile(blend_buf_path):
+            return {}
+        layout = EFMIBoneMapBuilder.parse_blend_layout(submesh_json_dict)
+        if not layout:
+            return {}
+        element_info = EFMIBoneMapBuilder.layout_element_info(layout)
+        indices = EFMIBoneMapBuilder.parse_blendindices_from_buf(
+            blend_buf_path, element_info
+        )
+        positions = EFMIBoneMapBuilder._read_positions_for_strength(
+            position_buf_path, submesh_json_dict
+        )
+        weights = EFMIBoneMapBuilder.parse_blendweights_from_buf(
+            blend_buf_path, layout
+        )
+        valid_mask = EFMIBoneMapBuilder.valid_blend_channels(
+            indices, element_info, weights
+        )
+        bi_channels = int(layout.get("bi_channels", 4) or 4)
+        if weights is None:
+            weights = numpy.zeros((len(indices), bi_channels), dtype=numpy.float32)
+            weights[:, 0] = 1.0
+        accum: dict[int, float] = defaultdict(float)
+        for c in range(indices.shape[1]):
+            idx_col = indices[:, c]
+            w_col = weights[:, c] if c < weights.shape[1] else weights[:, 0]
+            valid = valid_mask[:, c]
+            if positions is not None:
+                valid = valid & numpy.isfinite(positions).all(axis=1)
+            if not numpy.any(valid):
+                continue
+            v_idx = idx_col[valid]
+            v_w = w_col[valid].astype(numpy.float64)
+            for local in numpy.unique(v_idx):
+                mask = v_idx == local
+                w_sum = float(v_w[mask].sum())
+                if w_sum > 0:
+                    accum[int(local)] += w_sum
+        return {local: s for local, s in accum.items() if s > 0}
+
+    @staticmethod
+    def _read_positions_for_strength(
+        position_buf_path: str, submesh_json_dict: dict
+    ) -> numpy.ndarray | None:
+        """读取绑定姿态位置 (v,3)；布局缺失/文件缺失返回 None（跳过位置过滤）。"""
+        pos_stride = 0
+        has_position = False
+        for category_buffer in submesh_json_dict.get("CategoryBufferList", []):
+            for element in category_buffer.get("D3D11ElementList", []):
+                if str(element.get("Category", "") or "").strip().lower() == "position":
+                    pos_stride += int(element.get("ByteWidth", 0) or 0)
+                    if str(element.get("SemanticName", "") or "").upper() == "POSITION":
+                        has_position = True
+        if pos_stride <= 0 or not has_position:
+            return None
+        raw = numpy.fromfile(position_buf_path, dtype=numpy.uint8)
+        vertex_count = len(raw) // pos_stride
+        if vertex_count <= 0:
+            return None
+        return (
+            raw.reshape(vertex_count, pos_stride)[:, 0:12]
+            .copy().view(numpy.float32).reshape(vertex_count, 3)
+        )
+
+    @staticmethod
+    def run(workspace_root: str, outdir: str) -> int:
+        """t6 契约：完整转换 CLI（只读工作区，输出到 outdir）。
+
+        - A1：VGMap 键集 != VGCount 的子网格跳过 + 警告（不越权修复、不纳入、rc 仍 0）；
+        - A4：json 声明了 Position/Blend 条目但 buffer 物理缺失 ⇒ 抛 RuntimeError
+          （数据缺失，大声失败，不静默取 0）；json 完全未声明 Position 类别且
+          无 Blend 条目 ⇒ rc=1 + summary.assert_A4_strength_available=false；
+        - A2/A3/B10：冲突/撞车 ⇒ rc=1 + summary 标记 + fail_reason；
+        - 输出 t5-summary.json / t5-ledger.json / t5-rename_map.json。
+        返回 0=成功（或无可转换数据），1=规格断言触发。
+        """
+        summary = {
+            "workspace_root": workspace_root,
+            "submesh_with_vgmap": 0,
+            "slots_total": 0,
+            "slots_single": 0,
+            "slots_merged": 0,
+            "slots_renamed": 0,
+            "assert_A2_export_unique": True,
+            "assert_A3_identity_single": True,
+            "assert_A4_strength_available": True,
+            "assert_B10_lod_segments_disjoint": True,
+            "fail_reason": "",
+            "warnings": [],
+        }
+        slot_members: dict[int, list[dict]] = defaultdict(list)
+        identity_seen: dict[int, str] = {}
+        identity_conflicts: list[tuple] = []
+        slot_lod_prefixes: dict[int, set] = defaultdict(set)
+        a4_missing: list[str] = []  # 强度不可得子网格（文件缺失 或 形态缺 Position）
+        for submesh_dir, submesh_json in EFMIBoneMapBuilder._iter_submesh_jsons(
+            workspace_root
+        ):
+            vg_map = submesh_json.get("VGMap") or {}
+            vg_offset = int(submesh_json.get("VGOffset", 0) or 0)
+            vg_count = int(submesh_json.get("VGCount", 0) or 0)
+            unique_str = submesh_json.get("__unique_str__", "")
+            lod_prefix = str(unique_str or "").split(".", 1)[0]
+            if len(vg_map) != vg_count:  # A1：损坏 json 跳过 + 警告
+                summary["warnings"].append(
+                    f"[A1] {unique_str}: VGMap 键集({len(vg_map)}) != VGCount({vg_count})，跳过"
+                )
+                continue
+            # A4：强度数据不可得（json 声明的 buf 文件缺失，或声明了 Blend 但未声明
+            # Position 类别）⇒ 拒绝转换（rc=1 + summary 标记），绝不静默取 0。
+            if EFMIBoneMapBuilder._dualset_strength_unavailable(
+                submesh_dir, submesh_json
+            ):
+                a4_missing.append(unique_str)
+                continue
+            summary["submesh_with_vgmap"] += 1
+            _pos = EFMIBoneMapBuilder._dualset_workspace_strength(submesh_dir, submesh_json)
+            for raw_local, raw_slot in vg_map.items():
+                local = int(raw_local)
+                slot = int(raw_slot)
+                identity = vg_offset + local
+                if identity in identity_seen and identity_seen[identity] != unique_str:
+                    identity_conflicts.append((identity, identity_seen[identity], unique_str))
+                identity_seen[identity] = unique_str
+                slot_lod_prefixes[slot].add(lod_prefix)
+                sig = _pos.get(local)
+                wt = 0.0
+                vc = 0
+                if isinstance(sig, dict):
+                    try:
+                        wt = float(sig.get("weight_total", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        wt = 0.0
+                    try:
+                        vc = int(sig.get("vertex_count", 0) or 0)
+                    except (TypeError, ValueError):
+                        vc = 0
+                slot_members[slot].append({
+                    "comp": unique_str,
+                    "local": local,
+                    "identity": identity,
+                    "weight_total": wt,
+                    "vertex_count": vc,
+                })
+        # A4 汇总：任一子网格强度不可得 ⇒ rc=1 + 标记 + fail_reason（不抛异常）。
+        if a4_missing:
+            summary["assert_A4_strength_available"] = False
+            summary["fail_reason"] = (
+                f"强度数据不可得（A4）: {a4_missing}"
+            )
+            EFMIBoneMapBuilder._write_dualset_outputs(outdir, {}, summary)
+            return 1
+
+        table = EFMIBoneMapBuilder.build_export_table(slot_members)
+        export_ids = [row["export_identity"] for row in table.values()]
+        a2_ok = len(export_ids) == len(set(export_ids))
+        a3_ok = not identity_conflicts
+        b10_ok = all(len(lod_set) == 1 for lod_set in slot_lod_prefixes.values())
+        summary["assert_A2_export_unique"] = a2_ok
+        summary["assert_A3_identity_single"] = a3_ok
+        summary["assert_B10_lod_segments_disjoint"] = b10_ok
+        if not a2_ok or not a3_ok or not b10_ok:
+            summary["fail_reason"] = (
+                f"A2={a2_ok} A3={a3_ok} B10={b10_ok} "
+                f"identity_conflicts={identity_conflicts[:5]}"
+            )
+            EFMIBoneMapBuilder._write_dualset_outputs(outdir, table, summary)
+            return 1
+        merged = {s: r for s, r in table.items() if len(r["members"]) >= 2}
+        renamed = {s: r for s, r in merged.items() if r["renamed"]}
+        summary["slots_total"] = len(table)
+        summary["slots_single"] = len(table) - len(merged)
+        summary["slots_merged"] = len(merged)
+        summary["slots_renamed"] = len(renamed)
+        EFMIBoneMapBuilder._write_dualset_outputs(outdir, table, summary)
+        return 0
+
+    @staticmethod
+    def _write_dualset_outputs(outdir: str, table: dict, summary: dict) -> None:
+        """写 t5-summary.json / t5-ledger.json / t5-rename_map.json（outdir 在工作区之外）。"""
+        os.makedirs(outdir, exist_ok=True)
+        with open(os.path.join(outdir, "t5-summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(outdir, "t5-ledger.json"), "w", encoding="utf-8") as f:
+            json.dump({str(s): row for s, row in sorted(table.items())},
+                      f, ensure_ascii=False, indent=2)
+        rename_map = {
+            str(s): row["export_identity"]
+            for s, row in sorted(table.items())
+            if row.get("renamed")
+        }
+        with open(os.path.join(outdir, "t5-rename_map.json"), "w", encoding="utf-8") as f:
+            json.dump(rename_map, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _dualset_workspace_strength(submesh_dir: str, submesh_json: dict) -> dict:
+        """从工作区子网格 json 定位 Position/Blend.buf 并重算每 local 强度签名。
+
+        buffer 文件与 json 同目录（CategoryBufferList.FileName）。
+        任一必需 buf 缺失/无法解析 ⇒ 返回 {}（A4：强度数据不可得）。
+        返回 compute_driven_signatures 的原始签名 dict。
+        """
+        pos_path = blend_path = ""
+        for category_buffer in submesh_json.get("CategoryBufferList", []):
+            file_name = str(category_buffer.get("FileName", "") or "")
+            lowered = file_name.lower()
+            if lowered.endswith("-position.buf"):
+                pos_path = os.path.join(submesh_dir, file_name)
+            elif lowered.endswith("-blend.buf"):
+                blend_path = os.path.join(submesh_dir, file_name)
+        if not pos_path or not blend_path:
+            return {}
+        if not os.path.isfile(pos_path) or not os.path.isfile(blend_path):
+            return {}
+        return EFMIBoneMapBuilder.compute_driven_signatures(
+            pos_path, blend_path, submesh_json
+        )
+
+    @staticmethod
+    def _is_dualset_strength_missing(submesh_dir: str, submesh_json: dict) -> bool:
+        """A4 判定：子网格强度数据不可得（refuse 转换）。
+
+        满足任一即不可得：
+        1. json 声明了 Position/Blend 类别条目但对应 buffer 物理缺失；
+        2. json 未声明 Position 类别（或未声明 -Position.buf）——compute_driven_
+           signatures 对无 Position 布局直接返回空表（L671），该子网格无法
+           重算 weight_total。
+        """
+        pos_path = blend_path = ""
+        blend_declared = False
+        for category_buffer in submesh_json.get("CategoryBufferList", []):
+            file_name = str(category_buffer.get("FileName", "") or "")
+            lowered = file_name.lower()
+            if lowered.endswith("-position.buf"):
+                pos_path = os.path.join(submesh_dir, file_name)
+            elif lowered.endswith("-blend.buf"):
+                blend_path = os.path.join(submesh_dir, file_name)
+                blend_declared = True
+        if (pos_path and not os.path.isfile(pos_path)) or (
+            blend_path and not os.path.isfile(blend_path)
+        ):
+            return True
+        if not pos_path or not blend_declared:
+            # 未声明 Position 类别 / 没有任何 Blend buffer → 无法重算强度。
+            return True
+        return False
+
+    @staticmethod
+    def _is_dualset_file_missing(submesh_dir: str, submesh_json: dict) -> bool:
+        """A4（数据缺失）细分判定：json 声明了 Position/Blend 条目但文件物理缺失。
+
+        与 _is_dualset_strength_missing 的区别：本函数只查「声明了但文件不在」
+        的硬缺失（应大声失败）；「根本没声明强度类别」由 _dualset_has_strength_decl
+        统一判形态缺失（rc=1）。
+        """
+        pos_path = blend_path = ""
+        for category_buffer in submesh_json.get("CategoryBufferList", []):
+            file_name = str(category_buffer.get("FileName", "") or "")
+            lowered = file_name.lower()
+            if lowered.endswith("-position.buf"):
+                pos_path = os.path.join(submesh_dir, file_name)
+            elif lowered.endswith("-blend.buf"):
+                blend_path = os.path.join(submesh_dir, file_name)
+        if pos_path and not os.path.isfile(pos_path):
+            return True
+        if blend_path and not os.path.isfile(blend_path):
+            return True
+        return False
+
+    @staticmethod
+    def _dualset_has_strength_decl(submesh_dir: str, submesh_json: dict) -> bool:
+        """是否声明了任一强度类别（Position.buf 或 Blend.buf 条目）。"""
+        for category_buffer in submesh_json.get("CategoryBufferList", []):
+            file_name = str(category_buffer.get("FileName", "") or "")
+            lowered = file_name.lower()
+            if lowered.endswith("-position.buf") or lowered.endswith("-blend.buf"):
+                return True
+        return False
+
+    @staticmethod
+    def _dualset_strength_shape_ok(submesh_dir: str, submesh_json: dict) -> bool:
+        """强度类别形态完备：Position 与 Blend 条目都必须声明（缺一不可重算）。"""
+        has_pos = has_blend = False
+        for category_buffer in submesh_json.get("CategoryBufferList", []):
+            file_name = str(category_buffer.get("FileName", "") or "")
+            lowered = file_name.lower()
+            if lowered.endswith("-position.buf"):
+                has_pos = True
+            elif lowered.endswith("-blend.buf"):
+                has_blend = True
+        return has_pos and has_blend
+
+    @staticmethod
+    def _dualset_strength_unavailable(submesh_dir: str, submesh_json: dict) -> bool:
+        """A4 统一判定：子网格强度数据不可得（拒绝转换）。
+
+        任一满足即不可得：
+        1. json 声明的 Position/Blend buffer 文件物理缺失；
+        2. 未声明 Position 类别（或只有 Blend 条目）——无法重算 weight_total。
+        """
+        if EFMIBoneMapBuilder._is_dualset_file_missing(submesh_dir, submesh_json):
+            return True
+        declared = EFMIBoneMapBuilder._dualset_has_strength_decl(submesh_dir, submesh_json)
+        if declared:
+            return not EFMIBoneMapBuilder._dualset_strength_shape_ok(
+                submesh_dir, submesh_json
+            )
+        return True
+
+    @staticmethod
+    def _iter_submesh_jsons(workspace_root: str):
+        """遍历工作区含 VGMap 的子网格 json（无 bpy；LOD 目录与 TYPE_ 目录两级）。
+
+        yield (submesh_dir, submesh_json_dict)；json dict 附加 __unique_str__。
+        路径形态（与 t1 scan 脚本同规则）：
+        - <ws>/LOD0/<bare>/TYPE_*/<bare>.json -> "LOD0.<bare>"
+        - <ws>/<bare>/TYPE_*/<bare>.json -> "<bare>"
+        submesh_dir = 含 json 的 TYPE_ 目录（供调用方定位 Position/Blend.buf）。
+        """
+        if not workspace_root or not os.path.isdir(workspace_root):
+            return
+        for dirpath, _dirs, files in os.walk(workspace_root):
+            for name in files:
+                if not name.lower().endswith(".json"):
+                    continue
+                full = os.path.join(dirpath, name)
+                try:
+                    with open(full, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    continue
+                if not isinstance(data, dict) or "VGMap" not in data:
+                    continue
+                bare = os.path.basename(os.path.dirname(dirpath))          # <bare>
+                lod = os.path.basename(os.path.dirname(os.path.dirname(dirpath)))  # LOD0 | <ws>
+                unique_str = f"{lod}.{bare}" if lod.upper().startswith("LOD") else bare
+                data = dict(data)
+                data["__unique_str__"] = unique_str
+                yield dirpath, data
 
     @staticmethod
     def _diffusion_radius(points: numpy.ndarray) -> float:
@@ -1938,10 +2835,11 @@ class EFMIBoneMapBuilder:
         返回 {lod_name: {unique_str: frozenset(域内 LOD 名集合)}}。
         """
         def _ib_of(unique_str: str) -> str:
-            bare = str(unique_str or "")
-            if bare.upper().startswith("LOD") and "." in bare:
-                bare = bare.split(".", 1)[1]
-            return bare.split("-")[0] if "-" in bare else bare
+            # C8（P6 同源）：IB 判定键统一走模块级 efmi_ib_key（去 LOD 前缀 +
+            # 首段），与导出侧 same-IB 折叠判定（efmi.py _baseline_draw_key 的
+            # match_draw_ib 缺省回退）同源，杜绝三视图（去重域/折叠/导出校验）
+            # 判定漂移。
+            return efmi_ib_key(unique_str)
 
         presence: dict[str, set] = {}
         for lod_name, submeshes in (collected_by_lod or {}).items():
@@ -2114,6 +3012,46 @@ class EFMIBoneMapBuilder:
             shift_base = segment_end
 
         return maps_by_lod, offsets_by_lod, baseline_size
+
+    @staticmethod
+    def _bone_matrix_rotation_diff(
+        a, b, default: float = float("inf")
+    ) -> float:
+        """4x3 骨骼矩阵的旋转/尺度块最大差（去掉捕获帧世界平移列）。
+
+        布局：每骨骼 12 floats = 3 行 × 4 列（行列式 4x3）；
+        平移在每行末列（index 3/7/11），旋转在列 0..2（index 0:3/4:7/8:11）。
+
+        显式论证（用户领域裁决，2026-09-01；t4 铁证，佩丽卡脸部 b9767716 same-IB
+        家族）：
+        - 跨环境捕获是**固有常态**（L0/L1 本就在不同环境/不同 FrameAnalysis 目录
+          捕获；同 IB = 不管哪个环境都是这个 draw 在渲染）；
+        - 骨骼矩阵里的世界平移 = 捕获帧角色世界位置（环境噪声），不携带骨骼身份：
+          去除平移列后 53 根旋转差全部 <2.0（5 根 raw 大差行 26/32/34/35/37 →
+          1.082/0.902/1.139/0.886/1.994），无一根骨骼旋转语义不同；同一平移常数
+          -368..-408 跨组件一字不差复用；
+        - 因此 **rotation-only 判据 = 语义修正、不是放松闸门**：阈值 16.0/1.0 未动；
+          旋转/缩放真实不兼容时旋转差仍 >16，fail-closed 拒绝不变；单调性：旋转差
+          ⊆ raw 差元素（12 中取 9 的 max），此前 raw ≤16 合法放行的家族旋转必 ≤16
+          ——不产生任何新拒绝。用户已复核拍板**接受此判据现状**（不再补 n<3 守卫 /
+          中位数残差 / 审计日志）。
+
+        ``default``：骨骼形状无法解析时返回的保守值（默认 inf = 当作不兼容，
+        闸门按 fail-closed 拒绝；调用方不应传有限值放宽）。
+        """
+        try:
+            ra = numpy.asarray(a, dtype=numpy.float64)
+            rb = numpy.asarray(b, dtype=numpy.float64)
+            if ra.size < 12 or rb.size < 12:
+                return default
+            rot_a = numpy.concatenate((ra[0:3], ra[4:7], ra[8:11]))
+            rot_b = numpy.concatenate((rb[0:3], rb[4:7], rb[8:11]))
+            diff = float(numpy.max(numpy.abs(rot_a - rot_b)))
+            if not numpy.isfinite(diff):
+                return default
+            return diff
+        except Exception:
+            return default
 
     @staticmethod
     def build_cross_lod_correspondence(
@@ -2461,6 +3399,13 @@ class EFMIBoneMapBuilder:
 
         def _pair_score(left: dict, right: dict):
             matrix_diff = float(numpy.max(numpy.abs(left["bone"] - right["bone"])))
+            # 用户领域裁决（2026-09-01）：rotation-only 判据为主修复——跨捕获帧的
+            # 世界平移（角色世界位置）是环境噪声，不携带骨骼身份；比较前去掉平移
+            # 列只比旋转/尺度块（_bone_matrix_rotation_diff）。raw matrix_diff 保留
+            # 供内部评分/无几何硬门控/诊断口径使用。
+            matrix_diff_rotation = EFMIBoneMapBuilder._bone_matrix_rotation_diff(
+                left["bone"], right["bone"]
+            )
             if not numpy.isfinite(matrix_diff):
                 return None
             # 跨 LOD 对应由几何证据建立。没有任何权重中心时不能凭宽松的矩阵
@@ -2497,7 +3442,7 @@ class EFMIBoneMapBuilder:
             matrix_term = min(matrix_diff / matrix_scale, 8.0) * 0.05
             score = center_term + matrix_term
             score += weight_ratio * 0.03
-            return score, matrix_diff, centroid_distance
+            return score, matrix_diff, matrix_diff_rotation, centroid_distance
 
         protected_by_lod: dict[str, set[tuple[tuple[str, int], tuple[str, int]]]] = {
             lod: set() for lod in lod_names
@@ -2530,13 +3475,14 @@ class EFMIBoneMapBuilder:
                     scored = _pair_score(ref, target)
                     if scored is None:
                         continue
-                    score, matrix_diff, centroid_distance = scored
+                    score, matrix_diff, matrix_diff_rotation, centroid_distance = scored
                     pair_rows.append((
                         score,
                         ref,
                         target,
                         matrix_diff,
                         centroid_distance,
+                        matrix_diff_rotation,
                     ))
 
             # 先做稳定的一对一主匹配：一个目标候选不能被两个参考候选抢走。
@@ -2701,6 +3647,7 @@ class EFMIBoneMapBuilder:
                     "centroid_distance": (
                         None if row[4] is None else float(row[4])
                     ),
+                    "matrix_diff_rotation": float(row[5]),
                 })
 
         unmatched_reference = []
@@ -2835,16 +3782,17 @@ class EFMIBoneMapBuilder:
         vg_maps: dict[str, dict],
         base: int,
     ) -> tuple[dict[str, dict], int]:
-        """把本 LOD 的槽位**值域**按（子网格, 局部）首次出现顺序压到 [base, base+k)。
+        """【已废弃（F3，t1 §6）】把本 LOD 的槽位**值域**压到 [base, base+k)。
 
-        用户实测 v10 输出：LOD0 域 [0,370]、LOD1 域 [372,739]——中间的 371
-        不见了。根因：LOD1 首个子网格的 local 0 在去重时并入了其它子网格的
-        canonical 槽位（如 596），其自身声明段起始槽位 371 没有任何候选引用，
-        值域出现空洞。本步把该 LOD 的全部现存槽位重新编号为 base 起、无洞、
-        密集（槽位语义不变，只是压缩编号），并返回段尾（base+去重后组数）供
-        下一 LOD 平移。子网格各自的 VGOffset（声明段，按 vg_count 连续累加）
-        保持不变——声明段只用于“互不相交”的布局检查，实际读槽位以 VGMap
-        值域为准。
+        本函数在 v13 撤销「值域压缩」（efmi_skeleton.py:104-107、build_-
+        independent_lod_maps docstring）后已无任何调用者（全仓仅定义处），
+        仅保留作历史参考：v12 曾把两侧值域压缩重排，实测游戏内直接乱掉
+        （L1 值域侵入 L0 声明段区域），v13 已恢复 v10 平移口径（值域 = 去重
+        原生槽位 + 整段平移，跨 LOD 零共享）。新代码一律使用
+        ``build_independent_lod_maps``；删除或恢复使用前请先确认平移语义。
+
+        历史语义（不再生效）：按（子网格, 局部）首次出现顺序重编号，消除
+        值域空洞；声明段（VGOffset 按 vg_count 连续累加）保持不变。
         """
         order: dict[int, int] = {}
         next_slot = int(base)
@@ -4027,6 +4975,16 @@ class EFMISkeletonMergeHelper:
             submesh_json["VGMapDedupEnabled"] = (
                 bool(_DEDUP_ENABLED) if dedup_enabled is None else bool(dedup_enabled)
             )
+            # F1（t1 §4.5）：源数据指纹。去重结果依赖 json 同目录的
+            # Position.buf/Blend.buf；写回缓存时刻的 (mtime_ns, size) 指纹入 json，
+            # _efmi_cache_intact 据此在「源数据变更而 json 未变」（重新提取 dump /
+            # 替换绑定姿势 buffer）时自动失效整批重算（旧实现只校验版本常量，
+            # 陈旧合并布局会持续生效）。无声明 Position/Blend 的 json 记 None。
+            submesh_json["EFMIVGMapSourceFingerprint"] = (
+                EFMIBoneMapBuilder._vgmap_source_fingerprint(
+                    os.path.dirname(json_path), submesh_json
+                )
+            )
 
             # 联合 LOD 对应只写诊断/后续处理元数据，不改变本 LOD 的运行时
             # offset 布局。这样 LOD0/LOD1 仍可各自挂载自己的骨骼池，同时保留
@@ -4058,6 +5016,9 @@ class EFMISkeletonMergeHelper:
                             ),
                             "component_score": float(row.get("component_score", 0.0) or 0.0),
                             "matrix_diff": float(row.get("matrix_diff", 0.0) or 0.0),
+                            "matrix_diff_rotation": float(
+                                row.get("matrix_diff_rotation", 0.0) or 0.0
+                            ),
                             "centroid_distance": row.get("centroid_distance"),
                         }
                     elif row.get("target_lod") == current_lod:
@@ -4074,8 +5035,12 @@ class EFMISkeletonMergeHelper:
                             "target_component": row.get("target_component", unique_str),
                             "component_score": float(row.get("component_score", 0.0) or 0.0),
                             "matrix_diff": float(row.get("matrix_diff", 0.0) or 0.0),
+                            "matrix_diff_rotation": float(
+                                row.get("matrix_diff_rotation", 0.0) or 0.0
+                            ),
                             "centroid_distance": row.get("centroid_distance"),
                         }
+                submesh_json["EFMILODCorrespondence"] = correspondence_rows
                 submesh_json["EFMILODLayoutVersion"] = _CROSS_LOD_LAYOUT_VERSION
                 submesh_json["EFMILODReference"] = reference_lod
                 submesh_json["EFMILODProjection"] = bool(
@@ -4087,7 +5052,19 @@ class EFMISkeletonMergeHelper:
                 submesh_json["EFMILODMissingBaselineCount"] = max(
                     baseline_count - actual_count, 0
                 ) if current_lod != reference_lod else 0
-                submesh_json["EFMILODCorrespondence"] = correspondence_rows
+            else:
+                # F6（t1 §3.4）：单 LOD 批次也盖章「三件套」使 json 自描述。
+                # 单 LOD（或无跨 LOD 对应）时槽位按原生 0 起（无分段平移），
+                # 旧实现不写任何 EFMILOD* 键，产生「非规范布局」的临时状态；
+                # 下次联合导入时被版本门控发现并整批重算（可自愈，无静默损坏）。
+                # 现盖章 layout version（reference 留空、projection 记 False）：
+                # - 联合导入门控（:4217）见到版本 13 + Projection=False 与开启的
+                #   投影开关不一致 → 整批重算平移，行为不变且更显式；
+                # - 单 LOD 自身幂等判定不受影响（_is_projection_skipped 需
+                #   EFMILODProjectionSkipped=True，此处不写该键）。
+                submesh_json["EFMILODLayoutVersion"] = _CROSS_LOD_LAYOUT_VERSION
+                submesh_json["EFMILODReference"] = ""
+                submesh_json["EFMILODProjection"] = False
 
             # 双来源缓存与 JSON 作为同一可回滚文件事务提交；任一准备/替换失败
             # 都不能留下“新 BoneMatrix + 旧 InstanceConfig/JSON”的混合状态。
@@ -4441,7 +5418,10 @@ class EFMISkeletonMergeHelper:
         - VGMap 非空、键完整覆盖 0..VGCount-1 且槽位非负；全零矩阵骨骼
           不参与去重，但从 v15 起也必须保留独立稳定槽位；
         - BoneMatrixFileName 指向的 ModImpRuntime 文件存在且大小
-          >= VGCount * 48 字节（每骨骼 4x3 float32）。
+          >= VGCount * 48 字节（每骨骼 4x3 float32）；
+        - F1（t1 §4.5）：json 声明 Position/Blend.buf 时，EFMIVGMapSource-
+          Fingerprint 必须存在且与当前 (mtime_ns, size) 一致（缺指纹键 =
+          旧口径缓存 = 失效重建；源数据变更 = 失效整批重算）。
         """
         def _strict_int(value) -> int:
             if isinstance(value, bool):
@@ -4501,6 +5481,42 @@ class EFMISkeletonMergeHelper:
             return False
         if not EFMIBoneMapBuilder.cache_file_size_ok(cache_path, vg_count):
             return False
+
+        # F1 源数据指纹（t1 §4.5 / FC-5）：去重结果依赖 Position/Blend.buf
+        # 内容；缓存必须携带写回时刻的 (mtime_ns, size) 指纹并与当前一致。
+        # - 未声明 Position/Blend 的 json（无 FileName 的旧/合成形态）不适用，
+        #   跳过（既有 schema 测试形态保持完整）；
+        # - 声明了但指纹键缺失/不一致/文件也不存在 → 失效（旧口径/数据变更）。
+        declared_buffers = EFMIBoneMapBuilder._declared_source_buffers(submesh_json)
+        if declared_buffers:
+            stored_fingerprint = submesh_json.get("EFMIVGMapSourceFingerprint")
+            if not isinstance(stored_fingerprint, dict):
+                return False
+            submesh_dir = os.path.dirname(json_path)
+            for file_name in declared_buffers:
+                entry = stored_fingerprint.get(file_name)
+                if not isinstance(entry, list) or len(entry) != 2:
+                    return False
+                try:
+                    stored_mtime_ns = int(entry[0])
+                    stored_size = int(entry[1])
+                except (TypeError, ValueError):
+                    return False
+                path = os.path.join(submesh_dir, file_name)
+                if stored_mtime_ns < 0 or stored_size < 0:
+                    # 写缓存时源文件缺失 → 现在仍缺失才算一致
+                    if os.path.isfile(path):
+                        return False
+                    continue
+                try:
+                    stat_result = os.stat(path)
+                except OSError:
+                    return False
+                if (
+                    int(stat_result.st_mtime_ns) != stored_mtime_ns
+                    or int(stat_result.st_size) != stored_size
+                ):
+                    return False
         return True
 
     @staticmethod
@@ -4746,6 +5762,40 @@ class EFMISkeletonMergeHelper:
         return pairs
 
     @classmethod
+    def missing_merged_metadata_exist(
+        cls, workspace_root: str, unique_str_list: list[str]
+    ) -> bool:
+        """EFMI GPU 子网格是否存在缺失的合并元数据（VGMap 系列键）。
+
+        t15 活性修复：用户执行「清除骨骼合并VGMap缓存（clear_vgmap_cache）+
+        重新导入」时，若重导入的 import_merged_vgmap 复选框处于关闭状态，导入
+        预生成 ensure 被门控跳过 → json 的 VGOffset/VGCount/VGMap 键保持被清空
+        （域前置/导出依赖这些键；L0 段读空 → 域前置全拦，佩丽卡 13:12 实况）。
+
+        本方法供导入侧判断「无论复选框如何都需要修复性重生成」：请求集内含
+        GPU（GPU-PreSkinning != False）子网格且其 json 缺失 VGMap/VGMapAlgorithmVersion
+        即返回 True；键完好时返回 False（幂等快路径，零行为变化）。只检查请求
+        集内可解析的 json；CPU/无 GPU-PreSkinning 标记的 json 不参与判定。
+        """
+        if not workspace_root or not unique_str_list:
+            return False
+        for unique_str in unique_str_list:
+            json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+            if not json_path:
+                continue
+            try:
+                payload = JsonUtils.LoadFromFile(json_path)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("GPU-PreSkinning") is False:
+                continue
+            if not payload.get("VGMap") or not payload.get("VGMapAlgorithmVersion"):
+                return True
+        return False
+
+    @classmethod
     def clear_vgmap_cache(cls, workspace_root: str) -> tuple[int, int]:
         """删除工作空间内所有子网格 json 的 VGMap/VGOffset/VGCount/SkeletonGroup 缓存键。
 
@@ -4753,6 +5803,11 @@ class EFMISkeletonMergeHelper:
         按当前策略重新生成；正常导入也会通过 VGMapAlgorithmVersion 自动
         使旧策略缓存失效。SkeletonGroup 是 ZZMI 分组版字段（EFMI json 没有，
         一并列出无副作用）。
+        清理范围（F2，t1 §4.4/计划书 §415 承诺）：**含 VGMap 系列键 或 投影
+        裁决标记（EFMILODProjectionSkipped/Matched）的 json**——被投影裁决
+        「未匹配」的部件 json 没有 VGMap（写跳过标记前已 pop VGMap 五键），
+        旧实现只清含 VGMap 的文件，导致清缓存后该部件仍被持续排除；现按
+        「缓存/裁决键集合」判定，无 VGMap 的裁决 json 同样清除。
         ModImpRuntime/*-BoneMatrix.buf、*-InstanceConfig.buf 及其来源元数据不删：
         它们是原始骨骼池与 instance-config 的工作空间副本，与去重策略无关；
         即使 FrameAnalysis 已删除，重新生成也会复用这些文件。
@@ -4776,7 +5831,16 @@ class EFMISkeletonMergeHelper:
                     payload = JsonUtils.LoadFromFile(path)
                 except Exception:
                     continue
-                if not isinstance(payload, dict) or "VGMap" not in payload:
+                if not isinstance(payload, dict):
+                    continue
+                # F2：清理判定 = 携带任一缓存/裁决键（含无 VGMap 的投影裁决
+                # json——重复导入时该部件不会被旧的「未匹配」标记永久排除）。
+                if not any(
+                    key in payload
+                    for key in (
+                        "VGMap", "EFMILODProjectionSkipped", "EFMILODProjectionMatched",
+                    )
+                ):
                     continue
                 for key in (
                     "VGMap", "VGOffset", "VGCount", "VGMapAlgorithmVersion",
@@ -4784,7 +5848,7 @@ class EFMISkeletonMergeHelper:
                     "EFMILODReference", "EFMILODProjection", "EFMILODBaselineGroupCount", "EFMILODGroupCount",
                     "EFMILODActualGroupCount", "EFMILODMissingBaselineCount",
                     "EFMILODCorrespondence", "EFMILODProjectionSkipped",
-                    "EFMILODProjectionMatched"
+                    "EFMILODProjectionMatched", "EFMIVGMapSourceFingerprint"
                 ):
                     payload.pop(key, None)
                 try:

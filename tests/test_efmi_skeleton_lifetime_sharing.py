@@ -124,6 +124,16 @@ def _bone(tx=0.0, ty=0.0, tz=0.0):
     return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, tx, ty, tz]
 
 
+def _bone4x3(rot=None, tx=0.0, ty=0.0, tz=0.0):
+    """12 floats 4x3 骨骼矩阵（行主 3x4：旋转 3x3 在列 0..2，平移在列 3 idx 3/7/11）。
+
+    与产品提取布局（load_skeleton_buffer_from_sources 12 floats / 每骨骼）一致；
+    世界平移 = 捕获帧角色位置（跨 LOD 跨组件复用的帧伪影）。
+    """
+    r = rot if rot is not None else [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    return [r[0], r[1], r[2], tx, r[3], r[4], r[5], ty, r[6], r[7], r[8], tz]
+
+
 def _sig(centroid):
     c = numpy.array(centroid, dtype=numpy.float32)
     h = numpy.array([0.05, 0.05, 0.05], dtype=numpy.float32)
@@ -428,6 +438,132 @@ class SameIbFoldSkinningCompatibilityTests(unittest.TestCase):
         )
         aliases = ExportEFMI._build_same_ib_bone_aliases(baseline, lod)
         self.assertEqual(aliases, {200: 100, 201: 101})
+
+
+class RotationAlignedFoldMetricTests(unittest.TestCase):
+    """t5 用户领域裁决（2026-09-01 拍板）：折叠判据 = rotation-only。
+
+    佩丽卡脸部：raw matrix_diff 368-409（跨捕获帧世界位移伪影）但旋转差 53/53 <2.0
+    （t4 裁决）→ I3 优先 matrix_diff_rotation 判据后折叠放行；阈值 16.0/1.0 未变。
+    用户明确不再补 n<3 守卫/中位数残差/审计日志（接受现状）。
+    """
+
+    def test_rotation_diff_ignores_translation_only(self):
+        """只有平移不同的两根骨骼：raw max|Δ|=408 而 rotation diff=0。"""
+        a = _bone4x3()
+        b = _bone4x3(tx=-408.865, ty=119.034, tz=-144.461)
+        self.assertEqual(EFMIBoneMapBuilder._bone_matrix_rotation_diff(a, b), 0.0)
+        raw = float(numpy.max(numpy.abs(numpy.asarray(a) - numpy.asarray(b))))
+        self.assertGreater(raw, 400.0, "raw max|Δ| 必须仍反映平移差（诊断口径保留）")
+
+    def test_rotation_diff_detects_rotation_mismatch(self):
+        """旋转/尺度真实不兼容：rotation diff 必须仍大（fail-closed 不失效）。"""
+        a = _bone4x3()
+        b = _bone4x3(rot=[10.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 10.0])
+        self.assertGreater(EFMIBoneMapBuilder._bone_matrix_rotation_diff(a, b), 8.0)
+
+    def test_rotation_diff_defensive_default(self):
+        """形状无法解析（<12 floats）→ 返回 inf（闸门按不兼容拒绝）。"""
+        import math
+        val = EFMIBoneMapBuilder._bone_matrix_rotation_diff(
+            [1.0, 0.0, 0.0], _bone4x3()
+        )
+        self.assertEqual(val, float("inf"))
+        self.assertIsNotNone(math.isinf(val) and val)
+
+    def test_same_ib_fold_accepts_translation_artifact_when_rotation_matches(self):
+        """t5 佩丽卡脸部：raw 368/408（世界平移伪影）+ rotation <16 → 折叠放行。
+
+        真实账本 5 根大差 local（26/32/34/35/37）raw=368.101/408.864/407.926/
+        408.889/387.073、rotation=1.082/0.902/1.139/0.886/1.994（t4 裁决）。
+        """
+        baseline = _FakePreSkindSubmesh(
+            "LOD0.face-0", 100, 2, match_draw_ib="face",
+            vg_map={"0": 100, "1": 101},
+        )
+        lod = _FakePreSkindSubmesh(
+            "LOD1.face-0", 200, 2, match_draw_ib="face",
+            ref_component="LOD0.face-0",
+            vg_map={"0": 200, "1": 201},
+            corr={
+                "0": {"local_vg_id": 0, "matrix_diff": 408.864, "matrix_diff_rotation": 0.902,
+                      "component_score": 0.0, "centroid_distance": 0.0},
+                "1": {"local_vg_id": 1, "matrix_diff": 368.101, "matrix_diff_rotation": 1.082,
+                      "component_score": 0.0, "centroid_distance": 0.0},
+            },
+        )
+        aliases = ExportEFMI._build_same_ib_bone_aliases(baseline, lod)
+        self.assertEqual(aliases, {200: 100, 201: 101},
+                         "旋转语义一致时平移伪影不得阻断折叠")
+
+    def test_same_ib_fold_rejects_real_rotation_mismatch_with_aligned_metric(self):
+        """rotation 判据真实超阈值（>16）→ 仍拒绝（fail-closed 保留，未放宽）。"""
+        baseline = _FakePreSkindSubmesh(
+            "LOD0.face-0", 100, 2, match_draw_ib="face",
+            vg_map={"0": 100, "1": 101},
+        )
+        lod = _FakePreSkindSubmesh(
+            "LOD1.face-0", 200, 2, match_draw_ib="face",
+            ref_component="LOD0.face-0",
+            vg_map={"0": 200, "1": 201},
+            corr={
+                "0": {"local_vg_id": 0, "matrix_diff": 408.864, "matrix_diff_rotation": 30.0},
+                "1": {"local_vg_id": 1, "matrix_diff": 368.101, "matrix_diff_rotation": 25.0},
+            },
+        )
+        with self.assertRaisesRegex(RuntimeError, "matrix_diff|骨骼矩阵差异|蒙皮语义"):
+            ExportEFMI._build_same_ib_bone_aliases(baseline, lod)
+
+    def test_old_ledger_without_rotation_field_falls_back_to_raw(self):
+        """旧账本无 matrix_diff_rotation → 回退 raw matrix_diff（行为不变，fail-closed）。"""
+        baseline = _FakePreSkindSubmesh(
+            "LOD0.face-0", 100, 2, match_draw_ib="face",
+            vg_map={"0": 100, "1": 101},
+        )
+        lod = _FakePreSkindSubmesh(
+            "LOD1.face-0", 200, 2, match_draw_ib="face",
+            ref_component="LOD0.face-0",
+            vg_map={"0": 200, "1": 201},
+            corr={
+                "0": {"local_vg_id": 0, "matrix_diff": 449.64},
+                "1": {"local_vg_id": 1, "matrix_diff": 0.001},
+            },
+        )
+        with self.assertRaisesRegex(RuntimeError, "matrix_diff|骨骼矩阵差异|蒙皮语义"):
+            ExportEFMI._build_same_ib_bone_aliases(baseline, lod)
+
+    def test_correspondence_row_carries_rotation_metric(self):
+        """build_cross_lod_correspondence 的 match 行同时持久化 raw 与 rotation 差。"""
+        rotA = [0.348, 0.102, -0.932, 0.731, -0.652, 0.202, -0.587, -0.752, -0.302]
+        # L0：local0 旋转大差（真实不兼容）、local1 恒等+世界平移
+        bones0 = [_bone4x3(rot=rotA), _bone4x3(tx=-408.865, ty=119.034, tz=-144.461)]
+        # L1：local0 恒等（旋转真差）、local1 恒等+不同平移（帧伪影）
+        bones1 = [_bone4x3(), _bone4x3(tx=-0.5, ty=0.2, tz=0.1)]
+        collected = {
+            "LOD0": {
+                "LOD0.parta-0-0": _entry(
+                    bones0,
+                    {0: _sig((0.0, 0.0, 0.0)), 1: _sig((10.0, 0.0, 0.0))},
+                ),
+            },
+            "LOD1": {
+                "LOD1.parta-0-0": _entry(
+                    bones1,
+                    {0: _sig((0.0, 0.0, 0.0)), 1: _sig((10.0, 0.0, 0.0))},
+                ),
+            },
+        }
+        out = EFMIBoneMapBuilder.build_cross_lod_correspondence(collected)
+        matches = {int(m["reference_local_vg_id"]): m for m in out.get("matches", [])}
+        self.assertIn(0, matches)
+        self.assertIn(1, matches)
+        m0, m1 = matches[0], matches[1]
+        # local0：旋转真差 → 两指标都大
+        self.assertGreater(float(m0["matrix_diff"]), 1.0)
+        self.assertGreater(float(m0["matrix_diff_rotation"]), 1.0)
+        # local1：仅平移差 → raw 大、rotation 小
+        self.assertGreater(float(m1["matrix_diff"]), 400.0)
+        self.assertLess(float(m1["matrix_diff_rotation"]), 2.0)
 
 
 if __name__ == "__main__":
