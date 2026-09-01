@@ -1479,6 +1479,84 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertIn("run = CommandListSSMTTTLDraw_241deac5_A", new_lines)
             self.assertNotIn(f"run = CommandList{BS}TTL{BS}Draw", new_lines)
 
+    def test_ttl_command_list_rebuilt_via_sibling_hook_fallback(self):
+        """回归（2026-08-30 实机）：拖拽钩子落在兄弟主绘制段（而非 TTL copy 段
+        头部）时，TTL 命令表必须经全表回退重建；陈旧 ShadowVB+copy 残留段
+        必须被覆盖为当前 TempVB0 形态，否则 TTL 层断链。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+            mesh_name = "LOD0.241deac5-56376-0.中文中文_透明0.75_copy"
+            obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
+            _fake_bpy.data.objects[obj.name] = obj
+
+            sections = OrderedDict([
+                # 主绘制段：拖拽钩子在此（当前生成器只注入 part 主段）
+                ("[TextureOverride_LOD0.241deac5_56376_0_main]", [
+                    "hash = 241deac5",
+                    "match_first_index = 0",
+                    "    ; --- DRAG HOOK BEGIN 241deac5P0_A ---",
+                    "    if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1",
+                    "        if time != $ssmtdrag_last_dispatch_241deac5_A",
+                    "            run = CustomShaderDragJiggle241deac5_A",
+                    "            $ssmtdrag_last_dispatch_241deac5_A = time",
+                    "        endif",
+                    "        vb0 = ResourceDragJiggleTempVB0_241deac5_A",
+                    "    endif",
+                    "    ; --- DRAG HOOK END 241deac5P0_A ---",
+                    "; [mesh:LOD0.241deac5-56376-0.主体] [vertex_count:100]",
+                    "drawindexed = 600, 0, 0",
+                ]),
+                # TTL copy 段（本测试的处理对象）：头部无钩子块
+                ("[TextureOverride_LOD0.241deac5_56376_0_copy]", [
+                    "hash = 241deac5",
+                    "match_first_index = 0",
+                    "ib = Resource_LOD0.241deac5_56376_0_Index",
+                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                    "run = CommandListSkinTexture",
+                    f"; [mesh:{mesh_name}] [vertex_count:15618]",
+                    f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_DiffuseMap_X",
+                    "$" + BS + "TTL" + BS + "mask_channel = 3",
+                    "drawindexed = 56376, 0, 0",
+                ]),
+                # 陈旧残留：ShadowVB 时代 + 手改 copy（处理后必须被覆盖）
+                ("[CommandListSSMTTTLDraw_241deac5_A]", [
+                    "if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1",
+                    "    vb0 = copy ResourceDragJiggleShadowVB_241deac5_A",
+                    "endif",
+                    "ib = Resource_LOD0.241deac5_56376_0_Index",
+                    f"run = CommandList{BS}TTL{BS}Draw",
+                ]),
+                ("_config_path", temp_dir),
+            ])
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.process_texture_override_section(
+                "[TextureOverride_LOD0.241deac5_56376_0_copy]",
+                sections,
+                material_group_to_swapkey={},
+                swap_key_prefix="$swapkey",
+                next_swap_key_num=150,
+                used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            cl = sections["[CommandListSSMTTTLDraw_241deac5_A]"]
+            cl_text = "\n".join(cl)
+            self.assertIn("vb0 = ResourceDragJiggleTempVB0_241deac5_A", cl_text,
+                          "钩子落在兄弟段时命令表必须经全表回退重建为当前 TempVB0 形态")
+            self.assertNotIn("ShadowVB", cl_text, "陈旧 ShadowVB 引用必须被覆盖")
+            self.assertNotIn("copy ResourceDragJiggle", cl_text,
+                             "手改 copy 残留必须被覆盖")
+            self.assertIn("if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1",
+                          cl_text)
+            self.assertIn("ib = Resource_LOD0.241deac5_56376_0_Index", cl_text)
+
     def test_ttl_draw_lines_preserve_drag_vis_flags(self):
         """TTL 块重建必须保留拖拽物体显隐 flag 行（否则隐藏判定失效）。"""
         node = node_postprocess_material.SSMTNode_PostProcess_Material()

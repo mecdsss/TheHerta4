@@ -1650,11 +1650,34 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
     @staticmethod
     def _ttl_extract_drag_vb0(lines):
+        # 拖拽 Jiggle 影子缓冲当前形态为 TempVB0（R9 ShadowVB 直写链实机回归已回退）；
+        # 正则同时匹配两家族，兼容 ShadowVB 时代的旧生成物。
         for line in lines:
-            match = re.search(r'\b(ResourceDragJiggleTempVB0_[A-Za-z0-9_]+)\b', str(line or ""))
+            match = re.search(r'\b(ResourceDragJiggle(?:ShadowVB|TempVB0)_[A-Za-z0-9_]+)\b', str(line or ""))
             if match:
                 return match.group(1)
         return None
+
+    @staticmethod
+    def _ttl_find_drag_vb0_global(all_sections):
+        """全表扫描 jiggle 换绑行，返回 (drag_vb0, 所在段 lines)，均无则 (None, None)。
+
+        排除 [CommandListSSMTTTLDraw_*] 段（那里只是引用，且可能是陈旧残留）。
+        优先当前形态 TempVB0：ShadowVB 资源段在重导出时会被拖拽侧清理，
+        命令表若引用它将悬空。
+        """
+        for family in ("TempVB0", "ShadowVB"):
+            pattern = r'\b(ResourceDragJiggle' + family + r'_[A-Za-z0-9_]+)\b'
+            for sec_name, sec_lines in all_sections.items():
+                if not isinstance(sec_lines, list):
+                    continue
+                if str(sec_name).startswith("[CommandListSSMTTTLDraw_"):
+                    continue
+                for line in sec_lines:
+                    match = re.search(pattern, str(line or ""))
+                    if match:
+                        return match.group(1), sec_lines
+        return None, None
 
     @staticmethod
     def _ttl_extract_ib(lines):
@@ -1791,6 +1814,13 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         first_block_start = self._ttl_find_block_start(lines, first_mesh_index)
         header_lines = self._strip_drag_hook_blocks(lines[:first_block_start])
         drag_vb0 = self._ttl_extract_drag_vb0(header_lines)
+        drag_vb0_lines = header_lines
+        if drag_vb0 is None:
+            # 回退：拖拽钩子只注入单一主绘制段（_inject_draw_hooks 只落 part.section），
+            # TTL copy 段头部无钩子块时全表扫描兄弟段；否则陈旧
+            # [CommandListSSMTTTLDraw_*] 段会被原样保留、引用已失效的 jiggle 资源
+            # → TTL 断链（2026-08-30 实机回归：TTL 层吃不到形态键/拖拽交互）。
+            drag_vb0, drag_vb0_lines = self._ttl_find_drag_vb0_global(all_sections)
         ib_resource = self._ttl_extract_ib(header_lines)
 
         generated_section_names = set()
@@ -1841,10 +1871,11 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 continue
 
             if drag_vb0:
-                token = drag_vb0[len("ResourceDragJiggleTempVB0_"):]
+                # 资源名家族前缀长度不等（TempVB0/ShadowVB 两代命名），按匹配结果取后缀
+                token = re.sub(r'^ResourceDragJiggle(?:ShadowVB|TempVB0)_', '', drag_vb0)
                 command_list_name = f"CommandListSSMTTTLDraw_{token}"
                 if command_list_name not in ttl_draw_command_lists:
-                    drag_condition = self._ttl_extract_drag_condition(header_lines, drag_vb0)
+                    drag_condition = self._ttl_extract_drag_condition(drag_vb0_lines, drag_vb0)
                     command_list_lines = []
                     if drag_condition:
                         # 仅在拖拽激活时绑定 jiggle 临时 VB0;其余情况不覆盖 vb0,
