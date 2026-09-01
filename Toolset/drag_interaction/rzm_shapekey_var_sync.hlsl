@@ -19,9 +19,12 @@
 //   - CPU/GPU arbitration uses a mode handshake in IniParams[90..98]:
 //     mode 1 suppresses a CPU readback echo; mode 2 force-pushes a changed
 //     variable until the delayed store readback confirms the same value.
-//   - ZoneActive is still recomputed here every frame (same hit test as
-//     rzm_shapekey_drive) and consumed by the CPU readback to decide which
-//     side owns the variable.
+//   - ZoneActive mirrors the drag drive CS's latched binding (single source
+//     of truth: the ResourceDragShapeKeyDragLatch slot, see below) and is
+//     consumed by the CPU
+//     readback to decide which side owns the variable. The bound zone stays
+//     active while LMB/X is held even after the cursor leaves the hit zone;
+//     the flag falls once the drive CS observes the release edge.
 // GPU->CPU synchronization is emitted by the generated
 // CommandListDragShapeKeyVarReadback section. It reads ZoneActive and the
 // drive slot with the loader's direct-resource store syntax (without ref).
@@ -29,8 +32,9 @@
 // so a fresh hotkey value is never clobbered by a stale buffer read.
 //
 // Bindings:
-//   t67  = ResourceDragPinnedDetectInfo (hover hit + zone id; same SRV the
-//          drive CS uses for its hit test)
+//   t67  = ResourceDragPinnedDetectInfo (hover hit + zone id; retained for
+//          binding compatibility — the hit test itself moved into the drive
+//          CS's latch, this CS no longer re-derives it)
 //   t69  = ResourceDragShapeKeyVarSyncMap (R32G32B32A32_UINT, one uint4 per
 //          binding: x = drive slot, y = zone id, z = nd_stage or 0xFFFFFFFF,
 //          w = reserved; baked at export)
@@ -41,7 +45,10 @@
 //   u3   = ResourceDragShapeKeyClickCountF (R32_FLOAT, array = zone capacity;
 //          float mirror kept coherent with ClickCount for CPU store export)
 //   u4   = ResourceDragShapeKeyZoneActive (R32_FLOAT, array = zone capacity;
-//          per-zone drag-active flags, recomputed every frame below)
+//          per-zone drag-active flags, mirrored from the latch every frame)
+//   u5   = ResourceDragShapeKeyDragLatch (shared latch resource maintained by
+//          rzm_shapekey_drive; single slot: 0 = unbound, otherwise bound
+//          zone id + 1 — boot/disarm clears (0.0) read as unbound)
 //   t120 = IniParams
 //
 // IniParams (packed 4 variables per float4, from index 81; 76-80 are used
@@ -50,27 +57,22 @@
 //   [90 + i/4][i%4] = CPU/GPU arbitration mode of binding i
 //                     (0 = normal, 1 = suppress readback echo,
 //                      2 = force-push until delayed readback acknowledges)
-// IniParams[75] gate inputs (fixed below the drive CS range):
-//   x = drag system mode (1 = hit only), y = grab modifier + LMB/X held,
-//   z = target drawn this frame, w = input mode (0 = game)
+// IniParams[75] gate inputs (fixed below the drive CS range) are still fed by
+// the generator but no longer consulted here: drag-active arbitration follows
+// the drive CS latch (single source of truth), not a per-frame hit retest.
 
 RWBuffer<float> ShapeKeyDrive       : register(u0);
 RWBuffer<uint>  ClickCount          : register(u1);
 RWBuffer<float> VarSyncPrev         : register(u2);
 RWBuffer<float> ClickCountF         : register(u3);
 RWBuffer<float> ZoneActive          : register(u4);
+RWBuffer<float> DragLatch           : register(u5);
 Buffer<uint4>   VarSyncMap          : register(t69);
 StructuredBuffer<float4> PinnedDetectInfo : register(t67);
 Texture1D<float4> IniParams         : register(t120);
 
 #define VAR_SYNC_INIPARAM_BASE 81
 #define VAR_SYNC_MODE_BASE 90
-#define VAR_SYNC_GATE_PARAMS 75
-
-uint ClampZoneID(float zoneValue, uint zoneCount)
-{
-    return min((uint)max(round(zoneValue), 0.0), max(zoneCount, 1u) - 1u);
-}
 
 [numthreads(1, 1, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
@@ -90,18 +92,20 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     if (clickSlots == 0u || clickFloatSlots < clickSlots || prevSlots < count)
         return;
 
-    // 拖拽激活标志（每区域，与驱动 CS 同一命中判定）：
-    // 仅命中模式 + 目标绘制 + LMB/X 按住 + 命中区域 → 该区域的缓冲归拖拽 CS 所有。
-    // 本 CS 每帧无条件重算（覆盖驱动 CS 不运行的帧：松开 ALT/切换模式/目标移出），
-    // 保证标志必然回落。
-    float4 gate = IniParams[VAR_SYNC_GATE_PARAMS];
-    bool gateOn = gate.x == 1.0 && gate.y > 0.5 && gate.z > 0.5 && gate.w < 0.5;
-    float4 detected = PinnedDetectInfo[0u];
-    bool hasHit = gateOn && detected.x >= 0.0 && detected.y < 1e30
-        && abs(PinnedDetectInfo[1u].w - 7.0) < 0.5;
-    uint hoverZone = ClampZoneID(PinnedDetectInfo[7u].w, clickSlots);
+    // 拖拽激活标志（每区域）：直接镜像驱动 CS 的绑定锁存（单一事实源）。
+    // 驱动 CS 维护锁存：按住 LMB/X 命中即绑定、绑定期间移出区域不丢、
+    // 松开当帧写 0（=未绑定编码）解除；失臂（松 Alt/undraw/模式 0）由生成器
+    // else 分支整清锁存资源兜底。本 CS 每帧照抄为 ZoneActive，门控 CPU 回读
+    // 拉取方向；帧序上驱动 CS 先于本 CS 运行（[Present] 段内 PinDetected →
+    // VarSync），因此绑定/释放沿当帧生效。
+    uint latchSlots;
+    DragLatch.GetDimensions(latchSlots);
+    float latchValue = latchSlots >= 1u ? DragLatch[0] : 0.0;
+    int boundZone = (latchValue > 0.5) ? (int)floor(latchValue + 0.5) - 1 : -1;
+    if (boundZone >= (int)clickSlots)
+        boundZone = -1;  // 区域布局变更防御：陈旧绑定作废
     for (uint z = 0u; z < clickSlots; ++z)
-        ZoneActive[z] = (hasHit && z == hoverZone) ? 1.0 : 0.0;
+        ZoneActive[z] = (boundZone >= 0 && z == (uint)boundZone) ? 1.0 : 0.0;
 
     for (uint i = 0u; i < count; ++i)
     {

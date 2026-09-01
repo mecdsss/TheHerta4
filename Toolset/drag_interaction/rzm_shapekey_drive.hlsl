@@ -8,15 +8,19 @@
 //   - Each zone has its own independent segment: 4 directional slots
 //     (0=up, 1=right, 2=down, 3=left) followed by N no-direction stage
 //     slots (N = ZoneStageCounts[zone], per-zone independent).
-//   - Directional slots ignore click stages entirely: while hitting this
-//     zone and holding LMB/X, each direction follows that direction's net
-//     mouse displacement (opposite direction subtracts), clamped to 0..1.
+//   - Directional slots follow the latched drag binding: the first hover hit
+//     while LMB/X is held binds that zone (level-triggered, same semantics as
+//     the drag × panel binding latch); while held, the bound zone keeps being
+//     driven by mouse displacement even after the cursor leaves the zone.
+//     Releasing LMB/X unlatches on that frame. Unbound zones hold their value.
 //   - No-direction stage slots: each press while hovering advances that
 //     zone's click count in 0..N cycle (0 = inactive/cleared); the matching
 //     stage slot is set to 1 and held until cleared or another stage is
-//     active. No mouse displacement is involved.
-// Release or leaving the zone holds the current value. Buffers are never
-// cleared by mode switches: mode 1 is the only mode that can drive them,
+//     active. Click-stage advance still requires a real hit on the press
+//     edge — the latch never advances stages outside the zone.
+// Releasing LMB/X only unlatches; the driven values themselves hold.
+// Buffers are never cleared by mode switches: mode 1 is the only mode that
+// can drive them,
 // and every other mode (0/2) holds the current values so adjusted
 // intensities are inherited when switching back to mode 1.
 //
@@ -32,6 +36,12 @@
 //   u0   = ResourceDragShapeKeyDrive (R32_FLOAT, array = sum(4+N per zone))
 //   u1   = ResourceDragShapeKeyDir   (R32_FLOAT, array = sum(4+N per zone)+1;
 //          last = prev press state)
+//   u5   = ResourceDragShapeKeyDragLatch (R32_FLOAT, array = 1; drag binding
+//          latch: 0 = unbound, otherwise bound zone id + 1 — the +1 encoding
+//          makes boot/disarm clears (0.0) read as unbound. Kept in its own
+//          resource so a disarm clear never wipes the prev-press slot.
+//          Maintained by this CS, also read by rzm_shapekey_var_sync for its
+//          ZoneActive flags)
 //   u2   = ResourceDragShapeKeyClickCount (R32_UINT, array = capacity)
 //   u3   = ResourceDragShapeKeyActiveDir (R32_UINT, array = capacity;
 //          dominant direction per zone 0=up 1=right 2=down 3=left)
@@ -56,6 +66,7 @@ RWBuffer<float> ShapeKeyDir         : register(u1);
 RWBuffer<uint> ClickCount           : register(u2);
 RWBuffer<uint> ActiveDir            : register(u3);
 RWBuffer<float> ClickCountF         : register(u4);
+RWBuffer<float> DragLatch           : register(u5);
 StructuredBuffer<float4> PinnedDetectInfo : register(t67);
 Buffer<uint> ZoneStageCounts        : register(t68);
 Texture1D<float4> IniParams         : register(t120);
@@ -83,6 +94,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     for (uint z = 0u; z < zoneCount; ++z)
         lastSlot += 4u + max(1u, ZoneStageCounts[z]);
     if (driveSlots < lastSlot || dirSlots < lastSlot + 1u)
+        return;
+    uint latchSlots;
+    DragLatch.GetDimensions(latchSlots);
+    if (latchSlots < 1u)
         return;
 
     float mode = DRIVE_PARAMS.z;
@@ -141,20 +156,42 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     // 仅“仅命中”模式（1）下驱动；其余模式（0/2）不清零、不驱动，保持当前数值。
     // 播种必须在此分支之前完成：默认模式 2 也需要从 persist 变量恢复点击状态。
+    // 模式切出即解除绑定：latch 只在模式 1 存活，防止陈旧绑定跨模式残留。
     if (mode != 1.0)
     {
         // 仍更新上一帧按键状态槽，保证切回模式 1 时按下沿检测准确
         ShapeKeyDir[lastSlot] = triggerHeld ? 1.0 : 0.0;
+        DragLatch[0] = 0.0;
         return;
     }
 
-    // 命中 + 左键/X 按下：PinnedDetectInfo[0].x >= 0 表示命中，[1].w == 7 表示区域感知命中，
-    // [7].w 是区域索引（与 rzm_jiggle_screen_state 的判定一致）
+    // 命中判定（不含按键状态）：供绑定/按下沿判定
     float4 detected = PinnedDetectInfo[0u];
-    bool hasHit = detected.x >= 0.0 && detected.y < 1e30
+    bool realHit = detected.x >= 0.0 && detected.y < 1e30
         && abs(PinnedDetectInfo[1u].w - 7.0) < 0.5;
-    hasHit = hasHit && triggerHeld;
     uint hoverZone = ClampZoneID(PinnedDetectInfo[7u].w, zoneCount);
+
+    // 拖拽绑定锁存（与拖拽×面板联动的锁存变量同构）：
+    // 按住 LMB/X 期间首次命中即绑定（level-triggered，滑入已按住同样绑定）；
+    // 绑定后光标移出区域不丢，继续由鼠标位移驱动；松开 LMB/X 的当帧解除。
+    // 编码：0 = 未绑定（boot/失臂清零值即未绑定，评审 F1），否则存 区域id+1。
+    float latchValue = DragLatch[0];
+    int boundZone = (latchValue > 0.5) ? (int)floor(latchValue + 0.5) - 1 : -1;
+    if (triggerHeld)
+    {
+        if (boundZone < 0 && realHit)
+            boundZone = (int)hoverZone;
+        if (boundZone >= (int)zoneCount)
+            boundZone = -1;  // 区域布局变更防御：陈旧绑定作废
+    }
+    else
+    {
+        boundZone = -1;
+    }
+    DragLatch[0] = (float)(boundZone + 1);
+
+    // 按下沿判定保留原语义：需真实命中 + triggerHeld
+    bool hasHit = realHit && triggerHeld;
 
     // 按下瞬间：推进该区域点击档位（0..zoneStageCount 循环；0=未激活/清空）
     if (pressed && hasHit)
@@ -174,16 +211,18 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         runningBase += 4u + zoneStageCount;
         bool zoneHit = hasHit && zone == hoverZone;
         bool zonePressed = zoneHit && pressed;
+        // 位移驱动/主导方向只看锁存绑定：绑定后光标移出区域不丢控
+        bool zoneDriven = boundZone >= 0 && zone == (uint)boundZone;
         uint activeStage = ClickCount[zone];
         // 浮点镜像：供 CPU store 回读导出点击次数（R32_UINT 直接 store 无格式保证）
         ClickCountF[zone] = (float)activeStage;
-        // 方向槽：忽略档位，按住命中该区域时由鼠标位移驱动；否则保持
+        // 方向槽：忽略档位，绑定该区域且按住时由鼠标位移驱动；否则保持
         for (uint dir = 0u; dir < 4u; ++dir)
         {
             uint idx = zoneBase + dir;
             float current = ShapeKeyDrive[idx];
             float next = current;
-            if (zoneHit)
+            if (zoneDriven)
             {
                 // 位移驱动：该方向净位移（同向 +、对向 -）× 灵敏度，
                 // 向上时“上”增“下”减，向下时反之，左右同理
@@ -192,8 +231,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             }
             ShapeKeyDrive[idx] = next;
         }
-        // 无方向档位槽：仅当前命中区域按下该档位时置 1 并保持；非活动/清空时归 0。
-        // 必须同时满足 zoneHit，否则在其他区域按下时会误置本区域槽
+        // 无方向档位槽：仅当前真实命中区域按下该档位时置 1 并保持；非活动/清空时归 0。
+        // 必须同时满足按下沿真实命中（zonePressed），锁存绑定不参与档位推进，
+        // 否则绑定期间在其他位置按下时会误置本区域槽
         for (uint stage = 1u; stage <= zoneStageCount; ++stage)
         {
             uint ndIdx = zoneBase + 4u + (stage - 1u);
@@ -202,7 +242,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             else if (activeStage != stage)
                 ShapeKeyDrive[ndIdx] = 0.0;
         }
-        if (zoneHit)
+        if (zoneDriven)
             ActiveDir[zone] = activeDir;
     }
 }

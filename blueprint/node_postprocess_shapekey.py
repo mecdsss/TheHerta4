@@ -367,17 +367,30 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return f"${assigned_name}"
 
     def _find_drag_drive_node(self):
-        """在同一节点树中查找已开启形态键驱动输出的拖拽交互节点。"""
+        """在同一节点树中查找已开启形态键驱动输出的拖拽交互节点。
+
+        四开关迁移后改读拖拽节点的 _feature_skd()（形态键联动总开关，含旧值迁移
+        与消费方约束）；旧版本/测试桩无该方法时回退 enable_shapekey_drive。
+        若谓词不同步，F1 关闭后形态键节点仍会绑定指向未发射资源的 t100/t101
+        （3Dmigoto 加载报错/绑定失败），见 phase2/n1 §5.2 跨节点读取链。"""
         tree = getattr(self, "id_data", None)
         if tree is None:
             return None
         for node in tree.nodes:
             if (
                 getattr(node, "bl_idname", "") == "SSMTNode_PostProcess_DragInteraction"
-                and getattr(node, "enable_shapekey_drive", False)
+                and self._drag_node_skd_enabled(node)
             ):
                 return node
         return None
+
+    @staticmethod
+    def _drag_node_skd_enabled(node):
+        """读拖拽节点的形态键联动有效值；无新方法的旧节点/测试桩走旧开关。"""
+        feature_skd = getattr(node, "_feature_skd", None)
+        if feature_skd is not None:
+            return bool(feature_skd())
+        return bool(getattr(node, "enable_shapekey_drive", False))
 
     def _drag_shapekey_drive_resource_name(self, ini_path=None):
         """自动从同一节点树中的拖拽交互节点推导 ShapeKeyDrive 资源名。"""

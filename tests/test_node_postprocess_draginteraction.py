@@ -73,7 +73,8 @@ def _install_stub_bpy():
 
     bpy.utils = _Utils()
     bpy.data = types.SimpleNamespace(objects=None, node_groups=None)
-    bpy.context = types.SimpleNamespace(scene=None)
+    bpy.context = types.SimpleNamespace(
+        scene=None, active_object=None, selected_objects=())
 
     sys.modules["bpy"] = bpy
     sys.modules["bpy.types"] = bpy.types
@@ -1065,10 +1066,15 @@ class DragNodeEmitTests(unittest.TestCase):
             sections["[ResourceDragShapeKeyDrive_testns]"],
             ["type = RWBuffer", "format = R32_FLOAT", "array = 5"],
         )
-        # 方向缓冲 = 区域×档位×5槽（4方向 + 1无方向）+ 1（末位槽存上一帧按键状态）
+        # 方向缓冲 = 区域×档位×5槽（4方向 + 1无方向）+ 1（末位槽存上一帧按键状态）；
+        # 拖拽绑定锁存独立为单槽资源（编码 0=未绑定，否则 区域id+1）
         self.assertEqual(
             sections["[ResourceDragShapeKeyDir_testns]"],
             ["type = RWBuffer", "format = R32_FLOAT", "array = 6"],
+        )
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyDragLatch_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
         )
         self.assertEqual(
             sections["[ResourceDragShapeKeyClickCount_testns]"],
@@ -1089,6 +1095,9 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("cs-u2 = ResourceDragShapeKeyClickCount_testns", cs)
         self.assertIn("cs-u3 = ResourceDragShapeKeyActiveDir_testns", cs)
         self.assertIn("cs-u4 = ResourceDragShapeKeyClickCountF_testns", cs)
+        # 绑定锁存资源绑定给驱动 CS（u5）
+        self.assertIn("cs-u5 = ResourceDragShapeKeyDragLatch_testns", cs)
+        self.assertIn("post cs-u5 = null", cs)
         self.assertIn("post cs-u1 = null", cs)
         self.assertIn("z77 = $ssmtdrag_drag_enabled_testns", cs)
         self.assertIn("w77 = $ssmtdrag_lmb_down_testns", cs)
@@ -1097,6 +1106,13 @@ class DragNodeEmitTests(unittest.TestCase):
         pin = sections["[CommandListDragPinDetected_testns]"]
         self.assertIn("\tclear = ResourceDragShapeKeyDrive_testns 0.0", pin)
         self.assertIn("\tclear = ResourceDragShapeKeyDir_testns 0.0", pin)
+        # boot 清零绑定锁存（编码 0=未绑定，不得假绑 zone 0）；
+        # 失臂 else 分支同样整清锁存（松 Alt/undraw/模式 0 时驱动 CS 不运行）
+        self.assertIn("\tclear = ResourceDragShapeKeyDragLatch_testns 0.0", pin)
+        disarm_idx = next(
+            i for i, line in enumerate(pin)
+            if line == "\t$ObjectDetectAllowed_testns = 0")
+        self.assertIn("clear = ResourceDragShapeKeyDragLatch_testns", pin[disarm_idx + 1])
 
         present = sections["[Present]"]
         gate_idx = next(
@@ -1107,6 +1123,15 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertNotIn("if $ssmtdrag_drag_enabled_testns != 1", gate_block)
         self.assertNotIn("clear = ResourceDragShapeKeyDrive_testns 0.0", gate_block)
         self.assertNotIn("clear = ResourceDragShapeKeyClickCount_testns", gate_block)
+        # 评审 G1：模式 0（含 1→0 直跳，无 dispatch）由 Present 终态 else 清锁存，
+        # 防陈旧绑定跨 mode-0 滞留、回模式 1 后无命中复活
+        elif_idx = next(
+            i for i, line in enumerate(present)
+            if line == "elif $ssmtdrag_drag_enabled_testns >= 1")
+        tail = present[elif_idx:]
+        else_idx = next(i for i, line in enumerate(tail) if line == "else")
+        self.assertEqual(tail[else_idx + 1], "\tclear = ResourceDragShapeKeyDragLatch_testns 0.0")
+        self.assertEqual(tail[else_idx + 2], "endif")
 
     def test_shapekey_drive_mouse_displacement_present_lines(self):
         zone = self._zone_item(0)
@@ -1192,6 +1217,10 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertEqual(
             sections["[ResourceDragShapeKeyDir_testns]"],
             ["type = RWBuffer", "format = R32_FLOAT", "array = 7"],
+        )
+        self.assertEqual(
+            sections["[ResourceDragShapeKeyDragLatch_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
         )
         cs = sections["[CustomShaderDragShapeKeyDrive_testns]"]
         self.assertIn("cs-t68 = ResourceDragShapeKeyZoneStageCounts_testns", cs)
@@ -1289,7 +1318,7 @@ class DragNodeEmitTests(unittest.TestCase):
             ["type = Buffer", "format = R32G32B32A32_UINT",
              "filename = res/drag_interaction/ShapeKeyVarSyncMap_testns.buf"],
         )
-        # 拖拽激活标志（每区域）：同步 CS 每帧按命中判定重算，CPU store 直接读取
+        # 拖拽激活标志（每区域）：同步 CS 每帧镜像驱动 CS 的绑定锁存，CPU store 直接读取
         self.assertEqual(
             sections["[ResourceDragShapeKeyZoneActive_testns]"],
             ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
@@ -1317,9 +1346,12 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("cs-u2 = ResourceDragShapeKeyVarPrev_testns", cs)
         self.assertIn("cs-u3 = ResourceDragShapeKeyClickCountF_testns", cs)
         self.assertIn("cs-u4 = ResourceDragShapeKeyZoneActive_testns", cs)
+        # 绑定锁存（独立单槽资源）是 ZoneActive 的单一事实源
+        self.assertIn("cs-u5 = ResourceDragShapeKeyDragLatch_testns", cs)
         self.assertIn("dispatch = 1, 1, 1", cs)
         self.assertIn("post cs-t67 = null", cs)
         self.assertIn("post cs-u4 = null", cs)
+        self.assertIn("post cs-u5 = null", cs)
 
         pin = sections["[CommandListDragPinDetected_testns]"]
         self.assertIn("\tclear = ResourceDragShapeKeyVarPrev_testns 0.0", pin)
@@ -1471,13 +1503,20 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertNotIn("RWBuffer<float> VarReadback", content)
         # 变量 4 个一组打包：从 IniParams[81] 起（76-80 为驱动 CS 占用）
         self.assertIn("#define VAR_SYNC_INIPARAM_BASE 81", content)
-        self.assertIn("#define VAR_SYNC_GATE_PARAMS 75", content)
+        # 命中判定门控已移除：ZoneActive 改由驱动 CS 的绑定锁存镜像（单一事实源）
+        self.assertNotIn("#define VAR_SYNC_GATE_PARAMS 75", content)
         self.assertIn("#define VAR_SYNC_MODE_BASE 90", content)
         self.assertIn("[90 + i/4][i%4] = CPU/GPU arbitration mode", content)
         self.assertNotIn("[83 + i/4][i%4] = CPU readback pull flag", content)
         self.assertIn("IniParams[VAR_SYNC_INIPARAM_BASE + (i >> 2)][i & 3]", content)
-        # 与驱动 CS 同一命中判定，每帧重算每区域激活标志
-        self.assertIn("ZoneActive[z] = (hasHit && z == hoverZone) ? 1.0 : 0.0;", content)
+        # 激活标志镜像驱动 CS 的绑定锁存资源（DragLatch[0]，编码 0=未绑定/区域id+1）：
+        # 按住命中即绑定、移出区域不丢、松开沿/失臂解除
+        self.assertIn("RWBuffer<float> DragLatch           : register(u5);", content)
+        self.assertIn("DragLatch[0]", content)
+        # 评审 G2：头部契约注释不得残留旧资源名（锁存已迁独立 DragLatch 资源）
+        self.assertNotIn("ShapeKeyDir latch slot", content)
+        self.assertIn("ResourceDragShapeKeyDragLatch slot", content)
+        self.assertIn("ZoneActive[z] = (boundZone >= 0 && z == (uint)boundZone) ? 1.0 : 0.0;", content)
         # 仅在变量真实变化时处理（不变则不覆写拖拽结果）
         self.assertIn("if (abs(raw - VarSyncPrev[i]) <= 1e-6)", content)
         self.assertIn("VarSyncPrev[i] = raw;", content)
@@ -1524,8 +1563,11 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("bool zoneHit = hasHit && zone == hoverZone;", content)
         self.assertIn("bool zonePressed = zoneHit && pressed;", content)
         self.assertIn("if (activeStage == stage && zonePressed)", content)
-        # 方向槽位移积分同样只在 zoneHit 时执行，其余区域保持不积分
-        self.assertIn("if (zoneHit)", content)
+        # 方向槽位移积分由锁存绑定（zoneDriven）门控：绑定后光标移出区域不丢控，
+        # 未绑定区域保持不积分；当帧实时命中（zoneHit）不再参与位移门控
+        self.assertIn("bool zoneDriven = boundZone >= 0 && zone == (uint)boundZone;", content)
+        self.assertIn("if (zoneDriven)", content)
+        self.assertNotIn("if (zoneHit)\n", content)
 
     def test_mode_toggle_key_generates_cycle_section(self):
         _, sections, _ = self._emit()
@@ -1562,21 +1604,112 @@ class DragNodeEmitTests(unittest.TestCase):
             "$ssmtdrag_drag_enabled_testns = 0,1,2",
         ])
 
-    def test_tempvb0_empty_declaration(self):
+    def test_jiggle_temp_vb0_empty_declaration_and_copy_roundtrip(self):
+        # R9 回退：恢复 TempVB0 空声明 + copy 往返自愈链（Alt 模型消失回归修复）
         _, sections, _ = self._emit()
-        lines = sections["[ResourceDragJiggleTempVB0_abc123_43191_testns]"]
-        self.assertEqual(lines, ["type = RWBuffer"])  # 空声明段：无 format/array
+        self.assertEqual(
+            sections["[ResourceDragJiggleTempVB0_abc123_43191_testns]"],
+            ["type = RWBuffer"],
+        )
+        self.assertNotIn("[ResourceDragJiggleShadowVB_abc123_43191_testns]", sections)
+        jig = "\n".join(sections["[CustomShaderDragJiggleabc123_43191_testns]"])
+        # 自愈链：copy-in → u5=copy → vb0=null → copy-out（CS 不写也有完整网格）
+        self.assertIn("ResourceDragJiggleTempVB0_abc123_43191_testns = vb0", jig)
+        self.assertIn("cs-t24 = vb0", jig)
+        self.assertIn("cs-u5 = copy ResourceDragJiggleTempVB0_abc123_43191_testns", jig)
+        self.assertIn("vb0 = null", jig)
+        self.assertIn("ResourceDragJiggleTempVB0_abc123_43191_testns = copy cs-u5", jig)
+        self.assertNotIn("ShadowVB", jig)
+        self.assertIn("Dispatch = 55, 1, 1", jig)  # ceil(14078/256)
+
+    def test_legacy_jiggle_vb0_sections_stripped_on_read(self):
+        # 迁移：历代命名（TempVB0 空声明段 / ShadowVB 真声明段）在重读时都被剔除，
+        # 由发射侧按当前形态（TempVB0）重建，避免双份并存
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        sections["[ResourceDragJiggleTempVB0_abc123_43191_testns]"] = ["type = RWBuffer"]
+        sections["[ResourceDragJiggleShadowVB_abc123_43191_testns]"] = [
+            "type = RWStructuredBuffer", "stride = 40", "array = 14078",
+        ]
+        node._remove_existing_legacy_jiggle_vb0_sections(sections)
+        self.assertNotIn("[ResourceDragJiggleTempVB0_abc123_43191_testns]", sections)
+        self.assertNotIn("[ResourceDragJiggleShadowVB_abc123_43191_testns]", sections)
+
+    def test_jiggle_reemit_overwrites_shadowvb_form(self):
+        # 迁移：R9 ShadowVB 时代段落在重导出时整体替换为 TempVB0 copy 形态
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        sections["[CustomShaderDragJiggleabc123_43191_testns]"] = [
+            "cs-t24 = vb0",
+            "cs-u5 = ResourceDragJiggleShadowVB_abc123_43191_testns",
+            "Dispatch = 55, 1, 1",
+        ]
+        sections["[ResourceDragJiggleShadowVB_abc123_43191_testns]"] = [
+            "type = RWStructuredBuffer", "stride = 40", "array = 14078",
+        ]
+        node._remove_existing_legacy_jiggle_vb0_sections(sections)
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        jig = "\n".join(sections["[CustomShaderDragJiggleabc123_43191_testns]"])
+        self.assertIn("cs-u5 = copy ResourceDragJiggleTempVB0_abc123_43191_testns", jig)
+        self.assertIn("ResourceDragJiggleTempVB0_abc123_43191_testns = copy cs-u5", jig)
+        self.assertNotIn("ShadowVB", jig)
+        self.assertNotIn("[ResourceDragJiggleShadowVB_abc123_43191_testns]", sections)
+
+    def test_hook_rebind_targets_temp_vb0_every_part(self):
+        # 换绑一致性：全部件钩子块 vb0 换绑目标必须为 TempVB0（灰模防线）
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        for comp in comps:
+            node._inject_draw_hooks(sections, comp, "testns")
+        rebinds = [
+            line.strip()
+            for lines in sections.values()
+            for line in lines
+            if line.strip().startswith("vb0 = ResourceDragJiggle")
+        ]
+        self.assertTrue(rebinds, "应存在 jiggle 换绑行")
+        for line in rebinds:
+            self.assertIn("ResourceDragJiggleTempVB0_abc123_43191_testns", line)
+            self.assertNotIn("ShadowVB", line)
 
     def test_bake_offsets_part_local(self):
         _, sections, _ = self._emit()
-        # part A: index_count=52688 → step = 52688//8 = 6586
-        s1 = sections["[CustomShaderDragBakeSample1_abc123_43191P0_testns]"]
-        self.assertIn("y26 = 6586", s1)
-        self.assertIn("drawindexed = 1, 6586, 0", s1)
+        # part A: index_count=52688 → step = 52688//8 = 6586；R5 段合并后单 sample 段
+        #（8P → P），偏移经 [Constants] global 迭代变量推导
+        s1 = sections["[CustomShaderDragBakeSample_abc123_43191P0_testns]"]
+        self.assertIn("local $ssmtdrag_bake_off_abc123_43191P0_testns", s1)
+        self.assertIn(
+            "$ssmtdrag_bake_off_abc123_43191P0_testns = "
+            "$ssmtdrag_bake_base_abc123_43191P0_testns + "
+            "$ssmtdrag_bake_i_abc123_43191P0_testns * "
+            "$ssmtdrag_bake_step_abc123_43191P0_testns",
+            s1,
+        )
+        self.assertIn("x26 = $ssmtdrag_bake_i_abc123_43191P0_testns", s1)
+        self.assertIn("y26 = $ssmtdrag_bake_off_abc123_43191P0_testns", s1)
+        self.assertIn("drawindexed = 1, $ssmtdrag_bake_off_abc123_43191P0_testns, 0", s1)
         self.assertIn("gs-t1 = Resourceabc123-43191AIB", s1)
         # part B 用自己的 IB 资源名
-        s1b = sections["[CustomShaderDragBakeSample1_abc123_43191P1_testns]"]
+        s1b = sections["[CustomShaderDragBakeSample_abc123_43191P1_testns]"]
         self.assertIn("gs-t1 = Resourceabc123-43191BIB", s1b)
+        # [Constants] 必须发射三个 global 迭代变量（t6 §4.3 作用域修复）
+        constants = "\n".join(sections["[Constants]"])
+        self.assertIn("global $ssmtdrag_bake_base_abc123_43191P0_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_bake_step_abc123_43191P0_testns = 6586", constants)
+        self.assertIn("global $ssmtdrag_bake_i_abc123_43191P0_testns = 0", constants)
+        # 旧 8 段全部消失，仅 1 个合并 sample 段；bake 段 = 1 unbind + 1 clear +
+        # 1 初始化 + 8 run + 7 自增
+        for i in range(8):
+            self.assertNotIn(f"[CustomShaderDragBakeSample{i}_abc123_43191P0_testns]", sections)
+        self.assertIn("[CustomShaderDragBakeSample_abc123_43191P0_testns]", sections)
+        bake = sections["[CustomShaderDragBakeabc123_43191P0_testns]"]
+        self.assertEqual(
+            [line for line in bake if line.startswith("run = CustomShaderDragBakeSample")],
+            ["run = CustomShaderDragBakeSample_abc123_43191P0_testns"] * 8,
+        )
 
     def test_redirect_base_vertex_reaches_bake_and_detect(self):
         node = _make_node(self.mod)
@@ -1590,8 +1723,8 @@ class DragNodeEmitTests(unittest.TestCase):
 
         node._emit_sections(sections, comps, "testns")
 
-        sample = sections["[CustomShaderDragBakeSample1_abc123_43191P0_testns]"]
-        self.assertIn("drawindexed = 1, 6586, 3", sample)
+        sample = sections["[CustomShaderDragBakeSample_abc123_43191P0_testns]"]
+        self.assertIn("drawindexed = 1, $ssmtdrag_bake_off_abc123_43191P0_testns, 3", sample)
         detect = sections["[CustomShaderDragDetectabc123_43191P0_testns]"]
         self.assertIn("z26 = 3", detect)
 
@@ -1607,9 +1740,18 @@ class DragNodeEmitTests(unittest.TestCase):
 
         node._emit_sections(sections, comps, "testns")
 
-        sample = sections["[CustomShaderDragBakeSample1_abc123_43191P0_testns]"]
-        self.assertIn("y26 = 7201", sample)
-        self.assertIn("drawindexed = 1, 7201, 0", sample)
+        # 双 draw 合并后 index_count=57612 → step=7201；R5 后 base/step 落在 [Constants]
+        constants = "\n".join(sections["[Constants]"])
+        self.assertIn("global $ssmtdrag_bake_base_abc123_43191P0_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_bake_step_abc123_43191P0_testns = 7201", constants)
+        sample = sections["[CustomShaderDragBakeSample_abc123_43191P0_testns]"]
+        self.assertIn(
+            "$ssmtdrag_bake_off_abc123_43191P0_testns = "
+            "$ssmtdrag_bake_base_abc123_43191P0_testns + "
+            "$ssmtdrag_bake_i_abc123_43191P0_testns * "
+            "$ssmtdrag_bake_step_abc123_43191P0_testns",
+            sample,
+        )
 
     def test_sparse_zone_resources_replace_fixed_register_block(self):
         _, sections, _ = self._emit()
@@ -2476,7 +2618,11 @@ class DragNodeInjectTests(unittest.TestCase):
                 self.assertEqual(output.count("DRAG HOOK BEGIN"), 2)
                 self.assertEqual(output.count("DRAG HOOK END"), 2)
                 self.assertEqual(output.count("[ResourceDragDetectID_testns]"), 1)
-                self.assertIn("drawindexed = 1, 7201, 0", output)
+                # R5 合并后：8 组采样参数经 [Constants] global 迭代变量推导，
+                # 不再以字面量逐段出现；bake 段仍 8 次 run 同一 sample 段
+                self.assertIn("drawindexed = 1, $ssmtdrag_bake_off_abc123_43191P0_testns, 0", output)
+                self.assertEqual(output.count("run = CustomShaderDragBakeSample_abc123_43191P0_testns"), 8)
+                self.assertEqual(output.count("CustomShaderDragBakeSample1_abc123_43191P0_testns"), 0)
 
 
 class DragNodePreviewTests(unittest.TestCase):
@@ -2485,6 +2631,16 @@ class DragNodePreviewTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.mod = _load_drag_module()
+
+    def setUp(self):
+        # t12 需求变更：预览只显示选中的区域空物体——签名/重建路径依赖
+        # bpy.context.selected_objects，本类统一桩为「无选中」（各用例按需覆写）
+        self._orig_context = getattr(self.mod.bpy, "context", None)
+        self.mod.bpy.context = types.SimpleNamespace(
+            active_object=None, selected_objects=())
+
+    def tearDown(self):
+        self.mod.bpy.context = self._orig_context
 
     def _make_zone_empty(self, name="SSMT_DragZone_0", loc=(0.0, 0.0, 0.0), scale=1.0,
                          enabled=True, brush_strength=1.0, brush_falloff_k=4.6):
@@ -2529,29 +2685,36 @@ class DragNodePreviewTests(unittest.TestCase):
 
     def test_signature_sensitive_to_matrix_and_brush(self):
         mod = self.mod
+        ctx = mod.bpy.context
         target = types.SimpleNamespace(name="Mesh", matrix_world=np.eye(4),
                                        data=types.SimpleNamespace(vertices=range(100)))
         empty = self._make_zone_empty()
         node = self._make_preview_node(mod, target=target, zone_empties=[empty])
+        ctx.selected_objects = [empty]  # t12：区域空物体须被选中才进签名
         base = mod._preview_signature(node)
         # 移动空物体 → 签名变化
         moved = self._make_zone_empty(loc=(1.0, 0.0, 0.0))
         node2 = self._make_preview_node(mod, tree_name="Tree", node_name="Drag",
                                         target=target, zone_empties=[moved])
+        ctx.selected_objects = [moved]
         self.assertNotEqual(base, mod._preview_signature(node2))
         # 改 brush_strength → 签名变化
         stronger = self._make_zone_empty(brush_strength=2.0)
         node3 = self._make_preview_node(mod, tree_name="Tree", node_name="Drag",
                                         target=target, zone_empties=[stronger])
+        ctx.selected_objects = [stronger]
         self.assertNotEqual(base, mod._preview_signature(node3))
         # 未变 → 签名稳定
+        same = self._make_zone_empty()
         node4 = self._make_preview_node(mod, tree_name="Tree", node_name="Drag",
-                                        target=target, zone_empties=[self._make_zone_empty()])
+                                        target=target, zone_empties=[same])
+        ctx.selected_objects = [same]
         self.assertEqual(base, mod._preview_signature(node4))
 
     def test_signature_sensitive_to_target_move(self):
         mod = self.mod
         empty = self._make_zone_empty()
+        mod.bpy.context.selected_objects = [empty]  # t12：选中才进签名
         m = np.eye(4)
         m[2, 3] = 5.0
         node = self._make_preview_node(
@@ -2590,7 +2753,11 @@ class DragNodePreviewTests(unittest.TestCase):
         mesh_b = types.SimpleNamespace(type="MESH", name="B", name_full="B", matrix_world=np.eye(4),
                                        data=types.SimpleNamespace(vertices=range(5)))
         collection = types.SimpleNamespace(name="PreviewSet", all_objects=[mesh_a])
-        node = self._make_preview_node(mod, collection=collection)
+        # t12：目标进签名的前提是节点有选中的区域空物体（否则预览不渲染、
+        # 签名最小化，目标/集合变化零 churn）
+        empty = self._make_zone_empty()
+        node = self._make_preview_node(mod, collection=collection, zone_empties=[empty])
+        mod.bpy.context.selected_objects = [empty]
         before = mod._preview_signature(node)
         collection.all_objects.append(mesh_b)
         self.assertNotEqual(before, mod._preview_signature(node))
@@ -2848,6 +3015,896 @@ class DragNodePreviewTests(unittest.TestCase):
         target.matrix_world[3, 3] = 1.0
         r3 = mod._preview_mesh_data(node, target)
         self.assertIsNot(r1[0], r3[0])
+
+
+class DragNodePreviewSelectionTests(unittest.TestCase):
+    """权重预览选中过滤（t12 需求变更）：只预览选中的区域空物体——
+    多选 = 并集（active 无特权）；未选中任何区域空物体 = 不显示预览。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    def setUp(self):
+        self._orig_context = getattr(self.mod.bpy, "context", None)
+        self.mod.bpy.context = types.SimpleNamespace(
+            active_object=None, selected_objects=())
+
+    def tearDown(self):
+        self.mod.bpy.context = self._orig_context
+
+    def _zone_empty(self, name="SSMT_DragZone_0", loc=(0.0, 0.0, 0.0),
+                    enabled=True):
+        m = np.eye(4)
+        if loc is not None:
+            m[:3, 3] = loc
+        settings = types.SimpleNamespace(
+            enabled=enabled, brush_strength=1.0, brush_falloff_k=4.6,
+            propagate=True, include_objects=[])
+        return types.SimpleNamespace(name=name, matrix_world=m,
+                                     ssmt_drag_zone=settings)
+
+    def _make_preview_node(self, target, empties, tree="Tree", name="Drag"):
+        node = _make_node(self.mod)
+        object.__setattr__(node, "preview_weights", True)
+        object.__setattr__(node, "preview_target", target)
+        object.__setattr__(node, "preview_collection", None)
+        object.__setattr__(node, "id_data", types.SimpleNamespace(name=tree))
+        object.__setattr__(node, "name", name)
+        object.__setattr__(node, "zone_objects",
+                           [types.SimpleNamespace(zone_object=e) for e in empties])
+        return node
+
+    def test_selected_zones_union_active_has_no_privilege(self):
+        """t12 多选并集：多个区内空物体被选 → 全部返回（按 zone_objects 顺序），
+        active 无特权（只是 selected 的普通成员）。"""
+        mod = self.mod
+        a = self._zone_empty(name="A")
+        b = self._zone_empty(name="B")
+        ctx = mod.bpy.context
+        ctx.active_object = a
+        ctx.selected_objects = [a, b]
+        node = self._make_preview_node(
+            types.SimpleNamespace(name="Mesh", matrix_world=np.eye(4),
+                                  data=types.SimpleNamespace(vertices=range(3))),
+            [a, b])
+        sel = mod._preview_selected_zones(node)
+        self.assertEqual([z[0].name for z in sel], ["A", "B"])
+        zones = mod._preview_node_zones(node)
+        self.assertEqual([z[0].name for z in zones], ["A", "B"])
+        # active 换成 b 不改变并集内容
+        ctx.active_object = b
+        self.assertEqual([z[0].name for z in mod._preview_node_zones(node)], ["A", "B"])
+
+    def test_sole_selected_zone_when_active_is_other(self):
+        """active 是他物、selected 与区内交集恰好一个 → 只预览它。"""
+        mod = self.mod
+        a = self._zone_empty(name="A")
+        b = self._zone_empty(name="B")
+        other = types.SimpleNamespace(name="Mesh")
+        ctx = mod.bpy.context
+        ctx.active_object = other
+        ctx.selected_objects = [other, b]
+        node = self._make_preview_node(
+            types.SimpleNamespace(name="Mesh", matrix_world=np.eye(4),
+                                  data=types.SimpleNamespace(vertices=range(3))),
+            [a, b])
+        sel = mod._preview_selected_zones(node)
+        self.assertEqual(len(sel), 1)
+        self.assertIs(sel[0][0], b)
+
+    def test_no_selection_yields_no_preview(self):
+        """t12 需求变更（推翻 t1『显示全部』）：未选中任何区域空物体 →
+        返回空列表 → rebuild 跳过该节点 → 不显示任何预览。"""
+        mod = self.mod
+        a = self._zone_empty(name="A")
+        b = self._zone_empty(name="B")
+        ctx = mod.bpy.context
+        ctx.active_object = None
+        ctx.selected_objects = []
+        node = self._make_preview_node(
+            types.SimpleNamespace(name="Mesh", matrix_world=np.eye(4),
+                                  data=types.SimpleNamespace(vertices=range(3))),
+            [a, b])
+        self.assertEqual(mod._preview_selected_zones(node), [])
+        self.assertEqual(mod._preview_node_zones(node), [])
+        # 选中的都不是本节点区域空物体（无关选择）→ 同样无预览、零重算
+        ctx.selected_objects = [types.SimpleNamespace(name="Unrelated")]
+        self.assertEqual(mod._preview_node_zones(node), [])
+
+    def test_multiple_selected_zones_all_preview(self):
+        """t12 多选：多个区内空物体被选（无论 active 是否区内）→ 并集全部预览。"""
+        mod = self.mod
+        a = self._zone_empty(name="A")
+        b = self._zone_empty(name="B")
+        other = types.SimpleNamespace(name="Mesh")
+        ctx = mod.bpy.context
+        ctx.active_object = other
+        ctx.selected_objects = [a, b]
+        node = self._make_preview_node(
+            types.SimpleNamespace(name="Mesh", matrix_world=np.eye(4),
+                                  data=types.SimpleNamespace(vertices=range(3))),
+            [a, b])
+        self.assertEqual([z[0].name for z in mod._preview_selected_zones(node)],
+                         ["A", "B"])
+
+    def test_disabled_selected_zone_yields_no_zones(self):
+        """选中区域 disabled → 预览不渲染（返回空列表）。"""
+        mod = self.mod
+        a = self._zone_empty(name="A", enabled=False)
+        ctx = mod.bpy.context
+        ctx.active_object = a
+        ctx.selected_objects = [a]
+        node = self._make_preview_node(
+            types.SimpleNamespace(name="Mesh", matrix_world=np.eye(4),
+                                  data=types.SimpleNamespace(vertices=range(3))),
+            [a])
+        self.assertEqual(mod._preview_node_zones(node), [])
+
+    def test_selected_zone_field_only_that_zone(self):
+        """多区域时只选中 A → 场只由 A 计算；远处顶点（只属于 B）权重为 0；
+        t12 多选：A、B 都选中 → 场 = 两者并集（远处顶点恢复权重）。"""
+        mod = self.mod
+        node = _make_node(mod)
+        object.__setattr__(node, "mask_plateau", 0.0)
+        object.__setattr__(node, "surface_propagate", True)
+        a = self._zone_empty(name="A", loc=(1.0, 0.0, 0.0))
+        b = self._zone_empty(name="B", loc=(10.0, 0.0, 0.0))
+        ctx = mod.bpy.context
+        ctx.active_object = a
+        ctx.selected_objects = [a]  # 只选中 A（t12：不再以 active 缩小多选）
+        verts = np.array([[0.9, 0.0, 0.0], [1.0, 0.0, 0.0], [1.1, 0.0, 0.0],
+                          [9.9, 0.0, 0.0]], dtype=np.float64)
+        tris = np.array([[0, 1, 2]], dtype=np.int64)
+        pnode = self._make_preview_node(
+            types.SimpleNamespace(name="Mesh", matrix_world=np.eye(4),
+                                  data=types.SimpleNamespace(vertices=range(3))),
+            [a, b])
+        node_zones = mod._preview_node_zones(pnode)
+        self.assertEqual(len(node_zones), 1)
+        self.assertIs(node_zones[0][0], a)
+        field_sel = mod._preview_target_field(node, verts, tris, node_zones, 0.0)
+        field_a = mod._preview_target_field(
+            node, verts, tris, [(a, a.ssmt_drag_zone)], 0.0)
+        field_ab = mod._preview_target_field(
+            node, verts, tris, [(a, a.ssmt_drag_zone), (b, b.ssmt_drag_zone)], 0.0)
+        np.testing.assert_array_equal(field_sel, field_a)
+        self.assertEqual(float(field_sel[3]), 0.0)      # 远处顶点只属于 B
+        self.assertGreater(float(field_ab[3]), 0.0)     # 全部区域时 B 参与
+        # t12 多选并集：A、B 都选中 → 场等于两者合并
+        ctx.selected_objects = [a, b]
+        node_zones_ab = mod._preview_node_zones(pnode)
+        self.assertEqual(len(node_zones_ab), 2)
+        field_sel_ab = mod._preview_target_field(node, verts, tris, node_zones_ab, 0.0)
+        np.testing.assert_array_equal(field_sel_ab, field_ab)
+
+    def test_signature_changes_on_selection_switch(self):
+        """选中状态进入签名：A→B、A→无选择 都触发重建。"""
+        mod = self.mod
+        target = types.SimpleNamespace(name="Mesh", matrix_world=np.eye(4),
+                                       data=types.SimpleNamespace(vertices=range(3)))
+        a = self._zone_empty(name="A")
+        b = self._zone_empty(name="B")
+        ctx = mod.bpy.context
+        node = self._make_preview_node(target, [a, b])
+        ctx.active_object = a
+        ctx.selected_objects = [a]
+        sig_a = mod._preview_signature(node)
+        ctx.active_object = b
+        ctx.selected_objects = [b]
+        self.assertNotEqual(sig_a, mod._preview_signature(node))
+        ctx.active_object = None
+        ctx.selected_objects = []
+        self.assertNotEqual(sig_a, mod._preview_signature(node))
+
+    def test_signature_ignores_unselected_zone_movement(self):
+        """选中 A 时移动未选中的 B → 签名不变（零 churn）；
+        移动选中的 A → 签名变化。t12：多选下 A、B 都被选则两者都进签名。"""
+        mod = self.mod
+        target = types.SimpleNamespace(name="Mesh", matrix_world=np.eye(4),
+                                       data=types.SimpleNamespace(vertices=range(3)))
+        a = self._zone_empty(name="A")
+        b = self._zone_empty(name="B")
+        ctx = mod.bpy.context
+        ctx.active_object = a
+        ctx.selected_objects = [a]  # 只选中 A（B 的移动不进签名）
+        node = self._make_preview_node(target, [a, b])
+        sig_before = mod._preview_signature(node)
+        m = np.eye(4)
+        m[0, 3] = 5.0
+        b.matrix_world = m
+        self.assertEqual(sig_before, mod._preview_signature(node))
+        a.matrix_world = m
+        self.assertNotEqual(sig_before, mod._preview_signature(node))
+
+    def test_signature_deform_and_pose_sensitivity(self):
+        """形变签名进入签名：形态键值变化、骨骼姿态变化触发重建；
+        无形态键/无骨骼 → deform 分量恒定 None。"""
+        mod = self.mod
+        plain = types.SimpleNamespace(name="M", data=types.SimpleNamespace())
+        self.assertIsNone(mod._preview_deform_signature(plain))
+        kb = [types.SimpleNamespace(name="Key", value=0.0, mute=False)]
+        sk = types.SimpleNamespace(key_blocks=kb)
+        target = types.SimpleNamespace(
+            name="Mesh", matrix_world=np.eye(4),
+            data=types.SimpleNamespace(vertices=range(3), shape_keys=sk))
+        a = self._zone_empty(name="A")
+        ctx = mod.bpy.context
+        ctx.active_object = a
+        ctx.selected_objects = [a]
+        node = self._make_preview_node(target, [a])
+        sig_before = mod._preview_signature(node)
+        kb[0].value = 0.5
+        self.assertNotEqual(sig_before, mod._preview_signature(node))
+        # 骨骼姿态变化（无形态键）→ 签名变化
+        bone = types.SimpleNamespace(name="Bone", matrix=np.eye(4))
+        pose = types.SimpleNamespace(bones=[bone])
+        arm = types.SimpleNamespace(name="Arm",
+                                    data=types.SimpleNamespace(pose_position="POSE"),
+                                    pose=pose)
+        arm_mod = types.SimpleNamespace(type="ARMATURE", object=arm)
+        target2 = types.SimpleNamespace(
+            name="Mesh2", matrix_world=np.eye(4),
+            data=types.SimpleNamespace(vertices=range(3)),
+            modifiers=[arm_mod])
+        node2 = self._make_preview_node(target2, [a], name="Drag2")
+        sig2_before = mod._preview_signature(node2)
+        rotated = np.array([[0.0, -1.0, 0.0, 0.0],
+                            [1.0, 0.0, 0.0, 0.0],
+                            [0.0, 0.0, 1.0, 0.0],
+                            [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
+        bone.matrix = rotated
+        # 姿态摘要每代缓存一次：同一代内返回旧摘要（防每 tick 重复全量遍历），
+        # 模拟下一 tick（代号推进）后检出新姿态 → 签名变化
+        self.assertEqual(sig2_before, mod._preview_signature(node2))
+        mod._PREVIEW_DIGEST_GENERATION += 1
+        self.assertNotEqual(sig2_before, mod._preview_signature(node2))
+
+
+class DragNodePreviewDeformTests(unittest.TestCase):
+    """形变感知网格读取：evaluated mesh 路径 + 形变签名缓存失效 + 失败回退。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    def setUp(self):
+        self._orig_context = getattr(self.mod.bpy, "context", None)
+        self.mod.bpy.context = types.SimpleNamespace(
+            active_object=None, selected_objects=())
+
+    def tearDown(self):
+        self.mod.bpy.context = self._orig_context
+
+    def _make_fake_mesh(self, verts_local, tris):
+        """构造可 foreach_get 的假网格（模拟 bpy Mesh）。"""
+        verts_arr = np.asarray(verts_local, dtype=np.float64)
+        tris_arr = np.asarray(tris, dtype=np.int64)
+
+        class FakeVerts:
+            def __len__(self):
+                return len(verts_arr)
+
+            def foreach_get(self, attr, dest):
+                dest[:] = verts_arr.reshape(-1)[:len(dest)]
+
+        class FakeTriangles:
+            def __len__(self):
+                return len(tris_arr)
+
+            def foreach_get(self, attr, dest):
+                dest[:] = tris_arr.reshape(-1)[:len(dest)]
+
+        class FakeMesh:
+            vertices = FakeVerts()
+            polygons = [1] * len(tris_arr)
+            loop_triangles = FakeTriangles()
+
+            def calc_loop_triangles(self):
+                pass
+
+        return FakeMesh()
+
+    def _make_base_target(self, name="Mesh", sk_value=0.0):
+        mesh = self._make_fake_mesh(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]], [[0, 1, 2]])
+        kb = [types.SimpleNamespace(name="Key", value=sk_value, mute=False)]
+        mesh.shape_keys = types.SimpleNamespace(key_blocks=kb)
+        return types.SimpleNamespace(name=name, matrix_world=np.eye(4), data=mesh)
+
+    def _attach_eval_geometry(self, target, eval_verts, tris):
+        """给目标挂 evaluated_get（真实 API：object.evaluated_get(depsgraph)），
+        返回产出 eval_verts 的假评估物体；返回调用计数列表。"""
+        eval_mesh = self._make_fake_mesh(eval_verts, tris)
+        calls = []
+
+        class FakeEvalObj:
+            def to_mesh(self):
+                return eval_mesh
+
+            def to_mesh_clear(self):
+                pass
+
+        def evaluated_get(depsgraph):
+            calls.append(depsgraph)
+            return FakeEvalObj()
+
+        target.evaluated_get = evaluated_get
+        return calls
+
+    def _node(self):
+        node = _make_node(self.mod)
+        object.__setattr__(node, "id_data", types.SimpleNamespace(name="Tree"))
+        object.__setattr__(node, "name", "Drag")
+        return node
+
+    def test_evaluated_mesh_path_uses_deformed_verts(self):
+        """带 shape key 的目标 + 可用 depsgraph → 预览顶点取自求值网格（形变后），
+        缓存命中后不再走 evaluated_get。"""
+        mod = self.mod
+        mod._PREVIEW_MESH_CACHE.clear()
+        target = self._make_base_target(sk_value=0.5)
+        base = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+                        dtype=np.float64)
+        deformed = base + np.array([[0.0, 0.0, 0.3]] * 3)
+        eval_calls = self._attach_eval_geometry(target, deformed, [[0, 1, 2]])
+        node = self._node()
+        result = mod._preview_mesh_data(node, target, object())
+        self.assertIsNotNone(result)
+        verts_world, tri, topo_key = result
+        # 世界顶点应为形变后位置（z 抬升 0.3），而非基础网格 z=0
+        self.assertGreater(float(verts_world[:, 2].max()), 0.29)
+        np.testing.assert_allclose(verts_world, deformed, atol=1e-12)
+        self.assertEqual(len(eval_calls), 1)
+        # 同 matrix/vcount/pcount/deform_sig → 缓存命中，evaluated_get 不再被调
+        r2 = mod._preview_mesh_data(node, target, object())
+        np.testing.assert_array_equal(r2[0], verts_world)
+        self.assertEqual(len(eval_calls), 1)
+
+    def test_deform_signature_change_invalidates_mesh_cache(self):
+        """matrix/vcount/pcount 未变但形态键值变化 → 重新读求值网格。"""
+        mod = self.mod
+        mod._PREVIEW_MESH_CACHE.clear()
+        target = self._make_base_target(sk_value=0.5)
+        base = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+                        dtype=np.float64)
+        eval_calls = self._attach_eval_geometry(
+            target, base + np.array([[0.0, 0.0, 0.3]] * 3), [[0, 1, 2]])
+        node = self._node()
+        r1 = mod._preview_mesh_data(node, target, object())
+        self.assertEqual(len(eval_calls), 1)
+        target.data.shape_keys.key_blocks[0].value = 0.7
+        r2 = mod._preview_mesh_data(node, target, object())
+        self.assertEqual(len(eval_calls), 2)
+        self.assertIsNot(r1[0], r2[0])
+
+    def test_evaluated_get_failure_falls_back_to_base(self):
+        """evaluated_get 抛异常 → 安全回退基础网格，不抛异常。"""
+        mod = self.mod
+        mod._PREVIEW_MESH_CACHE.clear()
+        target = self._make_base_target(sk_value=0.5)
+
+        def boom(depsgraph):
+            raise RuntimeError("no depsgraph")
+
+        target.evaluated_get = boom
+        node = self._node()
+        result = mod._preview_mesh_data(node, target, object())
+        self.assertIsNotNone(result)
+        np.testing.assert_allclose(result[0][:, 2], np.zeros(3), atol=1e-12)
+
+    def test_no_depsgraph_or_no_deform_stays_static(self):
+        """无 depsgraph → 基础网格；目标无形态键/无骨骼 → 即使有 depsgraph
+        也不触发求值（deform_sig=None 静态路径）。"""
+        mod = self.mod
+        mod._PREVIEW_MESH_CACHE.clear()
+        target = self._make_base_target(sk_value=0.5)
+        eval_calls = self._attach_eval_geometry(
+            target, [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+            [[0, 1, 2]])
+        node = self._node()
+        # 无 depsgraph → evaluated_get 不被调用，基础网格
+        r = mod._preview_mesh_data(node, target, None)
+        self.assertIsNotNone(r)
+        np.testing.assert_allclose(r[0][:, 2], np.zeros(3), atol=1e-12)
+        self.assertEqual(len(eval_calls), 0)
+        # 有 depsgraph 但目标无形态键/无骨骼 → 不改走求值
+        plain_mesh = self._make_fake_mesh([[0.0, 0.0, 0.0]], [[0, 0, 0]])
+        plain = types.SimpleNamespace(name="Plain", matrix_world=np.eye(4),
+                                      data=plain_mesh)
+        calls = []
+
+        def spy(depsgraph):
+            calls.append(1)
+            raise RuntimeError("should not be called")
+
+        plain.evaluated_get = spy
+        r2 = mod._preview_mesh_data(node, plain, object())
+        self.assertIsNotNone(r2)
+        self.assertEqual(len(calls), 0)
+
+    def test_deform_signature_helper_detail(self):
+        """形变签名内容：形态键、修改器类型指纹、骨骼姿态、约束目标矩阵；
+        无形态键且无任何修改器 → None（静态路径）。"""
+        mod = self.mod
+        # 形态键
+        kb = [types.SimpleNamespace(name="K1", value=0.25, mute=False)]
+        sk = types.SimpleNamespace(key_blocks=kb)
+        sk_target = types.SimpleNamespace(
+            name="M", data=types.SimpleNamespace(vertices=range(3), shape_keys=sk))
+        sig_sk = mod._preview_deform_signature(sk_target)
+        self.assertIsNotNone(sig_sk)
+        self.assertIn("K1", str(sig_sk))
+        # 骨骼姿态 + IK 约束目标
+        ik = types.SimpleNamespace(name="IK", matrix_world=np.eye(4))
+        bone = types.SimpleNamespace(name="B1", matrix=np.eye(4),
+                                     constraints=[types.SimpleNamespace(target=ik)])
+        pose = types.SimpleNamespace(bones=[bone])
+        arm = types.SimpleNamespace(name="Arm",
+                                    data=types.SimpleNamespace(pose_position="POSE"),
+                                    pose=pose)
+        arm_mod = types.SimpleNamespace(type="ARMATURE", object=arm)
+        skinned = types.SimpleNamespace(
+            name="S", data=types.SimpleNamespace(vertices=range(3)),
+            modifiers=[arm_mod])
+        sig_arm = mod._preview_deform_signature(skinned)
+        self.assertIsNotNone(sig_arm)
+        self.assertIn("Arm", str(sig_arm))
+        # IK 约束目标矩阵变化（下一 tick，代号推进）→ 摘要变化（覆盖 IK 目标移动）
+        mod._PREVIEW_DIGEST_GENERATION += 1
+        ik.matrix_world = np.eye(4) * 2.0
+        ik.matrix_world[3, 3] = 1.0
+        self.assertNotEqual(sig_arm, mod._preview_deform_signature(skinned))
+        # 修改器类型指纹：非 ARMATURE 修改器（SUBSURF）也计入形变源
+        plain_mod = types.SimpleNamespace(type="SUBSURF", object=None)
+        t = types.SimpleNamespace(name="T", data=types.SimpleNamespace(),
+                                  modifiers=[plain_mod])
+        sig_mod = mod._preview_deform_signature(t)
+        self.assertIsNotNone(sig_mod)
+        self.assertIn(("MOD", ("SUBSURF",)), sig_mod)
+        # 修改器增删/类型变化 → 指纹变化
+        self.assertNotEqual(
+            sig_mod,
+            mod._preview_deform_signature(
+                types.SimpleNamespace(name="T", data=types.SimpleNamespace(),
+                                      modifiers=[])))
+        self.assertNotEqual(
+            sig_mod,
+            mod._preview_deform_signature(
+                types.SimpleNamespace(name="T", data=types.SimpleNamespace(),
+                                      modifiers=[types.SimpleNamespace(
+                                          type="MIRROR", object=None)])))
+        # 无形态键且无任何修改器 → None（静态路径，性能）
+        self.assertIsNone(mod._preview_deform_signature(
+            types.SimpleNamespace(name="T", data=types.SimpleNamespace())))
+
+    def test_volume_mode_field_invalidates_on_geometry_change(self):
+        """propagate=False（体积球）回归：形变前后不同几何（同顶点数）→
+        场必须不同——vol 键并入内容哈希，防逐球场缓存误命中旧几何。"""
+        mod = self.mod
+        mod._PREVIEW_ZONE_FIELD_CACHE.clear()
+        node = _make_node(mod)
+        object.__setattr__(node, "mask_plateau", 0.0)
+        settings = types.SimpleNamespace(
+            enabled=True, brush_strength=1.0, brush_falloff_k=4.6,
+            propagate=False, include_objects=[])
+        empty = types.SimpleNamespace(name="z", matrix_world=np.eye(4),
+                                      ssmt_drag_zone=settings)
+        zones = [(empty, settings)]
+        tris = np.array([[0, 1, 2]], dtype=np.int64)
+        # 形变前：顶点在球（原点，半径 1）内
+        verts_a = np.array([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.5, 0.0]],
+                           dtype=np.float64)
+        # 形变后：同顶点数，几何整体远离球（z+3，d>=1 硬截止为 0）
+        verts_b = verts_a + np.array([[0.0, 0.0, 3.0]] * 3)
+        field_a = mod._preview_target_field(node, verts_a, tris, zones, 0.0)
+        field_b = mod._preview_target_field(node, verts_b, tris, zones, 0.0)
+        self.assertGreater(float(field_a.max()), 0.0)
+        np.testing.assert_array_equal(field_b, np.zeros(3))
+        self.assertFalse(np.array_equal(field_a, field_b))
+
+
+class DragNodePreviewPerfTests(unittest.TestCase):
+    """性能回归：tick 签名轻量稳定（不触 depsgraph、不随网格规模放大、
+    同一输入不反复触发重建）、armature 姿态摘要每代共享一次。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    def setUp(self):
+        self.mod._PREVIEW_DIGEST_CACHE.clear()
+        self.mod._PREVIEW_DIGEST_GENERATION = 0
+        self.mod._PREVIEW_SIG_ORIG = None
+        self._orig_context = getattr(self.mod.bpy, "context", None)
+        self.mod.bpy.context = types.SimpleNamespace(
+            active_object=None, selected_objects=())
+
+    def tearDown(self):
+        self.mod.bpy.context = self._orig_context
+        self.mod._PREVIEW_DIGEST_CACHE.clear()
+        self.mod._PREVIEW_DIGEST_GENERATION = 0
+
+    def _make_rig(self, n_bones=48, n_ik=16):
+        """48 骨 armature + 16 个 IK 约束目标，矩阵多样。"""
+        rng = np.random.default_rng(5)
+        bones = []
+        for i in range(n_bones):
+            m = np.eye(4)
+            m[:3, :3] = rng.normal(size=(3, 3)) * 0.3
+            m[:3, 3] = rng.normal(size=3)
+            b = types.SimpleNamespace(name=f"B{i}", matrix=m, constraints=[])
+            if i < n_ik:
+                tgt = types.SimpleNamespace(name=f"T{i}",
+                                            matrix_world=np.eye(4) + i * 1e-3)
+                b.constraints = [types.SimpleNamespace(target=tgt)]
+            bones.append(b)
+        pose = types.SimpleNamespace(bones=bones)
+        arm = types.SimpleNamespace(name="Arm01",
+                                    data=types.SimpleNamespace(pose_position="POSE"),
+                                    pose=pose)
+        return arm, bones
+
+    def _make_target(self, name, armature=None, n_keys=3):
+        mesh = types.SimpleNamespace(vertices=range(40))
+        sk = types.SimpleNamespace(key_blocks=[
+            types.SimpleNamespace(name=f"Key{i}", value=0.0, mute=False)
+            for i in range(n_keys)
+        ])
+        mesh.shape_keys = sk
+        obj = types.SimpleNamespace(name=name, name_full=name, type="MESH",
+                                    matrix_world=np.eye(4), data=mesh)
+        if armature is not None:
+            obj.modifiers = [types.SimpleNamespace(type="ARMATURE", object=armature)]
+        return obj
+
+    def _make_node(self, targets, tree="Tree", name="Drag"):
+        node = _make_node(self.mod)
+        object.__setattr__(node, "preview_weights", True)
+        if len(targets) == 1:
+            object.__setattr__(node, "preview_target", targets[0])
+            object.__setattr__(node, "preview_collection", None)
+        else:
+            object.__setattr__(node, "preview_target", None)
+            object.__setattr__(node, "preview_collection",
+                               types.SimpleNamespace(name="Col",
+                                                     all_objects=list(targets)))
+        object.__setattr__(node, "id_data", types.SimpleNamespace(name=tree))
+        object.__setattr__(node, "name", name)
+        empty = types.SimpleNamespace(
+            name="SSMT_DragZone_0",
+            matrix_world=np.eye(4),
+            ssmt_drag_zone=types.SimpleNamespace(
+                enabled=True, brush_strength=1.0, brush_falloff_k=4.6,
+                propagate=True, include_objects=[]))
+        object.__setattr__(node, "zone_objects",
+                           [types.SimpleNamespace(zone_object=empty)])
+        # t12：区域空物体须被选中才进签名/重建路径（否则签名最小化，
+        # 性能测试测的正是选中后的完整路径成本）
+        self.mod.bpy.context.selected_objects = [empty]
+        return node
+
+    def test_signature_does_not_touch_depsgraph(self):
+        """tick 签名路径零 depsgraph 求值：签名/重复签名不调用
+        evaluated_depsgraph_get 与 target.evaluated_get。"""
+        mod = self.mod
+        arm, _bones = self._make_rig()
+        target = self._make_target("MeshRig", armature=arm)
+        node = self._make_node([target])
+        ctx = mod.bpy.context
+        calls = []
+        orig_get = getattr(ctx, "evaluated_depsgraph_get", None)
+        ctx.evaluated_depsgraph_get = lambda: calls.append("deps") or object()
+        target.evaluated_get = lambda deps: calls.append("evaluated") or None
+        try:
+            mod._preview_signature(node)
+            mod._preview_signature(node)
+        finally:
+            if orig_get is not None:
+                ctx.evaluated_depsgraph_get = orig_get
+            else:
+                try:
+                    del ctx.evaluated_depsgraph_get
+                except AttributeError:
+                    pass
+        self.assertEqual(calls, [])
+
+    def test_repeated_idle_ticks_do_not_rebuild(self):
+        """同一稳定输入连续 tick：仅首 tick 建立预览（1 次重建），
+        签名稳定 → 后续 tick 不触发额外重建（重建计数有上界）。"""
+        mod = self.mod
+        arm, _bones = self._make_rig()
+        target = self._make_target("MeshRig", armature=arm)
+        node = self._make_node([target])
+        mod._preview_sig_cache = None
+        mod._preview_pending_signature = None
+        mod._preview_pending_since = None
+        rebuilds = []
+        clock = iter([0.0, 0.2, 0.4, 0.6, 0.8])
+        original = (
+            mod._collect_preview_nodes,
+            mod._ensure_preview_handler,
+            mod._rebuild_preview_batches,
+            mod._preview_now,
+        )
+        mod._collect_preview_nodes = lambda: [node]
+        mod._ensure_preview_handler = lambda: None
+        mod._rebuild_preview_batches = lambda nodes: rebuilds.append(list(nodes))
+        mod._preview_now = lambda: next(clock)
+        try:
+            for _ in range(5):
+                mod._preview_tick()
+        finally:
+            (mod._collect_preview_nodes,
+             mod._ensure_preview_handler,
+             mod._rebuild_preview_batches,
+             mod._preview_now) = original
+            mod._preview_sig_cache = None
+            mod._preview_pending_signature = None
+            mod._preview_pending_since = None
+        self.assertEqual(len(rebuilds), 1)
+
+    def test_signature_stable_across_generations_unless_pose_changes(self):
+        """重复取签名相等（同代与跨代均稳定）；仅真实姿态变化后（下一 tick）
+        签名变化。"""
+        mod = self.mod
+        arm, bones = self._make_rig()
+        target = self._make_target("MeshRig", armature=arm)
+        node = self._make_node([target])
+        sig1 = mod._preview_signature(node)
+        self.assertEqual(sig1, mod._preview_signature(node))
+        mod._PREVIEW_DIGEST_GENERATION += 1  # 下一 tick，静态姿态
+        sig2 = mod._preview_signature(node)
+        self.assertEqual(sig1, sig2)
+        bones[3].matrix = np.eye(4) + 0.01  # 真实姿态变化
+        mod._PREVIEW_DIGEST_GENERATION += 1
+        self.assertNotEqual(sig1, mod._preview_signature(node))
+
+    def test_armature_digest_cache_bounded_per_generation(self):
+        """多 target 共享同一 armature：同代内骨架摘要只缓存一项（O(T×B)→O(B)），
+        缓存项数有上界；代推进后重新计算。"""
+        mod = self.mod
+        arm, _bones = self._make_rig()
+        targets = [self._make_target(f"M{i}", armature=arm) for i in range(6)]
+        node = self._make_node(targets)
+        mod._preview_signature(node)
+        self.assertEqual(len(mod._PREVIEW_DIGEST_CACHE), 1)
+        mod._PREVIEW_DIGEST_GENERATION += 1
+        mod._preview_signature(node)
+        # 同代内仍只有该 armature 一项（无泄漏、无逐 target 增长）
+        self.assertEqual(len(mod._PREVIEW_DIGEST_CACHE), 1)
+
+
+class DragNodePreviewEventDrivenTests(unittest.TestCase):
+    """事件驱动失效（t12）：depsgraph_update_post 置 dirty + 空闲 tick O(1)
+    （零签名/零骨骼遍历/零重建），选中变化轮询兜底，安全阀周期性全量签名。
+    桩环境用假 bpy.app.handlers.depsgraph_update_post 列表模拟。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    def setUp(self):
+        mod = self.mod
+        self._orig_context = getattr(mod.bpy, "context", None)
+        mod.bpy.context = types.SimpleNamespace(active_object=None, selected_objects=())
+        self._orig_app = getattr(mod.bpy, "app", None)
+        self.handler_list = []
+        mod.bpy.app = types.SimpleNamespace(
+            handlers=types.SimpleNamespace(depsgraph_update_post=self.handler_list))
+        self._saved = (
+            mod._preview_deps_registered, mod._preview_dirty,
+            mod._preview_last_selection, mod._preview_safety_count,
+            mod._PREVIEW_RELEVANT_IDS,
+            mod._preview_sig_cache, mod._preview_pending_signature,
+            mod._preview_pending_since,
+        )
+        mod._preview_deps_registered = False
+        mod._preview_dirty = True
+        mod._preview_last_selection = None
+        mod._preview_safety_count = 0
+        mod._PREVIEW_RELEVANT_IDS = None
+        mod._preview_sig_cache = None
+        mod._preview_pending_signature = None
+        mod._preview_pending_since = None
+        mod._PREVIEW_DIGEST_CACHE.clear()
+        mod._PREVIEW_DIGEST_GENERATION = 0
+
+    def tearDown(self):
+        mod = self.mod
+        (mod._preview_deps_registered, mod._preview_dirty,
+         mod._preview_last_selection, mod._preview_safety_count,
+         mod._PREVIEW_RELEVANT_IDS,
+         mod._preview_sig_cache, mod._preview_pending_signature,
+         mod._preview_pending_since) = self._saved
+        mod.bpy.context = self._orig_context
+        mod.bpy.app = self._orig_app
+        mod._PREVIEW_DIGEST_CACHE.clear()
+        mod._PREVIEW_DIGEST_GENERATION = 0
+
+    def _zone_empty(self, name="SSMT_DragZone_0"):
+        return types.SimpleNamespace(
+            name=name, matrix_world=np.eye(4),
+            ssmt_drag_zone=types.SimpleNamespace(
+                enabled=True, brush_strength=1.0, brush_falloff_k=4.6,
+                propagate=True, include_objects=[]))
+
+    def _make_node(self):
+        node = _make_node(self.mod)
+        object.__setattr__(node, "preview_weights", True)
+        object.__setattr__(node, "preview_target", types.SimpleNamespace(
+            name="Mesh", matrix_world=np.eye(4),
+            data=types.SimpleNamespace(vertices=range(3))))
+        object.__setattr__(node, "preview_collection", None)
+        object.__setattr__(node, "id_data", types.SimpleNamespace(name="Tree"))
+        object.__setattr__(node, "name", "Drag")
+        empty = self._zone_empty()
+        object.__setattr__(node, "zone_objects",
+                           [types.SimpleNamespace(zone_object=empty)])
+        self.mod.bpy.context.selected_objects = [empty]
+        return node, empty
+
+    def _tick(self, node, rebuilds, clock):
+        """受控桩下跑一拍 _preview_tick（收集/绘制/重建/时钟全部替换）。"""
+        mod = self.mod
+        original = (mod._collect_preview_nodes, mod._ensure_preview_handler,
+                    mod._rebuild_preview_batches, mod._preview_now)
+        mod._collect_preview_nodes = lambda: [node]
+        mod._ensure_preview_handler = lambda: None
+        mod._rebuild_preview_batches = lambda nodes: rebuilds.append(list(nodes))
+        mod._preview_now = lambda: next(clock)
+        try:
+            mod._preview_tick()
+        finally:
+            (mod._collect_preview_nodes, mod._ensure_preview_handler,
+             mod._rebuild_preview_batches, mod._preview_now) = original
+
+    def _sig_spy(self):
+        """包装真实 _preview_signature 记录调用次数；返回 (calls, restore)。"""
+        mod = self.mod
+        orig = mod._preview_signature
+        calls = []
+
+        def spy(n):
+            calls.append(1)
+            return orig(n)
+
+        mod._preview_signature = spy
+        return calls, lambda: setattr(mod, "_preview_signature", orig)
+
+    def test_handler_register_unregister_idempotent(self):
+        """注册/注销幂等；_preview_cleanup 一并注销 deps handler（无泄漏）。"""
+        mod = self.mod
+        mod._ensure_preview_deps_handler()
+        self.assertTrue(mod._preview_deps_registered)
+        self.assertEqual(self.handler_list.count(mod._preview_depsgraph_update), 1)
+        mod._ensure_preview_deps_handler()  # 重复注册防护
+        self.assertEqual(self.handler_list.count(mod._preview_depsgraph_update), 1)
+        mod._remove_preview_deps_handler()
+        self.assertFalse(mod._preview_deps_registered)
+        self.assertNotIn(mod._preview_depsgraph_update, self.handler_list)
+        self.assertTrue(mod._preview_dirty)  # 注销后保守置脏
+        # cleanup 路径同样注销
+        mod._ensure_preview_deps_handler()
+        mod._preview_cleanup()
+        self.assertNotIn(mod._preview_depsgraph_update, self.handler_list)
+        self.assertFalse(mod._preview_deps_registered)
+
+    def test_idle_ticks_event_driven_skip_signature_and_rebuild(self):
+        """事件驱动空闲 tick = O(1)：首拍建立后，连续干净 tick 不计算签名、
+        不重建（零骨骼/矩阵/depsgraph 访问）。"""
+        mod = self.mod
+        node, _empty = self._make_node()
+        mod._ensure_preview_deps_handler()
+        rebuilds = []
+        calls, restore = self._sig_spy()
+        clock = iter(range(100))
+        try:
+            self._tick(node, rebuilds, clock)   # 首拍：dirty → 全量签名 + 建立预览
+            self.assertFalse(mod._preview_dirty)
+            for _ in range(3):                  # 干净 tick：O(1) 早退
+                self._tick(node, rebuilds, clock)
+        finally:
+            restore()
+        self.assertEqual(len(rebuilds), 1)
+        self.assertEqual(len(calls), 1)         # 签名只在首拍计算一次
+
+    def test_relevant_update_marks_dirty_and_debounced_rebuild(self):
+        """相关对象（区域空物体）的 depsgraph 更新 → 置 dirty → 下一拍重算签名；
+        签名实变（移动空物体）→ 防抖后重建。"""
+        mod = self.mod
+        node, empty = self._make_node()
+        mod._ensure_preview_deps_handler()
+        rebuilds = []
+        calls, restore = self._sig_spy()
+        clock = iter(range(100))
+        try:
+            self._tick(node, rebuilds, clock)
+            self.assertEqual(len(calls), 1)
+            # 无关对象更新 → 不置脏
+            mod._preview_depsgraph_update(types.SimpleNamespace(
+                updates=[types.SimpleNamespace(id=types.SimpleNamespace(name="Other"))]))
+            self.assertFalse(mod._preview_dirty)
+            self._tick(node, rebuilds, clock)
+            self.assertEqual(len(calls), 1)     # 仍空闲
+            # 相关对象（区域空物体）更新 → 置脏 → 下一拍重算签名（内容未变则不重建）
+            mod._preview_depsgraph_update(types.SimpleNamespace(
+                updates=[types.SimpleNamespace(id=empty)]))
+            self.assertTrue(mod._preview_dirty)
+            self._tick(node, rebuilds, clock)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(rebuilds), 1)
+            # 真实移动空物体 + 更新事件 → 签名变化 → 防抖窗口后重建一次
+            m = np.eye(4)
+            m[0, 3] = 5.0
+            empty.matrix_world = m
+            mod._preview_depsgraph_update(types.SimpleNamespace(
+                updates=[types.SimpleNamespace(id=empty)]))
+            self._tick(node, rebuilds, clock)   # 记录待处理签名（clock 步进 1）
+            self._tick(node, rebuilds, clock)   # 距首变 >0.6s → 重建
+        finally:
+            restore()
+        self.assertEqual(len(rebuilds), 2)
+
+    def test_safety_valve_forces_signature_after_n_clean_ticks(self):
+        """安全阀：每 _PREVIEW_SAFETY_TICKS 个干净 tick 强制一次全量签名
+        （兜 driver 漏报），但无实际变化时不重建。"""
+        mod = self.mod
+        node, _empty = self._make_node()
+        mod._ensure_preview_deps_handler()
+        rebuilds = []
+        calls, restore = self._sig_spy()
+        clock = iter(range(1000))
+        try:
+            self._tick(node, rebuilds, clock)          # 首拍建立
+            for _ in range(mod._PREVIEW_SAFETY_TICKS): # 干净 tick × N
+                self._tick(node, rebuilds, clock)
+        finally:
+            restore()
+        self.assertEqual(len(calls), 2)   # 首拍 1 次 + 安全阀 1 次
+        self.assertEqual(len(rebuilds), 1)
+
+    def test_stub_without_handlers_falls_back_to_polling(self):
+        """无 app.handlers（stub/旧版 Blender）→ 静默降级回 t8 轮询语义：
+        每拍都算全量签名，防抖语义不变。"""
+        mod = self.mod
+        mod.bpy.app = types.SimpleNamespace()  # 无 handlers
+        node, _empty = self._make_node()
+        mod._ensure_preview_deps_handler()
+        self.assertFalse(mod._preview_deps_registered)  # 降级：未注册
+        rebuilds = []
+        calls, restore = self._sig_spy()
+        clock = iter(range(100))
+        try:
+            for _ in range(3):
+                self._tick(node, rebuilds, clock)
+        finally:
+            restore()
+        self.assertEqual(len(calls), 3)   # 轮询：每拍都付签名
+        self.assertEqual(len(rebuilds), 1)
+
+    def test_refresh_relevant_ids_covers_preview_datablocks(self):
+        """相关键集覆盖：目标物体/网格/形态键/骨架+骨架数据/区域空物体/集合；
+        无关对象不在集内。"""
+        mod = self.mod
+        node, empty = self._make_node()
+        target = node.preview_target
+        target.type = "MESH"
+        target.name_full = target.name
+        mesh = target.data
+        mesh.shape_keys = types.SimpleNamespace(key_blocks=[])
+        arm = types.SimpleNamespace(name="Arm",
+                                    data=types.SimpleNamespace(pose_position="POSE"))
+        target.modifiers = [types.SimpleNamespace(type="ARMATURE", object=arm)]
+        collection = types.SimpleNamespace(name="Col", all_objects=[target])
+        object.__setattr__(node, "preview_collection", collection)
+        mod._preview_refresh_relevant_ids([node])
+        relevant = mod._PREVIEW_RELEVANT_IDS
+        for datablock in (target, mesh, mesh.shape_keys, arm, arm.data,
+                          empty, collection):
+            self.assertIn(mod._preview_rel_key(datablock), relevant)
+        self.assertNotIn(mod._preview_rel_key(
+            types.SimpleNamespace(name="Other")), relevant)
 
 
 class DragNodeZoneFilterTests(unittest.TestCase):

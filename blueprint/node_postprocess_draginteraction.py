@@ -113,10 +113,13 @@ SHADER_FILES = (
     "rzm_pin_detected.hlsl",
     "rzm_jiggle_screen_state.hlsl",
     "rzm_jiggle_interaction.hlsl",
-    "rzm_shapekey_drive.hlsl",
-    "rzm_shapekey_var_sync.hlsl",
     "rzm_vis_publish.hlsl",
 )
+# 形态键驱动 / 变量同步着色器不随基础组无条件复制：前者仅在“启用形态键联动”
+# （F1）时拷贝，后者在“启用变量联动”（F4）时拷贝——避免段族已发射但文件未落盘
+# 的 3Dmigoto 加载期缺失（漏拷 = 悬空引用，见 phase2/n1 §5.3）。
+SHADER_DRIVE_FILES = ("rzm_shapekey_drive.hlsl",)
+SHADER_VARSYNC_FILES = ("rzm_shapekey_var_sync.hlsl",)
 HAND_SHADER_FILES = ("rzm_jiggle_cursor_preview.hlsl", "rzm_jiggle_hand.hlsl", "rzm_jiggle_cursor.hlsl")
 # 手部网格/法线资产（二进制，原样复制）
 HAND_ASSET_FILES = (
@@ -681,11 +684,36 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         description="预分配鼠标当前命中稳定区域 ID 的只读联动变量；编号与节点区域 ID 完全一致",
         default="ssmtdrag_ui_zone",
     )
-    # ---- 形态键驱动输出（ShapeKeyDrive 缓冲，纯 GPU 无回读）----
+    # ---- 形态键驱动输出（旧开关，仅作旧工程兼容存储；ShapeKeyDrive 缓冲，纯 GPU 无回读）----
+    # UI 已并入「功能开关」box 的 feature_shapekey_link（启用形态键联动，t11 合并），
+    # 本属性不再单独渲染：旧工程显式 True 经 _feature_skd 兼容分支无条件生效，
+    # 并在 _migrate_feature_defaults 中继承后退位（phase2/n1 §5.4 档一）。
     enable_shapekey_drive: bpy.props.BoolProperty(
         name="形态键驱动输出",
-        description="在仅命中模式下，命中区域并按住左键或 X：按鼠标位移驱动方向强度，或按点击档位直接 0/1 开关，写入 ShapeKeyDrive 缓冲区供形态键节点读取",
+        description="旧版开关，已并入功能开关的「启用形态键联动」（仅命中模式下命中区域按住左键/X：按鼠标位移驱动方向强度，或按点击档位 0/1 开关，写入 ShapeKeyDrive 缓冲）；仅作旧工程兼容存储，界面不再单独显示",
         default=False,
+    )
+
+    # ---- 四功能开关（总闸：关闭则不生成对应段族 / 不拷贝对应 hlsl）----
+    # 两段式迁移（phase2/n1 §5.4 档一）：旧工程 enable_shapekey_drive 显式开启的值
+    # 经 _migrate_feature_defaults 继承进 feature_shapekey_link 后旧开关退位；
+    # 新工程默认 ON = “能力声明”，发射仍受消费方约束（见 _feature_skd），
+    # 新建空工程不产生垃圾段、既有已配置工程导出不变。
+    feature_shapekey_link: bpy.props.BoolProperty(
+        name="启用形态键联动",
+        description="生成形态键驱动整族（ShapeKeyDrive/Dir/DragLatch/ClickCount/ActiveDir 资源 + rzm_shapekey_drive.hlsl + 每帧 dispatch），供形态键节点绑定读取",
+        default=True,
+        update=lambda self, context: self._migrate_feature_defaults(context),
+    )
+    feature_variable_link: bpy.props.BoolProperty(
+        name="启用变量联动",
+        description="生成变量↔驱动缓冲双向同步（rzm_shapekey_var_sync.hlsl + readback 命令表 + ClickExport 点击回读）；依赖形态键联动缓冲，形态键联动关闭时自动一并关闭",
+        default=True,
+    )
+    feature_panel_link: bpy.props.BoolProperty(
+        name="启用面板联动",
+        description="生成 UI 桥（$ssmtdrag_ui_detected/$ssmtdrag_ui_zone 只读联动变量 + readback 命令表）；关闭后模型拖拽命中不再暴露给面板（默认 ON = 现状恒发）",
+        default=True,
     )
     shapekey_drive_move_sensitivity: bpy.props.FloatProperty(
         name="位移灵敏度",
@@ -791,6 +819,57 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         "ui_zone_variable_name": "ssmtdrag_ui_zone",
     }
 
+    # ------------------------------------------------------------------
+    # 四功能开关统一取值（phase2/n1 §5.2/§5.4 档一：迁移 + 消费方约束）
+    # ------------------------------------------------------------------
+
+    def _migrate_feature_defaults(self, context=None):
+        """两段式迁移（档一）：旧工程 enable_shapekey_drive 显式开启（True）时
+        继承进 feature_shapekey_link，随后旧开关退位；幂等，仅经新开关
+        feature_shapekey_link 的 update 触发一次。Fail-closed：异常仅跳过迁移，
+        读取侧由 _feature_skd 的旧值兼容兜底，不影响导出。"""
+        try:
+            if getattr(self, "_feature_defaults_migrated", False):
+                return
+            if getattr(self, "enable_shapekey_drive", False):
+                self.feature_shapekey_link = True
+            self.enable_shapekey_drive = False
+            self._feature_defaults_migrated = True
+        except Exception:
+            pass
+
+    def _has_shapekey_consumer(self):
+        """档一消费方约束：同树存在开启拖拽驱动的形态键节点，或点击计数导出
+        绑定（ClickExport）。两者任一存在时 F1 发射有意义，否则不发射。"""
+        tree = getattr(self, "id_data", None)
+        if tree is not None:
+            for node in getattr(tree, "nodes", None) or []:
+                if (
+                    getattr(node, "bl_idname", "") == "SSMTNode_PostProcess_ShapeKey"
+                    and getattr(node, "drag_drive_enabled", False)
+                ):
+                    return True
+        return bool(self._collect_click_export_drivers())
+
+    def _feature_skd(self):
+        """F1 形态键联动总开关。迁移期旧值显式开启 → 无条件 ON（旧工程输出不变）；
+        新开关默认 ON 但受消费方约束（档一）——无消费方时视为未配置，不发射。"""
+        if getattr(self, "enable_shapekey_drive", False):
+            return True
+        if not bool(getattr(self, "feature_shapekey_link", True)):
+            return False
+        return self._has_shapekey_consumer()
+
+    def _feature_var(self):
+        """F4 变量联动总开关。硬依赖 F1 缓冲族 → F1 关时强制一并降级（§6 约束）。"""
+        if not self._feature_skd():
+            return False
+        return bool(getattr(self, "feature_variable_link", True))
+
+    def _feature_panel(self):
+        """F3 面板联动总开关。默认 ON = 现状恒发，无依赖。"""
+        return bool(getattr(self, "feature_panel_link", True))
+
     def init(self, context):
         super().init(context)
         self.drag_system_mode_default = 2 if self.drag_enabled_default else 1
@@ -837,14 +916,27 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         poke_row.prop(self, "poke_gesture")
         layout.prop(self, "enable_hand_cursor")
 
-        # ---- 形态键驱动输出 ----
+        # ---- 功能开关（总闸：关闭则不生成对应段族 / 不拷对应 hlsl）----
+        feature_box = layout.box()
+        feature_box.label(text="功能开关（关闭则不生成对应段族）", icon='PREFERENCES')
+        feature_box.prop(self, "feature_shapekey_link", text="启用形态键联动")
+        var_row = feature_box.row()
+        var_row.enabled = self._feature_skd()
+        var_row.prop(self, "feature_variable_link", text="启用变量联动")
+        if not self._feature_skd():
+            feature_box.label(text="变量联动依赖形态键联动缓冲，形态键联动关闭时自动一并关闭", icon='INFO')
+        feature_box.prop(self, "feature_panel_link", text="启用面板联动")
+        feature_box.prop(self, "collision_enabled", text="启用碰撞检测（未完善）")
+
+        # ---- 形态键驱动输出（开关已并入上方「功能开关·启用形态键联动」，此 box 仅余输出配置）----
         drive_box = layout.box()
         drive_box.label(text="形态键驱动输出", icon='SHAPEKEY_DATA')
-        drive_box.prop(self, "enable_shapekey_drive")
-        if self.enable_shapekey_drive:
+        if self._feature_skd():
             drive_box.prop(self, "shapekey_drive_move_sensitivity", text="位移灵敏度")
             drive_box.label(text="点击档位数：由各形态键节点配置的最大点击档位自动推导", icon='INFO')
             drive_box.label(text="仅命中模式：命中区域按住左键/X，方向形态键随鼠标位移驱动，无方向形态键按点击档位直接 0/1 开关", icon='INFO')
+        else:
+            drive_box.label(text="未生效：开启上方「启用形态键联动」且存在形态键消费方时可用", icon='INFO')
 
         runtime_box = layout.box()
         runtime_box.label(text="运行时联动变量", icon='DRIVER')
@@ -1003,7 +1095,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # =======================================================================
 
     def _get_vertex_attrs_node(self):
-        if not self.inputs[0].is_linked:
+        inputs = getattr(self, "inputs", None)
+        if not inputs or len(inputs) == 0 or not inputs[0].is_linked:
             return None
         source_node = self.inputs[0].links[0].from_node
         if source_node.bl_idname == 'SSMTNode_PostProcess_VertexAttrs':
@@ -1099,6 +1192,20 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 index = hook_end + 1
             sections[section_name] = cleaned_lines
 
+    @staticmethod
+    def _remove_existing_legacy_jiggle_vb0_sections(sections):
+        """清除历代 Jiggle vb0 资源段（重导出迁移）。
+
+        历史命名有两种：`[ResourceDragJiggleTempVB0_*]`（copy 往返，当前形态）与
+        `[ResourceDragJiggleShadowVB_*]`（R9 常驻影子缓冲，已回退）。读入旧 ini 时
+        按两种前缀整体剔除，由发射侧按当前形态重建（资源段为 setdefault 语义，
+        不剔除会让 ShadowVB 时代残留与新段并存）。
+        新 jiggle 段（CustomShaderDragJiggle）内容由生成器无条件重发，无需在此清。
+        """
+        for section_name in [name for name in sections if name.startswith((
+                "[ResourceDragJiggleTempVB0_", "[ResourceDragJiggleShadowVB_"))]:
+            del sections[section_name]
+
     def _read_ini_to_ordered_dict(self, ini_file_path):
         sections = OrderedDict()
         current_section = None
@@ -1118,6 +1225,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 elif current_section is not None:
                     sections[current_section].append(line)
             self._remove_existing_draw_hooks(sections)
+            self._remove_existing_legacy_jiggle_vb0_sections(sections)
         except FileNotFoundError:
             return None, "", ""
         return sections, preserved_tail_content, preserved_driver_content
@@ -1257,7 +1365,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         return "".join(lines)
 
     def _write_ordered_dict_to_ini(self, sections, ini_file_path, preserved_tail_content="", preserved_driver_content="", ns=None):
-        if ns:
+        if ns and self._feature_panel():
+            # 面板联动关闭时不把拖拽 Present 块搬进 UI tail（避免消费方
+            # 读到已消失的 $ssmtdrag_ui_* 全局）；UI tail 资产本身不改不删。
             preserved_tail_content = self._relocate_drag_present_into_ui_tail(sections, preserved_tail_content)
             preserved_tail_content = self._normalize_ui_drag_references(preserved_tail_content, ns)
         with open(ini_file_path, 'w', encoding='utf-8') as f:
@@ -1787,6 +1897,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     def _copy_shaders(self, res_dir):
         toolset = self._get_toolset_dir()
         files = list(SHADER_FILES)
+        if self._feature_skd():
+            files += list(SHADER_DRIVE_FILES)
+        if self._feature_var():
+            files += list(SHADER_VARSYNC_FILES)
         vertex_struct = self._get_vertex_struct_definition()
         for fname in files:
             src = os.path.join(toolset, fname)
@@ -1916,12 +2030,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         os.makedirs(res_dir, exist_ok=True)
         params.tofile(os.path.join(res_dir, f"ZoneParams_{ns}.buf"))
         paths.tofile(os.path.join(res_dir, f"PathVectors_{ns}.buf"))
-        if getattr(self, "enable_shapekey_drive", False):
+        if self._feature_skd():
             _total_slots, _zone_bases, _zone_stage_counts = self._drag_drive_buffer_layout()
             stage_counts = np.array(_zone_stage_counts, dtype=np.uint32)
             stage_counts.tofile(os.path.join(res_dir, f"ZoneStageCounts_{ns}.buf"))
             sync_bindings = self._drag_drive_var_sync_bindings()
-            if sync_bindings:
+            if self._feature_var() and sync_bindings:
                 # 变量同步映射表：每绑定 4×uint32 = (驱动槽位, 区域 ID, 无方向档位, 保留)；
                 # 方向形态键无档位概念，nd_stage 以 0xFFFFFFFF 哨兵表示
                 sync_map = np.array(
@@ -2943,8 +3057,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     def validate_export_configuration(self):
         """在写入任何导出文件前验证拖拽交互的跨节点约束。"""
-        if getattr(self, "enable_shapekey_drive", False):
+        if self._feature_skd():
             self._click_export_seed_entries()
+        if getattr(self, "feature_variable_link", True) and not self._feature_skd():
+            # F4 ⇒ F1 硬依赖（phase2/n1 §6）：_feature_var 已强制降级，此处仅告警提示
+            print(
+                "[DragInteraction][WARNING] 已启用变量联动但形态键联动关闭，"
+                "变量联动随之后台降级（其缓冲族依赖形态键联动）"
+            )
 
     def _drag_drive_zone_stage_counts(self):
         """按区域统计点击档位数：扫描同树所有开启拖拽驱动的形态键节点，
@@ -3107,7 +3227,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "bind_flags = render_target shader_resource",
             ],
         }
-        if getattr(self, "enable_shapekey_drive", False):
+        if self._feature_skd():
             _total_slots, _zone_bases, _zone_stage_counts = self._drag_drive_buffer_layout()
             _drive_capacity = len(_zone_stage_counts)
             global_resources[f"[ResourceDragShapeKeyDrive_{ns}]"] = [
@@ -3115,9 +3235,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"array = {_total_slots}",
             ]
             # 方向缓冲：与驱动缓冲同构，末位 1 个上一帧按键状态槽
+            #（拖拽绑定锁存独立在 ResourceDragShapeKeyDragLatch，见下）
             global_resources[f"[ResourceDragShapeKeyDir_{ns}]"] = [
                 "type = RWBuffer", "format = R32_FLOAT",
                 f"array = {_total_slots + 1}",
+            ]
+            # 拖拽绑定锁存（独立单槽资源）：0 = 未绑定，否则存 区域id+1。
+            # +1 编码使 boot/失臂清零（0.0）即未绑定（评审 F1）；独立于方向缓冲，
+            # 失臂 else 整清锁存不波及 prev-press 槽（防重新臂动产生伪按下沿）
+            global_resources[f"[ResourceDragShapeKeyDragLatch_{ns}]"] = [
+                "type = RWBuffer", "format = R32_FLOAT", "array = 1",
             ]
             # 点击计数缓冲：每区域 1 个点击档位（1..stage_count，0=未点击），供多段切换
             global_resources[f"[ResourceDragShapeKeyClickCount_{ns}]"] = [
@@ -3140,10 +3267,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "type = Buffer", "format = R32_UINT",
                 f"filename = {res}/ZoneStageCounts_{ns}.buf",
             ]
-            # 变量→驱动缓冲同步（绑定项非空时生成）：prev 值缓冲用于变更检测，
-            # 映射表为导出期烘焙的静态 Buffer（每绑定 4×uint32）
+            # 变量→驱动缓冲同步（绑定项非空且变量联动开启时生成）：prev 值缓冲
+            # 用于变更检测，映射表为导出期烘焙的静态 Buffer（每绑定 4×uint32）
             sync_bindings = self._drag_drive_var_sync_bindings()
-            if sync_bindings:
+            if self._feature_var() and sync_bindings:
                 global_resources[f"[ResourceDragShapeKeyVarPrev_{ns}]"] = [
                     "type = RWBuffer", "format = R32_FLOAT",
                     f"array = {len(sync_bindings)}",
@@ -3152,8 +3279,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     "type = Buffer", "format = R32G32B32A32_UINT",
                     f"filename = {res}/ShapeKeyVarSyncMap_{ns}.buf",
                 ]
-                # 拖拽激活标志（每区域）：同步 CS 每帧按命中判定重算（仅命中模式+绘制+
-                # 按住+命中区域），门控 CPU 回读与变量→缓冲写入，实现两写入方分时互斥。
+                # 拖拽激活标志（每区域）：同步 CS 每帧镜像驱动 CS 的绑定锁存
+                #（ResourceDragShapeKeyDragLatch 单槽，按住命中即绑定、移出区域
+                # 不丢、松开/失臂解除），门控 CPU 回读与变量→缓冲写入，
+                # 实现两写入方分时互斥。
                 # CPU 经 store 直接读取（store = $var, <资源名>, <float 索引>，
                 # 不能带 ref 关键字——分词器会把 ref 交给 GetTarget 报 Unknown target，
                 # 整条 store 行在加载期被静默丢弃）；
@@ -3207,10 +3336,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # ---- 全局 Pin / UpdateScreenJiggle / CommandList 段 ----
         self._emit_pin_detected_section(sections, ns)
         self._emit_update_screen_jiggle_section(sections, ns)
-        if getattr(self, "enable_shapekey_drive", False):
+        if self._feature_skd():
             self._emit_shapekey_drive_section(sections, ns)
-            self._emit_shapekey_var_sync_section(sections, ns)
-            self._emit_shapekey_var_readback_command_list(sections, ns)
+            if self._feature_var():
+                self._emit_shapekey_var_sync_section(sections, ns)
+                self._emit_shapekey_var_readback_command_list(sections, ns)
         # ---- 物体显隐：发布 CS + 命令列表 + 缓冲资源 ----
         self._emit_vis_publish_sections(sections, components, ns)
         self._emit_command_lists(sections, components, ns)
@@ -3239,7 +3369,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"[ResourceDragPinnedComponentInfo_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
             f"[ResourceDragComponentZoneOut_{cn}_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
             f"[ResourceDragJiggleState_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 10"],
-            # TempVB0：空声明段（type=RWBuffer，无 format/array），copy 往返后换绑
+            # TempVB0：空声明段（type=RWBuffer，无 format/array），copy 往返后换绑。
+            #（R9 ShadowVB 直写链已回退：实机 Alt 进入拖拽整模消失，实验 A/B 双证
+            # 常驻自定义缓冲换绑在当前 fork 运行二进制上不工作；无日志前勿再直写。）
             f"[ResourceDragJiggleTempVB0_{cn}_{ns}]": ["type = RWBuffer"],
         }
         comp_resources[f"[ResourceDragJiggleZoneIDs_{cn}_{ns}]"] = [
@@ -3391,48 +3523,71 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             if part_sec not in sections:
                 sections[part_sec] = self._detect_section_lines(comp, ns, p_idx)
 
-    # ---- Bake{Comp}{Part} + Sample×8 ----
+    # ---- Bake{Comp}{Part} + Sample（R5：8P 段 → P 段 + 8 次参数化 run）----
 
     def _emit_bake_sections(self, sections, comp, ns):
         cn = comp["comp_name"]
+        const_lines = sections.setdefault("[Constants]", [])
         for p_idx, part in enumerate(comp["parts"]):
             part_tag = f"{cn}P{p_idx}"
             bake_sec = f"[CustomShaderDragBake{part_tag}_{ns}]"
             if bake_sec in sections:
                 continue
-            lines = [
-                "run = BuiltInCommandListUnbindAllRenderTargets",
-                f"clear = ResourceDragBakeRT_{ns} 0.0",
-            ]
             ib_res = part["ib_resource"]
             vertex_base = int(
                 part.get("vertex_base", comp.get("vertex_base", 0)) or 0
             )
             step = part["index_count"] // 8
             ib_first_index = part["ib_first_index"]
+            # R5 段合并（phase2/n1 §7.2 + t6 §4.3）：8 个 Sample{i} 段合并为 1 个
+            # 参数化 sample 段，bake 段内 8 次 run。三个迭代变量必须声明为
+            # [Constants] global——3Dmigoto 每 [CustomShader] 段独立局部 scope，
+            # 裸 $x= 不自动声明，跨段仅 global 可见；按部件 {cn}P{p}_{ns} 隔离。
+            i_var = f"$ssmtdrag_bake_i_{part_tag}_{ns}"
+            base_var = f"$ssmtdrag_bake_base_{part_tag}_{ns}"
+            step_var = f"$ssmtdrag_bake_step_{part_tag}_{ns}"
+            off_var = f"$ssmtdrag_bake_off_{part_tag}_{ns}"
+            sample_target = f"CustomShaderDragBakeSample_{part_tag}_{ns}"
+            for g in (
+                f"global {base_var} = {ib_first_index}",
+                f"global {step_var} = {step}",
+                f"global {i_var} = 0",
+            ):
+                var = g.split("=", 1)[0].replace("global ", "").replace("persist ", "").strip()
+                if not any(f"{var} " in line or f"{var}=" in line for line in const_lines):
+                    const_lines.append(g)
+            lines = [
+                "run = BuiltInCommandListUnbindAllRenderTargets",
+                f"clear = ResourceDragBakeRT_{ns} 0.0",
+                f"{i_var} = 0",
+            ]
+            # 8 次参数化 run：i 递增后由 sample 段经 off = base + i*step 推导
+            # draw 起始索引（drawindexed 第二参 == y26 == off 同步约束，t6 §4.4）
             for i in range(8):
-                sample_sec = f"[CustomShaderDragBakeSample{i}_{part_tag}_{ns}]"
-                offset = ib_first_index + i * step
-                lines.append(f"run = CustomShaderDragBakeSample{i}_{part_tag}_{ns}")
-                sections[sample_sec] = [
-                    f"gs = {RES_SHADER_DIR}/rzm_gs_probe.hlsl",
-                    f"gs-t1 = {ib_res}",
-                    f"ps = {RES_SHADER_DIR}/rzm_gs_probe.hlsl",
-                    "topology = point_list",
-                    f"o0 = set_viewport no_view_cache ResourceDragBakeRT_{ns}",
-                    f"x26 = {i}",
-                    f"y26 = {offset}",
-                    f"drawindexed = 1, {offset}, {vertex_base}",
-                ]
+                lines.append(f"run = {sample_target}")
+                if i < 7:
+                    lines.append(f"{i_var} = {i_var} + 1")
             sections[bake_sec] = lines
+            sections[f"[{sample_target}]"] = [
+                f"gs = {RES_SHADER_DIR}/rzm_gs_probe.hlsl",
+                f"gs-t1 = {ib_res}",
+                f"ps = {RES_SHADER_DIR}/rzm_gs_probe.hlsl",
+                "topology = point_list",
+                f"o0 = set_viewport no_view_cache ResourceDragBakeRT_{ns}",
+                f"local {off_var}",
+                f"{off_var} = {base_var} + {i_var} * {step_var}",
+                f"x26 = {i_var}",
+                f"y26 = {off_var}",
+                f"drawindexed = 1, {off_var}, {vertex_base}",
+            ]
 
     # ---- Jiggle{Comp}（TempVB0 序列 + 完整寄存器块）----
 
     def _emit_jiggle_section(self, sections, comp, ns):
         cn = comp["comp_name"]
         sec = f"[CustomShaderDragJiggle{cn}_{ns}]"
-        if sec in sections:
-            return
+        # 本段内容随生成器版本演进（含 R9 ShadowVB 时代），无条件重发以让重导出
+        # 覆盖旧形态；内容确定性保证幂等（同输入同输出）。
         vertex_count = comp["vertex_count"] or 100000
         dispatch_n = (vertex_count + 255) // 256
 
@@ -3649,15 +3804,18 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "x79 = $ssmtdrag_shapekey_dy_" + ns,
             "y79 = $ssmtdrag_shapekey_dx_" + ns,
             "x80 = " + self._fmt(self.shapekey_drive_move_sensitivity),
-            f"y80 = $ssmtdrag_seed_pending_{ns}",
         ]
-        seed_entries = self._click_export_seed_entries()
-        if seed_entries:
-            # 冷启动播种参数：x81=条目数，从 82 起每条 (x=区域, y=导出变量当前值)
-            lines.append(f"x81 = {len(seed_entries)}")
-            for seed_idx, (seed_zone, seed_var) in enumerate(seed_entries):
-                lines.append(f"x{82 + seed_idx} = {seed_zone}")
-                lines.append(f"y{82 + seed_idx} = {seed_var}")
+        if self._feature_var():
+            # 冷启动播种（F4/ClickExport 链）：x81=条目数，从 82 起每条
+            # (x=区域, y=导出变量当前值)；变量联动关闭时不发，避免残留 F4 引用
+            lines.append(f"y80 = $ssmtdrag_seed_pending_{ns}")
+            seed_entries = self._click_export_seed_entries()
+            if seed_entries:
+                # 冷启动播种参数：x81=条目数，从 82 起每条 (x=区域, y=导出变量当前值)
+                lines.append(f"x81 = {len(seed_entries)}")
+                for seed_idx, (seed_zone, seed_var) in enumerate(seed_entries):
+                    lines.append(f"x{82 + seed_idx} = {seed_zone}")
+                    lines.append(f"y{82 + seed_idx} = {seed_var}")
         lines.extend([
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
             f"cs-t68 = ResourceDragShapeKeyZoneStageCounts_{ns}",
@@ -3666,6 +3824,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"cs-u2 = ResourceDragShapeKeyClickCount_{ns}",
             f"cs-u3 = ResourceDragShapeKeyActiveDir_{ns}",
             f"cs-u4 = ResourceDragShapeKeyClickCountF_{ns}",
+            f"cs-u5 = ResourceDragShapeKeyDragLatch_{ns}",
             "dispatch = 1, 1, 1",
             "post cs-t67 = null",
             "post cs-t68 = null",
@@ -3674,6 +3833,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "post cs-u2 = null",
             "post cs-u3 = null",
             "post cs-u4 = null",
+            "post cs-u5 = null",
         ])
         sections[sec] = lines
 
@@ -3714,6 +3874,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"cs-u2 = ResourceDragShapeKeyVarPrev_{ns}",
             f"cs-u3 = ResourceDragShapeKeyClickCountF_{ns}",
             f"cs-u4 = ResourceDragShapeKeyZoneActive_{ns}",
+            # 驱动 CS 的绑定锁存（独立单槽资源）是 ZoneActive 的单一事实源
+            f"cs-u5 = ResourceDragShapeKeyDragLatch_{ns}",
             "dispatch = 1, 1, 1",
             "post cs-t67 = null",
             "post cs-t69 = null",
@@ -3722,6 +3884,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "post cs-u2 = null",
             "post cs-u3 = null",
             "post cs-u4 = null",
+            "post cs-u5 = null",
         ])
         sections[sec] = lines
 
@@ -3793,17 +3956,19 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             ]
             if any(int(comp.get("object_count") or 0) for comp in components):
                 lines.append(f"\tclear = ResourceDragObjectVis_{ns} 0.0")
-            if getattr(self, "enable_shapekey_drive", False):
+            if self._feature_skd():
                 lines.append(f"\tclear = ResourceDragShapeKeyDrive_{ns} 0.0")
                 lines.append(f"\tclear = ResourceDragShapeKeyDir_{ns} 0.0")
+                # 绑定锁存清零：编码 0=未绑定，boot 后不得假绑 zone 0（评审 F1）
+                lines.append(f"\tclear = ResourceDragShapeKeyDragLatch_{ns} 0.0")
                 lines.append(f"\tclear = ResourceDragShapeKeyClickCount_{ns}")
                 lines.append(f"\tclear = ResourceDragShapeKeyClickCountF_{ns} 0.0")
                 lines.append(f"\tclear = ResourceDragShapeKeyActiveDir_{ns}")
-                if self._click_export_seed_entries():
+                if self._feature_var() and self._click_export_seed_entries():
                     # 冷启动播种：缓冲随游戏关闭销毁、persist 变量仍有上次值——
                     # boot 清零后由驱动 CS 把导出变量值写回点击计数（含镜像与档位槽）
                     lines.append(f"\t$ssmtdrag_seed_pending_{ns} = 1")
-                if self._drag_drive_var_sync_bindings():
+                if self._feature_var() and self._drag_drive_var_sync_bindings():
                     # prev 值缓冲/激活标志随 boot 一并清零：persist 变量非 0 时首帧即触发同步写入
                     lines.append(f"\tclear = ResourceDragShapeKeyVarPrev_{ns} 0.0")
                     lines.append(f"\tclear = ResourceDragShapeKeyZoneActive_{ns} 0.0")
@@ -3826,7 +3991,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "endif",
                 "",
             ])
-            if getattr(self, "enable_shapekey_drive", False) and self._click_export_seed_entries():
+            if self._feature_var() and self._click_export_seed_entries():
                 lines.extend([
                     # 冷启动恢复不能依赖 Alt/命中门控；boot 清零后立即从 persist 变量播种。
                     f"if $ssmtdrag_seed_pending_{ns} == 1",
@@ -3871,14 +4036,22 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             for comp in components:
                 lines.append(f"\trun = CustomShaderDragPinComponent{comp['comp_name']}_{ns}")
             lines.append(f"\trun = CustomShaderDragUpdateScreenJiggle_{ns}")
-            if getattr(self, "enable_shapekey_drive", False):
+            if self._feature_skd():
                 lines.append(f"\trun = CustomShaderDragShapeKeyDrive_{ns}")
             for _slot in ("69", "70", "72", "73", "97"):
                 for _comp in ("x", "y", "z", "w"):
                     lines.append(f"\t{_comp}{_slot} = $ssmtdrag_ipbak_{_comp}{_slot}")
+            lines.append("else")
+            lines.append(f"\t$ObjectDetectAllowed_{ns} = 0")
+            if self._feature_skd():
+                # 失臂（松 Alt/undraw/输入模式切换）时驱动 CS 被内层门控跳过、
+                # 锁存无人清理：在此整清锁存资源，防止下次臂动+按住时复活
+                # 旧绑定（评审 F2；语义对齐面板侧「松开 Alt 结束绑定」）。
+                # 注意：本 else 只在 drag_mode>=1 时才执行（PinDetected 整条由
+                # 模式门控）；模式直跳 0 由 [Present] 块的终态 else 覆盖（G1）。
+                # 只清独立锁存资源，不波及 prev-press 槽（防重新臂动伪按下沿）。
+                lines.append(f"\tclear = ResourceDragShapeKeyDragLatch_{ns} 0.0")
             lines.extend([
-                "else",
-                f"\t$ObjectDetectAllowed_{ns} = 0",
                 "endif",
             ])
             sections[pin_sec] = lines
@@ -4340,10 +4513,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"global $ssmtdrag_poke_strength_{ns} = 1.0",
             f"global $ssmtdrag_release_boost_{ns} = 1.05",
             f"global $ssmtdrag_release_decay_{ns} = 0.92",
-            f"global $ssmtdrag_shapekey_dy_{ns} = 0",
-            f"global $ssmtdrag_shapekey_dx_{ns} = 0",
-            f"global $ssmtdrag_shapekey_prev_y_{ns} = 0",
-            f"global $ssmtdrag_shapekey_prev_x_{ns} = 0",
             f"global $ssmtdrag_modifier_ok_{ns} = 0",
             f"global $ssmtdrag_lmb_press_time_{ns} = 0",
             f"global $ssmtdrag_rmb_press_time_{ns} = 0",
@@ -4363,11 +4532,23 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # run= 命令列表边界传递必须声明为 global，否则子列表里置 1 后回调用方仍读 0 →
             # 视口恒无效 → cursor 恒 (-1,-1) → 检测永不命中且手型光标锚定屏幕外（导出模组无效果的根因）
             f"global $ssmtdrag_viewport_valid = 0",
+        ]
+        if self._feature_panel():
             # UI 构造器桥接：把 GPU 检测结果回读成可跨 INI 命名空间引用的只读全局量。
             # detected < 0 表示未命中；zone 仅在 detected >= 0 时有效。
-            f"global {ui_detected_var} = -1",
-            f"global {ui_zone_var} = -1",
-        ]
+            globals_to_add.extend([
+                f"global {ui_detected_var} = -1",
+                f"global {ui_zone_var} = -1",
+            ])
+        if self._feature_skd():
+            # 鼠标位移量测的上一帧值全局（F1 专属：驱动 CS x79/y79 消费）——
+            # 形态键联动关闭时不声明，避免残留 F1 引用
+            globals_to_add.extend([
+                f"global $ssmtdrag_shapekey_dy_{ns} = 0",
+                f"global $ssmtdrag_shapekey_dx_{ns} = 0",
+                f"global $ssmtdrag_shapekey_prev_y_{ns} = 0",
+                f"global $ssmtdrag_shapekey_prev_x_{ns} = 0",
+            ])
         if self.enable_viewport_probe:
             globals_to_add.extend([
                 f"global $ssmtdrag_viewport_probe_enabled_{ns} = 1",
@@ -4408,7 +4589,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"global $ssmtdrag_rmb_lone_hold_{ns} = 0",
             ])
         # 变量↔缓冲双向同步辅助变量：激活/回读/上一值/待确认/同步模式。
-        if getattr(self, "enable_shapekey_drive", False):
+        if self._feature_var():
             _sync_n = len(self._drag_drive_var_sync_bindings())
             if _sync_n:
                 globals_to_add.append(f"global $ssmtdrag_skheld_{ns} = 0")
@@ -4603,7 +4784,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\t$ssmtdrag_rmb_hold_fraction_{ns} = 0",
                 "endif",
             ])
-        if getattr(self, "enable_shapekey_drive", False):
+        if self._feature_skd():
             # 鼠标位移控制：帧内计算 Y/X 位移（$cursorY 自下而上，向上移动为增），
             # 由 CustomShaderDragShapeKeyDrive 段的 x79/y79 写入 IniParams[79] 供驱动 CS 读取
             block.extend([
@@ -4646,7 +4827,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"if $ssmtdrag_booted_{ns} == 0",
             f"\tpre run = CommandListDragPinDetected_{ns}",
         ])
-        if getattr(self, "enable_shapekey_drive", False) and self._click_export_seed_entries():
+        if self._feature_var() and self._click_export_seed_entries():
             block.extend([
                 f"elif $ssmtdrag_seed_pending_{ns} == 1",
                 f"\tpre run = CommandListDragPinDetected_{ns}",
@@ -4656,14 +4837,23 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"elif {drag_mode_var} >= 1",
             f"\tpre run = CommandListDragPinDetected_{ns}",
             f"\trun = CommandListDragCursorUpdate_{ns}",
-            "endif",
         ])
+        if self._feature_skd():
+            # 模式 0（含 1→0 直跳，不经过模式 2 dispatch 帧）：PinDetected 整体不
+            # dispatch，臂动门控内的失臂 else 够不到；在此终态 else 清锁存，
+            # 防陈旧绑定跨 mode-0 滞留、回模式 1 后无命中复活（评审 G1）。
+            block.extend([
+                "else",
+                f"\tclear = ResourceDragShapeKeyDragLatch_{ns} 0.0",
+            ])
+        block.append("endif")
         sync_bindings = (
             self._drag_drive_var_sync_bindings()
-            if getattr(self, "enable_shapekey_drive", False) else []
+            if self._feature_var() else []
         )
         if sync_bindings:
-            # 分时互斥：ZoneActive 标志由同步 CS 每帧按命中判定重算；
+            # 分时互斥：ZoneActive 标志由同步 CS 每帧镜像驱动 CS 的绑定锁存
+            #（按住命中即绑定、移出区域不丢、松开解除）；
             # 回读只在「对应区域拖拽激活」时进行，其余时间变量完全归驱动器/用户所有
             block.extend([
                 f"$ssmtdrag_skheld_{ns} = 0",
@@ -4677,7 +4867,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"run = CustomShaderDragShapeKeyVarSync_{ns}",
             ])
         ui_readback_sec = f"[CommandListDragUIReadback_{ns}]"
-        if ui_readback_sec not in sections:
+        if self._feature_panel() and ui_readback_sec not in sections:
             sections[ui_readback_sec] = list(ui_bridge_lines)
 
         if self.enable_hand_cursor:
@@ -4739,8 +4929,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # 第二组件起的 oid（曾出现 0-14 重复、37-51 缺失）。
             for oid in self._global_object_oids(components):
                 block.append(f"post $ssmtdrag_objvis_{ns}_{oid} = 0")
+        if self._feature_panel():
+            block.append(f"post run = CommandListDragUIReadback_{ns}")
         block.extend([
-            f"post run = CommandListDragUIReadback_{ns}",
             f"post $ssmtdrag_drawn_{ns} = 0",
         ])
         block.append("\t; --- DRAG PRESENT END ---")
@@ -4802,35 +4993,199 @@ def _preview_targets(node):
     return [target] if target is not None else []
 
 
+# armature 姿态摘要缓存：按 (id(armature), name) 每代缓存一次，
+# 同一代（同一次 tick）内所有 target 共享一次 O(B) 计算（O(T×B)→O(B)，
+# 修复多子网格引用同一 armature 时每 tick 重复全量遍历的卡死根因）。
+# 代号由 _preview_tick 每 tick 推进：姿态变化在下一个 tick 被检出
+# （0.2s 检测延迟，与现有轮询/防抖语义一致）。
+# 摘要为纯索引读取（m[i][j]）+ round(4) 滚动整数哈希：确定性、稳定、
+# 不构造 16-float tuple、不触发 depsgraph 求值（tick 签名保持便宜）。
+_PREVIEW_DIGEST_GENERATION = 0
+_PREVIEW_DIGEST_CACHE = {}
+_PREVIEW_DIGEST_CACHE_MAX = 8
+
+# ---------------- 事件驱动失效状态（t12） ----------------
+# depsgraph_update_post handler 置 dirty 后才走全量签名；空闲 tick O(1)。
+# 相关键集：参与预览的数据块（目标/网格/形态键/骨架/区域空物体/集合）的
+# 稳定键（as_pointer 优先，stub 回退 id()），handler 内只做 O(|updates|)
+# 集合查找过滤；None = 未建（handler 保守置脏）。
+_preview_dirty = True
+_preview_last_selection = None
+_preview_deps_registered = False
+_PREVIEW_RELEVANT_IDS = None
+_PREVIEW_SAFETY_TICKS = 10  # 事件驱动下每 N 个干净 tick 强制一次全量签名（兜 driver 漏报）
+_preview_safety_count = 0
+
+
+def _preview_armature_digest(arm, generation):
+    """单 armature 姿态滚动摘要：O(B) 一次、同代内全 target 共享。
+    骨骼矩阵 16 元素索引读取 + round(4) 滚动哈希；约束目标物体矩阵同法
+    并入（覆盖 IK 目标物体移动但骨骼通道未变的情形）。"""
+    key = (id(arm), getattr(arm, "name", ""))
+    cached = _PREVIEW_DIGEST_CACHE.get(key)
+    if cached is not None and cached[0] == generation:
+        return cached[1]
+    pose = getattr(arm, "pose", None)
+    h = hash(getattr(getattr(arm, "data", None), "pose_position", None))
+    if pose is not None:
+        for b in getattr(pose, "bones", None) or ():
+            h = (h * 31 + hash(getattr(b, "name", ""))) & 0xFFFF_FFFF
+            m = getattr(b, "matrix", None)
+            if m is not None:
+                try:
+                    for i in range(4):
+                        row = m[i]
+                        for j in range(4):
+                            h = (h * 31 + hash(round(float(row[j]), 4))) & 0xFFFF_FFFF
+                except Exception:
+                    pass
+            for ct in getattr(b, "constraints", None) or ():
+                tgt = getattr(ct, "target", None)
+                if tgt is None:
+                    continue
+                h = (h * 31 + hash(getattr(tgt, "name", ""))) & 0xFFFF_FFFF
+                tw = getattr(tgt, "matrix_world", None)
+                if tw is not None:
+                    try:
+                        for i in range(4):
+                            row = tw[i]
+                            for j in range(4):
+                                h = (h * 31 + hash(round(float(row[j]), 4))) & 0xFFFF_FFFF
+                    except Exception:
+                        pass
+    if len(_PREVIEW_DIGEST_CACHE) >= _PREVIEW_DIGEST_CACHE_MAX:
+        _PREVIEW_DIGEST_CACHE.clear()
+    _PREVIEW_DIGEST_CACHE[key] = (generation, h)
+    return h
+
+
+def _preview_deform_signature(target):
+    """形变签名：形态键值 + 修改器类型指纹 + armature 姿态滚动摘要。
+    同一代内同一 armature 的摘要只算一次（全 target 共享）；
+    纯数据读取、不触发 depsgraph 求值，0.2s/tick 签名保持便宜。
+    无形态键且无任何修改器 → None（静态，零增量）。"""
+    mesh = getattr(target, "data", None)
+    if mesh is None:
+        return None
+    mods = getattr(target, "modifiers", None) or ()
+    parts = []
+    sk = getattr(mesh, "shape_keys", None)
+    key_blocks = getattr(sk, "key_blocks", None)
+    if key_blocks is not None:
+        for kb in key_blocks:
+            parts.append((
+                getattr(kb, "name", ""),
+                round(float(getattr(kb, "value", 0.0) or 0.0), 6),
+                bool(getattr(kb, "mute", False)),
+            ))
+    if mods:
+        # 修改器类型指纹：低成本纯读；增删/类型变化即使顶点数不变也失效
+        parts.append(("MOD", tuple(sorted({str(getattr(m, "type", "")) for m in mods}))))
+    for mod in mods:
+        if getattr(mod, "type", None) != 'ARMATURE':
+            continue
+        arm = getattr(mod, "object", None)
+        if arm is None:
+            continue
+        parts.append((getattr(arm, "name", ""),
+                      _preview_armature_digest(arm, _PREVIEW_DIGEST_GENERATION)))
+    return tuple(parts) if parts else None
+
+
+def _preview_selected_zones(node):
+    """多选并集：selected_objects ∩ node.zone_objects 中 enabled 的空物体
+    （identity 比较；active 无特权，只是 selected 的普通成员）。
+    按 node.zone_objects 顺序输出（确定性签名）；空集 = 不显示预览。"""
+    ctx = getattr(bpy, "context", None)
+    if ctx is None:
+        return []
+    selected = getattr(ctx, "selected_objects", None) or ()
+    sel_ids = {id(s) for s in selected}
+    out = []
+    for item in node.zone_objects:
+        empty = item.zone_object
+        if empty is None or id(empty) not in sel_ids:
+            continue
+        s = getattr(empty, "ssmt_drag_zone", None)
+        if s is not None and getattr(s, "enabled", True):
+            out.append((empty, s))
+    return out
+
+
+def _preview_node_zones(node):
+    """节点预览使用的区域 = 选中并集；未选中任何区域空物体 → 空列表（不显示）。
+
+    需求变更（t11）：推翻 t1『未选中=显示全部』——预览只回答
+    『当前选中的区域权重长啥样』，无选中即无预览。"""
+    return _preview_selected_zones(node)
+
+
+def _preview_selection_digest(nodes):
+    """选中集摘要（O(#selected + Σ#zones)），供 tick 轮询——选中变化不进
+    depsgraph，必须轮询；zone 成员增删也翻转摘要（节点属性编辑不进 depsgraph
+    的兜底路径）。摘要只含名字与数量，不含矩阵/骨骼。"""
+    ctx = getattr(bpy, "context", None)
+    sel_ids = set()
+    if ctx is not None:
+        selected = getattr(ctx, "selected_objects", None) or ()
+        sel_ids = {id(s) for s in selected}
+    digests = []
+    for n in nodes:
+        members = []
+        hits = []
+        for item in getattr(n, "zone_objects", ()):
+            empty = item.zone_object
+            if empty is None:
+                continue
+            name = getattr(empty, "name", "")
+            members.append(name)
+            if id(empty) in sel_ids:
+                hits.append(name)
+        digests.append((getattr(n, "name", ""), tuple(members), tuple(hits)))
+    return tuple(digests)
+
+
+def _preview_zone_signature_part(empty):
+    """单个区域空物体的签名分量（矩阵/参数/包含名单）。"""
+    s = empty.ssmt_drag_zone
+    include_names = tuple(
+        getattr(getattr(item, "object", None), "name", None)
+        for item in getattr(s, "include_objects", ())
+    )
+    return (empty.name,
+            tuple(round(v, 6) for v in np.array(empty.matrix_world, dtype=np.float64).reshape(-1)),
+            s.enabled, round(s.brush_strength, 6), round(s.brush_falloff_k, 6),
+            bool(getattr(s, "propagate", True)), include_names)
+
+
 def _preview_signature(n):
-    """矩阵/参数签名：集合成员、网格变换和区域参数变化都会触发重算。"""
+    """矩阵/参数/选择签名：集合成员、网格变换、区域参数、选中并集与
+    形变（形态键值 + 骨骼姿态）变化都会触发重算。
+    未选中任何区域空物体 → 签名最小化（(树, 节点, ("sel", ()))），
+    此时不渲染预览，任何目标/区域变化都不触发重建（零 churn）。"""
     collection = getattr(n, "preview_collection", None)
+    zones = _preview_selected_zones(n)
+    sel_names = tuple(z[0].name for z in zones)
     parts = [
         n.id_data.name,
         n.name,
         getattr(collection, "name", None),
         round(float(getattr(n, "mask_plateau", 0.0) or 0.0), 6),
+        # 选中并集（有序元组）：切换选择（A→B、A→∅、多选增删）触发重建
+        ("sel", sel_names),
     ]
+    if not zones:
+        return tuple(parts)
     for target in _preview_targets(n):
         parts.append((
             target.name,
             tuple(round(v, 6) for v in np.array(target.matrix_world, dtype=np.float64).reshape(-1)),
             len(target.data.vertices),
+            _preview_deform_signature(target),
         ))
-    for item in n.zone_objects:
-        empty = item.zone_object
-        if empty is None:
-            parts.append(None)
-            continue
-        s = empty.ssmt_drag_zone
-        include_names = tuple(
-            getattr(getattr(item, "object", None), "name", None)
-            for item in getattr(s, "include_objects", ())
-        )
-        parts.append((empty.name,
-                      tuple(round(v, 6) for v in np.array(empty.matrix_world, dtype=np.float64).reshape(-1)),
-                      s.enabled, round(s.brush_strength, 6), round(s.brush_falloff_k, 6),
-                      bool(getattr(s, "propagate", True)), include_names))
+    # 只对参与预览的（选中）区域收签名：未选中区域的变化不触发重建（零churn）
+    for empty, _s in zones:
+        parts.append(_preview_zone_signature_part(empty))
     return tuple(parts)
 
 
@@ -4854,9 +5209,14 @@ def _preview_target_field(node, verts_world, tri, zones, plateau, target_name=No
             node, topo, zones, plateau, topo_key=topo_key
         )
     else:
-        # 全部体积球：无需拓扑，只保留顶点集（逐球场缓存按 mesh_key 区分）
+        # 全部体积球：无需拓扑，只保留顶点集。vol 键并入几何内容哈希
+        # （传入的 topo_key 即 _preview_mesh_data 已算出的 _preview_topology_key；
+        # 缺省时现场计算），使形变/目标矩阵变化但顶点数不变时逐球场缓存
+        # 不再误命中旧几何的场。
+        if topo_key is None:
+            topo_key = _preview_topology_key(verts_world, tri, None)
         topo = {"world_pts": verts_world, "edge_verts": None, "adjacency": None}
-        topo_key = ("vol", mesh_key, len(verts_world))
+        topo_key = ("vol", mesh_key, len(verts_world), topo_key)
         field = _preview_field_from_topology(
             node, topo, zones, plateau, topo_key=topo_key
         )
@@ -5042,11 +5402,37 @@ def _preview_zone_field(node, topo, topo_key, empty, s, plateau,
     return field
 
 
-def _preview_mesh_data(node, target):
+def _preview_deformed_mesh_data(target, depsgraph):
+    """depsgraph evaluated mesh（形态键 + 骨骼 + 其他修改器生效后的实际网格），
+    返回局部坐标顶点/三角形；失败返回 None（调用方回退基础网格）。"""
+    try:
+        eval_obj = target.evaluated_get(depsgraph)
+        eval_mesh = eval_obj.to_mesh()
+        try:
+            vcount = len(eval_mesh.vertices)
+            if vcount == 0:
+                return None
+            verts = np.empty(vcount * 3, dtype=np.float64)
+            eval_mesh.vertices.foreach_get("co", verts)
+            eval_mesh.calc_loop_triangles()
+            tri = np.empty(len(eval_mesh.loop_triangles) * 3, dtype=np.int64)
+            eval_mesh.loop_triangles.foreach_get("vertices", tri)
+            return (verts.reshape(-1, 3), tri.reshape(-1, 3))
+        finally:
+            eval_obj.to_mesh_clear()
+    except Exception:
+        return None
+
+
+def _preview_mesh_data(node, target, depsgraph=None):
     """读取并缓存单个目标网格的世界顶点/三角形/拓扑 key。
-    目标矩阵、顶点数、面数均未变时复用（跳过 foreach_get + calc_loop_triangles +
-    拓扑哈希——这些是大量区域下预览重建的主要开销）。网格顶点原地编辑但数量
-    不变时预览可能滞后，关闭再开启预览或移动目标即可刷新。"""
+    目标矩阵、顶点数、面数与形变签名（形态键值 + 骨骼姿态）均未变时复用
+    （跳过 foreach_get + calc_loop_triangles + 拓扑哈希——这些是大量区域下
+    预览重建的主要开销）。目标带形态键/骨骼修改器且 depsgraph 可用时优先读
+    evaluated mesh（形变后顶点）；获取失败回退基础网格并打印一次警告。
+    网格顶点原地编辑但数量不变时预览可能滞后——含形态键几何点编辑
+    （改关键点坐标但不改 value/数量时，矩阵/顶点数/面数/形变签名均不变，
+    网格数据缓存不失效），关闭再开启预览或移动目标即可刷新。"""
     key = (node.id_data.name, node.name, target.name)
     mesh = target.data
     vcount = len(mesh.vertices)
@@ -5056,10 +5442,27 @@ def _preview_mesh_data(node, target):
     matrix_sig = tuple(round(v, 6) for v in mw.reshape(-1))
     pcount = len(mesh.polygons)
     cached = _preview_cache_get(_PREVIEW_MESH_CACHE, key)
-    if cached is not None:
-        (c_matrix_sig, c_vcount, c_pcount, c_verts_world, c_tri, c_topo_key) = cached
-        if (c_matrix_sig == matrix_sig and c_vcount == vcount and c_pcount == pcount):
+    if cached is not None and len(cached) == 7:
+        (c_matrix_sig, c_vcount, c_pcount, c_deform_sig,
+         c_verts_world, c_tri, c_topo_key) = cached
+        # 便宜键（矩阵/顶点数/面数）先查；形变签名走 armature 共享 digest 缓存，
+        # 缓存命中路径不重复全量重算姿态摘要
+        if (c_matrix_sig == matrix_sig and c_vcount == vcount
+                and c_pcount == pcount
+                and c_deform_sig == _preview_deform_signature(target)):
             return (c_verts_world, c_tri, c_topo_key)
+    deform_sig = _preview_deform_signature(target)
+    if depsgraph is not None and deform_sig is not None:
+        deformed = _preview_deformed_mesh_data(target, depsgraph)
+        if deformed is not None:
+            verts, tri = deformed
+            verts_world = verts @ mw[:3, :3].T + mw[:3, 3]
+            topo_key = _preview_topology_key(verts_world, tri, None)
+            item = (matrix_sig, vcount, pcount, deform_sig,
+                    verts_world, tri, topo_key)
+            _preview_cache_put(_PREVIEW_MESH_CACHE, key, item, _PREVIEW_MESH_CACHE_MAX)
+            return (verts_world, tri, topo_key)
+        print(f"[drag preview] 目标 {target.name} 形变网格获取失败，回退基础网格")
     verts = np.empty(vcount * 3, dtype=np.float64)
     mesh.vertices.foreach_get("co", verts)
     verts = verts.reshape(-1, 3)
@@ -5069,7 +5472,7 @@ def _preview_mesh_data(node, target):
     mesh.loop_triangles.foreach_get("vertices", tri)
     tri = tri.reshape(-1, 3)
     topo_key = _preview_topology_key(verts_world, tri, None)
-    item = (matrix_sig, vcount, pcount, verts_world, tri, topo_key)
+    item = (matrix_sig, vcount, pcount, deform_sig, verts_world, tri, topo_key)
     _preview_cache_put(_PREVIEW_MESH_CACHE, key, item, _PREVIEW_MESH_CACHE_MAX)
     return (verts_world, tri, topo_key)
 
@@ -5197,21 +5600,25 @@ def _rebuild_preview_batches(nodes):
     import gpu
     from gpu_extras.batch import batch_for_shader
     shader = gpu.shader.from_builtin('SMOOTH_COLOR')
+    # 一次取 depsgraph（形态键/骨骼求值的网格源）；timer 上下文里可用，失败回退基础网格
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except Exception:
+        depsgraph = None
     new_batches = {}
     for n in nodes:
-        zones = []
-        for item in n.zone_objects:
-            empty = item.zone_object
-            if empty is None or not empty.ssmt_drag_zone.enabled:
-                continue
-            zones.append((empty, empty.ssmt_drag_zone))
+        # 选中过滤（t11 需求变更）：只预览选中区域空物体的并集；
+        # 未选中任何区域空物体 → 跳过该节点（不渲染任何预览）
+        zones = _preview_node_zones(n)
+        if not zones:
+            continue
         targets = _preview_targets(n)
         plateau = getattr(n, "mask_plateau", 0.0)
         # 收集每个目标网格的 world 顶点与三角形（命中网格缓存时跳过
         # foreach_get / calc_loop_triangles / 拓扑哈希）
         mesh_data = []
         for target in targets:
-            result = _preview_mesh_data(n, target)
+            result = _preview_mesh_data(n, target, depsgraph)
             if result is None:
                 continue
             verts_world, tri, topo_key = result
@@ -5301,7 +5708,7 @@ def _ensure_preview_handler():
 
 
 def _remove_preview_handler():
-    global _preview_handler, _preview_batches
+    global _preview_handler, _preview_batches, _PREVIEW_DIGEST_GENERATION
     if _preview_handler is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(_preview_handler, 'WINDOW')
@@ -5314,32 +5721,179 @@ def _remove_preview_handler():
     _PREVIEW_MESH_CACHE.clear()
     _PREVIEW_MERGED_CACHE.clear()
     _PREVIEW_ZONE_FIELD_CACHE.clear()
+    _PREVIEW_DIGEST_CACHE.clear()
+    _PREVIEW_DIGEST_GENERATION = 0
+
+
+def _preview_rel_key(datablock):
+    """depsgraph update id 的稳定键：as_pointer 优先（bpy 数据块跨访问稳定，
+    Python 包装对象的 id() 不可靠），stub/无该方法时回退 id()。"""
+    if datablock is None:
+        return None
+    try:
+        return ("ptr", datablock.as_pointer())
+    except Exception:
+        return ("id", id(datablock))
+
+
+def _preview_refresh_relevant_ids(nodes):
+    """重建相关数据块键集（目标物体/网格/形态键/骨架/区域空物体/集合）。
+    仅在 dirty 后的全量签名路径调用（O(Σ(targets+zones))），空闲 tick 不付。"""
+    global _PREVIEW_RELEVANT_IDS
+    relevant = set()
+    for n in nodes:
+        collection = getattr(n, "preview_collection", None)
+        if collection is not None:
+            relevant.add(_preview_rel_key(collection))
+        for target in _preview_targets(n):
+            relevant.add(_preview_rel_key(target))
+            mesh = getattr(target, "data", None)
+            if mesh is not None:
+                relevant.add(_preview_rel_key(mesh))
+                sk = getattr(mesh, "shape_keys", None)
+                if sk is not None:
+                    relevant.add(_preview_rel_key(sk))
+            for mod in getattr(target, "modifiers", None) or ():
+                if getattr(mod, "type", None) != 'ARMATURE':
+                    continue
+                arm = getattr(mod, "object", None)
+                if arm is not None:
+                    relevant.add(_preview_rel_key(arm))
+                    arm_data = getattr(arm, "data", None)
+                    if arm_data is not None:
+                        relevant.add(_preview_rel_key(arm_data))
+        for item in getattr(n, "zone_objects", ()):
+            empty = getattr(item, "zone_object", None)
+            if empty is not None:
+                relevant.add(_preview_rel_key(empty))
+    relevant.discard(None)
+    _PREVIEW_RELEVANT_IDS = relevant
+
+
+def _preview_depsgraph_update(depsgraph):
+    """depsgraph_update_post 回调：低成本过滤（O(|updates|) 集合查找）。
+    仅当本次更新涉及预览相关对象（目标网格/骨架/形态键/区域空物体/集合/节点树）
+    才置 _preview_dirty；无可过滤信息（updates 缺失/相关集未建）时保守置脏。
+    只读已求值图的更新清单，不触发任何再求值。"""
+    global _preview_dirty
+    if _preview_dirty:
+        return
+    relevant = _PREVIEW_RELEVANT_IDS
+    if not relevant:
+        _preview_dirty = True
+        return
+    updates = getattr(depsgraph, "updates", None)
+    if updates is None:
+        # 无更新清单（旧版 Blender）：无法过滤 → 保守置脏
+        _preview_dirty = True
+        return
+    for u in updates:
+        iid = getattr(u, "id", None)
+        if iid is None:
+            _preview_dirty = True
+            return
+        if _preview_rel_key(iid) in relevant:
+            _preview_dirty = True
+            return
+        tname = type(iid).__name__
+        if tname in ("Collection", "NodeGroup"):
+            # 集合成员/节点列表变更的主要载体（罕见，需兜底）
+            _preview_dirty = True
+            return
+
+
+def _ensure_preview_deps_handler():
+    """注册 depsgraph_update_post 失效 handler（幂等）。
+    stub bpy / 旧版 Blender 无 app.handlers → 静默降级（回退轮询）。
+    与 _ensure_preview_running 的生命周期对齐（预览激活即注册）。"""
+    global _preview_deps_registered
+    if _preview_deps_registered:
+        return
+    try:
+        handlers = getattr(getattr(bpy, "app", None), "handlers", None)
+        deps = getattr(handlers, "depsgraph_update_post", None) if handlers is not None else None
+        if deps is None:
+            return
+        if _preview_depsgraph_update not in deps:
+            deps.append(_preview_depsgraph_update)
+        _preview_deps_registered = True
+    except Exception:
+        _preview_deps_registered = False
+
+
+def _remove_preview_deps_handler():
+    """注销 depsgraph_update_post handler（幂等）；预览停用时清理并重置状态。"""
+    global _preview_deps_registered, _PREVIEW_RELEVANT_IDS
+    global _preview_dirty, _preview_last_selection, _preview_safety_count
+    if not _preview_deps_registered:
+        return
+    try:
+        handlers = getattr(getattr(bpy, "app", None), "handlers", None)
+        deps = getattr(handlers, "depsgraph_update_post", None) if handlers is not None else None
+        if deps is not None and _preview_depsgraph_update in deps:
+            deps.remove(_preview_depsgraph_update)
+    except Exception:
+        pass
+    _preview_deps_registered = False
+    _PREVIEW_RELEVANT_IDS = None
+    _preview_dirty = True
+    _preview_last_selection = None
+    _preview_safety_count = 0
 
 
 def _preview_tick():
-    """轮询预览，并将连续编辑产生的多次变化合并为一次批次重建。"""
-    global _preview_timer, _preview_sig_cache
+    """轮询预览，并将连续编辑产生的多次变化合并为一次批次重建。
+    事件驱动模式（depsgraph handler 已注册）：空闲 tick O(1)
+    （dirty 标志 + 选中集轮询），零骨骼/矩阵/depsgraph 访问；
+    降级模式（无 handler 的 stub/旧版）回退 t8 全量签名轮询。"""
+    global _preview_timer, _preview_sig_cache, _PREVIEW_DIGEST_GENERATION
     global _preview_pending_signature, _preview_pending_since
+    global _preview_dirty, _preview_last_selection, _preview_safety_count
+    # 推进 armature 姿态摘要代号：本 tick 内所有签名/重建共享同一代摘要
+    # （每次 O(B) 一次），姿态变化在下一 tick 被检出（0.2s 检测延迟）。
+    _PREVIEW_DIGEST_GENERATION = (_PREVIEW_DIGEST_GENERATION + 1) & 0xFFFF
     nodes = _collect_preview_nodes()
     if not nodes:
         _remove_preview_handler()
+        _remove_preview_deps_handler()
         _preview_timer = None
         _preview_sig_cache = None
         _preview_pending_signature = None
         _preview_pending_since = None
         return None  # 取消 timer
     _ensure_preview_handler()
+    event_driven = _preview_deps_registered
+    if event_driven:
+        sel = _preview_selection_digest(nodes)
+        if sel != _preview_last_selection:
+            _preview_last_selection = sel
+            _preview_dirty = True
+        if _preview_dirty or _preview_sig_cache is None:
+            _preview_safety_count = 0
+        elif _preview_safety_count < _PREVIEW_SAFETY_TICKS - 1:
+            # ★ O(1) 空闲：零骨骼遍历/零矩阵读取/零 depsgraph 求值
+            _preview_safety_count += 1
+            return _PREVIEW_TICK
+        else:
+            # 安全阀：每 N 个干净 tick 强制一次全量签名（兜 driver 漏报）
+            _preview_safety_count = 0
     try:
         sig = tuple(_preview_signature(n) for n in nodes)
+        if event_driven:
+            # dirty 后已付全量签名：同步刷新相关键集（区域成员增删等
+            # 不翻转签名但会改变相关集，handler 过滤依赖其新鲜度）
+            _preview_refresh_relevant_ids(nodes)
         now = _preview_now()
         if _preview_sig_cache is None:
             _rebuild_preview_batches(nodes)
             _preview_sig_cache = sig
             _preview_pending_signature = None
             _preview_pending_since = None
+            _preview_dirty = False
         elif sig == _preview_sig_cache:
             _preview_pending_signature = None
             _preview_pending_since = None
+            _preview_dirty = False        # 误报：dirty 但签名未变
         elif sig != _preview_pending_signature:
             _preview_pending_signature = sig
             _preview_pending_since = now
@@ -5348,6 +5902,7 @@ def _preview_tick():
             _preview_sig_cache = sig
             _preview_pending_signature = None
             _preview_pending_since = None
+            _preview_dirty = False
     except Exception:
         # 重建失败时保留可诊断输出（控制台可见 traceback），避免静默黑屏
         import traceback
@@ -5363,6 +5918,7 @@ def _ensure_preview_running():
             _preview_timer = bpy.app.timers.register(_preview_tick, first_interval=_PREVIEW_TICK)
         except Exception:
             _preview_timer = None
+    _ensure_preview_deps_handler()
 
 
 def _preview_cleanup():
@@ -5379,6 +5935,7 @@ def _preview_cleanup():
     _preview_pending_signature = None
     _preview_pending_since = None
     _remove_preview_handler()
+    _remove_preview_deps_handler()
 
 
 classes = (

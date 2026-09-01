@@ -172,6 +172,39 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
         )
         self.assertEqual(node._drag_drive_dirs(["A", "B"]), [4, 0])
 
+    def test_find_drag_drive_node_reads_feature_switch(self):
+        """S7 反扫谓词：优先读拖拽节点 _feature_skd()（四开关+档一消费方约束），
+        旧节点/测试桩回退 enable_shapekey_drive。避免 F1 关闭后 t100/t101
+        绑定指向未发射资源（phase2/n1 §5.2）。"""
+        on = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_DragInteraction",
+            _feature_skd=lambda: True,
+        )
+        off = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_DragInteraction",
+            _feature_skd=lambda: False,
+        )
+        legacy = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_DragInteraction",
+            enable_shapekey_drive=True,
+        )
+        legacy_off = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_DragInteraction",
+            enable_shapekey_drive=False,
+        )
+        node = _make_node({})
+        node.id_data = types.SimpleNamespace(nodes=[on])
+        self.assertIs(node._find_drag_drive_node(), on)
+        node.id_data = types.SimpleNamespace(nodes=[off])
+        self.assertIsNone(node._find_drag_drive_node())
+        node.id_data = types.SimpleNamespace(nodes=[legacy])
+        self.assertIs(node._find_drag_drive_node(), legacy)
+        node.id_data = types.SimpleNamespace(nodes=[legacy_off])
+        self.assertIsNone(node._find_drag_drive_node())
+        # 新旧混排：开启者胜出
+        node.id_data = types.SimpleNamespace(nodes=[off, on])
+        self.assertIs(node._find_drag_drive_node(), on)
+
     def test_non_directional_stages_and_directional_slot_layout(self):
         node = _make_node(
             {"A": 0, "B": 0, "C": 1},

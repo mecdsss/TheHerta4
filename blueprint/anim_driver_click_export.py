@@ -16,6 +16,17 @@ from .node_postprocess_draginteraction import (
 from .variable_registry import normalize_variable_name
 
 
+def _drag_drive_feature_linked(candidate):
+    """四开关兼容谓词：新拖拽节点读 _feature_var()（变量联动总开关，含 F4⇒F1
+    降级与旧值迁移）；旧版本/测试桩无该方法时回退 enable_shapekey_drive。
+    若谓词不同步，变量联动关闭后 ClickExport 仍会生成引用未发射 ClickCountF
+    的 store 段（悬空引用），见 phase2/n1 §5.2 跨节点读取链。"""
+    feature_var = getattr(candidate, "_feature_var", None)
+    if feature_var is not None:
+        return bool(feature_var())
+    return bool(getattr(candidate, "enable_shapekey_drive", False))
+
+
 class ClickExportTargetItem(bpy.types.PropertyGroup):
     variable_name: StringProperty(
         name="受控变量",
@@ -182,7 +193,7 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
                 if getattr(candidate, "bl_idname", "") == "SSMTNode_PostProcess_DragInteraction" \
                         and not getattr(candidate, "mute", False) \
                         and is_postprocess_node_on_export_chain(tree, candidate) \
-                        and getattr(candidate, "enable_shapekey_drive", False):
+                        and _drag_drive_feature_linked(candidate):
                     candidates.append(candidate)
         return candidates
 
