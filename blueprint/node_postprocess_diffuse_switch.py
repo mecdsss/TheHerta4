@@ -60,18 +60,38 @@ def find_resource_by_filename(text, wanted):
 
 
 def find_texture_overrides_for_resource(text, resource_name):
+    assignment = _resource_assignment_pattern(resource_name)
     result = []
     for name, _, _, block in parse_sections(text):
         if not name.lower().startswith("textureoverride_"):
             continue
         hash_match = re.search(r"(?mi)^\s*hash\s*=\s*([0-9a-fA-F]+)\s*$", block)
-        resource_match = re.search(
-            r"(?mi)^\s*this\s*=\s*" + re.escape(resource_name) + r"\s*$",
-            block,
-        )
+        resource_match = assignment.search(block)
         if hash_match and resource_match:
             result.append((name, hash_match.group(1), block))
     return result
+
+
+def _resource_assignment_pattern(resource_name):
+    """Match legacy ``this =`` and any ZZMI texture assignment."""
+    return re.compile(
+        r"(?mi)^([ \t]*)(this|Resource\\ZZMI\\[A-Za-z0-9_]+)[ \t]*=[ \t]*"
+        r"(ref[ \t]+)?" + re.escape(resource_name) + r"[ \t]*$"
+    )
+
+
+def _find_resource_assignment_style(block, resource_name=None):
+    """Return ``(indent, lhs, ref_prefix)`` for an existing resource assignment."""
+    candidates = []
+    if resource_name:
+        candidates.append(_resource_assignment_pattern(resource_name).search(block))
+    candidates.extend([
+        re.search(r"(?mi)^([ \t]*)(this|Resource\\ZZMI\\[A-Za-z0-9_]+)[ \t]*=[ \t]*(ref[ \t]+)?[^\r\n]+$", block),
+    ])
+    match = next((item for item in candidates if item), None)
+    if not match:
+        return None
+    return match.group(1), match.group(2), match.group(3) or ""
 
 
 def ensure_resource(text, name, filename):
@@ -107,11 +127,21 @@ def sanitize_key_for_var(key):
 
 
 def key_variable(key):
+    """Return the variable name used by releases before per-group identities."""
     return "DiffuseSwap_Key_" + sanitize_key_for_var(key)
 
 
+def diffuse_group_variable(group):
+    """Return a stable control variable unique to one texture-switch group."""
+    uid = str(getattr(group, "uid", "") or "").strip()
+    if not uid:
+        uid = uuid.uuid4().hex[:8]
+        group.uid = uid
+    return "DiffuseSwap_Group_" + sanitize_identifier(uid)
+
+
 def diffuse_group_variable_name(group):
-    return "$" + key_variable(str(getattr(group, "key", "") or ""))
+    return "$" + diffuse_group_variable(group)
 
 
 def diffuse_group_hotkey(group):
@@ -134,8 +164,8 @@ def ensure_constants_var(text, var):
     return text.rstrip() + f"\n\n[Constants]\n{line}\n"
 
 
-def ensure_keyswap(text, key, state_count, comment="", gui_guard=""):
-    var = key_variable(key)
+def ensure_keyswap(text, key, state_count, comment="", gui_guard="", var=None):
+    var = var or key_variable(key)
     section_name = f"KeySwap_Diffuse_{var}"
     values = ",".join(str(index) for index in range(max(2, state_count)))
     condition = f"${var} == 0 || ${var} < {max(2, state_count)}"
@@ -151,6 +181,15 @@ def ensure_keyswap(text, key, state_count, comment="", gui_guard=""):
         f"${var} = {values}",
     ])
     block = "\n".join(lines)
+
+    # Migrate the pre-fix key-based section. Multiple groups may intentionally
+    # share a hotkey, but each now needs its own state variable and KeySwap.
+    legacy_section_name = f"KeySwap_Diffuse_{key_variable(key)}"
+    if legacy_section_name != section_name:
+        legacy = section_span(text, legacy_section_name)
+        if legacy:
+            text = text[:legacy.start()] + text[legacy.end():].lstrip("\r\n")
+
     existing = section_span(text, section_name)
     if existing:
         suffix = text[existing.end():].lstrip("\r\n")
@@ -159,31 +198,100 @@ def ensure_keyswap(text, key, state_count, comment="", gui_guard=""):
     return text.rstrip() + "\n\n" + block + "\n"
 
 
-def make_switch_block(block, original_resource, replacement_resources, var):
-    generated = re.search(
-        r"(?ms)^([ \t]*)if[ \t]+\$" + re.escape(var)
-        + r"[ \t]*==[ \t]*0[ \t]*$.*?^\1endif[ \t]*$",
-        block,
-    )
+def make_switch_block(block, original_resource, replacement_resources, var, legacy_vars=()):
+    generated = None
+    for candidate_var in (var, *legacy_vars):
+        generated = re.search(
+            r"(?ms)^([ \t]*)if[ \t]+\$" + re.escape(candidate_var)
+            + r"[ \t]*==[ \t]*0[ \t]*$.*?^\1endif[ \t]*$",
+            block,
+        )
+        if generated:
+            break
+    original_assignment = _resource_assignment_pattern(original_resource).search(block)
+    if (
+        generated
+        and original_assignment
+        and not (generated.start() <= original_assignment.start() < generated.end())
+    ):
+        # Repair output produced by the earlier multi-group fix: it could wrap
+        # the first ordinary draw condition after SetTextures while leaving the
+        # original diffuse assignment in place. Remove that misplaced block and
+        # regenerate at the original assignment location.
+        cleaned = block[:generated.start()] + block[generated.end():]
+        return make_switch_block(cleaned, original_resource, replacement_resources, var)
+    # Only nest an existing switch block when it writes the same ZZMI slot.
+    # Diffuse, LightMap, MaterialMap, etc. must remain independent blocks.
+    target_style = _find_resource_assignment_style(block, original_resource)
+    target_lhs = target_style[1] if target_style else None
+    any_generated = generated
+    if any_generated is None:
+        # Only treat an existing conditional as a diffuse-switch block when
+        # it actually assigns Resource\\ZZMI\\Diffuse.  Ordinary drawindexed
+        # conditions in the same TextureOverride must not be mistaken for it.
+        for candidate in re.finditer(
+            r"(?ms)^([ \t]*)if[ \t]+\$[A-Za-z0-9_]+[ \t]*==[ \t]*0[ \t]*$.*?^\1endif[ \t]*$",
+            block,
+        ):
+            candidate_text = candidate.group(0)
+            if target_lhs and re.search(
+                r"(?mi)^\s*" + re.escape(target_lhs) + r"\s*=\s*(?:ref\s+)?",
+                candidate_text,
+            ):
+                any_generated = candidate
+                break
+    if generated is None and any_generated:
+        # Another diffuse group already owns this override. Nest the new
+        # group's selection around it so both groups remain independently
+        # controllable instead of replacing the first group's block.
+        indent = any_generated.group(1)
+        style = _find_resource_assignment_style(block, original_resource)
+        if not style:
+            return None
+        _, lhs, ref_prefix = style
+
+        def assignment(resource):
+            return f"{indent}    {lhs} = {ref_prefix}{resource}"
+
+        nested = any_generated.group(0)
+        nested_lines = nested.splitlines()
+        lines = [f"{indent}if ${var} == 0"]
+        lines.extend(f"{indent}    {line}" for line in nested_lines)
+        for index, resource in enumerate(replacement_resources, start=1):
+            lines.append(f"{indent}else if ${var} == {index}")
+            lines.append(assignment(resource))
+        if replacement_resources:
+            lines.append(f"{indent}else")
+            lines.append(assignment(replacement_resources[-1]))
+        lines.append(f"{indent}endif")
+        return block[:any_generated.start()] + "\n".join(lines) + block[any_generated.end():]
+
     if generated:
         indent = generated.group(1)
     else:
-        matches = list(re.finditer(
-            r"(?m)^([ \t]*)this[ \t]*=[ \t]*" + re.escape(original_resource) + r"[ \t]*$",
-            block,
-        ))
-        if len(matches) != 1:
+        style = _find_resource_assignment_style(block, original_resource)
+        if not style:
             return None
-        generated = matches[0]
-        indent = generated.group(1)
+        generated = _resource_assignment_pattern(original_resource).search(block)
+        indent, lhs, ref_prefix = style
 
-    lines = [f"{indent}if ${var} == 0", f"{indent}    this = {original_resource}"]
+    if generated:
+        style = _find_resource_assignment_style(block, original_resource)
+    if not style:
+        # A generated block may have no original-resource line after a manual edit.
+        style = (indent, "this", "")
+    indent, lhs, ref_prefix = style
+
+    def assignment(resource):
+        return f"{indent}    {lhs} = {ref_prefix}{resource}"
+
+    lines = [f"{indent}if ${var} == 0", assignment(original_resource)]
     for index, resource in enumerate(replacement_resources, start=1):
         lines.append(f"{indent}else if ${var} == {index}")
-        lines.append(f"{indent}    this = {resource}")
+        lines.append(assignment(resource))
     if replacement_resources:
         lines.append(f"{indent}else")
-        lines.append(f"{indent}    this = {replacement_resources[-1]}")
+        lines.append(assignment(replacement_resources[-1]))
     lines.append(f"{indent}endif")
     replacement = "\n".join(lines)
     return block[:generated.start()] + replacement + block[generated.end():]
@@ -224,14 +332,20 @@ def apply_group(text, group, ini_path, owner_id):
         text = ensure_resource(text, resource, filename)
         replacement_resources.append(resource)
 
-    var = key_variable(group.key)
+    var = diffuse_group_variable(group)
     text = ensure_constants_var(text, var)
     changed = 0
     for section_name, _, _ in targets:
         match = section_span(text, section_name)
         if not match:
             continue
-        new_block = make_switch_block(match.group(0), original_resource, replacement_resources, var)
+        new_block = make_switch_block(
+            match.group(0),
+            original_resource,
+            replacement_resources,
+            var,
+            legacy_vars=(key_variable(group.key),),
+        )
         if new_block is None:
             continue
         text = text[:match.start()] + new_block + text[match.end():]
@@ -360,7 +474,7 @@ class SSMT_OT_DiffuseSwitch_ScanTarget(bpy.types.Operator):
         if not node or not 0 <= self.group_index < len(node.groups):
             return {"CANCELLED"}
         group = node.groups[self.group_index]
-        path = abs_path(group.ini_path) if group.ini_path else None
+        path = node._shared_ini_path()
         if not path or not path.is_file():
             self.report({"ERROR"}, "请先选择可读取的参考 INI")
             return {"CANCELLED"}
@@ -427,6 +541,7 @@ class SSMTNode_PostProcess_DiffuseSwitch(SSMTNode_PostProcess_Base):
     groups: bpy.props.CollectionProperty(type=SSMT_DiffuseSwitchGroup)
     active_group: bpy.props.IntProperty(default=0)
     namespace: bpy.props.StringProperty(default="", options={"HIDDEN"})
+    ini_path: bpy.props.StringProperty(name="参考/手动修改 INI", subtype="FILE_PATH")
 
     def init(self, context):
         super().init(context)
@@ -445,7 +560,24 @@ class SSMTNode_PostProcess_DiffuseSwitch(SSMTNode_PostProcess_Base):
             self.namespace = "dts_" + uuid.uuid4().hex[:8]
         return self.namespace
 
+    def _shared_ini_path(self):
+        """Return the node-wide INI, migrating the first legacy group path."""
+        if self.ini_path:
+            return abs_path(self.ini_path)
+        for group in self.groups:
+            if group.ini_path:
+                return abs_path(group.ini_path)
+        return None
+
     def draw_buttons(self, context, layout):
+        if not self.ini_path:
+            for legacy_group in self.groups:
+                if legacy_group.ini_path:
+                    self.ini_path = legacy_group.ini_path
+                    break
+        ini_box = layout.box()
+        ini_box.label(text="共享 INI（所有切换组使用同一个文件）", icon="TEXT")
+        ini_box.prop(self, "ini_path", text="参考/手动 INI")
         top = layout.row(align=True)
         top.operator("ssmt.diffuse_switch_add_group", text="添加切换组", icon="ADD").node_name = self.name
         top.operator("ssmt.diffuse_switch_generate", text="生成指定 INI", icon="FILE_TICK").node_name = self.name
@@ -488,9 +620,8 @@ class SSMTNode_PostProcess_DiffuseSwitch(SSMTNode_PostProcess_Base):
                 remove_texture.texture_index = texture_index
 
             targets = box.box()
-            targets.label(text="INI 与目标", icon="TEXT")
+            targets.label(text="目标 TextureOverride", icon="TEXT")
             row = targets.row(align=True)
-            row.prop(group, "ini_path", text="参考/手动 INI")
             scan = row.operator("ssmt.diffuse_switch_scan_target", text="", icon="VIEWZOOM")
             scan.node_name = self.name
             scan.group_index = group_index
@@ -535,17 +666,17 @@ class SSMTNode_PostProcess_DiffuseSwitch(SSMTNode_PostProcess_Base):
 
     @staticmethod
     def _key_metadata(groups):
-        counts = {}
-        comments = OrderedDict()
+        metadata = OrderedDict()
         for group in groups:
+            var = diffuse_group_variable(group)
             key = diffuse_group_hotkey(group)
-            counts[key] = max(counts.get(key, 0), diffuse_group_option_count(group))
             comment = str(group.comment or group.name or "").strip()
-            if comment:
-                comments.setdefault(key, [])
-                if comment not in comments[key]:
-                    comments[key].append(comment)
-        return counts, {key: " / ".join(values) for key, values in comments.items()}
+            metadata[var] = {
+                "key": key,
+                "state_count": diffuse_group_option_count(group),
+                "comment": comment,
+            }
+        return metadata
 
     def _write_groups_to_path(self, path, groups, create_backup=False, gui_guard=""):
         path = Path(path)
@@ -559,14 +690,21 @@ class SSMTNode_PostProcess_DiffuseSwitch(SSMTNode_PostProcess_Base):
         updated = original
         target_count = 0
         owner_id = self._ensure_namespace()
-        key_counts, key_comments = self._key_metadata(groups)
+        key_metadata = self._key_metadata(groups)
         for group in groups:
             if not group.uid:
                 group.uid = uuid.uuid4().hex[:8]
             updated, changed = apply_group(updated, group, path, owner_id)
             target_count += changed
-        for key, state_count in key_counts.items():
-            updated = ensure_keyswap(updated, key, state_count, key_comments.get(key, ""), gui_guard)
+        for var, metadata in key_metadata.items():
+            updated = ensure_keyswap(
+                updated,
+                metadata["key"],
+                metadata["state_count"],
+                metadata["comment"],
+                gui_guard,
+                var=var,
+            )
         if updated != original:
             write_ini(path, updated)
             return True, target_count
@@ -574,9 +712,9 @@ class SSMTNode_PostProcess_DiffuseSwitch(SSMTNode_PostProcess_Base):
 
     def generate_configured_ini_files(self):
         groups_by_path = OrderedDict()
-        for group in self.groups:
-            if group.ini_path:
-                groups_by_path.setdefault(abs_path(group.ini_path), []).append(group)
+        shared_path = self._shared_ini_path()
+        if shared_path:
+            groups_by_path[shared_path] = list(self.groups)
         changed = 0
         target_count = 0
         errors = []
@@ -594,7 +732,8 @@ class SSMTNode_PostProcess_DiffuseSwitch(SSMTNode_PostProcess_Base):
 
     def restore_configured_backups(self):
         count = 0
-        paths = {abs_path(group.ini_path) for group in self.groups if group.ini_path}
+        shared_path = self._shared_ini_path()
+        paths = {shared_path} if shared_path else set()
         for path in paths:
             backup = Path(str(path) + ".diffuse_switch_backup")
             if backup.is_file():
@@ -611,7 +750,8 @@ class SSMTNode_PostProcess_DiffuseSwitch(SSMTNode_PostProcess_Base):
         by_name = {path.name.lower(): path for path in ini_files}
         groups_by_target = OrderedDict()
         for group in self.groups:
-            configured_name = abs_path(group.ini_path).name.lower() if group.ini_path else ""
+            shared_path = self._shared_ini_path()
+            configured_name = shared_path.name.lower() if shared_path else ""
             target = by_name.get(configured_name, ini_files[0])
             groups_by_target.setdefault(target, []).append(group)
 

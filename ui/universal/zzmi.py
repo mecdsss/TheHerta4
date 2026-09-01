@@ -36,11 +36,13 @@ class ExportZZMI(ExportUnity):
     CROSS_IB_METHOD_VB_COPY = "VB_COPY"
     CROSS_IB_METHOD_VB_COPY_CB1 = "VB_COPY_CB1"
     CROSS_IB_METHOD_VB_REF_SO0 = "VB_REF_SO0"
+    CROSS_IB_METHOD_VB_COPY_NORMAL = "VB_COPY_NORMAL"
 
     SUPPORTED_CROSS_IB_METHODS = {
         CROSS_IB_METHOD_VB_COPY,
         CROSS_IB_METHOD_VB_COPY_CB1,
         CROSS_IB_METHOD_VB_REF_SO0,
+        CROSS_IB_METHOD_VB_COPY_NORMAL,
     }
 
     @staticmethod
@@ -661,7 +663,7 @@ class ExportZZMI(ExportUnity):
             section.append("type = Buffer")
             section.append("stride = 40")
 
-        if self.CROSS_IB_METHOD_VB_COPY in source_methods or self.CROSS_IB_METHOD_VB_COPY_CB1 in source_methods:
+        if self.CROSS_IB_METHOD_VB_COPY in source_methods or self.CROSS_IB_METHOD_VB_COPY_CB1 in source_methods or self.CROSS_IB_METHOD_VB_COPY_NORMAL in source_methods:
             section.append("[" + self._get_source_body_vb_resource_name(source_hash, source_first_index) + "]")
 
         if self.CROSS_IB_METHOD_VB_COPY_CB1 in source_methods:
@@ -679,7 +681,7 @@ class ExportZZMI(ExportUnity):
                 self._get_source_so0_resource_name(source_hash, source_first_index) + " = ref so0"
             )
 
-        if self.CROSS_IB_METHOD_VB_COPY in source_methods or self.CROSS_IB_METHOD_VB_COPY_CB1 in source_methods:
+        if self.CROSS_IB_METHOD_VB_COPY in source_methods or self.CROSS_IB_METHOD_VB_COPY_CB1 in source_methods or self.CROSS_IB_METHOD_VB_COPY_NORMAL in source_methods:
             section.append(
                 self._get_source_body_vb_resource_name(source_hash, source_first_index) + " = copy vb0"
             )
@@ -701,7 +703,8 @@ class ExportZZMI(ExportUnity):
         section.append("[TextureOverride_" + texture_override_name_suffix + "_copy]")
         section.append("hash = " + source_hash)
         section.append("match_first_index = " + str(source_first_index))
-        section.append("match_instance_count = 0")
+        if self.CROSS_IB_METHOD_VB_COPY_NORMAL not in source_methods:
+            section.append("match_instance_count = 0")
         self._append_source_capture_lines(
             section,
             source_hash,
@@ -739,7 +742,8 @@ class ExportZZMI(ExportUnity):
             section.append("vs-cb1 = " + self._get_source_cb1_capture_resource_name(source_hash, source_first_index))
         else:
             section.append("vb2 = Resource" + source_hash + "Blend")
-            section.append("vb3 = " + source_body_vb_name)
+            if method != self.CROSS_IB_METHOD_VB_COPY_NORMAL:
+                section.append("vb3 = " + source_body_vb_name)
 
     def _append_target_cross_ib_cleanup(
         self,

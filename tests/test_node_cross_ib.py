@@ -98,6 +98,7 @@ class CrossIBNodeTests(unittest.TestCase):
                 node_cross_ib.CrossIBMethodEnum.VB_COPY,
                 node_cross_ib.CrossIBMethodEnum.VB_COPY_CB1,
                 node_cross_ib.CrossIBMethodEnum.VB_REF_SO0,
+                node_cross_ib.CrossIBMethodEnum.VB_COPY_NORMAL,
             ],
         )
 
