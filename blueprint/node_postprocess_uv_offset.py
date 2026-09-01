@@ -786,7 +786,10 @@ class SSMTNode_PostProcess_UVOffset(SSMTNode_PostProcess_Base):
                 data = f.read(read_size)
             if len(data) < read_size:
                 return None, None
-            indices = [idx + base_vertex_location for idx in struct.unpack(f'<{index_count}I', data)]
+            # 与 node_postprocess_shapekey._calculate_vertex_range 同理：
+            # 烘焙/查找表按静态 VB 行索引，base_vertex 是运行时 SO 前缀偏移，
+            # 不能加进范围（否则范围整体平移 base 行，跨物体边界互相污染）。
+            indices = list(struct.unpack(f'<{index_count}I', data))
             return (min(indices), max(indices)) if indices else (None, None)
         except Exception as e:
             print(f"计算顶点范围时出错: {e}")

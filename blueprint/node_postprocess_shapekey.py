@@ -941,7 +941,13 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 if len(data) < read_size:
                     print(f"    [WARNING] 读取数据不足: 期望 {read_size}, 实际 {len(data)}")
                     return None, None
-                indices = [idx + base_vertex_location for idx in struct.unpack(f'<{index_count}I', data)]
+                # 烘焙表（freq_indices/merged_map 等）按**静态 VB 行**索引，
+                # 而 drawindexed 的 base_vertex 是运行时 SO 缓冲的前缀偏移
+                # （合并骨骼重定向生成的 IB 已预移 base，静态行号 = 裸索引值）。
+                # 若把 base_vertex 加进来，每个物体的烘焙范围会整体平移 base 行，
+                # 跨物体边界互相盖章（base=3 时后一个物体头部 3 行被前一个物体
+                # 的动画槽位覆盖 → 运行时那 3 个顶点跟随错误动画漂移）。
+                indices = list(struct.unpack(f'<{index_count}I', data))
                 
                 min_idx = min(indices) if indices else None
                 max_idx = max(indices) if indices else None
