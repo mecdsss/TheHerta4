@@ -99,6 +99,10 @@ class CrossIBMethodEnum:
     VB_REF_SO0_LABEL = 'VB 引用 SO0'
     VB_REF_SO0_LOGIC_NAME = 'ZZMI'
 
+    VB_COPY_NORMAL = 'VB_COPY_NORMAL'
+    VB_COPY_NORMAL_LABEL = 'VB 复制（兼容正常跨 IB）'
+    VB_COPY_NORMAL_LOGIC_NAME = 'ZZMI'
+
     @classmethod
     def get_items(cls):
         return [
@@ -106,6 +110,7 @@ class CrossIBMethodEnum:
             (cls.VB_COPY, cls.VB_COPY_LABEL, "VB 复制方式 (仅 ZZMI)"),
             (cls.VB_COPY_CB1, cls.VB_COPY_CB1_LABEL, "VB 复制并捕获/恢复 VS-CB1 (仅 ZZMI)"),
             (cls.VB_REF_SO0, cls.VB_REF_SO0_LABEL, "通过 SO0 引用 Body VB0 的方式 (仅 ZZMI)"),
+            (cls.VB_COPY_NORMAL, cls.VB_COPY_NORMAL_LABEL, "复制源 VB0，并绑定源 IB/VB0/VB1/VB2，不绑定 VB3 (仅 ZZMI)"),
         ]
 
     @classmethod
