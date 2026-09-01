@@ -18,3 +18,5 @@ reports/
 test_result.txt
 test/
 theherta4_updater/
+scan_*.py
+audit_drawindexed.py
