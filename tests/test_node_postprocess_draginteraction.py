@@ -2484,6 +2484,223 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertFalse(undeclared, f"未声明变量: {undeclared}")
 
 
+class DragNodeReexportLatchMigrationTests(unittest.TestCase):
+    """D1 回归：旧格式（锁存前）ini 重导出必须升级锁存族段。
+
+    旧 drive/var_sync CS 段无 cs-u5 绑定、旧 PinDetected 段无 latch 清零；
+    读入时按内容特征剥离（_remove_existing_legacy_shapekey_sections），
+    发射侧无条件重发（与 jiggle 同等待遇）→ 重导出后锁存链存活：
+    cs-u5 绑定存在、boot/失臂清零生效，防 F1 假绑/F2 复活回潮。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    def _node_with_sk_consumer(self):
+        node = _make_node(self.mod, enable_shapekey_drive=True)
+        node.id_data = types.SimpleNamespace(nodes=[
+            DragNodeEmitTests._fake_sk_node([("A", 0, "-1", 2), ("B", 0, "0", 1)]),
+        ])
+        return node
+
+    def test_read_ini_strips_legacy_shapekey_sections(self):
+        """读入剥离：无 cs-u5 绑定的旧 drive/var_sync 段与无 latch 清零的旧
+        PinDetected 段必须被删；已含锁存标记的新格式段保留。"""
+        node = _make_node(self.mod)
+        import tempfile
+        old_content = "\n".join([
+            "[Constants]",
+            "global $active = 0",
+            "[CustomShaderDragShapeKeyDrive_testns]",
+            "cs = res/drag_interaction/rzm_shapekey_drive.hlsl",
+            "cs-u0 = ResourceDragShapeKeyDrive_testns",
+            "cs-u4 = ResourceDragShapeKeyClickCountF_testns",
+            "dispatch = 1, 1, 1",
+            "[CustomShaderDragShapeKeyVarSync_testns]",
+            "cs = res/drag_interaction/rzm_shapekey_var_sync.hlsl",
+            "cs-u4 = ResourceDragShapeKeyZoneActive_testns",
+            "dispatch = 1, 1, 1",
+            "[CommandListDragPinDetected_testns]",
+            "if $ssmtdrag_booted_testns == 0",
+            "\tclear = ResourceDragShapeKeyDrive_testns 0.0",
+            "\t$ssmtdrag_booted_testns = 1",
+            "endif",
+        ])
+        with tempfile.TemporaryDirectory() as td:
+            ini_path = Path(td) / "old.ini"
+            ini_path.write_text(old_content, encoding="utf-8")
+            sections, _tail, _driver = node._read_ini_to_ordered_dict(str(ini_path))
+        self.assertNotIn("[CustomShaderDragShapeKeyDrive_testns]", sections)
+        self.assertNotIn("[CustomShaderDragShapeKeyVarSync_testns]", sections)
+        self.assertNotIn("[CommandListDragPinDetected_testns]", sections)
+
+        # 当前形态（含 cs-u5 / latch 清零）不剥离
+        new_content = old_content.replace(
+            "cs-u0 = ResourceDragShapeKeyDrive_testns",
+            "cs-u0 = ResourceDragShapeKeyDrive_testns\n"
+            "cs-u5 = ResourceDragShapeKeyDragLatch_testns",
+        ).replace(
+            "cs-u4 = ResourceDragShapeKeyZoneActive_testns",
+            "cs-u4 = ResourceDragShapeKeyZoneActive_testns\n"
+            "cs-u5 = ResourceDragShapeKeyDragLatch_testns",
+        ).replace(
+            "\tclear = ResourceDragShapeKeyDrive_testns 0.0",
+            "\tclear = ResourceDragShapeKeyDrive_testns 0.0\n"
+            "\tclear = ResourceDragShapeKeyDragLatch_testns 0.0",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            ini_path = Path(td) / "new.ini"
+            ini_path.write_text(new_content, encoding="utf-8")
+            sections, _tail, _driver = node._read_ini_to_ordered_dict(str(ini_path))
+        self.assertIn("[CustomShaderDragShapeKeyDrive_testns]", sections)
+        self.assertIn("[CustomShaderDragShapeKeyVarSync_testns]", sections)
+        self.assertIn("[CommandListDragPinDetected_testns]", sections)
+
+    def test_latch_family_sections_unconditional_reemit(self):
+        """无条件重发：即便 sections 里已存在旧形态段（绕过读入剥离路径），
+        发射侧也必须覆盖为携带 cs-u5 绑定的当前形态。"""
+        sections = _base_sections()
+        sections["[CustomShaderDragShapeKeyDrive_testns]"] = [
+            "cs = res/drag_interaction/rzm_shapekey_drive.hlsl",
+            "cs-u0 = ResourceDragShapeKeyDrive_testns",
+            "dispatch = 1, 1, 1",
+        ]
+        sections["[CustomShaderDragShapeKeyVarSync_testns]"] = [
+            "cs = res/drag_interaction/rzm_shapekey_var_sync.hlsl",
+            "dispatch = 1, 1, 1",
+        ]
+        sections["[CommandListDragPinDetected_testns]"] = [
+            "if $ssmtdrag_booted_testns == 0",
+            "\tclear = ResourceDragShapeKeyDrive_testns 0.0",
+            "\t$ssmtdrag_booted_testns = 1",
+            "endif",
+        ]
+        node = self._node_with_sk_consumer()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+
+        cs = "\n".join(sections["[CustomShaderDragShapeKeyDrive_testns]"])
+        self.assertIn("cs-u5 = ResourceDragShapeKeyDragLatch_testns", cs)
+        self.assertIn("post cs-u5 = null", cs)
+        vs = "\n".join(sections["[CustomShaderDragShapeKeyVarSync_testns]"])
+        self.assertIn("cs-u5 = ResourceDragShapeKeyDragLatch_testns", vs)
+        pin = "\n".join(sections["[CommandListDragPinDetected_testns]"])
+        self.assertIn("clear = ResourceDragShapeKeyDragLatch_testns 0.0", pin)
+
+    def test_old_ini_reexport_latch_chain_alive(self):
+        """端到端回归（验收场景）：旧格式 ini → 读入剥离 → 重导出 →
+        锁存链存活（cs-u5 绑定存在、boot/失臂清零生效、latch 资源落盘）。"""
+        import tempfile
+        old_drive = "\n".join([
+            "cs = res/drag_interaction/rzm_shapekey_drive.hlsl",
+            "x76 = $ssmtdrag_delta_time_testns",
+            "z77 = $ssmtdrag_drag_enabled_testns",
+            "w77 = $ssmtdrag_lmb_down_testns",
+            "x78 = $ssmtdrag_x_down_testns",
+            "x79 = $ssmtdrag_shapekey_dy_testns",
+            "y79 = $ssmtdrag_shapekey_dx_testns",
+            "x80 = 0.02",
+            "cs-u0 = ResourceDragShapeKeyDrive_testns",
+            "cs-u1 = ResourceDragShapeKeyDir_testns",
+            "cs-u2 = ResourceDragShapeKeyClickCount_testns",
+            "cs-u3 = ResourceDragShapeKeyActiveDir_testns",
+            "cs-u4 = ResourceDragShapeKeyClickCountF_testns",
+            "dispatch = 1, 1, 1",
+            "post cs-u0 = null",
+            "post cs-u1 = null",
+            "post cs-u2 = null",
+            "post cs-u3 = null",
+            "post cs-u4 = null",
+        ])
+        old_pin = "\n".join([
+            "if $ssmtdrag_booted_testns == 0",
+            "\tclear = ResourceDragDetectID_testns 0.0",
+            "\tclear = ResourceDragShapeKeyDrive_testns 0.0",
+            "\tclear = ResourceDragShapeKeyDir_testns 0.0",
+            "\t$ssmtdrag_booted_testns = 1",
+            "endif",
+            "if $ssmtdrag_drag_enabled_testns >= 1 && $ssmtdrag_mode_testns == 1",
+            "\t$ObjectDetectAllowed_testns = 1",
+            "\trun = CustomShaderDragShapeKeyDrive_testns",
+            "else",
+            "\t$ObjectDetectAllowed_testns = 0",
+            "endif",
+        ])
+        content = "\n".join([
+            "[Constants]",
+            "global $active = 0",
+            "[TextureOverride_abc123_abc123-43191_VertexLimitRaise]",
+            "hash = abc123",
+            "override_byte_stride = 40",
+            "override_vertex_count = 14078",
+            "uav_byte_stride = 4",
+            "[TextureOverride_abc123_abc123-43191A]",
+            "hash = abc123",
+            "match_first_index = 0",
+            "ib = Resourceabc123-43191AIB",
+            "drawindexed = 52688, 0, 0",
+            "[Resource_abc123_Position]",
+            "type = Buffer",
+            "stride = 40",
+            "filename = Meshes/abc123-43191-Position.buf",
+            "[Resourceabc123-43191AIB]",
+            "type = Buffer",
+            "format = DXGI_FORMAT_R32_UINT",
+            "[CustomShaderDragShapeKeyDrive_testns]",
+            old_drive,
+            "[CommandListDragPinDetected_testns]",
+            old_pin,
+            "[Present]",
+        ])
+        with tempfile.TemporaryDirectory() as td:
+            ini_path = Path(td) / "old.ini"
+            ini_path.write_text(content, encoding="utf-8")
+            node = self._node_with_sk_consumer()
+            sections, _tail, _driver = node._read_ini_to_ordered_dict(str(ini_path))
+            # 旧段读入即剥离（无 cs-u5 / 无 latch 清零）
+            self.assertNotIn("[CustomShaderDragShapeKeyDrive_testns]", sections)
+            self.assertNotIn("[CommandListDragPinDetected_testns]", sections)
+            comps = node._locate_components(sections, ["abc123"])
+            self.assertTrue(comps)
+            node._emit_sections(sections, comps, "testns")
+            node._emit_present_and_constants(sections, comps, "testns")
+            # 锁存链存活：cs-u5 绑定 + latch 资源落盘
+            cs = "\n".join(sections["[CustomShaderDragShapeKeyDrive_testns]"])
+            self.assertIn("cs-u5 = ResourceDragShapeKeyDragLatch_testns", cs)
+            self.assertIn("post cs-u5 = null", cs)
+            vs = "\n".join(sections["[CustomShaderDragShapeKeyVarSync_testns]"])
+            self.assertIn("cs-u5 = ResourceDragShapeKeyDragLatch_testns", vs)
+            self.assertEqual(
+                sections["[ResourceDragShapeKeyDragLatch_testns]"],
+                ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
+            )
+            # boot 清零 + 失臂 else 清零生效
+            pin = sections["[CommandListDragPinDetected_testns]"]
+            boot_idx = next(
+                i for i, line in enumerate(pin)
+                if "$ssmtdrag_booted_testns == 0" in line
+            )
+            self.assertIn(
+                "clear = ResourceDragShapeKeyDragLatch_testns 0.0",
+                "\n".join(pin[boot_idx:]),
+            )
+            disarm_idx = next(
+                i for i, line in enumerate(pin)
+                if line == "\t$ObjectDetectAllowed_testns = 0"
+            )
+            self.assertEqual(
+                pin[disarm_idx + 1],
+                "\tclear = ResourceDragShapeKeyDragLatch_testns 0.0",
+            )
+            # Present 终态 else（G1：模式 1→0 直跳清锁存）
+            present = "\n".join(sections["[Present]"])
+            self.assertIn(
+                "else\n\tclear = ResourceDragShapeKeyDragLatch_testns 0.0\nendif",
+                present,
+            )
+
+
 class DragNodeInjectTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

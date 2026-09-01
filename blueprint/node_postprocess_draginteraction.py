@@ -1206,6 +1206,33 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "[ResourceDragJiggleTempVB0_", "[ResourceDragJiggleShadowVB_"))]:
             del sections[section_name]
 
+    @staticmethod
+    def _remove_existing_legacy_shapekey_sections(sections):
+        """清除锁存（latch）引入前的形态键驱动族段（重导出迁移，评审 D1）。
+
+        当前治理目标：旧格式 ini（锁存前版本生成）重导出后，新 hlsl（声明
+        DragLatch u5）会与旧段错配——旧 drive/var_sync CS 段无
+        `cs-u5 = ResourceDragShapeKeyDragLatch_*` 绑定（u5 未绑定，GetDimensions
+        落空或加载报错）、旧 PinDetected 段无 `clear = ResourceDragShapeKeyDragLatch`
+        （boot/失臂锁存清零缺失 → F1 假绑 zone0 / F2 复活回潮）。
+        按内容特征剔除：命中旧形态（缺锁存标记）的段删除，由发射侧按当前形态
+        无条件重发（见 _emit_shapekey_* 的 D1 注释）。已含锁存标记的新段保留
+        （重发内容与之一致，剔除与否无差异，仅在发射侧统一覆盖）。"""
+        for family in (
+            "[CustomShaderDragShapeKeyDrive_",
+            "[CustomShaderDragShapeKeyVarSync_",
+        ):
+            for section_name in [name for name in sections
+                                 if name.startswith(family)]:
+                joined = "\n".join(str(line) for line in sections[section_name])
+                if "cs-u5 = ResourceDragShapeKeyDragLatch" not in joined:
+                    del sections[section_name]
+        for section_name in [name for name in sections
+                             if name.startswith("[CommandListDragPinDetected_")]:
+            joined = "\n".join(str(line) for line in sections[section_name])
+            if "clear = ResourceDragShapeKeyDragLatch" not in joined:
+                del sections[section_name]
+
     def _read_ini_to_ordered_dict(self, ini_file_path):
         sections = OrderedDict()
         current_section = None
@@ -1226,6 +1253,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     sections[current_section].append(line)
             self._remove_existing_draw_hooks(sections)
             self._remove_existing_legacy_jiggle_vb0_sections(sections)
+            self._remove_existing_legacy_shapekey_sections(sections)
         except FileNotFoundError:
             return None, "", ""
         return sections, preserved_tail_content, preserved_driver_content
@@ -3790,8 +3818,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     def _emit_shapekey_drive_section(self, sections, ns):
         sec = f"[CustomShaderDragShapeKeyDrive_{ns}]"
-        if sec in sections:
-            return
+        # 无条件重发（评审 D1，与 _emit_jiggle_section 同等待遇）：内容确定性幂等，
+        # 重导出必须覆盖旧形态——旧段无 cs-u5 锁存绑定会与新 hlsl 错配（u5 未绑定 →
+        # 锁存链死）；读入侧另按内容特征剥离旧段（_remove_existing_legacy_shapekey_sections），
+        # 此处无既有段跳过守卫，保证当前形态恒胜出。
         drag_mode_var = self._runtime_variable_names(ns)[0]
         lines = [
             f"cs = {RES_SHADER_DIR}/rzm_shapekey_drive.hlsl",
@@ -3844,8 +3874,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if not bindings:
             return
         sec = f"[CustomShaderDragShapeKeyVarSync_{ns}]"
-        if sec in sections:
-            return
+        # 无条件重发（评审 D1，与 _emit_jiggle_section 同等待遇）：内容确定性幂等，
+        # 重导出覆盖旧形态（旧段无 cs-u5 锁存绑定，读入侧已剥离，见
+        # _remove_existing_legacy_shapekey_sections）
         drag_mode_var = self._runtime_variable_names(ns)[0]
         # 值区固定 81..89、握手模式区固定 90..98，各容纳 36 个绑定且不重叠。
         # 门控输入固定 IniParams[75]（低于驱动 CS 段，不与其他段冲突）
@@ -3895,8 +3926,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if not bindings:
             return
         sec = f"[CommandListDragShapeKeyVarReadback_{ns}]"
-        if sec in sections:
-            return
+        # 无条件重发（评审 D1，与 _emit_jiggle_section 同等待遇）：内容确定性幂等，
+        # 重导出覆盖旧形态（bindings 由当前节点树决定，存在旧段时也必须刷新）
         # store 放在命名命令列表内（[Present] 以 pre run 调用、boot 门控）。
         # 写法：store = $var, <资源名>, <float 索引>——不能带 ref 关键字！
         # 分词器把 ref 当独立 token 交给 GetTarget，ParseTarget 无此分支 →
@@ -3942,6 +3973,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         drag_mode_var, _ui_detected_var, _ui_zone_var = self._runtime_variable_names(ns)
         # PinDetected
         pin_sec = f"[CommandListDragPinDetected_{ns}]"
+        # 无条件重发（评审 D1，与 _emit_jiggle_section 同等待遇）：内容确定性幂等，
+        # 重导出必须覆盖旧形态——旧段缺 boot/失臂锁存清零（F1 假绑/F2 复活回潮）。
+        # 先剔除旧段保证恒走重建路径；读入侧另按内容特征剥离
+        #（_remove_existing_legacy_shapekey_sections）。
+        sections.pop(pin_sec, None)
         if pin_sec not in sections:
             lines = [
                 # boot-clear：RWBuffer 初始内容未定义，首帧垃圾会假命中/假位移
