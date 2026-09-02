@@ -1675,6 +1675,72 @@ class DragNodeEmitTests(unittest.TestCase):
             self.assertIn("ResourceDragJiggleTempVB0_abc123_43191_testns", line)
             self.assertNotIn("ShadowVB", line)
 
+    def test_ttl_copy_sections_get_slim_hook(self):
+        # 回归（2026-09-02 实机：TTL 层完全不吃形态键/拖拽，与本体一层分歧）：
+        # 引用 CommandListSSMTTTLDraw 的材质 copy 段必须获得段级钩子——命令
+        # 列表内层的 vb0 换绑传播不到 run = 嵌套命令列表的绘制，仅 CL 内换绑时
+        # TTLib 离屏捕获读到的是段级 RedirectSO 原始数据。
+        # 钩子为瘦身形态（无 Bake/Detect）：逐段重复 Bake/Detect dispatch 是
+        # 86e3c86 去重要消的开销；jiggle 烘焙 time 守卫每帧至多一次。
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        copy_sec = "[TextureOverrideLOD0_abc123_abc123-43191A_deadbeef_copy]"
+        sections[copy_sec] = [
+            "hash = abc123",
+            "match_first_index = 0",
+            "vb0 = ResourceZZRedirectSO_deadbeef",
+            "ib = Resourceabc123-43191AIB",
+            "run = CommandListSkinTexture",
+            "if $swapkey0 == 1",
+            "    run = CommandListSSMTTTLDraw_abc123_43191_testns",
+            "endif",
+        ]
+        for comp in comps:
+            node._inject_draw_hooks(sections, comp, "testns")
+        copy_lines = sections[copy_sec]
+        copy_text = "\n".join(copy_lines)
+        self.assertIn("DRAG HOOK BEGIN abc123_43191P0_testns", copy_text)
+        self.assertIn("vb0 = ResourceDragJiggleTempVB0_abc123_43191_testns", copy_text)
+        self.assertNotIn("CustomShaderDragBake", copy_text)
+        self.assertNotIn("CustomShaderDragDetect", copy_text)
+        # 钩子落点：SkinTexture 之后、TTL 条件块之前（与旧版可用布局一致）
+        skin_idx = next(i for i, l in enumerate(copy_lines)
+                        if l.strip() == "run = CommandListSkinTexture")
+        hook_idx = next(i for i, l in enumerate(copy_lines)
+                        if "DRAG HOOK BEGIN" in l)
+        cond_idx = next(i for i, l in enumerate(copy_lines)
+                        if l.strip() == "if $swapkey0 == 1")
+        self.assertLess(skin_idx, hook_idx)
+        self.assertLess(hook_idx, cond_idx)
+
+    def test_ttl_copy_hook_reexport_idempotent(self):
+        # 重导出链路：读入剥离（_remove_existing_draw_hooks）后必须重建 copy
+        # 段钩子，且重复注入不产生重复钩子（回归：重导出后 TTL 段钩子永久丢失）
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        copy_sec = "[TextureOverrideLOD0_abc123_abc123-43191A_deadbeef_copy]"
+        sections[copy_sec] = [
+            "hash = abc123",
+            "match_first_index = 0",
+            "ib = Resourceabc123-43191AIB",
+            "run = CommandListSkinTexture",
+            "    run = CommandListSSMTTTLDraw_abc123_43191_testns",
+        ]
+        for comp in comps:
+            node._inject_draw_hooks(sections, comp, "testns")
+        # 模拟重导出：读入剥离 → 重新注入
+        node._remove_existing_draw_hooks(sections)
+        self.assertNotIn("DRAG HOOK BEGIN", "\n".join(sections[copy_sec]))
+        comps = node._locate_components(sections, ["abc123"])
+        for comp in comps:
+            node._inject_draw_hooks(sections, comp, "testns")
+        text = "\n".join(sections[copy_sec])
+        self.assertEqual(text.count("DRAG HOOK BEGIN"), 1)
+
     def test_bake_offsets_part_local(self):
         _, sections, _ = self._emit()
         # part A: index_count=52688 → step = 52688//8 = 6586；R5 段合并后单 sample 段

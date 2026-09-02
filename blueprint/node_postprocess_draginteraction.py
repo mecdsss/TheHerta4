@@ -4400,6 +4400,52 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             new_lines = lines[:insert_at] + hook + lines[insert_at:]
             sections[section] = new_lines
 
+        # 3) TTL 材质 copy 段的段级钩子（瘦身形态：探针 + drawn + jiggle 烘焙/换绑，
+        #    不含 Bake/Detect）。
+        #    必须段级换绑的原因：命令列表内层的 vb0 赋值传播不到 run = 嵌套命令
+        #    列表的绘制（2026-09-02 实机：仅 CommandListSSMTTTLDraw 内换绑时 TTLib
+        #    离屏捕获读到的是段级 RedirectSO 原始数据 → TTL 层完全不吃拖拽/形态键，
+        #    与本体出现一层分歧）。Bake/Detect 的逐段重复 dispatch 才是 86e3c86
+        #    去重要消的开销（同 IB 55 钩子帧数个位数）；jiggle 烘焙有 time 守卫
+        #    每帧全局至多一次，探针有 armed 门控，瘦身钩子零额外成本。
+        #    读入侧 _remove_existing_draw_hooks 会全表剥离钩子，此处无条件重建，
+        #    重导出路径同样生效。
+        cl_ref = f"run = CommandListSSMTTTLDraw_{cn}_{ns}"
+        for section_name, sec_lines in list(sections.items()):
+            if not isinstance(sec_lines, list):
+                continue
+            if section_name.startswith("[CommandList"):
+                continue
+            if any("DRAG HOOK BEGIN" in line for line in sec_lines):
+                continue
+            if not any(str(line).strip() == cl_ref for line in sec_lines):
+                continue
+            # 该 copy 段克隆自哪个 part：按段名内嵌的 drawid 归归属，兜底 P0
+            parent_p_idx = 0
+            haystack = re.sub(r"[^0-9A-Za-z_]+", "_", str(section_name))
+            for p_idx, part in enumerate(comp["parts"]):
+                raw = str(part.get("section", "")).strip().strip("[]")
+                raw = re.sub(r"^TextureOverride_?", "", raw)
+                token = re.sub(r"[^0-9A-Za-z_]+", "_", raw).strip("_")
+                if token and token in haystack:
+                    parent_p_idx = p_idx
+                    break
+            hook = self._build_hook_block(comp, parent_p_idx, ns, include_detect=False)
+            insert_at = self._find_ttl_copy_hook_insert_index(sec_lines)
+            sections[section_name] = sec_lines[:insert_at] + hook + sec_lines[insert_at:]
+
+    @staticmethod
+    def _find_ttl_copy_hook_insert_index(lines):
+        """TTL copy 段钩子落点：最后一个 run = CommandListSkinTexture 之后
+        （与旧版可用布局一致：钩子位于段头资源绑定之后、mesh 注释/TTL 参数之前）。"""
+        for i in range(len(lines) - 1, -1, -1):
+            if str(lines[i]).strip() == "run = CommandListSkinTexture":
+                return i + 1
+        for i, line in enumerate(lines):
+            if str(line).strip().startswith("; [mesh:"):
+                return i
+        return len(lines)
+
     @classmethod
     def _find_part_hook_insert_index(cls, lines, part):
         anchor_comment = part.get("hook_anchor_comment")
@@ -4445,7 +4491,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 没有 run/drawindexed（异常）：插到 ib 后一行
         return ib_idx + 1
 
-    def _build_hook_block(self, comp, p_idx, ns):
+    def _build_hook_block(self, comp, p_idx, ns, include_detect=True):
         drag_mode_var, _ui_detected_var, _ui_zone_var = self._runtime_variable_names(ns)
         cn = comp["comp_name"]
         part_tag = f"{cn}P{p_idx}"
@@ -4463,14 +4509,17 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\t\tResourceDragViewportSource_{ns} = copy o0 unless_null",
                 "\tendif",
             ])
+        lines.append(f"\t$ssmtdrag_drawn_{ns} = 1")
+        if include_detect:
+            lines.extend([
+                # 悬停检测不要求 Alt（与实机验证过的可用配置一致）：
+                # 模式开关（drag_mode_var >= 1）打开即检测，Alt 只门控实际形变（jiggle 门）。
+                f"\tif {drag_mode_var} >= 1 && $ObjectDetectAllowed_{ns} == 1",
+                f"\t\trun = CustomShaderDragBake{part_tag}_{ns}",
+                f"\t\trun = CustomShaderDragDetect{part_tag}_{ns}",
+                "\tendif",
+            ])
         lines.extend([
-            f"\t$ssmtdrag_drawn_{ns} = 1",
-            # 悬停检测不要求 Alt（与实机验证过的可用配置一致）：
-            # 模式开关（drag_mode_var >= 1）打开即检测，Alt 只门控实际形变（jiggle 门）。
-            f"\tif {drag_mode_var} >= 1 && $ObjectDetectAllowed_{ns} == 1",
-            f"\t\trun = CustomShaderDragBake{part_tag}_{ns}",
-            f"\t\trun = CustomShaderDragDetect{part_tag}_{ns}",
-            "\tendif",
             f"\tif {drag_mode_var} >= 2 && $ssmtdrag_mode_{ns} == 1",
             f"\t\tif time != {last_dispatch}",
             f"\t\t\trun = CustomShaderDragJiggle{cn}_{ns}",

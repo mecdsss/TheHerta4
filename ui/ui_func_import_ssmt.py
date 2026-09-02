@@ -883,8 +883,14 @@ def ImprotFromWorkSpaceFull(self, context):
                         rename_by_group[id(rename_group)] = rename_node
                     rule = rename_node.rename_rules.add()
                     rule.name = f"Rule_{len(rename_node.rename_rules):03d}"
-                    rule.search_str = source_obj.name
-                    rule.replace_str = target_obj.name
+                    # 与右键「快速添加重命名规则」（node_menu.py
+                    # SSMT_OT_QuickAddRenameRule）同口径：规则只写结构化前缀，
+                    # 剔除点后的自定义后缀/Blender .001 冲突后缀，避免规则与
+                    # 导入瞬时全名强耦合、后缀被连坐替换；提取失败时回退全名保底。
+                    _src_prefix_info = ObjectPrefixHelper.extract_prefix_info(source_obj.name)
+                    _tgt_prefix_info = ObjectPrefixHelper.extract_prefix_info(target_obj.name)
+                    rule.search_str = (_src_prefix_info[0] if _src_prefix_info else "") or source_obj.name
+                    rule.replace_str = (_tgt_prefix_info[0] if _tgt_prefix_info else "") or target_obj.name
 
                     # 顶点组处理节点挂在 LOD1（目标）端所在组
                     vg_proc = vg_process_by_group.get(id(group_node))
