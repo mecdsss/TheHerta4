@@ -102,6 +102,175 @@ def _find_node(context, node_name):
     return None
 
 
+def _find_custom_node(node):
+    """只接受材质转资源pro 节点（独立检测 operator 使用）。"""
+    return bool(node is not None and getattr(node, "bl_idname", "") == NODE_IDNAME)
+
+
+class SSMT_OT_CustomMaterialDetectAddPrefix(bpy.types.Operator):
+    bl_idname = "ssmt.custom_material_detect_add_prefix"
+    bl_label = "添加前缀"
+    bl_description = "按预设顺序添加下一个材质检测前缀（材质转资源pro 独立）"
+    bl_options = {'INTERNAL'}
+
+    node_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        node = _find_node(context, self.node_name)
+        if not node:
+            return {'CANCELLED'}
+
+        existing = {item.prefix for item in node.material_detect_prefixes}
+        for preset in MATERIAL_DETECT_PRESETS:
+            if preset not in existing:
+                new_item = node.material_detect_prefixes.add()
+                new_item.prefix = preset
+                return {'FINISHED'}
+
+        self.report({'WARNING'}, "所有预设前缀已添加")
+        return {'CANCELLED'}
+
+
+class SSMT_OT_CustomMaterialDetectRemovePrefix(bpy.types.Operator):
+    bl_idname = "ssmt.custom_material_detect_remove_prefix"
+    bl_label = "移除前缀"
+    bl_description = "移除指定索引的材质检测前缀（材质转资源pro 独立）"
+    bl_options = {'INTERNAL'}
+
+    node_name: bpy.props.StringProperty()
+    item_index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        node = _find_node(context, self.node_name)
+        if node:
+            if 0 <= self.item_index < len(node.material_detect_prefixes):
+                node.material_detect_prefixes.remove(self.item_index)
+        return {'FINISHED'}
+
+
+class SSMT_OT_CustomMaterialDetectAddCustomPrefix(bpy.types.Operator):
+    bl_idname = "ssmt.custom_material_detect_add_custom_prefix"
+    bl_label = "添加自定义前缀"
+    bl_description = "添加手动输入的材质检测前缀（材质转资源pro 独立）"
+    bl_options = {'INTERNAL'}
+
+    node_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        node = _find_node(context, self.node_name)
+        if not node:
+            return {'CANCELLED'}
+
+        custom = node.temp_prefix_input.strip()
+        if not custom:
+            self.report({'WARNING'}, "请输入前缀")
+            return {'CANCELLED'}
+
+        existing = {item.prefix for item in node.material_detect_prefixes}
+        if custom in existing:
+            self.report({'WARNING'}, f"前缀 '{custom}' 已存在")
+            return {'CANCELLED'}
+
+        new_item = node.material_detect_prefixes.add()
+        new_item.prefix = custom
+        node.temp_prefix_input = ""
+        return {'FINISHED'}
+
+
+class SSMT_OT_CustomMaterialDetect(bpy.types.Operator):
+    bl_idname = "ssmt.custom_material_detect"
+    bl_label = "Material Detect (Pro)"
+    bl_description = "按材质转资源pro 的指定范围检测缺失前缀材质（含嵌套蓝图）"
+    bl_options = {'INTERNAL'}
+
+    node_name: bpy.props.StringProperty()
+
+    def _collect_target_object_names(self, node):
+        """返回本次检测的部件名列表：非全局=白名单部件，全局=蓝图链路部件。"""
+        names = []
+        seen = set()
+        if bool(getattr(node, "use_global_assign", False)):
+            tree = getattr(node, "id_data", None)
+            for obj_name in _connected_blueprint_object_names(tree) if tree is not None else []:
+                if obj_name in seen:
+                    continue
+                seen.add(obj_name)
+                names.append(obj_name)
+        else:
+            for item in node.target_items:
+                obj = getattr(item, "target_object", None)
+                if obj is None or getattr(obj, "type", "") != "MESH":
+                    continue
+                if obj.name in seen:
+                    continue
+                seen.add(obj.name)
+                names.append(obj.name)
+        return names
+
+    def execute(self, context):
+        node = _find_node(context, self.node_name)
+        if not node:
+            return {'CANCELLED'}
+
+        prefixes = [item.prefix.strip() for item in node.material_detect_prefixes if item.prefix.strip()]
+        if not prefixes:
+            self.report({'WARNING'}, 'Add at least one material prefix first')
+            return {'CANCELLED'}
+
+        unique_object_names = self._collect_target_object_names(node)
+        if not unique_object_names:
+            self.report({'WARNING'}, '未找到需要检测的部件（非全局模式请先在材质转资源pro节点中添加目标部件）')
+            return {'CANCELLED'}
+
+        node.detected_materials.clear()
+
+        missing_count = 0
+        for obj_name in unique_object_names:
+            obj = bpy.data.objects.get(obj_name)
+            if not obj:
+                continue
+
+            for prefix in prefixes:
+                has_prefix_material = False
+                for material_slot in obj.material_slots:
+                    material = material_slot.material
+                    if material and material.name.startswith(prefix):
+                        has_prefix_material = True
+                        break
+
+                if has_prefix_material:
+                    continue
+
+                item = node.detected_materials.add()
+                item.object_name = obj_name
+                item.missing_prefix = prefix
+                missing_count += 1
+
+        node.detect_all_ok = (missing_count == 0)
+
+        if missing_count > 0:
+            self.report({'WARNING'}, f'Detection finished: {missing_count} missing entries across {len(unique_object_names)} objects')
+        else:
+            self.report({'INFO'}, f'Detection finished: all prefixes found across {len(unique_object_names)} objects')
+        return {'FINISHED'}
+
+
+class SSMT_OT_CustomMaterialDetectClear(bpy.types.Operator):
+    bl_idname = "ssmt.custom_material_detect_clear"
+    bl_label = "清除结果"
+    bl_description = "清除材质转资源pro 的检测结果"
+    bl_options = {'INTERNAL'}
+
+    node_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        node = _find_node(context, self.node_name)
+        if node:
+            node.detected_materials.clear()
+            node.detect_all_ok = False
+        return {'FINISHED'}
+
+
 class SSMT_OT_CustomMaterialAssignAddTarget(bpy.types.Operator):
     bl_idname = "ssmt.custom_material_assign_add_target"
     bl_label = "添加目标部件"
@@ -1175,14 +1344,14 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_Material):
         box = layout.box()
         prefix_row = box.row(align=True)
         prefix_row.label(text="检测前缀:", icon="FILTER")
-        op = prefix_row.operator("ssmt.material_detect_add_prefix", text="", icon="ADD")
+        op = prefix_row.operator("ssmt.custom_material_detect_add_prefix", text="", icon="ADD")
         op.node_name = self.name
 
         for index, item in enumerate(self.material_detect_prefixes):
             row = box.row(align=True)
             row.label(text=item.prefix, icon="MATERIAL")
             remove = row.operator(
-                "ssmt.material_detect_remove_prefix",
+                "ssmt.custom_material_detect_remove_prefix",
                 text="",
                 icon="X",
             )
@@ -1192,16 +1361,16 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_Material):
         input_row = box.row(align=True)
         input_row.prop(self, "temp_prefix_input", text="", icon="CONSOLE")
         add_custom = input_row.operator(
-            "ssmt.material_detect_add_custom_prefix",
+            "ssmt.custom_material_detect_add_custom_prefix",
             text="",
             icon="ADD",
         )
         add_custom.node_name = self.name
 
         btn_row = box.row(align=True)
-        detect = btn_row.operator("ssmt.material_detect", text="检测材质", icon="VIEWZOOM")
+        detect = btn_row.operator("ssmt.custom_material_detect", text="检测材质", icon="VIEWZOOM")
         detect.node_name = self.name
-        clear = btn_row.operator("ssmt.material_detect_clear", text="清除", icon="X")
+        clear = btn_row.operator("ssmt.custom_material_detect_clear", text="清除", icon="X")
         clear.node_name = self.name
 
         if self.detected_materials:
@@ -1373,112 +1542,6 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_Material):
                 icon="TIME",
             )
         self.draw_material_detection_panel(context, layout)
-        return
-
-        title = layout.box()
-        if self.use_global_assign:
-            title.label(text="使用全局指定：目标列表不会限制处理范围", icon="OBJECT_DATA")
-            title.label(
-                text="下方列表仅用于预览与贴图切换扫描",
-                icon="INFO",
-            )
-        else:
-            title.label(text="目标部件（仅这些部件会按材质生成）", icon="OBJECT_DATA")
-            title.label(
-                text="未在此列表中的部件保持默认配置，不会修改",
-                icon="INFO",
-            )
-        scan_row = layout.row(align=True)
-        scan = scan_row.operator(
-            "ssmt.custom_material_scan_switches",
-            text="全局扫描贴图切换",
-            icon="FILE_REFRESH",
-        )
-        scan.node_name = self.name
-        clear = scan_row.operator(
-            "ssmt.custom_material_clear_switches",
-            text="清除",
-            icon="X",
-        )
-        clear.node_name = self.name
-
-        rows = layout.box()
-        header = rows.row(align=True)
-        header.label(text=f"部件输入框（{len(self.target_items)} 个）")
-        add = header.operator(
-            "ssmt.custom_material_assign_add_target", text="添加", icon="ADD"
-        )
-        add.node_name = self.name
-
-        for index, item in enumerate(self.target_items):
-            box = rows.box()
-            row = box.row(align=True)
-            row.prop(item, "target_object", text=f"部件 {index + 1}")
-            pick = row.operator(
-                "ssmt.custom_material_assign_pick_target",
-                text="",
-                icon="EYEDROPPER",
-            )
-            pick.node_name = self.name
-            pick.item_index = index
-            remove_row = row.row(align=True)
-            remove_row.enabled = len(self.target_items) > 1
-            remove = remove_row.operator(
-                "ssmt.custom_material_assign_remove_target", text="", icon="X"
-            )
-            remove.node_name = self.name
-            remove.item_index = index
-
-            target = item.target_object
-            if target is None:
-                box.label(
-                    text="未指定（可拖入大纲物体，或使用吸管）",
-                    icon="INFO",
-                )
-            elif target.type != "MESH":
-                box.label(text="仅支持网格物体", icon="ERROR")
-            else:
-                box.label(text=f"物体: {target.name}", icon="MESH_DATA")
-                for group_index, group in enumerate(item.switch_groups):
-                    group_box = box.box()
-                    group_header = group_box.row(align=True)
-                    group_header.prop(
-                        group,
-                        "enabled",
-                        text="",
-                        icon="CHECKBOX_HLT" if group.enabled else "CHECKBOX_DEHLT",
-                    )
-                    group_header.label(
-                        text=f"贴图切换 {group_index + 1}（{group.state_count} 档）",
-                        icon="KEYFRAME_HLT",
-                    )
-                    group_box.prop(
-                        group,
-                        "switch_variable",
-                        text="材质切换变量",
-                    )
-                    group_box.prop(group, "comment", text="备注")
-                    group_box.prop(group, "key", text="切换按键")
-
-        options = layout.box()
-        options.label(text="材质转资源选项", icon="MATERIAL")
-        options.prop(self, "material_to_resource_override")
-        options.prop(self, "restore_default_textures_after_draw")
-        options.prop(self, "debug_disable_fx_ttl")
-
-        layout.label(
-            text="材质命名前缀沿用材质转资源规则（如 DiffuseMap_xxx）",
-            icon="INFO",
-        )
-        layout.label(
-            text="顶层指定部件会自动移到本段末尾绘制，避免污染后续部件",
-            icon="SORT_ASC",
-        )
-        layout.label(
-            text="导出 Mod 时自动执行；未指定部件对应的 INI 段不会被修改",
-            icon="TIME",
-        )
-        self.draw_material_detection_panel(context, layout)
 
     def execute_postprocess(self, mod_export_path, exporter=None):
         if not bool(getattr(self, "use_global_assign", False)) and not self._target_object_set():
@@ -1490,6 +1553,11 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_Material):
 classes = (
     SSMT_CustomMaterialAssignSwitchGroup,
     SSMT_CustomMaterialAssignTargetItem,
+    SSMT_OT_CustomMaterialDetectAddPrefix,
+    SSMT_OT_CustomMaterialDetectRemovePrefix,
+    SSMT_OT_CustomMaterialDetectAddCustomPrefix,
+    SSMT_OT_CustomMaterialDetect,
+    SSMT_OT_CustomMaterialDetectClear,
     SSMT_OT_CustomMaterialAssignAddTarget,
     SSMT_OT_CustomMaterialAssignRemoveTarget,
     SSMT_OT_CustomMaterialAssignPickTarget,
