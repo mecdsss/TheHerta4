@@ -36,6 +36,7 @@ _SINGLE_INSTANCE_POSTPROCESS_LABELS = {
     "SSMTNode_PostProcess_Glow": "RabbitFX 贴图后处理",
     "SSMTNode_PostProcess_HealthDetection": "血量检测",
     "SSMTNode_PostProcess_Material": "材质转资源",
+    "SSMTNode_PostProcess_CustomMaterialAssign": "材质转资源pro",
     "SSMTNode_PostProcess_MultiFile": "多文件配置",
     "SSMTNode_PostProcess_PSBinding": "PS绑定",
     "SSMTNode_PostProcess_ResourceMerge": "资源合并",

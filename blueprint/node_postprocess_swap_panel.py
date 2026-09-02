@@ -45,7 +45,6 @@ except ImportError:
 try:
     from PIL import Image as PILImage
     from PIL import ImageDraw as PILDraw
-    from PIL import ImageFont as PILImageFont
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -186,27 +185,6 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         default=1.0, min=0.1, max=5.0, precision=2
     )
 
-    use_remark_as_icon: bpy.props.BoolProperty(name="用备注生成图标", default=True)
-    remark_font_family: bpy.props.EnumProperty(
-        name="字体",
-        items=[('msyh.ttc', "微软雅黑", ""), ('simsun.ttc', "宋体", ""), ('simhei.ttf', "黑体", ""), ('arial.ttf', "Arial", "")],
-        default='msyh.ttc'
-    )
-    remark_font_size: bpy.props.IntProperty(name="字号大小", default=36, min=10, max=300)
-    remark_stroke_width: bpy.props.IntProperty(name="描边粗细", default=2, min=0, max=20)
-    remark_text_color: bpy.props.FloatVectorProperty(name="文字颜色", subtype='COLOR', default=(1.0, 1.0, 1.0), min=0.0, max=1.0, size=3)
-    remark_stroke_color: bpy.props.FloatVectorProperty(name="描边颜色", subtype='COLOR', default=(0.0, 0.0, 0.0), min=0.0, max=1.0, size=3)
-
-    button_bg_color: bpy.props.FloatVectorProperty(name="按钮背景色", subtype='COLOR', default=(0.16, 0.22, 0.32), min=0.0, max=1.0, size=3)
-    button_border_color: bpy.props.FloatVectorProperty(name="按钮边框色", subtype='COLOR', default=(0.59, 0.75, 0.94), min=0.0, max=1.0, size=3)
-    button_border_width: bpy.props.IntProperty(name="边框宽度", default=2, min=0, max=20)
-    button_opacity: bpy.props.FloatProperty(name="按钮透明度", default=0.9, min=0.0, max=1.0, precision=2)
-    button_align: bpy.props.EnumProperty(
-        name="按钮对齐",
-        items=[('LEFT', "左对齐", ""), ('CENTER', "居中", ""), ('RIGHT', "右对齐", "")],
-        default='CENTER'
-    )
-
     def _update_target_object(self, context):
         self._update_from_object()
 
@@ -218,10 +196,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     button_image: bpy.props.StringProperty(name="按钮图片", subtype='FILE_PATH', default="")
     button_border_image: bpy.props.StringProperty(name="按钮边框图片", subtype='FILE_PATH', default="")
 
-    # ---- 面板背景样式（圆角 + 边框，对背景图应用；自定义背景同样生效）----
-    background_corner_radius: bpy.props.IntProperty(name="背景圆角", default=24, min=0, max=100)
-    background_border_color: bpy.props.FloatVectorProperty(name="背景边框色", subtype='COLOR', default=(0.59, 0.75, 0.94), min=0.0, max=1.0, size=3)
-    background_border_width: bpy.props.IntProperty(name="背景边框宽度", default=3, min=0, max=20)
+    # ---- 面板背景透明度（背景仅保留直角矩形，不做圆角/边框）----
     background_opacity: bpy.props.FloatProperty(name="背景透明度", default=0.85, min=0.0, max=1.0, precision=2)
 
     check_hash: bpy.props.StringProperty(name="检测Hash值", default="")
@@ -377,7 +352,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         box_top.label(text="修改设置后点上方按钮即可原地更新，无需重新导出", icon='INFO')
         layout.separator()
 
-        # 左右两列：左=基础设置/检测/列表，右=文字图标/样式/资源（从「按钮文字图标」往下）
+        # 左右两列：左=基础设置/检测/列表，右=图片资源设置
         split = layout.split(factor=0.5)
         col_left = split.column()
         col_right = split.column()
@@ -429,28 +404,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         else:
             box.label(text="未检测到切换，点击「刷新列表」", icon='INFO')
 
-        # ---- 右列（从「按钮文字图标」往下的部分）----
-        box = col_right.box()
-        box.label(text="按钮文字图标（用切换备注生成）", icon='FILE_FONT')
-        col = box.column(align=True)
-        col.prop(self, "use_remark_as_icon", text="用备注生成图标")
-        col.prop(self, "remark_font_family", text="字体")
-        col.prop(self, "remark_font_size", text="字号")
-        row = col.row(align=True)
-        row.prop(self, "remark_text_color", text="文字色")
-        row.prop(self, "remark_stroke_color", text="描边色")
-        col.prop(self, "remark_stroke_width", text="描边粗细")
-
-        box = col_right.box()
-        box.label(text="按钮样式", icon='COLOR')
-        col = box.column(align=True)
-        row = col.row(align=True)
-        row.prop(self, "button_bg_color", text="背景色")
-        row.prop(self, "button_border_color", text="边框色")
-        col.prop(self, "button_border_width", text="边框宽度")
-        col.prop(self, "button_opacity", text="透明度")
-        col.prop(self, "button_align", text="对齐")
-
+        # ---- 右列（仅保留图片资源设置）----
         box = col_right.box()
         box.label(text="面板图片资源（自定义）", icon='TEXTURE')
         box.prop(self, "background_image", text="背景")
@@ -465,15 +419,6 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 row = box.row(align=True)
                 row.label(text=entry.label or "(无备注)", icon='NONE')
                 row.prop(entry, "image_path", text="")
-
-        box = col_right.box()
-        box.label(text="面板背景样式（圆角/边框）", icon='MATERIAL')
-        col = box.column(align=True)
-        col.prop(self, "background_corner_radius", text="背景圆角")
-        col.prop(self, "background_border_color", text="边框色")
-        col.prop(self, "background_border_width", text="边框宽度")
-        col.prop(self, "background_opacity", text="透明度")
-        col.label(text="对背景图片应用圆角/边框（自定义背景同样生效）", icon='INFO')
 
     # ==========================================
     # 扫描 / 解析
@@ -531,6 +476,50 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         collect(tree)
         return collected
 
+    def _collect_custom_material_switch_groups(self):
+        """Collect enabled switch groups from custom material-assign nodes."""
+        tree = getattr(self, "id_data", None)
+        if tree is None:
+            return []
+        collected = []
+        visited = set()
+
+        def collect(current_tree):
+            tree_key = getattr(current_tree, "name", str(id(current_tree)))
+            if tree_key in visited:
+                return
+            visited.add(tree_key)
+            for node in current_tree.nodes:
+                if node.bl_idname == 'SSMTNode_PostProcess_CustomMaterialAssign' and not node.mute:
+                    if bool(getattr(node, "use_global_assign", False)):
+                        for group in node.global_switch_groups:
+                            if not bool(getattr(group, "enabled", True)):
+                                continue
+                            variable = str(getattr(group, "switch_variable", "") or "").strip()
+                            if not variable:
+                                continue
+                            object_name = str(getattr(group, "object_name", "") or "")
+                            target_object = bpy.data.objects.get(object_name) if object_name else None
+                            collected.append((node, target_object, group))
+                    else:
+                        for item in node.target_items:
+                            target_object = item.target_object
+                            for group in item.switch_groups:
+                                if not bool(getattr(group, "enabled", True)):
+                                    continue
+                                variable = str(getattr(group, "switch_variable", "") or "").strip()
+                                if not variable:
+                                    continue
+                                collected.append((node, target_object, group))
+                elif node.bl_idname == 'SSMTNode_Blueprint_Nest' and not node.mute:
+                    blueprint_name = str(getattr(node, "blueprint_name", "") or "")
+                    nested = bpy.data.node_groups.get(blueprint_name) if blueprint_name and blueprint_name != "NONE" else None
+                    if nested and getattr(nested, "bl_idname", "") == "SSMTBlueprintTreeType":
+                        collect(nested)
+
+        collect(tree)
+        return collected
+
     def _refresh_entries(self):
         """刷新节点 UI 中的物体切换列表：蓝图节点 + 可选 INI 配置。"""
         self._ensure_namespace()
@@ -573,6 +562,31 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             entry.option_count = diffuse_group_option_count(group)
             entry.hotkey = diffuse_group_hotkey(group)
             entry.node_name = f"{node.name}:{getattr(group, 'name', '')}"
+            idx_map[var] = len(self.swap_panel_entries) - 1
+
+        # 2b. 自定义材质指定节点的贴图切换组
+        for node, target_object, group in self._collect_custom_material_switch_groups():
+            var = str(getattr(group, "switch_variable", "") or "").strip()
+            if not var:
+                continue
+            comment = str(getattr(group, "comment", "") or "").strip()
+            option_count = max(2, int(getattr(group, "state_count", 2) or 2))
+            hotkey = str(getattr(group, "key", "") or "").strip()
+            if var in idx_map:
+                entry = self.swap_panel_entries[idx_map[var]]
+                if comment and comment not in entry.comment.split(" / "):
+                    entry.comment = " / ".join(part for part in (entry.comment, comment) if part)
+                entry.option_count = max(entry.option_count, option_count)
+                if not entry.hotkey:
+                    entry.hotkey = hotkey
+                continue
+            entry = self.swap_panel_entries.add()
+            entry.variable_name = var
+            entry.comment = comment
+            entry.option_count = option_count
+            entry.hotkey = hotkey
+            part_name = getattr(target_object, "name", "") if target_object is not None else ""
+            entry.node_name = f"{node.name}:{part_name or 'part'}:{var}"
             idx_map[var] = len(self.swap_panel_entries) - 1
 
         # 3. 可选：从 INI 读取 [KeySwap_*] 配置并合并（覆盖备注/选项数/按键）
@@ -844,6 +858,19 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 "hotkey": hotkey,
                 "image_path": self._button_image_for_source(hotkey, var),
             })
+        # 4. Fill from every custom material-assign switch group in this blueprint.
+        for _node, _target_object, group in self._collect_custom_material_switch_groups():
+            var = str(getattr(group, "switch_variable", "") or "").strip()
+            if not var:
+                continue
+            hotkey = str(getattr(group, "key", "") or "").strip()
+            add_button({
+                "var_name": var,
+                "comment": str(getattr(group, "comment", "") or "").strip(),
+                "option_count": max(2, int(getattr(group, "state_count", 2) or 2)),
+                "hotkey": hotkey,
+                "image_path": self._button_image_for_source(hotkey, var),
+            })
         return self._merge_buttons_by_hotkey(buttons)
 
     @staticmethod
@@ -921,74 +948,6 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         else:
             print(f"警告: 默认图片不存在 {default_path}")
 
-    def _generate_text_icon(self, text, dest_path, font_size=36, font_family="msyh.ttc",
-                            text_color=(1.0, 1.0, 1.0), stroke_width=2, stroke_color=(0.0, 0.0, 0.0),
-                            bg_color=(0.16, 0.22, 0.32), border_color=(0.59, 0.75, 0.94),
-                            border_width=2, opacity=0.9):
-        """根据备注文本生成按钮图标（圆角按钮背景 + 居中文字）。"""
-        try:
-            if not PIL_AVAILABLE:
-                return None
-            text = text.replace('/', '\n').strip()
-            if not text:
-                return None
-
-            def float_to_int_rgb(vals):
-                return tuple(int(val * 255) for val in vals)
-
-            text_rgb = float_to_int_rgb(text_color)
-            stroke_rgb = float_to_int_rgb(stroke_color)
-
-            font = None
-            try:
-                font = PILImageFont.truetype(font_family, font_size)
-            except Exception:
-                for f in ["msyh.ttc", "simsun.ttc", "simhei.ttf", "arial.ttf"]:
-                    try:
-                        font = PILImageFont.truetype(f, font_size)
-                        break
-                    except Exception:
-                        continue
-            if font is None:
-                font = PILImageFont.load_default()
-
-            temp_img = PILImage.new('RGBA', (1, 1), (0, 0, 0, 0))
-            temp_draw = PILDraw.Draw(temp_img)
-            bbox = temp_draw.multiline_textbbox((0, 0), text, font=font, align='center', spacing=4)
-            text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
-
-            pad_x = 18 + (stroke_width * 2)
-            pad_y = 10 + (stroke_width * 2)
-            img_w = math.ceil(text_w + pad_x * 2)
-            img_h = math.ceil(text_h + pad_y * 2)
-
-            bg_rgb = float_to_int_rgb(bg_color)
-            bd_rgb = float_to_int_rgb(border_color)
-            btn_alpha = int(255 * max(0.0, min(1.0, opacity)))
-
-            img = PILImage.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
-            draw = PILDraw.Draw(img)
-            radius = min(14, img_h // 3)
-            try:
-                draw.rounded_rectangle([0, 0, img_w - 1, img_h - 1], radius=radius,
-                                       fill=bg_rgb + (btn_alpha,),
-                                       outline=bd_rgb + (btn_alpha,), width=border_width)
-            except Exception:
-                draw.rectangle([0, 0, img_w - 1, img_h - 1], fill=bg_rgb + (btn_alpha,),
-                               outline=bd_rgb + (btn_alpha,))
-
-            x = (img_w - text_w) / 2 - bbox[0]
-            y = (img_h - text_h) / 2 - bbox[1]
-            draw.multiline_text((x, y), text, font=font, fill=text_rgb + (255,),
-                                align='center', spacing=4,
-                                stroke_width=stroke_width, stroke_fill=stroke_rgb + (255,))
-            img.save(dest_path)
-            return dest_path
-        except Exception as e:
-            print(f"[物体切换面板] 生成文字图标失败: {e}")
-            return None
-
     def _apply_button_border_image(self, dest_path):
         """Alpha-composite the configured border over one final button image."""
         border_path = (self.button_border_image or "").strip()
@@ -1012,8 +971,10 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
     def _ensure_button_image(self, dest_res_dir, ns, i, source_asset_dir, button):
         """生成第 i 个按钮的图标图片，返回路径。
-        优先：该按钮自定义图片 → 全局按钮图片 → 备注文字图标 → 默认圆角按钮图；
-        最后将统一按钮边框图片叠加到成品上。"""
+
+        不再使用备注文字或按钮样式设置；只使用该按钮自定义图片 / 全局回退图片，
+        都没有时生成一块纯色直角矩形按钮。若配置了按钮边框图片，仍会叠加。
+        """
         dest_name = f"swpbtn_{ns}_{i}.png"
         dest_path = os.path.join(dest_res_dir, dest_name)
 
@@ -1024,39 +985,13 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             shutil.copy2(custom, dest_path)
             return self._apply_button_border_image(dest_path)
 
-        comment = (button.get("comment") or "").strip()
-        if self.use_remark_as_icon and comment:
-            generated = self._generate_text_icon(
-                comment, dest_path,
-                font_size=self.remark_font_size,
-                font_family=self.remark_font_family,
-                text_color=self.remark_text_color,
-                stroke_width=self.remark_stroke_width,
-                stroke_color=self.remark_stroke_color,
-                bg_color=self.button_bg_color,
-                border_color=self.button_border_color,
-                border_width=self.button_border_width,
-                opacity=self.button_opacity,
-            )
-            if generated:
-                return self._apply_button_border_image(generated)
-
         if PIL_AVAILABLE:
             try:
-                def _c(vals):
-                    return tuple(int(val * 255) for val in vals)
-                bg_rgb = _c(self.button_bg_color)
-                bd_rgb = _c(self.button_border_color)
-                btn_alpha = int(255 * max(0.0, min(1.0, self.button_opacity)))
+                bg_rgb = (41, 56, 82)
+                btn_alpha = 230
                 img = PILImage.new('RGBA', (384, 64), (0, 0, 0, 0))
                 draw = PILDraw.Draw(img)
-                try:
-                    draw.rounded_rectangle([0, 0, 383, 63], radius=12,
-                                           fill=bg_rgb + (btn_alpha,),
-                                           outline=bd_rgb + (btn_alpha,), width=self.button_border_width)
-                except Exception:
-                    draw.rectangle([0, 0, 383, 63], fill=bg_rgb + (btn_alpha,),
-                                   outline=bd_rgb + (btn_alpha,))
+                draw.rectangle([0, 0, 383, 63], fill=bg_rgb + (btn_alpha,))
                 img.save(dest_path)
                 return self._apply_button_border_image(dest_path)
             except Exception as e:
@@ -1069,70 +1004,32 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         return None
 
     def _generate_background_image(self, dest_path, panel_w, panel_h, use_existing=False):
-        """生成/处理面板背景图（圆角 + 边框）。panel_w/panel_h 为面板在屏幕单位的宽高。
+        """生成/处理面板背景图（直角矩形，圆角为 0，无边框）。
 
-        use_existing=False：生成纯色圆角背景（默认 512 高）。
-        use_existing=True：基于 dest_path 现有图（自定义背景）应用圆角遮罩 + 边框。
+        use_existing=False：生成纯色背景（默认 512 高）。
+        use_existing=True：直接使用现有背景图并应用透明度。
         """
         try:
             if not PIL_AVAILABLE:
                 return None
 
-            def float_to_int_rgb(vals):
-                return tuple(int(val * 255) for val in vals)
-
             if use_existing and os.path.exists(dest_path):
-                # 基于自定义背景图应用圆角/边框
                 with PILImage.open(dest_path) as src:
                     img = src.convert('RGBA')
             else:
-                # 生成纯色底图（按面板在 16:9 屏幕上的显示比例，保证圆角不变形）
                 img_h = 512
                 pixel_ratio = (panel_w / panel_h) * (1920.0 / 1080.0) if panel_h > 0 else 1.0
                 img_w = max(64, int(round(img_h * pixel_ratio)))
-                fill_rgb = float_to_int_rgb((0.05, 0.08, 0.12))
+                fill_rgb = (13, 20, 31)
                 img = PILImage.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
                 d = PILDraw.Draw(img)
                 d.rectangle([0, 0, img_w - 1, img_h - 1], fill=fill_rgb + (255,))
 
-            img_w, img_h = img.size
-            bd_rgb = float_to_int_rgb(self.background_border_color)
             alpha = int(255 * max(0.0, min(1.0, self.background_opacity)))
-
-            # 圆角半径按图片实际尺寸比例（自定义大图圆角视觉一致）
-            radius_px = int(min(img_w, img_h) * max(0, min(100, self.background_corner_radius)) / 100.0)
-            # 边框宽度按 512 参考高缩放（自定义大图也可见）
-            border_scale = max(1.0, img_h / 512.0)
-            border_px = max(0, int(round(self.background_border_width * border_scale)))
-
-            # 应用整体透明度
             if alpha < 255:
                 r, g, b, a = img.split()
                 a = a.point(lambda v: int(v * alpha / 255))
                 img = PILImage.merge('RGBA', (r, g, b, a))
-
-            # 圆角 alpha 遮罩
-            mask = PILImage.new('L', (img_w, img_h), 0)
-            md = PILDraw.Draw(mask)
-            if radius_px > 0:
-                md.rounded_rectangle([0, 0, img_w - 1, img_h - 1], radius=radius_px, fill=255)
-            else:
-                md.rectangle([0, 0, img_w - 1, img_h - 1], fill=255)
-            r, g, b, a = img.split()
-            a = PILImage.composite(a, PILImage.new('L', (img_w, img_h), 0), mask)
-            img = PILImage.merge('RGBA', (r, g, b, a))
-
-            # 边框（在圆角区域内）
-            if border_px > 0:
-                draw = PILDraw.Draw(img)
-                inset = max(0, border_px // 2)
-                try:
-                    draw.rounded_rectangle([inset, inset, img_w - 1 - inset, img_h - 1 - inset],
-                                           radius=max(0, radius_px - inset),
-                                           outline=bd_rgb + (alpha,), width=border_px)
-                except Exception:
-                    draw.rectangle([inset, inset, img_w - 1 - inset, img_h - 1 - inset],
-                                   outline=bd_rgb + (alpha,), width=border_px)
             img.save(dest_path)
             return dest_path
         except Exception as e:
@@ -1299,11 +1196,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         # 每个按钮固定行位置（相对父级高度）
         fixed_rel_y = []
         fixed_rel_x = []
-        grid_left = side_padding
-        if self.button_align == 'RIGHT':
-            grid_left = adjusted_panel_bg_width - side_padding - grid_width
-        elif self.button_align == 'CENTER':
-            grid_left = (adjusted_panel_bg_width - grid_width) * 0.5
+        grid_left = (adjusted_panel_bg_width - grid_width) * 0.5
 
         for i in range(num_buttons):
             row_index = i // buttons_per_row

@@ -50,6 +50,13 @@ MATERIAL_DETECT_PRESETS = [
 ]
 
 
+def _is_material_assign_detect_node(node):
+    return getattr(node, "bl_idname", "") in {
+        "SSMTNode_PostProcess_Material",
+        "SSMTNode_PostProcess_CustomMaterialAssign",
+    }
+
+
 class SSMT_OT_MaterialDetectAddPrefix(bpy.types.Operator):
     bl_idname = "ssmt.material_detect_add_prefix"
     bl_label = "添加前缀"
@@ -63,7 +70,7 @@ class SSMT_OT_MaterialDetectAddPrefix(bpy.types.Operator):
         if not tree:
             return {'CANCELLED'}
         node = tree.nodes.get(self.node_name)
-        if not node or node.bl_idname != 'SSMTNode_PostProcess_Material':
+        if not node or not _is_material_assign_detect_node(node):
             return {'CANCELLED'}
 
         existing = {item.prefix for item in node.material_detect_prefixes}
@@ -91,7 +98,7 @@ class SSMT_OT_MaterialDetectRemovePrefix(bpy.types.Operator):
         if not tree:
             return {'CANCELLED'}
         node = tree.nodes.get(self.node_name)
-        if node and node.bl_idname == 'SSMTNode_PostProcess_Material':
+        if node and _is_material_assign_detect_node(node):
             if 0 <= self.item_index < len(node.material_detect_prefixes):
                 node.material_detect_prefixes.remove(self.item_index)
         return {'FINISHED'}
@@ -110,7 +117,7 @@ class SSMT_OT_MaterialDetectAddCustomPrefix(bpy.types.Operator):
         if not tree:
             return {'CANCELLED'}
         node = tree.nodes.get(self.node_name)
-        if not node or node.bl_idname != 'SSMTNode_PostProcess_Material':
+        if not node or not _is_material_assign_detect_node(node):
             return {'CANCELLED'}
 
         custom = node.temp_prefix_input.strip()
@@ -228,7 +235,7 @@ class SSMT_OT_MaterialDetect(bpy.types.Operator):
             return {'CANCELLED'}
 
         node = tree.nodes.get(self.node_name)
-        if not node or node.bl_idname != 'SSMTNode_PostProcess_Material':
+        if not node or not _is_material_assign_detect_node(node):
             return {'CANCELLED'}
 
         prefixes = [item.prefix.strip() for item in node.material_detect_prefixes if item.prefix.strip()]
@@ -236,25 +243,40 @@ class SSMT_OT_MaterialDetect(bpy.types.Operator):
             self.report({'WARNING'}, 'Add at least one material prefix first')
             return {'CANCELLED'}
 
-        result_output = self._find_result_output(node)
-        if not result_output:
-            self.report({'WARNING'}, 'No connected Result_Output node found')
-            return {'CANCELLED'}
-
-        detect_nodes = self._collect_object_info_nodes(result_output)
-        if not detect_nodes:
-            self.report({'WARNING'}, 'No connected object nodes found')
-            return {'CANCELLED'}
-
         node.detected_materials.clear()
-
         unique_object_names = []
         seen_object_names = set()
-        for obj_name in self._iter_detect_object_names(detect_nodes):
-            if obj_name in seen_object_names:
-                continue
-            seen_object_names.add(obj_name)
-            unique_object_names.append(obj_name)
+
+        target_items = getattr(node, "target_items", None)
+        global_assign = bool(getattr(node, "use_global_assign", False))
+        if target_items is not None and not global_assign:
+            # 非全局模式：只检测本节点中手动指定的部件。
+            for item in target_items:
+                obj = getattr(item, "target_object", None)
+                if obj is None or getattr(obj, "type", "") != "MESH":
+                    continue
+                if obj.name in seen_object_names:
+                    continue
+                seen_object_names.add(obj.name)
+                unique_object_names.append(obj.name)
+            if not unique_object_names:
+                self.report({'WARNING'}, '请先在材质转资源pro节点中添加目标部件')
+                return {'CANCELLED'}
+        else:
+            # 全局模式/原材质转资源：沿蓝图输出链收集全部连接部件。
+            result_output = self._find_result_output(node)
+            if not result_output:
+                self.report({'WARNING'}, 'No connected Result_Output node found')
+                return {'CANCELLED'}
+            detect_nodes = self._collect_object_info_nodes(result_output)
+            if not detect_nodes:
+                self.report({'WARNING'}, 'No connected object nodes found')
+                return {'CANCELLED'}
+            for obj_name in self._iter_detect_object_names(detect_nodes):
+                if obj_name in seen_object_names:
+                    continue
+                seen_object_names.add(obj_name)
+                unique_object_names.append(obj_name)
 
         missing_count = 0
         for obj_name in unique_object_names:
@@ -300,7 +322,7 @@ class SSMT_OT_MaterialDetectClear(bpy.types.Operator):
         if not tree:
             return {'CANCELLED'}
         node = tree.nodes.get(self.node_name)
-        if node and node.bl_idname == 'SSMTNode_PostProcess_Material':
+        if node and _is_material_assign_detect_node(node):
             node.detected_materials.clear()
             node.detect_all_ok = False
         return {'FINISHED'}
@@ -1575,11 +1597,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             re.IGNORECASE,
         )
         if match:
-            # TTLib 的调用约定与 drawindexed 一致：
-            # _1=index count，_2=first index，_3=first vertex/base vertex。
-            # ZZMI RedirectSO 会在正文前保留 3 个 stub 顶点，因此第三项
-            # 不能丢弃，否则 TTL 二次绘制会从 base_vertex=0 错读 SO。
-            return int(match.group(1)), int(match.group(2)), int(match.group(3))
+            return int(match.group(1)), int(match.group(2))
         return None
 
     def _ttl_first_drawindexed(self, block_lines):
@@ -1650,34 +1668,11 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
     @staticmethod
     def _ttl_extract_drag_vb0(lines):
-        # 拖拽 Jiggle 影子缓冲当前形态为 TempVB0（R9 ShadowVB 直写链实机回归已回退）；
-        # 正则同时匹配两家族，兼容 ShadowVB 时代的旧生成物。
         for line in lines:
-            match = re.search(r'\b(ResourceDragJiggle(?:ShadowVB|TempVB0)_[A-Za-z0-9_]+)\b', str(line or ""))
+            match = re.search(r'\b(ResourceDragJiggleTempVB0_[A-Za-z0-9_]+)\b', str(line or ""))
             if match:
                 return match.group(1)
         return None
-
-    @staticmethod
-    def _ttl_find_drag_vb0_global(all_sections):
-        """全表扫描 jiggle 换绑行，返回 (drag_vb0, 所在段 lines)，均无则 (None, None)。
-
-        排除 [CommandListSSMTTTLDraw_*] 段（那里只是引用，且可能是陈旧残留）。
-        优先当前形态 TempVB0：ShadowVB 资源段在重导出时会被拖拽侧清理，
-        命令表若引用它将悬空。
-        """
-        for family in ("TempVB0", "ShadowVB"):
-            pattern = r'\b(ResourceDragJiggle' + family + r'_[A-Za-z0-9_]+)\b'
-            for sec_name, sec_lines in all_sections.items():
-                if not isinstance(sec_lines, list):
-                    continue
-                if str(sec_name).startswith("[CommandListSSMTTTLDraw_"):
-                    continue
-                for line in sec_lines:
-                    match = re.search(pattern, str(line or ""))
-                    if match:
-                        return match.group(1), sec_lines
-        return None, None
 
     @staticmethod
     def _ttl_extract_ib(lines):
@@ -1763,7 +1758,6 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                             ttl_lines.append(bl)
                     ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw1[0]))
                     ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw1[1]))
-                    ttl_lines.append("    ${}TTL{}_3 = {}".format(chr(92), chr(92), draw1[2]))
                     ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
                 if else_index != -1:
                     ttl_lines.append(block_lines[else_index])
@@ -1773,7 +1767,6 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                                 ttl_lines.append(bl)
                         ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw2[0]))
                         ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw2[1]))
-                        ttl_lines.append("    ${}TTL{}_3 = {}".format(chr(92), chr(92), draw2[2]))
                         ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
                 ttl_lines.append(tail)
                 i = j + 1
@@ -1785,7 +1778,6 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     pending_flags = []
                     ttl_lines.append("${}TTL{}_1 = {}".format(chr(92), chr(92), draw[0]))
                     ttl_lines.append("${}TTL{}_2 = {}".format(chr(92), chr(92), draw[1]))
-                    ttl_lines.append("${}TTL{}_3 = {}".format(chr(92), chr(92), draw[2]))
                     ttl_lines.append("run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
                 i += 1
         return ttl_lines, found
@@ -1814,13 +1806,6 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         first_block_start = self._ttl_find_block_start(lines, first_mesh_index)
         header_lines = self._strip_drag_hook_blocks(lines[:first_block_start])
         drag_vb0 = self._ttl_extract_drag_vb0(header_lines)
-        drag_vb0_lines = header_lines
-        if drag_vb0 is None:
-            # 回退：拖拽钩子只注入单一主绘制段（_inject_draw_hooks 只落 part.section），
-            # TTL copy 段头部无钩子块时全表扫描兄弟段；否则陈旧
-            # [CommandListSSMTTTLDraw_*] 段会被原样保留、引用已失效的 jiggle 资源
-            # → TTL 断链（2026-08-30 实机回归：TTL 层吃不到形态键/拖拽交互）。
-            drag_vb0, drag_vb0_lines = self._ttl_find_drag_vb0_global(all_sections)
         ib_resource = self._ttl_extract_ib(header_lines)
 
         generated_section_names = set()
@@ -1871,11 +1856,10 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 continue
 
             if drag_vb0:
-                # 资源名家族前缀长度不等（TempVB0/ShadowVB 两代命名），按匹配结果取后缀
-                token = re.sub(r'^ResourceDragJiggle(?:ShadowVB|TempVB0)_', '', drag_vb0)
+                token = drag_vb0[len("ResourceDragJiggleTempVB0_"):]
                 command_list_name = f"CommandListSSMTTTLDraw_{token}"
                 if command_list_name not in ttl_draw_command_lists:
-                    drag_condition = self._ttl_extract_drag_condition(drag_vb0_lines, drag_vb0)
+                    drag_condition = self._ttl_extract_drag_condition(header_lines, drag_vb0)
                     command_list_lines = []
                     if drag_condition:
                         # 仅在拖拽激活时绑定 jiggle 临时 VB0;其余情况不覆盖 vb0,
@@ -2262,14 +2246,11 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 reset_insert_idx = self._find_mesh_block_reset_insert_index(lines, insert_index)
                 if reset_insert_idx != -1:
                     lines[reset_insert_idx:reset_insert_idx] = reset_lines
-        # TTL 是 ZZMI 专属的绘制重建协议；EFMI 等其它逻辑仅执行普通材质转资源
-        # 与 FX/Glowmap，不得因为某种 drawindexed 参数恰好能被正则解析就误入 TTL。
-        ttl_supported = GlobalConfig.logic_name == LogicName.ZZMI
-        if not debug_disable_fx_ttl and ttl_supported:
+        if not debug_disable_fx_ttl:
             next_swap_key_num = self._process_ttl_sections(
                 section_name, lines, all_sections, material_group_to_swapkey,
                 swap_key_prefix, next_swap_key_num, used_swap_keys, texture_folder)
-        elif debug_disable_fx_ttl:
+        else:
             _LOG.info(f"      调试开关已开启，跳过 {section_name} 的 FX/TTL 生成")
 
         mesh_lines_info_phase2 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
@@ -2340,52 +2321,6 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                     del lines[start_move_idx:end_move_idx]
         return next_swap_key_num
 
-    @staticmethod
-    def _material_target_section_names(sections):
-        """返回需要执行材质转换的 INI 段，包含 EFMI 合并骨骼绘制回调。
-
-        普通导出把 ``[mesh:*]`` 与 draw 放在 ``TextureOverride`` 段内；EFMI
-        合并骨骼则只在 EntryPoint 中挂载 ``Callback_Component_DrawCustom``，实际
-        内容位于被引用的 ``CommandList_Draw_*``。这里只跟随该显式引用，避免把
-        用户自定义或其它后处理生成的同名前缀 CommandList 误当成绘制段。
-        """
-        target_names = []
-        seen_names = set()
-
-        texture_override_names = [
-            section_name
-            for section_name in sections
-            if section_name.startswith('[TextureOverride_')
-        ]
-        for section_name in texture_override_names:
-            seen_names.add(section_name)
-            target_names.append(section_name)
-
-        section_lookup = {
-            str(section_name).strip().strip('[]').casefold(): section_name
-            for section_name in sections
-            if str(section_name).strip().startswith('[')
-            and str(section_name).strip().endswith(']')
-        }
-        callback_pattern = re.compile(
-            r'^\s*CommandList\\EFMIv1\\Callback_Component_DrawCustom\s*=\s*'
-            r'ref\s+([^;\s]+)',
-            re.IGNORECASE,
-        )
-        for entrypoint_name in texture_override_names:
-            for line in sections.get(entrypoint_name, []):
-                callback_match = callback_pattern.match(str(line))
-                if not callback_match:
-                    continue
-                referenced_name = callback_match.group(1).strip().strip('[]')
-                section_name = section_lookup.get(referenced_name.casefold())
-                if section_name is None or section_name in seen_names:
-                    continue
-                seen_names.add(section_name)
-                target_names.append(section_name)
-
-        return target_names
-
     def execute_postprocess(self, mod_export_path, exporter=None):
         from ..utils.log_utils import LOG as _LOG
 
@@ -2425,12 +2360,13 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             swap_key_prefix = match.group(1) if match else base_swap_var
             next_swap_key_num = int(match.group(2)) if match else 0
 
-            for section_name in self._material_target_section_names(sections):
-                next_swap_key_num = self.process_texture_override_section(
-                    section_name, sections,
-                    material_group_to_swapkey, swap_key_prefix, next_swap_key_num,
-                    used_swap_keys, transparency_sections_to_add
-                )
+            for section_name, lines in list(sections.items()):
+                if section_name.startswith('[TextureOverride_') and section_name != '_config_path':
+                    next_swap_key_num = self.process_texture_override_section(
+                        section_name, sections,
+                        material_group_to_swapkey, swap_key_prefix, next_swap_key_num,
+                        used_swap_keys, transparency_sections_to_add
+                    )
 
             del sections['_config_path']
 

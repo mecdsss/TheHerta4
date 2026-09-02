@@ -79,6 +79,7 @@ _MODULE_REGISTRY = [
     {"name": "node_postprocess_shapekey", "required": False},
     {"name": "node_postprocess_uv_offset", "required": False},
     {"name": "node_postprocess_material", "required": False},
+    {"name": "node_postprocess_custom_material_assign", "required": False},
     {"name": "node_postprocess_health", "required": False},
     {"name": "node_postprocess_slider", "required": False},
     {"name": "node_postprocess_resource_merge", "required": False},
