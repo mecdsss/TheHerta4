@@ -162,11 +162,19 @@ class ExportEFMI:
                 bpy.data.objects.remove(obj, do_unlink=True)
 
         used_group_ids_by_lod = None  # 惰性计算：首个全缺 DrawIB 需要判定时才算
+        declared_vg_ids_by_lod = None  # 导出集合各部件的 VGMap 声明槽（去重前关系基线）
+
         def _get_used_group_ids(lod_name: str) -> set[int]:
             nonlocal used_group_ids_by_lod
             if used_group_ids_by_lod is None:
                 used_group_ids_by_lod = self._collect_used_group_ids_by_lod(ordered)
             return used_group_ids_by_lod.get(lod_name, set())
+
+        def _get_declared_vg_ids(lod_name: str) -> set[int]:
+            nonlocal declared_vg_ids_by_lod
+            if declared_vg_ids_by_lod is None:
+                declared_vg_ids_by_lod = self._collect_declared_vg_ids_by_lod(ordered)
+            return declared_vg_ids_by_lod.get(lod_name, set())
 
         created = []
         for lod_name in sorted(lod_component_maps.keys()):
@@ -184,12 +192,18 @@ class ExportEFMI:
                     # 部分缺失：缺失组件补占位
                     stub_members = [member for member in members if member not in present]
                 else:
-                    # 整个 DrawIB 缺席：与 ZZMI 一致，只认统一顶点组包含关系。
-                    # B 的 VGMap 全局组被同 LOD 现存对象 A 实际引用，说明 B 已并入 A。
+                    # 整个 DrawIB 缺席：判定「几何被并入现存对象」必须用
+                    # **去重前**的关系（用户裁决）：现存对象 A 实际使用（权重>0）
+                    # 的槽中，剔除 A 自己经 VGMap 声明的槽后，剩下的“外来槽”
+                    # 才是 A 真正搬进来的骨骼。矩阵相同的共享槽（如 A local 10
+                    # 与 B local 20 去重合并到同一 canonical）同时出现在 A 的
+                    # VGMap 声明里——那是 A 用自己的骨骼，不是吸收 B 的证据，
+                    # B 缺席时不应为其生成占位（游戏保留原版）。
                     absorbed = self._is_drawib_absorbed(
                         draw_ib,
                         search_dir,
                         _get_used_group_ids(lod_name),
+                        _get_declared_vg_ids(lod_name),
                     )
 
                     if absorbed:
@@ -206,6 +220,12 @@ class ExportEFMI:
                         continue
 
                 for member in stub_members:
+                    if self._is_component_dedup_excluded(member, lod_name):
+                        print(
+                            f"[EFMI骨骼合并] 部件 {member}（{lod_label}）已标记 "
+                            "VGMapDedupExcluded，按用户意图不生成占位（游戏保留原版绘制）"
+                        )
+                        continue
                     obj_name = self._create_stub_object(member, lod_name)
                     if obj_name:
                         ordered.append(DrawCallModel(obj_name=obj_name))
@@ -250,12 +270,71 @@ class ExportEFMI:
         draw_ib: str,
         search_dir: str,
         used_group_ids: set[int],
+        declared_vg_ids: set[int],
     ) -> bool:
-        """按统一顶点组关系判定整个缺席的 DrawIB 是否已并入现存对象。"""
+        """按「去重前」顶点组关系判定整个缺席的 DrawIB 是否已并入现存对象。
+
+        吸收的证据 = 现存对象实际使用的槽中存在**未由任何导出集合部件声明**的
+        槽（外来骨骼，只能来自被并入的部件）；该外来槽落在缺席 DrawIB 的
+        VGMap 值域内即判定吸收。共享槽（矩阵去重合并、但 A 自己经 VGMap
+        声明）不计入吸收证据——它只是 A 用自己骨骼的去重槽位。
+        """
         vg_values = self._load_drawib_vg_values(draw_ib, search_dir)
         if not vg_values:
             return False
-        return bool(vg_values & used_group_ids)
+        foreign_used = set(used_group_ids) - set(declared_vg_ids)
+        return bool(vg_values & foreign_used)
+
+    def _collect_declared_vg_ids_by_lod(self, ordered) -> dict[str, set[int]]:
+        """收集导出集合内各部件 json VGMap 声明的全局槽 id，按 LOD 分组。
+
+        语义：部件网格“应该使用”的槽（去重前关系的基线）。某实况槽若不在
+        本集合中却被对象实际使用，说明它来自被并入的其它部件（吸收证据）。
+        """
+        declared: dict[str, set[int]] = {}
+        workspace_root = GlobalConfig.path_workspace_folder()
+        for draw_call in ordered:
+            try:
+                unique_str = str(draw_call.get_workspace_unique_str() or "")
+            except Exception:
+                continue
+            if not unique_str:
+                continue
+            if unique_str.upper().startswith("LOD") and "." in unique_str:
+                lod_name, bare = unique_str.split(".", 1)
+                if not (lod_name[3:].isdigit()):
+                    lod_name, bare = "", unique_str
+            else:
+                lod_name, bare = "", unique_str
+            json_path = self._locate_component_json(
+                workspace_root, lod_name, bare
+            )
+            if not json_path:
+                continue
+            payload = JsonUtils.LoadFromFile(json_path)
+            vg_map = payload.get("VGMap") or {}
+            bucket = declared.setdefault(lod_name, set())
+            for raw in vg_map.values():
+                try:
+                    bucket.add(int(raw))
+                except (TypeError, ValueError):
+                    continue
+        return declared
+
+    def _locate_component_json(
+        self, workspace_root: str, lod_name: str, bare: str
+    ) -> str:
+        base = os.path.join(workspace_root, lod_name) if lod_name else workspace_root
+        submesh_dir = os.path.join(base, bare)
+        if not os.path.isdir(submesh_dir):
+            return ""
+        for type_dir in sorted(os.listdir(submesh_dir)):
+            if not type_dir.startswith("TYPE_"):
+                continue
+            json_path = os.path.join(submesh_dir, type_dir, bare + ".json")
+            if os.path.isfile(json_path):
+                return json_path
+        return ""
 
     def _collect_used_group_ids_by_lod(self, ordered) -> dict[str, set[int]]:
         """收集蓝图内全部对象实际引用（权重>0）的全局顶点组 id，按 LOD 分组。
@@ -302,11 +381,41 @@ class ExportEFMI:
                         bucket.add(global_group_id)
         return used
 
+    def _is_component_dedup_excluded(self, bare_unique_str: str, lod_name: str) -> bool:
+        """部件是否被用户显式排除（json 标记 VGMapDedupExcluded=True）。
+
+        显式排除 = 用户意图“完全不出现在 mod 里”：跳过占位小三角面生成，
+        游戏侧保留原版绘制。与占位的 `absorbed`（几何被合并进其它对象）
+        语义正交——合并场景下的缺失部件仍须占位抑制重影，排除部件则相反。
+        """
+        base = GlobalConfig.path_workspace_folder()
+        search_roots = [os.path.join(base, lod_name), base] if lod_name else [base]
+        for root in search_roots:
+            submesh_dir = os.path.join(root, bare_unique_str)
+            if not os.path.isdir(submesh_dir):
+                continue
+            for type_dir in sorted(os.listdir(submesh_dir)):
+                if not type_dir.startswith("TYPE_"):
+                    continue
+                json_path = os.path.join(submesh_dir, type_dir, bare_unique_str + ".json")
+                if not os.path.isfile(json_path):
+                    continue
+                payload = JsonUtils.LoadFromFile(json_path)
+                if bool(payload.get("VGMapDedupExcluded")):
+                    return True
+                return False
+        return False
+
     def _create_stub_object(self, bare_unique_str: str, lod_name: str = "LOD0") -> str:
-        """创建占位对象：3 顶点 1 三角面（1e-6 尺度），权重全给组 "0"。
+        """创建占位对象：3 顶点 1 三角面（1e-6 尺度），权重挂在部件的已注册槽。
 
         对象名 = <LOD>.<bare>（ObjectPrefixHelper 可解析出带 LOD 前缀的
         workspace unique_str，保证 stub 部件从自己 LOD 的 json 读取骨骼元数据）。
+
+        权重组名必须是**已注册槽**（json VGMap 值）：合并骨架模式下局部命名空间
+        的组 "0" 不在全工作区注册域内，EFMI 双套域前置会拦截「被引用而缺席 →
+        补占位 → 占位权重组名不落注册域」的导出；无反查数据（json 无 VGMap，
+        局部命名空间部件）保持 "0" 与旧行为一致。
         """
         workspace_unique_str = (
             f"{lod_name}.{bare_unique_str}" if lod_name else bare_unique_str
@@ -323,7 +432,10 @@ class ExportEFMI:
         obj = bpy.data.objects.new(name=workspace_unique_str, object_data=mesh)
         obj["EFMI_STUB"] = 1
         obj["3DMigoto:WorkspaceUniqueStr"] = workspace_unique_str
-        vertex_group = obj.vertex_groups.new(name="0")
+        slot_group_name = self._resolve_stub_registered_slot(
+            bare_unique_str, lod_name
+        )
+        vertex_group = obj.vertex_groups.new(name=slot_group_name)
         vertex_group.add([0, 1, 2], 1.0, 'REPLACE')
 
         try:
@@ -331,6 +443,39 @@ class ExportEFMI:
         except Exception:
             bpy.context.scene.collection.objects.link(obj)
         return obj.name
+
+    def _resolve_stub_registered_slot(self, bare_unique_str: str, lod_name: str) -> str:
+        """解析占位三角的权重槽：合并骨架部件取 json VGMap 的第一个已注册槽。
+
+        缺失部件的 VGMap 引用槽必然在全工作区注册域内（域前置 = 本组件 VGMap
+        引用槽 ∪ 全工作区并集），占位权重组名落在域内即可通过双套更名/域前置；
+        随后 build_per_mesh_identity_map 会把它映射到本组件身份段，经合并预处理
+        排序后写盘的是合法全局骨骼 id。json 无 VGMap（局部命名空间/无反查数据）
+        时返回 "0"（与旧行为一致，不参与双套路径）。
+        """
+        base = GlobalConfig.path_workspace_folder()
+        search_roots = [os.path.join(base, lod_name), base] if lod_name else [base]
+        for root in search_roots:
+            submesh_dir = os.path.join(root, bare_unique_str)
+            if not os.path.isdir(submesh_dir):
+                continue
+            for type_dir in sorted(os.listdir(submesh_dir)):
+                if not type_dir.startswith("TYPE_"):
+                    continue
+                json_path = os.path.join(submesh_dir, type_dir, bare_unique_str + ".json")
+                if not os.path.isfile(json_path):
+                    continue
+                payload = JsonUtils.LoadFromFile(json_path)
+                vg_map = payload.get("VGMap") or {}
+                for raw in vg_map.values():
+                    try:
+                        slot = int(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if slot >= 0:
+                        return str(slot)
+                return "0"
+        return "0"
 
     def _cleanup_stub_objects(self):
         """导出结束后移除占位对象（含 mesh 数据）。"""

@@ -550,7 +550,40 @@ class SubMeshModel:
             target = rename_map.get(slot)
             if target is None or target == slot:
                 continue
-            vg.name = str(target)
+            existing = None
+            try:
+                existing = obj.vertex_groups.get(str(target))
+            except AttributeError:
+                # 测试桩/退化对象：vertex_groups 可能是普通列表
+                existing = None
+            if existing is None:
+                for candidate in obj.vertex_groups:
+                    if str(getattr(candidate, "name", "")) == str(target):
+                        existing = candidate
+                        break
+            if existing is None or existing == vg:
+                vg.name = str(target)
+            else:
+                # 目标名已被导入侧的全骨架占位组占用。直接改名会触发 Blender
+                # 自动后缀（"54.001"），随后被 _prepare_merged_skeleton_vertex_groups
+                # 当作非数字组删除 → 权重陪葬（33b5aa11 单骨组件权重归零 → 导出
+                # 报 "Cannot find any valid BLENDINDICES"；多骨组件静默丢权重）。
+                # 二段重命名：先把占位组挪到临时非数字名（空组，随后被非数字组
+                # 清理移除，无害），再把带权重的源组改名为正式身份名——只动名字
+                # 不动顶点分配，权重按 index 跟随组对象。
+                if any(
+                    g.weight > 0.0 and g.group == existing.index
+                    for v in getattr(obj.data, "vertices", ()) or ()
+                    for g in getattr(v, "groups", ()) or ()
+                ):
+                    raise RuntimeError(
+                        f"[EFMI双套导出] {obj.name}: 槽 {slot} -> 身份 {target} "
+                        "与现有带权重顶点组名冲突（重名两边都有本地权重），无法"
+                        "安全重命名，中止导出（fail-closed，不静默覆盖权重）。"
+                        "请重新导入该角色"
+                    )
+                existing.name = f"__TMP_DUALSET_{target}_{slot}"
+                vg.name = str(target)
             renamed_count += 1
         if renamed_count == 0:
             return

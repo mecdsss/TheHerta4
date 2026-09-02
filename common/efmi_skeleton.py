@@ -918,20 +918,48 @@ class EFMIBoneMapBuilder:
             )
 
     @staticmethod
-    def _declared_source_buffers(submesh_json: dict) -> dict[str, str]:
-        """json 声明的 Position/Blend 源 buffer（F1 指纹用）：FileName -> FileName。
+    def _category_buffer_path_from_json(submesh_json: dict, category: str) -> str:
+        """按类别定位子网格 json 声明的 buffer 文件名（无声明返回空串）。
 
-        与 ``_dualset_workspace_strength`` 同口径：CategoryBufferList 中
-        FileName 以 ``-Position.buf`` / ``-Blend.buf`` 结尾的文件。无声明返回
-        空 dict（该 json 不适用源数据指纹校验）。
+        类别优先按 Category/DrawCategory 字段判定；SSMT4 提取端在 LOD1+
+        把 Position 缓冲命名为 ``<bare>-trianglelist.buf``（旧端为
+        ``-Position.buf``），文件名后缀作为兼容兜底。
         """
-        declared: dict[str, str] = {}
+        wanted = str(category or "").lower()
         for category_buffer in submesh_json.get("CategoryBufferList", []) or []:
             if not isinstance(category_buffer, dict):
                 continue
             file_name = str(category_buffer.get("FileName", "") or "")
+            if not file_name:
+                continue
+            cat = str(
+                category_buffer.get("Category")
+                or category_buffer.get("DrawCategory")
+                or ""
+            ).lower()
             lowered = file_name.lower()
-            if lowered.endswith("-position.buf") or lowered.endswith("-blend.buf"):
+            suffix_ok = lowered.endswith(f"-{wanted}.buf")
+            if wanted == "position":
+                suffix_ok = suffix_ok or lowered.endswith("-trianglelist.buf")
+            if cat == wanted or suffix_ok:
+                return file_name
+        return ""
+
+    @staticmethod
+    def _declared_source_buffers(submesh_json: dict) -> dict[str, str]:
+        """json 声明的 Position/Blend 源 buffer（F1 指纹用）：FileName -> FileName。
+
+        与 ``_dualset_workspace_strength`` 同口径：CategoryBufferList 中属于
+        Position/Blend 类别的文件（Category 字段优先，``-position.buf`` /
+        ``-trianglelist.buf`` / ``-blend.buf`` 后缀兜底）。无声明返回空 dict
+        （该 json 不适用源数据指纹校验）。
+        """
+        declared: dict[str, str] = {}
+        for category in ("Position", "Blend"):
+            file_name = EFMIBoneMapBuilder._category_buffer_path_from_json(
+                submesh_json, category
+            )
+            if file_name:
                 declared[file_name] = file_name
         return declared
 
@@ -1550,14 +1578,14 @@ class EFMIBoneMapBuilder:
         任一必需 buf 缺失/无法解析 ⇒ 返回 {}（A4：强度数据不可得）。
         返回 compute_driven_signatures 的原始签名 dict。
         """
-        pos_path = blend_path = ""
-        for category_buffer in submesh_json.get("CategoryBufferList", []):
-            file_name = str(category_buffer.get("FileName", "") or "")
-            lowered = file_name.lower()
-            if lowered.endswith("-position.buf"):
-                pos_path = os.path.join(submesh_dir, file_name)
-            elif lowered.endswith("-blend.buf"):
-                blend_path = os.path.join(submesh_dir, file_name)
+        pos_file = EFMIBoneMapBuilder._category_buffer_path_from_json(
+            submesh_json, "Position"
+        )
+        blend_file = EFMIBoneMapBuilder._category_buffer_path_from_json(
+            submesh_json, "Blend"
+        )
+        pos_path = os.path.join(submesh_dir, pos_file) if pos_file else ""
+        blend_path = os.path.join(submesh_dir, blend_file) if blend_file else ""
         if not pos_path or not blend_path:
             return {}
         if not os.path.isfile(pos_path) or not os.path.isfile(blend_path):
@@ -1576,16 +1604,15 @@ class EFMIBoneMapBuilder:
            signatures 对无 Position 布局直接返回空表（L671），该子网格无法
            重算 weight_total。
         """
-        pos_path = blend_path = ""
-        blend_declared = False
-        for category_buffer in submesh_json.get("CategoryBufferList", []):
-            file_name = str(category_buffer.get("FileName", "") or "")
-            lowered = file_name.lower()
-            if lowered.endswith("-position.buf"):
-                pos_path = os.path.join(submesh_dir, file_name)
-            elif lowered.endswith("-blend.buf"):
-                blend_path = os.path.join(submesh_dir, file_name)
-                blend_declared = True
+        pos_file = EFMIBoneMapBuilder._category_buffer_path_from_json(
+            submesh_json, "Position"
+        )
+        blend_file = EFMIBoneMapBuilder._category_buffer_path_from_json(
+            submesh_json, "Blend"
+        )
+        pos_path = os.path.join(submesh_dir, pos_file) if pos_file else ""
+        blend_path = os.path.join(submesh_dir, blend_file) if blend_file else ""
+        blend_declared = bool(blend_file)
         if (pos_path and not os.path.isfile(pos_path)) or (
             blend_path and not os.path.isfile(blend_path)
         ):
@@ -1603,14 +1630,14 @@ class EFMIBoneMapBuilder:
         的硬缺失（应大声失败）；「根本没声明强度类别」由 _dualset_has_strength_decl
         统一判形态缺失（rc=1）。
         """
-        pos_path = blend_path = ""
-        for category_buffer in submesh_json.get("CategoryBufferList", []):
-            file_name = str(category_buffer.get("FileName", "") or "")
-            lowered = file_name.lower()
-            if lowered.endswith("-position.buf"):
-                pos_path = os.path.join(submesh_dir, file_name)
-            elif lowered.endswith("-blend.buf"):
-                blend_path = os.path.join(submesh_dir, file_name)
+        pos_file = EFMIBoneMapBuilder._category_buffer_path_from_json(
+            submesh_json, "Position"
+        )
+        blend_file = EFMIBoneMapBuilder._category_buffer_path_from_json(
+            submesh_json, "Blend"
+        )
+        pos_path = os.path.join(submesh_dir, pos_file) if pos_file else ""
+        blend_path = os.path.join(submesh_dir, blend_file) if blend_file else ""
         if pos_path and not os.path.isfile(pos_path):
             return True
         if blend_path and not os.path.isfile(blend_path):
@@ -1619,25 +1646,27 @@ class EFMIBoneMapBuilder:
 
     @staticmethod
     def _dualset_has_strength_decl(submesh_dir: str, submesh_json: dict) -> bool:
-        """是否声明了任一强度类别（Position.buf 或 Blend.buf 条目）。"""
-        for category_buffer in submesh_json.get("CategoryBufferList", []):
-            file_name = str(category_buffer.get("FileName", "") or "")
-            lowered = file_name.lower()
-            if lowered.endswith("-position.buf") or lowered.endswith("-blend.buf"):
+        """是否声明了任一强度类别（Position 或 Blend 条目）。"""
+        for category in ("Position", "Blend"):
+            if EFMIBoneMapBuilder._category_buffer_path_from_json(
+                submesh_json, category
+            ):
                 return True
         return False
 
     @staticmethod
     def _dualset_strength_shape_ok(submesh_dir: str, submesh_json: dict) -> bool:
         """强度类别形态完备：Position 与 Blend 条目都必须声明（缺一不可重算）。"""
-        has_pos = has_blend = False
-        for category_buffer in submesh_json.get("CategoryBufferList", []):
-            file_name = str(category_buffer.get("FileName", "") or "")
-            lowered = file_name.lower()
-            if lowered.endswith("-position.buf"):
-                has_pos = True
-            elif lowered.endswith("-blend.buf"):
-                has_blend = True
+        has_pos = bool(
+            EFMIBoneMapBuilder._category_buffer_path_from_json(
+                submesh_json, "Position"
+            )
+        )
+        has_blend = bool(
+            EFMIBoneMapBuilder._category_buffer_path_from_json(
+                submesh_json, "Blend"
+            )
+        )
         return has_pos and has_blend
 
     @staticmethod
@@ -2204,6 +2233,7 @@ class EFMIBoneMapBuilder:
         constraint_labels: dict[tuple[str, int], object] | None = None,
         deduplicate: bool | None = None,
         lifetime_domains: dict[str, object] | None = None,
+        dedup_excluded: set[str] | None = None,
     ) -> tuple[dict[str, dict], dict[str, int]]:
         """跨子网格按"矩阵硬门控 + 权重扩散确认"去重构建 vg_map（同部件不去重）。
 
@@ -2226,6 +2256,12 @@ class EFMIBoneMapBuilder:
               出现的距离下维护者不绘制，槽就无人写入（R1 悬空槽）。
               两个候选都带域且域不同时断边；缺域候选可附着到一侧，但不能再
               作为桥把两个不同域的组串起来（与 constraint_labels 同构）。
+            - dedup_excluded: 组件级“排除去重”集合（unique_str 集合）。集合内
+              组件的每根骨骼**不参与任何去重合并**（含组内/跨组件）：其 VGMap
+              恒为恒等映射（local -> vg_offset + local，独占自己声明段内的槽位），
+              其它组件也无法把骨骼并入它的槽位。用于用户指定“此部件骨骼必须
+              自持、不得被并入他段”的部件（如剔除导出但仍保留占位的部件）。
+              对应子网格 json 标记键：``VGMapDedupExcluded=True``。
         返回: (vg_maps, vg_offsets)
 
         去重判据（分层，矩阵是必要条件——几何接近无权推翻矩阵不一致）：
@@ -2337,6 +2373,29 @@ class EFMIBoneMapBuilder:
                     cand["local_vg_id"]
                 ] = cand["global_vg_id"]
             return identity_maps, vg_offsets
+
+        # 组件级“排除去重”（VGMapDedupExcluded=True）：被排除组件的每根骨骼
+        # 从候选池中取出，预建恒等映射（local -> 自己段的 global 槽位），
+        # 不参与下方任何并查集/扩散合并；其它组件也不能把骨骼并入其槽位。
+        # 槽位分配（offset 累加）已在上方候选收集阶段完成，排除不会改变布局。
+        excluded_set: set[str] = set(dedup_excluded or ())
+        excluded_maps: dict[str, dict] = {}
+        if excluded_set:
+            excluded_cands = [
+                c for c in candidates if c["unique_str"] in excluded_set
+            ]
+            if excluded_cands:
+                for cand in excluded_cands:
+                    excluded_maps.setdefault(cand["unique_str"], {})[
+                        cand["local_vg_id"]
+                    ] = cand["global_vg_id"]
+                active_cands = [
+                    c for c in candidates if c["unique_str"] not in excluded_set
+                ]
+                if not active_cands:
+                    return excluded_maps, vg_offsets
+                candidates = active_cands
+                n = len(candidates)
 
         parent = list(range(n))
         group_submeshes: list[set] = [{candidates[i]["unique_str"]} for i in range(n)]
@@ -2791,6 +2850,10 @@ class EFMIBoneMapBuilder:
             for i in members:
                 cand = candidates[i]
                 vg_maps.setdefault(cand["unique_str"], {})[cand["local_vg_id"]] = canonical_global
+
+        # 合并“排除去重”组件的恒等映射（不参与并查集的槽位）
+        for _excluded_unique_str, _identity_map in excluded_maps.items():
+            vg_maps.setdefault(_excluded_unique_str, {}).update(_identity_map)
 
         return vg_maps, vg_offsets
 
@@ -4774,7 +4837,13 @@ class EFMISkeletonMergeHelper:
 
             bare_name = os.path.splitext(os.path.basename(json_path))[0]
             submesh_dir = os.path.dirname(os.path.dirname(json_path))  # TYPE_ 的上一级 = 子网格目录
-            blend_buf_path = os.path.join(os.path.dirname(json_path), bare_name + "-Blend.buf")
+            blend_file_name = (
+                EFMIBoneMapBuilder._category_buffer_path_from_json(
+                    submesh_json, "Blend"
+                )
+                or (bare_name + "-Blend.buf")
+            )
+            blend_buf_path = os.path.join(os.path.dirname(json_path), blend_file_name)
 
             # 子网格 -> drawcall 索引（优先角色级映射，其次 LOD 目录映射，最后 dump 反查兜底）
             drawcall_index_list: list[str] = []
@@ -4875,7 +4944,13 @@ class EFMISkeletonMergeHelper:
 
             # 权重扩散去重签名（读 Position.buf + Blend.buf 计算每骨骼的
             # 正权重采样场；质心/包围盒仅作回退与剪枝）
-            position_buf_path = os.path.join(os.path.dirname(json_path), bare_name + "-Position.buf")
+            position_file_name = (
+                EFMIBoneMapBuilder._category_buffer_path_from_json(
+                    submesh_json, "Position"
+                )
+                or (bare_name + "-Position.buf")
+            )
+            position_buf_path = os.path.join(os.path.dirname(json_path), position_file_name)
             try:
                 centroids = EFMIBoneMapBuilder.compute_driven_signatures(
                     position_buf_path, blend_buf_path, submesh_json
@@ -4889,6 +4964,7 @@ class EFMISkeletonMergeHelper:
                 "json_path": json_path,
                 "submesh_dir": submesh_dir,
                 "bare_name": bare_name,
+                "dedup_excluded": bool(submesh_json.get("VGMapDedupExcluded")),
                 # 实际成功读到骨骼数据的 draw_index（后备 drawcall 成功时
                 # 绝不能回落到 drawcall_index_list[0] 的失败候选）
                 "draw_index": skeleton_draw_index,
@@ -4918,6 +4994,10 @@ class EFMISkeletonMergeHelper:
                 protected_pairs=protected_pairs,
                 constraint_labels=constraint_labels,
                 deduplicate=dedup_enabled,
+                dedup_excluded={
+                    us for us, meta in submesh_meta.items()
+                    if meta.get("dedup_excluded")
+                },
             )
 
         # 写回工作空间 json + 复制骨骼池缓存

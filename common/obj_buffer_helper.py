@@ -376,7 +376,7 @@ class ObjBufferHelper:
         return result
 
     @staticmethod
-    def _parse_blendindices(blendindices_dict, d3d11_element):
+    def _parse_blendindices(blendindices_dict, d3d11_element, owner_label: str = ""):
         blendindices = blendindices_dict.get(d3d11_element.SemanticIndex,None)
         # print("blendindices: " + str(len(blendindices_dict)))
         # 如果当前索引对应的 blendindices 为 None，则使用索引0的数据并全部置0
@@ -386,7 +386,11 @@ class ObjBufferHelper:
                 # 创建一个与 blendindices_0 形状相同的全0数组，保持相同的数据类型
                 blendindices = numpy.zeros_like(blendindices_0)
             else:
-                SSMTErrorUtils.raise_fatal("Cannot find any valid BLENDINDICES data in this model, Please check if your model's Vertex Group is correct.")
+                SSMTErrorUtils.raise_fatal(
+                    f"{owner_label + ': ' if owner_label else ''}"
+                    "Cannot find any valid BLENDINDICES data in this model, "
+                    "Please check if your model's Vertex Group is correct."
+                )
         # print(len(blendindices))
         component_count = int(
             d3d11_element.ByteWidth / numpy.dtype(FormatUtils.get_nptype_from_format(d3d11_element.Format)).itemsize
@@ -612,7 +616,11 @@ class ObjBufferHelper:
                 data = ObjBufferHelper._parse_texcoord(mesh, mesh_loops_length, d3d11_element_name, d3d11_element)
             
             elif d3d11_element_name.startswith('BLENDINDICES'):
-                data = ObjBufferHelper._parse_blendindices(blendindices_dict, d3d11_element)
+                data = ObjBufferHelper._parse_blendindices(
+                    blendindices_dict,
+                    d3d11_element,
+                    owner_label=str(getattr(mesh, "name", "") or ""),
+                )
                 
             elif d3d11_element_name.startswith('BLENDWEIGHT'):
                 data = ObjBufferHelper._parse_blendweight(blendweights_dict, d3d11_element)

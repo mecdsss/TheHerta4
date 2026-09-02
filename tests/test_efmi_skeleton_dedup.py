@@ -369,6 +369,32 @@ class DedupGateTests(unittest.TestCase):
         vg_maps, _ = EFMIBoneMapBuilder.build_vg_maps(submesh)
         self.assertEqual(vg_maps["aa_part"][0], vg_maps["bb_part"][0])
 
+    def test_dedup_excluded_component_keeps_identity_slots(self):
+        """VGMapDedupExcluded 组件不参与去重：恒等映射（local -> vg_offset+local），
+        独占自己声明段；其余组件之间照常合并，且排除不改变槽位布局。"""
+        submesh = {
+            "aa_part": _entry([_bone(0.1, 0.2, 0.3), _bone(1.0, 1.0, 1.0)]),
+            "bb_part": _entry([_bone(0.1, 0.2, 0.3)]),
+            "cc_part": _entry([_bone(0.1, 0.2, 0.3), _bone(5.0, 5.0, 5.0)]),
+        }
+        # 无排除：三部件相同的 (0.1,0.2,0.3) 合并到同一 canonical 槽
+        maps, offsets = EFMIBoneMapBuilder.build_vg_maps(submesh)
+        self.assertEqual(maps["aa_part"][0], maps["bb_part"][0])
+        self.assertEqual(maps["aa_part"][0], maps["cc_part"][0])
+
+        # 排除 cc：cc 必须恒等映射，其它组件不受影响
+        maps2, offsets2 = EFMIBoneMapBuilder.build_vg_maps(
+            submesh, dedup_excluded={"cc_part"}
+        )
+        self.assertEqual(maps2["cc_part"][0], offsets2["cc_part"] + 0)
+        self.assertEqual(maps2["cc_part"][1], offsets2["cc_part"] + 1)
+        self.assertEqual(maps2["aa_part"][0], maps2["bb_part"][0])
+        # cc 的槽位不得与任何合并组重叠
+        self.assertNotEqual(maps2["cc_part"][0], maps2["aa_part"][0])
+        self.assertNotEqual(maps2["cc_part"][0], maps2["aa_part"][1])
+        # 排除不改变其它部件的 offset 布局
+        self.assertEqual(offsets, offsets2)
+
     def test_exact_matrix_with_conflicting_diffusion_stays_split(self):
         """矩阵相同但已有扩散证据冲突时，不能让 bitwise 直接合并掩盖冲突。"""
         points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]

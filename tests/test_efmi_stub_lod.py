@@ -246,7 +246,7 @@ class EFMIStubLodTests(unittest.TestCase):
         with open(os.path.join(lod_dir, "DrawIB-Component.json"), "w", encoding="utf-8") as f:
             json.dump(component_map, f)
 
-    def _write_vgmap_json(self, lod, bare, gid, positions=None):
+    def _write_vgmap_json(self, lod, bare, gid, positions=None, excluded=False):
         type_dir = os.path.join(self.tmp, lod, bare, "TYPE_GPU_TEST_")
         os.makedirs(type_dir, exist_ok=True)
         payload = {
@@ -254,6 +254,8 @@ class EFMIStubLodTests(unittest.TestCase):
             "VGOffset": 0,
             "VGCount": 1 if gid is not None else 0,
         }
+        if excluded:
+            payload["VGMapDedupExcluded"] = True
         if positions is not None:
             payload["CategoryBufferList"] = [{
                 "D3D11ElementList": [{
@@ -318,17 +320,64 @@ class EFMIStubLodTests(unittest.TestCase):
         self.assertIsNone(_fake_bpy_data.objects.get("LOD1.ed6d1655-999-0"))
         self.assertEqual(exporter._efmi_stub_object_names, [])
 
+    def test_stub_weight_group_uses_registered_slot_when_vgmap_present(self):
+        """合并骨架模式：缺部件有 VGMap 时，占位权重组必须是已注册槽（首个 VGMap 值），
+        否则 EFMI 双套域前置会以「未注册/旧代槽」拦截导出。"""
+        self._write_component_map("LOD0", {
+            "31f9ac3d": {"0": "31f9ac3d-500-0", "1": "31f9ac3d-501-0"},
+        })
+        self._write_vgmap_json("LOD0", "31f9ac3d-501-0", 371)
+        ordered = [DrawCallModel(obj_name="LOD0.31f9ac3d-500-0")]
+        exporter = _make_exporter(ordered)
+
+        self._workspace_unique_strs(ordered)
+        stub = _fake_bpy_data.objects.get("LOD0.31f9ac3d-501-0")
+        self.assertIsNotNone(stub)
+        self.assertEqual(stub.get("EFMI_STUB"), 1)
+        # 权重组挂已注册槽 371，而不是局部命名空间的 "0"
+        self.assertEqual(stub.vertex_groups[0].name, "371")
+        exporter._cleanup_stub_objects()
+
     def test_stub_when_absent_lod1_drawib_absorbed_by_lod1_object(self):
-        """LOD1 整个 DrawIB 缺席，但其 VGMap 全局 id 被 LOD1 现存对象引用 = 被合并 -> 插桩。"""
+        """LOD1 整个 DrawIB 缺席，其独有槽被 LOD1 现存对象实际使用（外来槽）-> 插桩。"""
         self._write_component_map("LOD1", {"26ab840d": {"0": "26ab840d-24570-0"}})
         self._write_vgmap_json("LOD1", "26ab840d-24570-0", 7)
-        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])
+        self._write_vgmap_json("LOD1", "ed6d1655-816-0", 3)  # 现存对象声明槽 3
+        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])  # 实际却用了 7（外来）
         ordered = [DrawCallModel(obj_name="LOD1.ed6d1655-816-0")]
         exporter = _make_exporter(ordered)
 
         names = self._workspace_unique_strs(ordered)
         self.assertIn("LOD1.26ab840d-24570-0", names)
         self.assertEqual(len(exporter._efmi_stub_object_names), 1)
+        exporter._cleanup_stub_objects()
+
+    def test_shared_slot_from_matrix_dedup_does_not_absorb_missing_drawib(self):
+        """用户裁决：矩阵去重的共享槽（A 自己经 VGMap 声明了同槽）不算吸收证据——
+        A 用 X 是用自己的骨骼，B 缺席时不应补占位（游戏保留原版）。"""
+        self._write_component_map("LOD1", {"26ab840d": {"0": "26ab840d-24570-0"}})
+        self._write_vgmap_json("LOD1", "26ab840d-24570-0", 7)  # B: local0 -> 槽 7
+        self._write_vgmap_json("LOD1", "ed6d1655-816-0", 7)    # A: local0 -> 亦声明槽 7（共享）
+        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])
+        ordered = [DrawCallModel(obj_name="LOD1.ed6d1655-816-0")]
+        exporter = _make_exporter(ordered)
+
+        names = self._workspace_unique_strs(ordered)
+        self.assertNotIn("LOD1.26ab840d-24570-0", names)
+        self.assertEqual(exporter._efmi_stub_object_names, [])
+        exporter._cleanup_stub_objects()
+
+    def test_dedup_excluded_missing_component_skips_stub(self):
+        """VGMapDedupExcluded=True 的缺失部件：即使槽被引用，也按用户意图不生成占位。"""
+        self._write_component_map("LOD1", {"26ab840d": {"0": "26ab840d-24570-0"}})
+        self._write_vgmap_json("LOD1", "26ab840d-24570-0", 7, excluded=True)
+        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])
+        ordered = [DrawCallModel(obj_name="LOD1.ed6d1655-816-0")]
+        exporter = _make_exporter(ordered)
+
+        names = self._workspace_unique_strs(ordered)
+        self.assertNotIn("LOD1.26ab840d-24570-0", names)
+        self.assertEqual(exporter._efmi_stub_object_names, [])
         exporter._cleanup_stub_objects()
 
     def test_replacement_model_uses_vgmap_when_geometry_differs(self):
