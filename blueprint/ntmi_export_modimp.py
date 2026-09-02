@@ -110,6 +110,7 @@ COMPATIBLE_POSTPROCESS_NODE_TYPES = {
     "SSMTNode_PostProcess_AnimDriver",
     "SSMTNode_PostProcess_BufferCleanup",
     "SSMTNode_PostProcess_Material",
+    "SSMTNode_PostProcess_CustomMaterialAssign",
     "SSMTNode_PostProcess_MultiFile",
     "SSMTNode_PostProcess_ResourceMerge",
     "SSMTNode_PostProcess_ShapeKey",
@@ -525,7 +526,10 @@ def _execute_supported_postprocess_nodes(blueprint_model: BluePrintModel, output
             LOG.warning(f"Skip unsupported postprocess node: {getattr(node, 'name', '')}")
             continue
         try:
-            if node_type == "SSMTNode_PostProcess_Material":
+            if node_type in {
+                "SSMTNode_PostProcess_Material",
+                "SSMTNode_PostProcess_CustomMaterialAssign",
+            }:
                 execute_postprocess(output_dir, exporter=exporter)
             else:
                 execute_postprocess(output_dir)
