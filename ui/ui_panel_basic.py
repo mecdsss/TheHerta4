@@ -85,6 +85,11 @@ class SSMT_OT_ToggleStripTextureColorPrefix(bpy.types.Operator):
 
 
 class SSMT_OT_ClearMergedSkeletonCache(bpy.types.Operator):
+    """清除骨骼合并 VGMap 缓存（单次确认）。
+
+    本操作会删除工作空间所有子网格 json 的 VGMap/VGOffset/VGCount 缓存字段，
+    删除后不可恢复，故先弹窗说明将清除的内容，确认后才真正执行。
+    """
     bl_idname = "ssmt.clear_merged_skeleton_cache"
     bl_label = "清除骨骼合并VGMap缓存"
     bl_description = (
@@ -92,22 +97,49 @@ class SSMT_OT_ClearMergedSkeletonCache(bpy.types.Operator):
         "去重策略变更后旧缓存会被幂等跳过，清除后下次一键导入将按当前策略重新生成。"
         "EFMI（终末地）/ ZZMI（绝区零）模式下可用"
     )
+    bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
         return GlobalConfig.logic_name in (LogicName.EFMI, LogicName.ZZMI)
 
-    def execute(self, context):
+    def _precheck(self, context):
+        """模式 + 工作空间前置校验；返回错误信息字符串，无错误返回 None。"""
         if GlobalConfig.logic_name not in (LogicName.EFMI, LogicName.ZZMI):
-            self.report({'ERROR'}, "仅 EFMI（终末地）/ ZZMI（绝区零）模式下可用")
+            return "仅 EFMI（终末地）/ ZZMI（绝区零）模式下可用"
+        workspace_root = GlobalConfig.path_workspace_folder()
+        if not workspace_root or not os.path.isdir(workspace_root):
+            return "当前工作空间目录无效，无法清理"
+        return None
+
+    def invoke(self, context, event):
+        error = self._precheck(context)
+        if error:
+            self.report({'ERROR'}, error)
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="将清除当前工作空间全部子网格 json 的骨骼合并缓存：")
+        box = layout.box()
+        box.label(text="· VGMap")
+        box.label(text="· VGOffset")
+        box.label(text="· VGCount")
+        layout.label(
+            text="清除后去重策略变更产生的旧缓存会被移除，"
+            "下次一键导入将按当前策略重新生成",
+            icon='INFO',
+        )
+
+    def execute(self, context):
+        error = self._precheck(context)
+        if error:
+            self.report({'ERROR'}, error)
             return {'CANCELLED'}
 
         from ..common.efmi_skeleton import EFMISkeletonMergeHelper
         workspace_root = GlobalConfig.path_workspace_folder()
-        if not workspace_root or not os.path.isdir(workspace_root):
-            self.report({'ERROR'}, "当前工作空间目录无效，无法清理")
-            return {'CANCELLED'}
-
         cleaned, scanned = EFMISkeletonMergeHelper.clear_vgmap_cache(workspace_root)
         if cleaned > 0:
             message = (

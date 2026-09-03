@@ -306,10 +306,14 @@ class SSMT_OT_MaterialDetectClear(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
-    bl_idname = 'SSMTNode_PostProcess_Material'
-    bl_label = '材质转资源'
-    bl_description = '根据场景物体的材质和纹理创建资源引用'
+class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
+    """「材质转资源」节点的共享实现基类（未注册的纯 Python 基类）。
+
+    注意：Blender 不允许注册「继承自已注册自定义节点」的子类——注册子类会
+    破坏父节点类型（复现：注册 SSMTNode_PostProcess_CustomMaterialAssign 后，
+    SSMTNode_PostProcess_Material 无法再创建，并报 unable to get Python class
+    for RNA struct 警告）。因此两个具体节点类都继承本基类、各自独立注册。
+    """
 
     TRANSPARENCY_SECTION_MARKER = ";MARK:CustomShaderTransparency----------------------------------------------------------"
 
@@ -2448,6 +2452,17 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 f.write(new_content)
 
         _LOG.info(f"   ✅ 材质转资源节点执行完成")
+
+
+class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_MaterialBase):
+    """材质转资源：根据场景物体的材质和纹理创建资源引用。
+
+    全部实现逻辑在未注册的 SSMTNode_PostProcess_MaterialBase 中；本类只是
+    Blender 注册用的具体节点壳（bl_idname/bl_label/bl_description）。
+    """
+    bl_idname = 'SSMTNode_PostProcess_Material'
+    bl_label = '材质转资源'
+    bl_description = '根据场景物体的材质和纹理创建资源引用'
 
 
 classes = (

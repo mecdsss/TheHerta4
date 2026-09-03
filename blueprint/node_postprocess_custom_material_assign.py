@@ -12,7 +12,7 @@ from collections import OrderedDict
 
 from .node_postprocess_material import (
     MATERIAL_DETECT_PRESETS,
-    SSMTNode_PostProcess_Material,
+    SSMTNode_PostProcess_MaterialBase,
 )
 
 
@@ -747,7 +747,7 @@ class SSMT_OT_CustomMaterialClearSwitches(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_Material):
+class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBase):
     bl_idname = NODE_IDNAME
     bl_label = "材质转资源pro"
     bl_description = (

@@ -338,18 +338,41 @@ class EFMIStubLodTests(unittest.TestCase):
         self.assertEqual(stub.vertex_groups[0].name, "371")
         exporter._cleanup_stub_objects()
 
-    def test_stub_when_absent_lod1_drawib_absorbed_by_lod1_object(self):
-        """LOD1 整个 DrawIB 缺席，其独有槽被 LOD1 现存对象实际使用（外来槽）-> 插桩。"""
+    def test_absent_drawib_registered_slot_referenced_is_not_absorbed(self):
+        """LOD1 整个 DrawIB 缺席，其独有槽被现存对象实际使用——但该槽已在
+        全工作区 json 注册（缺部件自己的 json 声明了 7）：统一顶点组模式下
+        跨组件引用已注册槽是设计内合法状态（用户裁决 2026-11，基线改为
+        全工作区注册域），不判吸收 -> 不插桩（游戏保留原版）。"""
         self._write_component_map("LOD1", {"26ab840d": {"0": "26ab840d-24570-0"}})
         self._write_vgmap_json("LOD1", "26ab840d-24570-0", 7)
         self._write_vgmap_json("LOD1", "ed6d1655-816-0", 3)  # 现存对象声明槽 3
-        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])  # 实际却用了 7（外来）
+        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])  # 实际却用了 7（已注册）
         ordered = [DrawCallModel(obj_name="LOD1.ed6d1655-816-0")]
         exporter = _make_exporter(ordered)
 
         names = self._workspace_unique_strs(ordered)
-        self.assertIn("LOD1.26ab840d-24570-0", names)
-        self.assertEqual(len(exporter._efmi_stub_object_names), 1)
+        self.assertNotIn("LOD1.26ab840d-24570-0", names)
+        self.assertEqual(exporter._efmi_stub_object_names, [])
+        exporter._cleanup_stub_objects()
+
+    def test_absent_drawib_every_reference_is_registered_never_absorbed(self):
+        """整 DrawIB 缺席：declared = 全工作区注册域，缺部件自身的 json VGMap
+        值必然 ⊆ 注册域 -> vg_values ∩ (used − declared) 恒为空 -> absorbed
+        恒 False（用户裁决：几何未并入时槽位引用不算吸收证据；占位只由
+        「部分缺失」分支承担）。未注册槽（如 999）不属于任何 json 值域，
+        同样无法命中 vg_values，故正常数据下整缺席分支不再插桩。"""
+        self._write_component_map("LOD0", {"b20f90ea": {"0": "b20f90ea-19182-0"}})
+        self._write_vgmap_json("LOD0", "b20f90ea-19182-0", 7)
+        self._register_object_with_groups(
+            "LOD0.84618ee0-22296-0",
+            [7, 999],  # 7 已注册（缺部件声明）；999 未注册（也不属任何值域）
+        )
+        ordered = [DrawCallModel(obj_name="LOD0.84618ee0-22296-0")]
+        exporter = _make_exporter(ordered)
+
+        names = self._workspace_unique_strs(ordered)
+        self.assertNotIn("LOD0.b20f90ea-19182-0", names)
+        self.assertEqual(exporter._efmi_stub_object_names, [])
         exporter._cleanup_stub_objects()
 
     def test_shared_slot_from_matrix_dedup_does_not_absorb_missing_drawib(self):
@@ -380,8 +403,11 @@ class EFMIStubLodTests(unittest.TestCase):
         self.assertEqual(exporter._efmi_stub_object_names, [])
         exporter._cleanup_stub_objects()
 
-    def test_replacement_model_uses_vgmap_when_geometry_differs(self):
-        """替换模型即使几何不同且组下标被压缩，也按数字组名识别统一骨骼。"""
+    def test_replacement_model_registered_slot_reference_is_not_absorbed(self):
+        """替换模型即使几何不同且组下标被压缩，也按数字组名识别统一骨骼；
+        但被引用的槽 7 已由缺席部件自己的 json 注册（全工作区注册域）——
+        跨组件引用已注册槽是合法状态（用户裁决 2026-11）-> 不插桩，
+        游戏保留原版绘制。"""
         self._write_component_map("LOD0", {
             "b20f90ea": {"0": "b20f90ea-19182-0"},
         })
@@ -400,8 +426,8 @@ class EFMIStubLodTests(unittest.TestCase):
         exporter = _make_exporter(ordered)
 
         names = self._workspace_unique_strs(ordered)
-        self.assertIn("LOD0.b20f90ea-19182-0", names)
-        self.assertEqual(len(exporter._efmi_stub_object_names), 1)
+        self.assertNotIn("LOD0.b20f90ea-19182-0", names)
+        self.assertEqual(exporter._efmi_stub_object_names, [])
         exporter._cleanup_stub_objects()
 
     def test_geometry_overlap_without_vgmap_relation_does_not_create_stub(self):
@@ -474,8 +500,10 @@ class EFMIStubLodTests(unittest.TestCase):
         self.assertNotIn("LOD1.26ab840d-24570-0", names)
         self.assertEqual(exporter._efmi_stub_object_names, [])
 
-    def test_lod0_behavior_unchanged(self):
-        """LOD0 原语义不回退：LOD0 缺席 DrawIB 被 LOD0 对象引用 -> 仍插桩。"""
+    def test_lod0_registered_slot_referenced_is_not_absorbed(self):
+        """LOD0 新语义不回退：LOD0 缺席 DrawIB 的已注册槽被 LOD0 对象引用
+        （槽 3 由缺部件 json 注册在全工作区）-> 跨组件引用已注册槽合法，
+        不判吸收 -> 不插桩（用户裁决 2026-11，基线=全工作区注册域）。"""
         self._write_component_map("LOD0", {"b20f90ea": {"0": "b20f90ea-19182-0"}})
         self._write_vgmap_json("LOD0", "b20f90ea-19182-0", 3)
         self._register_object_with_groups("LOD0.84618ee0-22296-0", [3])
@@ -483,10 +511,8 @@ class EFMIStubLodTests(unittest.TestCase):
         exporter = _make_exporter(ordered)
 
         names = self._workspace_unique_strs(ordered)
-        self.assertIn("LOD0.b20f90ea-19182-0", names)
-        self.assertEqual(len(exporter._efmi_stub_object_names), 1)
-        stub = _fake_bpy_data.objects.get("LOD0.b20f90ea-19182-0")
-        self.assertIsNotNone(stub)
+        self.assertNotIn("LOD0.b20f90ea-19182-0", names)
+        self.assertEqual(exporter._efmi_stub_object_names, [])
         exporter._cleanup_stub_objects()
 
 

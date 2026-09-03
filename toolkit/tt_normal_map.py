@@ -768,7 +768,7 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
         output_node = node_tree.nodes.new("ShaderNodeOutputMaterial")
         output_node.location = (220, 0)
 
-        mat.blend_method = "BLEND"
+        mat.blend_method = "DITHER"   # 抖动透明（用户规则：防半透明排序/边缘伪影，勿用 BLEND）
         if hasattr(mat, "use_transparency_overlap"):
             mat.use_transparency_overlap = False
         elif hasattr(mat, "show_transparent_back"):
