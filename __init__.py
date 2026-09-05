@@ -196,6 +196,8 @@ def register():
     bpy.utils.register_class(HertaUpdatePreference)
 
     blueprint.register()
+    import TheHerta4_Velo_Bridge
+    TheHerta4_Velo_Bridge.register()
     _schedule_blueprint_node_color_refresh()
     ui_prefix_quick_ops.register()
     ui_panel_basic.register()
@@ -232,6 +234,8 @@ def unregister():
     ui_panel_sword.unregister()
     ui_panel_basic.unregister()
     ui_prefix_quick_ops.unregister()
+    import TheHerta4_Velo_Bridge
+    TheHerta4_Velo_Bridge.unregister()
     blueprint.unregister()
 
     bpy.utils.unregister_class(HertaUpdatePreference)
