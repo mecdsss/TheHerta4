@@ -1408,7 +1408,7 @@ class SSMT_MT_NodeMenu_PostProcess_Material(bpy.types.Menu):
 
     def draw(self, context):
         layout = self.layout
-        _add_node_entry(layout, "材质转资源", 'MATERIAL', "SSMTNode_PostProcess_Material")
+        # 原版「材质转资源」已弃用：功能被「材质转资源pro」完全覆盖，旧蓝图会自动迁移。
         _add_node_entry(layout, "材质转资源pro", 'OBJECT_DATA', "SSMTNode_PostProcess_CustomMaterialAssign")
         _add_node_entry(layout, "贴图资源去重", 'PACKAGE', "SSMTNode_PostProcess_ResourceMerge")
         _add_node_entry(layout, "缓冲区清理", 'TRASH', "SSMTNode_PostProcess_BufferCleanup")

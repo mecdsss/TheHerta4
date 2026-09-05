@@ -4,7 +4,7 @@ import os
 import re
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
-from .node_postprocess_material import SSMTNode_PostProcess_Material
+from .node_postprocess_material import SSMTNode_PostProcess_MaterialBase
 
 
 class SSMTNode_PostProcess_CommentCleanup(SSMTNode_PostProcess_Base):
@@ -22,7 +22,7 @@ class SSMTNode_PostProcess_CommentCleanup(SSMTNode_PostProcess_Base):
             try:
                 with open(ini_path, "r", encoding="utf-8-sig", newline="") as handle:
                     content = handle.read()
-                cleaned = SSMTNode_PostProcess_Material._replace_non_ascii_runs(content)
+                cleaned = SSMTNode_PostProcess_MaterialBase._replace_non_ascii_runs(content)
                 if cleaned == content:
                     continue
                 with open(ini_path, "w", encoding="utf-8", newline="") as handle:

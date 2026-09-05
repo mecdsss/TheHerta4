@@ -306,11 +306,16 @@ class SSMT_OT_MaterialDetectClear(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
-    bl_idname = 'SSMTNode_PostProcess_Material'
-    bl_label = '材质转资源'
-    bl_description = '根据场景物体的材质和纹理创建资源引用'
+class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
+    """材质转资源节点的共享实现基类（未注册的纯 Python 基类）。
 
+    注意：Blender 不允许注册「继承自已注册自定义节点」的子类——注册子类会
+    破坏父节点类型（复现：注册 SSMTNode_PostProcess_CustomMaterialAssign 后，
+    SSMTNode_PostProcess_Material 无法再创建，并报 unable to get Python class
+    for RNA struct 警告）。因此具体节点类都继承本基类、各自独立注册。
+    本基类由「材质转资源pro」（完整功能）与「材质转资源」弃用壳（旧文件兼容）
+    共用；原版功能已由 pro 完全覆盖（逐方法对比见 docs/PR7审查修复记录.md）。
+    """
     TRANSPARENCY_SECTION_MARKER = ";MARK:CustomShaderTransparency----------------------------------------------------------"
 
     @staticmethod
@@ -689,7 +694,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
             base_name = match.group(1)
             transparency_value = match.group(2)
             shader_name = f"CustomShaderTransparencyCloth{base_name.replace('-', '_').replace('.', '_')}_透明{transparency_value}"
-            shader_name = SSMTNode_PostProcess_Material._replace_non_ascii_runs(shader_name)
+            shader_name = SSMTNode_PostProcess_MaterialBase._replace_non_ascii_runs(shader_name)
             return shader_name, transparency_value
         return None, None
 
@@ -748,7 +753,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
     def _replace_non_ascii_runs(text):
         return re.sub(
             r"[^\x00-\x7f]+",
-            lambda match: SSMTNode_PostProcess_Material._latin_token_for_text(match.group(0)),
+            lambda match: SSMTNode_PostProcess_MaterialBase._latin_token_for_text(match.group(0)),
             str(text or ""),
         )
 
@@ -758,7 +763,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
         if not material_name:
             material_name = "Texture"
         stem = re.sub(r'[\r\n\[\]=<>:"/\\|?*\s]+', "_", material_name).strip()
-        stem = SSMTNode_PostProcess_Material._replace_non_ascii_runs(stem)
+        stem = SSMTNode_PostProcess_MaterialBase._replace_non_ascii_runs(stem)
         return stem.strip("._") or "Texture"
 
     @staticmethod
@@ -854,7 +859,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
 
     @staticmethod
     def _ps_texture_material_resource_name(material):
-        return f"ResourceTexture_{SSMTNode_PostProcess_Material._material_resource_stem(material)}"
+        return f"ResourceTexture_{SSMTNode_PostProcess_MaterialBase._material_resource_stem(material)}"
 
     def _collect_ntmi_cached_texture_slots_raw(self, obj):
         if obj is None:
@@ -1283,7 +1288,7 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 new_filename = forced_filename
             else:
                 _, file_extension = os.path.splitext(os.path.basename(source_path))
-                new_filename = f"{SSMTNode_PostProcess_Material._material_resource_stem(material)}{file_extension}"
+                new_filename = f"{SSMTNode_PostProcess_MaterialBase._material_resource_stem(material)}{file_extension}"
 
             target_path = os.path.join(target_folder, new_filename)
             if os.path.exists(target_path) and not self.material_to_resource_override:
@@ -2448,6 +2453,25 @@ class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_Base):
                 f.write(new_content)
 
         _LOG.info(f"   ✅ 材质转资源节点执行完成")
+
+
+class SSMTNode_PostProcess_Material(SSMTNode_PostProcess_MaterialBase):
+    """材质转资源（弃用壳）。
+
+    仅保留 bl_idname 用于加载旧版蓝图文件，避免未知节点类型导致节点被
+    Blender 静默丢弃。功能已完全被「材质转资源pro」覆盖；addon 注册/文件
+    加载后会自动迁移为 pro 节点（见 node_postprocess_custom_material_assign
+    的 _migrate_legacy_material_nodes）。
+    """
+    bl_idname = 'SSMTNode_PostProcess_Material'
+    bl_label = '材质转资源（已弃用）'
+    bl_description = '已弃用：功能已被「材质转资源pro」完全覆盖，打开/保存后会自动迁移为 pro 节点。'
+
+    def draw_buttons(self, context, layout):
+        layout.label(
+            text='已弃用：请改用「材质转资源pro」（本节点将自动迁移并转换）',
+            icon='ERROR',
+        )
 
 
 classes = (

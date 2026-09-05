@@ -1,13 +1,30 @@
 bl_info = {'name': 'TheHerta4 Velo Bridge', 'version': (0, 2, 0), 'blender': (4, 4, 0), 'category': 'Node'}
 import bpy
+import importlib.util
 import re
-import copy
 from pathlib import Path
 from bpy.props import StringProperty
 
 NODE_ID = 'SSMTNode_VeloExportBridge'
-BRIDGE_VERSION = '0.3.0-object-name-canonical'
+BRIDGE_VERSION = '0.2.0'
 LOG_PREFIX = '[TheHerta4][VeloBridge][Experimental] '
+
+# 前置插件检测：未安装 Velo Tools 时节点仍可创建（便于搭建蓝图），
+# 但导入/导出操作在执行时会直接失败并给出明确提示（参考 NTMI 的依赖检测模式）。
+VELO_TOOLS_AVAILABLE = importlib.util.find_spec('velo_tools') is not None
+
+
+def _require_velo_tools(self):
+    """执行导入/导出前检查 Velo Tools 前置插件；未安装时直接终止操作。"""
+    if VELO_TOOLS_AVAILABLE:
+        return True
+    message = '未检测到前置插件 Velo Tools，无法执行 Velo 导入/导出。请先安装并启用 Velo Tools。'
+    _debug('velo_tools_missing: ' + message)
+    try:
+        self.report({'ERROR'}, message)
+    except Exception:
+        print(message)
+    return False
 
 def _debug(message):
     message = LOG_PREFIX + str(message)
@@ -101,74 +118,71 @@ def _rewrite_nested_toggle_conditions(cfg, tree, bridge_node, bindings):
     folder = getattr(cfg, 'mod_output_folder', '')
     if not folder:
         return
-    ini_path = __import__('pathlib').Path(bpy.path.abspath(folder)) / 'mod.ini'
+    ini_path = Path(bpy.path.abspath(folder)) / 'mod.ini'
     _debug('ini_path=' + str(ini_path))
     if not ini_path.is_file():
         return
-    try:
-        from velo_tools.games.wuthering_waves._wwmi_core.blender_export.text_formatter import TextFormatter
-        fmt = TextFormatter()
-        paths = _object_condition_paths(bridge_node, bindings)
-        _debug('paths=' + repr(paths))
-        # Velo may split one source object into several material fragments.
-        # Bind conditions by Component N so every generated draw variable is covered.
-        component_paths = {}
-        component_names = {}
-        component_pattern = re.compile(r'.*component[_ -]*(\d+).*', re.IGNORECASE)
-        for object_name, alternatives in paths.items():
-            match = component_pattern.match(object_name)
-            if match:
-                component_paths.setdefault(int(match.group(1)), []).extend(alternatives)
-                component_names.setdefault(int(match.group(1)), object_name)
-        lines = ini_path.read_text(encoding='utf-8').splitlines()
-        draw_vars = {}
-        for line in lines:
-            m = re.match(r'\s*(?:global\s+)?(\$draw_component_(\d+)_\S+)\s*=\s*', line, re.IGNORECASE)
-            if m:
-                draw_vars.setdefault(int(m.group(2)), []).append(m.group(1))
-        # Canonicalize every generated component variable to the TheHerta object name.
-        # This removes material-derived names from the bridge contract entirely.
-        rename_map = {}
-        for component_id, names in draw_vars.items():
-            canonical = component_names.get(component_id)
-            if not canonical:
-                continue
-            target = fmt.format_ini_drawvar(canonical)
-            for source in names:
-                if source.casefold() != target.casefold():
-                    rename_map[source] = target
-        if rename_map:
-            _debug('rename_map=' + repr(rename_map))
+    from velo_tools.games.wuthering_waves._wwmi_core.blender_export.text_formatter import TextFormatter
+    fmt = TextFormatter()
+    paths = _object_condition_paths(bridge_node, bindings)
+    _debug('paths=' + repr(paths))
+    # Velo may split one source object into several material fragments.
+    # Bind conditions by Component N so every generated draw variable is covered.
+    component_paths = {}
+    component_names = {}
+    component_pattern = re.compile(r'.*component[_ -]*(\d+).*', re.IGNORECASE)
+    for object_name, alternatives in paths.items():
+        match = component_pattern.match(object_name)
+        if match:
+            component_paths.setdefault(int(match.group(1)), []).extend(alternatives)
+            component_names.setdefault(int(match.group(1)), object_name)
+    lines = ini_path.read_text(encoding='utf-8').splitlines()
+    draw_vars = {}
+    for line in lines:
+        m = re.match(r'\s*(?:global\s+)?(\$draw_component_(\d+)_\S+)\s*=\s*', line, re.IGNORECASE)
+        if m:
+            draw_vars.setdefault(int(m.group(2)), []).append(m.group(1))
+    # Canonicalize every generated component variable to the TheHerta object name.
+    # This removes material-derived names from the bridge contract entirely.
+    rename_map = {}
+    for component_id, names in draw_vars.items():
+        canonical = component_names.get(component_id)
+        if not canonical:
+            continue
+        target = fmt.format_ini_drawvar(canonical)
+        for source in names:
+            if source.casefold() != target.casefold():
+                rename_map[source] = target
+    if rename_map:
+        _debug('rename_map=' + repr(rename_map))
+        for i, line in enumerate(lines):
+            for source, target in rename_map.items():
+                lines[i] = re.sub(r'(?<![A-Za-z0-9_])' + re.escape(source) + r'(?![A-Za-z0-9_])', target, lines[i], flags=re.IGNORECASE)
+        draw_vars = {cid: [rename_map.get(v, v) for v in vals] for cid, vals in draw_vars.items()}
+    rewritten = set()
+    for component_id, alternatives in component_paths.items():
+        expressions = []
+        for path in alternatives:
+            if path:
+                expressions.append(' && '.join(f'{fmt.format_ini_swapvar(v)} == {state}' for v, state in path))
+        if not expressions:
+            continue
+        expression = ' || '.join(f'({x})' for x in expressions)
+        for lhs in draw_vars.get(component_id, []):
             for i, line in enumerate(lines):
-                for source, target in rename_map.items():
-                    lines[i] = re.sub(r'(?<![A-Za-z0-9_])' + re.escape(source) + r'(?![A-Za-z0-9_])', target, lines[i], flags=re.IGNORECASE)
-            draw_vars = {cid: [rename_map.get(v, v) for v in vals] for cid, vals in draw_vars.items()}
-        rewritten = set()
-        for component_id, alternatives in component_paths.items():
-            expressions = []
-            for path in alternatives:
-                if path:
-                    expressions.append(' && '.join(f'{fmt.format_ini_swapvar(v)} == {state}' for v, state in path))
-            if not expressions:
-                continue
-            expression = ' || '.join(f'({x})' for x in expressions)
-            for lhs in draw_vars.get(component_id, []):
-                for i, line in enumerate(lines):
-                    if line.strip().startswith(lhs + ' ='):
-                        lines[i] = f'{lhs} = {expression}'
-                        rewritten.add(lhs.casefold())
-        # Remove stale bridge assignments that target names absent from draw blocks.
-        process_start = next((i for i, line in enumerate(lines) if line.strip() == '[CommandListProcessToggles]'), None)
-        if process_start is not None:
-            process_end = next((i for i in range(process_start + 1, len(lines)) if lines[i].startswith('[')), len(lines))
-            valid = {v.casefold() for vals in draw_vars.values() for v in vals}
-            lines = [line for i, line in enumerate(lines)
-                     if not (process_start < i < process_end and re.match(r'\s*\$draw_\S+\s*=', line)
-                             and re.match(r'\s*(\$draw_\S+)\s*=', line).group(1).casefold() not in valid)]
-        ini_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-        _debug('rewrite_done')
-    except Exception:
-        raise
+                if line.strip().startswith(lhs + ' ='):
+                    lines[i] = f'{lhs} = {expression}'
+                    rewritten.add(lhs.casefold())
+    # Remove stale bridge assignments that target names absent from draw blocks.
+    process_start = next((i for i, line in enumerate(lines) if line.strip() == '[CommandListProcessToggles]'), None)
+    if process_start is not None:
+        process_end = next((i for i in range(process_start + 1, len(lines)) if lines[i].startswith('[')), len(lines))
+        valid = {v.casefold() for vals in draw_vars.values() for v in vals}
+        lines = [line for i, line in enumerate(lines)
+                 if not (process_start < i < process_end and re.match(r'\s*\$draw_\S+\s*=', line)
+                         and re.match(r'\s*(\$draw_\S+)\s*=', line).group(1).casefold() not in valid)]
+    ini_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    _debug('rewrite_done')
 
 def _inject_swap_toggles(cfg, tree):
     toggles = getattr(cfg, 'ini_toggles', None)
@@ -178,33 +192,38 @@ def _inject_swap_toggles(cfg, tree):
     old_enabled = bool(cfg.use_ini_toggles)
     # The bridge export is a self-contained transaction.  Do not enable and
     # validate dormant/incomplete Velo toggle rows owned by the user.
-    toggles.vars.clear()
-    bindings = _swap_bindings(tree)
-    for idx, node in enumerate(_swap_nodes(tree, '')):
-        name = bindings[node.as_pointer()]
-        var = toggles.vars.add()
-        var.name = name
-        var.hotkeys = getattr(node, 'hotkey', '') or ''
-        var.default_state = '0'
-        for state_index, socket in enumerate(node.inputs):
-            state = var.states.add()
-            state.name = str(state_index)
-            # An unlinked ObjectSwap input deliberately remains an empty state.
-            # Velo then emits no object bindings for that state, which matches
-            # TheHerta4's `skip` semantics: all objects from other options hide.
-            for link in socket.links:
-                upstream = link.from_node
-                try:
-                    candidates = linked_objects(upstream)
-                except Exception:
-                    candidates = []
-                for obj in candidates:
-                    item = state.objects.add()
-                    item.object = obj
-                    item.add_default_condition(var.name, state.name)
-        if not len(var.states):
-            toggles.vars.remove(toggles.vars.find(var.name))
-    cfg.use_ini_toggles = True
+    try:
+        toggles.vars.clear()
+        bindings = _swap_bindings(tree)
+        for idx, node in enumerate(_swap_nodes(tree, '')):
+            name = bindings[node.as_pointer()]
+            var = toggles.vars.add()
+            var.name = name
+            var.hotkeys = getattr(node, 'hotkey', '') or ''
+            var.default_state = '0'
+            for state_index, socket in enumerate(node.inputs):
+                state = var.states.add()
+                state.name = str(state_index)
+                # An unlinked ObjectSwap input deliberately remains an empty state.
+                # Velo then emits no object bindings for that state, which matches
+                # TheHerta4's `skip` semantics: all objects from other options hide.
+                for link in socket.links:
+                    upstream = link.from_node
+                    try:
+                        candidates = linked_objects(upstream)
+                    except Exception:
+                        candidates = []
+                    for obj in candidates:
+                        item = state.objects.add()
+                        item.object = obj
+                        item.add_default_condition(var.name, state.name)
+            if not len(var.states):
+                toggles.vars.remove(toggles.vars.find(var.name))
+        cfg.use_ini_toggles = True
+    except Exception:
+        # 注入失败必须还原用户原有的切换配置，避免失败后遗留被清空的 toggle 行。
+        _restore_swap_toggles(cfg, (snapshot, old_enabled))
+        raise
     return snapshot, old_enabled, bindings
 
 def _restore_swap_toggles(cfg, snapshot_state):
@@ -236,13 +255,6 @@ def _seed_postprocess_detection_from_ini(tree, ini_path):
     except Exception:
         pass
 
-def _normalize_postprocess_swap_variables(ini_path):
-    """Make GUI post-process writes target the same swapvar used by Velo KeySwap."""
-    path = Path(ini_path)
-    text = path.read_text(encoding='utf-8')
-    text = re.sub(r'(?<![A-Za-z0-9_])\$swapkey(\d+)(?![A-Za-z0-9_])', r'$swapvar_swapkey\1', text)
-    path.write_text(text, encoding='utf-8')
-
 def _restore_th4_swap_variable_names(ini_path):
     path = Path(ini_path)
     text = path.read_text(encoding='utf-8')
@@ -263,6 +275,8 @@ class SSMTNode_VeloExportBridge(bpy.types.Node):
         self.outputs.new('SSMTSocketPostProcess', 'Post Process')
         self.width = 240
     def draw_buttons(self, context, layout):
+        if not VELO_TOOLS_AVAILABLE:
+            layout.label(text='未安装前置插件 Velo Tools，无法导出', icon='ERROR')
         op = layout.operator('ssmt.velo_bridge_execute', text='导出mod', icon='EXPORT')
         op.tree_name = self.id_data.name
         op.node_name = self.name
@@ -272,6 +286,8 @@ class ImportVeloWorkspace(bpy.types.Operator):
     bl_label = '导入当前velo工作空间'
     bl_options = {'REGISTER', 'UNDO'}
     def execute(self, context):
+        if not _require_velo_tools(self):
+            return {'CANCELLED'}
         if context.scene.global_properties.workspace_source_mode != 'VELO':
             self.report({'WARNING'}, '请先选择velo工作空间')
             return {'CANCELLED'}
@@ -321,9 +337,13 @@ class ExportVeloWorkspace(bpy.types.Operator):
     tree_name: StringProperty()
     node_name: StringProperty()
     def execute(self, context):
+        if not _require_velo_tools(self):
+            return {'CANCELLED'}
         tmp = None
         cfg = None
         original = None
+        toggle_state = None
+        original_auto_split = None
         try:
             tree = bpy.data.node_groups[self.tree_name]
             objects = linked_objects(tree.nodes[self.node_name])
@@ -409,7 +429,7 @@ class ExportVeloWorkspace(bpy.types.Operator):
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
         finally:
-            _restore_swap_toggles(cfg, locals().get('toggle_state'))
+            _restore_swap_toggles(cfg, toggle_state)
             if cfg is not None and original_auto_split is not None:
                 cfg.velo_auto_split_by_material = original_auto_split
             if tmp is not None:

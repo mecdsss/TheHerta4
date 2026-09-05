@@ -12,7 +12,7 @@ from collections import OrderedDict
 
 from .node_postprocess_material import (
     MATERIAL_DETECT_PRESETS,
-    SSMTNode_PostProcess_Material,
+    SSMTNode_PostProcess_MaterialBase,
 )
 
 
@@ -32,18 +32,24 @@ _switch_sync_guard = False
 
 
 def _sync_switch_variable_fields(group, context):
-    """同一切换变量的启用状态与备注保持完全一致。"""
+    """同一切换变量的启用状态与备注保持完全一致（限定在所属蓝图内）。"""
     global _switch_sync_guard
     if _switch_sync_guard:
         return
     variable = str(getattr(group, "switch_variable", "") or "").strip()
     if not variable:
         return
+    # 只同步触发变量所属的蓝图树，避免不同蓝图同名变量互相干扰。
+    try:
+        owner_tree = group.id_data.id_data
+    except Exception:
+        owner_tree = None
     _switch_sync_guard = True
     try:
         enabled = bool(getattr(group, "enabled", True))
         comment = str(getattr(group, "comment", "") or "")
-        for tree in bpy.data.node_groups:
+        trees = [owner_tree] if owner_tree is not None else list(bpy.data.node_groups)
+        for tree in trees:
             for node in getattr(tree, "nodes", []) or []:
                 if getattr(node, "bl_idname", "") != NODE_IDNAME:
                     continue
@@ -911,7 +917,7 @@ class SSMT_OT_CustomMaterialClearSwitches(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_Material):
+class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBase):
     bl_idname = NODE_IDNAME
     bl_label = "材质转资源pro"
     bl_description = (
@@ -1817,6 +1823,73 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_Material):
         return super().execute_postprocess(mod_export_path, exporter=exporter)
 
 
+LEGACY_MATERIAL_NODE_ID = 'SSMTNode_PostProcess_Material'
+
+
+def _migrate_legacy_material_nodes():
+    """把旧版「材质转资源」节点原位迁移为「材质转资源pro」（幂等）。
+
+    旧类仅保留为注册壳（见 node_postprocess_material），目的是让旧蓝图文件
+    能够正常加载、避免未知节点类型被 Blender 静默丢弃；迁移在此之后执行：
+    复制全部共享属性、切换为全局指定模式（等价原版全场景行为），并重连
+    同名 socket 的连线。迁移完成的壳节点随即删除。
+    """
+    migrated = 0
+    for tree in bpy.data.node_groups:
+        if getattr(tree, 'bl_idname', '') != 'SSMTBlueprintTreeType':
+            continue
+        for node in list(tree.nodes):
+            if getattr(node, 'bl_idname', '') != LEGACY_MATERIAL_NODE_ID:
+                continue
+            try:
+                _migrate_legacy_material_node(tree, node)
+                migrated += 1
+            except Exception as exc:
+                print(f"[TheHerta4] 材质转资源节点迁移失败 {node.name}: {exc}")
+    if migrated:
+        print(f"[TheHerta4] 材质转资源节点迁移完成：{migrated} 个节点已转换为「材质转资源pro」。")
+    return migrated
+
+
+def _migrate_legacy_material_node(tree, node):
+    new_node = tree.nodes.new(NODE_IDNAME)
+    new_node.location = node.location
+    if node.label:
+        new_node.label = node.label
+    # 原版按场景全部物体处理，等价于 pro 的「使用全局指定」模式。
+    new_node.use_global_assign = True
+    # 复制共享属性（属性均声明在未注册的 SSMTNode_PostProcess_MaterialBase）。
+    for attr in ('material_to_resource_override', 'debug_disable_fx_ttl',
+                 'material_switch_var', 'temp_prefix_input',
+                 'show_detect_panel', 'detect_all_ok'):
+        try:
+            setattr(new_node, attr, getattr(node, attr))
+        except Exception:
+            pass
+    for item in node.material_detect_prefixes:
+        target = new_node.material_detect_prefixes.add()
+        target.prefix = item.prefix
+    for item in node.detected_materials:
+        target = new_node.detected_materials.add()
+        target.object_name = item.object_name
+        target.missing_prefix = item.missing_prefix
+    # 重连输入/输出 socket（两者的 socket 布局一致：PostProcess Input/Output）。
+    for index, output in enumerate(node.outputs):
+        for link in list(output.links):
+            tree.links.new(new_node.outputs[index], link.to_socket)
+    for index, socket_input in enumerate(node.inputs):
+        for link in list(socket_input.links):
+            tree.links.new(link.from_socket, new_node.inputs[index])
+    tree.nodes.remove(node)
+
+
+def _migrate_legacy_material_nodes_handler():
+    try:
+        _migrate_legacy_material_nodes()
+    except Exception as exc:
+        print(f"[TheHerta4] 材质转资源节点迁移失败: {exc}")
+
+
 classes = (
     SSMT_CustomMaterialAssignSwitchGroup,
     SSMT_CustomMaterialAssignTargetItem,
@@ -1840,9 +1913,15 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.VIEW3D_HT_header.append(_draw_picking_header)
+    if _migrate_legacy_material_nodes_handler not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_migrate_legacy_material_nodes_handler)
+    # 立即迁移一次：覆盖「addon 启用时文件已打开」的场景。
+    _migrate_legacy_material_nodes_handler()
 
 
 def unregister():
     bpy.types.VIEW3D_HT_header.remove(_draw_picking_header)
+    if _migrate_legacy_material_nodes_handler in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_migrate_legacy_material_nodes_handler)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
