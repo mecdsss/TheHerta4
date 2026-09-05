@@ -7,8 +7,11 @@ from bpy.props import StringProperty
 
 NODE_ID = 'SSMTNode_VeloExportBridge'
 BRIDGE_VERSION = '0.3.0-object-name-canonical'
+LOG_PREFIX = '[TheHerta4][VeloBridge][Experimental] '
 
 def _debug(message):
+    message = LOG_PREFIX + str(message)
+    print(message)
     try:
         p = Path.home() / 'TheHerta4_Velo_Bridge.debug.log'
         with p.open('a', encoding='utf-8') as f:
@@ -248,7 +251,8 @@ def _restore_th4_swap_variable_names(ini_path):
 
 class SSMTNode_VeloExportBridge(bpy.types.Node):
     bl_idname = NODE_ID
-    bl_label = 'Velo Mod'
+    bl_label = 'Velo Mod（实验性）'
+    bl_description = '实验性桥接：使用 Velo Tools 当前工作空间导出，并运行已连接的 TheHerta4 后处理节点。'
     bl_icon = 'EXPORT'
     @classmethod
     def poll(cls, tree):
@@ -307,7 +311,8 @@ class ImportVeloWorkspace(bpy.types.Operator):
         except Exception:
             bpy.data.node_groups.remove(tree)
             raise
-        self.report({'INFO'}, '已导入 Velo 工作空间: ' + coll.name)
+        _debug('workspace_import collection=' + coll.name + ' objects=' + str(len(coll.all_objects)))
+        self.report({'INFO'}, '已导入 Velo 工作空间（实验性）: ' + coll.name)
         return {'FINISHED'}
 
 class ExportVeloWorkspace(bpy.types.Operator):
@@ -322,6 +327,7 @@ class ExportVeloWorkspace(bpy.types.Operator):
         try:
             tree = bpy.data.node_groups[self.tree_name]
             objects = linked_objects(tree.nodes[self.node_name])
+            _debug('export_start tree=' + self.tree_name + ' node=' + self.node_name + ' objects=' + str(len(objects)))
             if not objects:
                 raise ValueError('没有连接到 Velo Mod 的网格物体')
             desc, cfg = workspace(context.scene)
@@ -364,8 +370,10 @@ class ExportVeloWorkspace(bpy.types.Operator):
                 raise ValueError('蓝图连接的对象不在 Velo 工作空间集合中')
             cfg.component_collection = tmp
             toggle_state = _inject_swap_toggles(cfg, tree)
+            _debug('swap_toggles_injected=' + str(bool(toggle_state)))
             category, name = desc.export_op.split('.')
             result = getattr(getattr(bpy.ops, category), name)('EXEC_DEFAULT')
+            _debug('velo_export_result=' + repr(result) + ' output=' + str(cfg.mod_output_folder))
             if 'FINISHED' not in result or getattr(cfg, 'last_error_text', ''):
                 raise ValueError(getattr(cfg, 'last_error_text', '') or 'Velo 导出未完成')
             _rewrite_nested_toggle_conditions(cfg, tree, tree.nodes[self.node_name], toggle_state[2] if toggle_state else {})
@@ -397,6 +405,7 @@ class ExportVeloWorkspace(bpy.types.Operator):
             except Exception as post_exc:
                 raise ValueError('后处理节点执行失败: ' + str(post_exc))
         except Exception as exc:
+            _debug('export_failed=' + repr(exc))
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
         finally:
